@@ -1,0 +1,11 @@
+10 REM CHR$ of integer-promoted byte variable
+20 FOR I=65 TO 90
+30 PRINT CHR$(I);
+40 NEXT
+50 PRINT
+60 REM CHR$ of FOR counter directly
+70 FOR J=48 TO 57:PRINT CHR$(J);:NEXT
+80 PRINT
+90 REM CHR$(0) and CHR$(255) edges
+100 PRINT CHR$(34);"NULL=";CHR$(48);CHR$(34)
+110 PRINT CHR$(255-1);CHR$(255)

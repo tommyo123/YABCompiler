@@ -1,0 +1,389 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.9.0)'
+        required: true
+        default: '0.9.0'
+      create_release:
+        description: 'Create GitHub release?'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_PACKAGES: "-p yabcompiler-gui -p yabcompiler-cli"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $fullVersion = "${{ github.event.inputs.version }}"
+          } else {
+            $fullVersion = "${{ github.ref_name }}"
+          }
+
+          $fullVersion = $fullVersion -replace '^v', ''
+
+          if ($fullVersion -match '^(\d+\.\d+\.\d+)') {
+            $wixVersion = $matches[1] + '.0'
+          } else {
+            $wixVersion = '0.9.0.0'
+          }
+
+          echo "VERSION=$fullVersion" >> $env:GITHUB_ENV
+          echo "WIX_VERSION=$wixVersion" >> $env:GITHUB_ENV
+          echo "version=$fullVersion" >> $env:GITHUB_OUTPUT
+          echo "wix_version=$wixVersion" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Full version: $fullVersion"
+          Write-Host "WiX version: $wixVersion"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build Release (GUI + CLI)
+        run: cargo build --release ${{ env.BUILD_PACKAGES }}
+
+      - name: Verify binaries exist
+        run: |
+          foreach ($exe in @("yabcompiler-gui.exe", "yabcompiler.exe")) {
+            if (-not (Test-Path "target\release\$exe")) {
+              Write-Error "$exe not found!"
+              exit 1
+            }
+            Write-Host "✓ $exe found"
+          }
+
+      - name: Install WiX Toolset
+        run: |
+          choco install wixtoolset -y
+          $wixBin = Get-ChildItem "${env:ProgramFiles(x86)}" -Recurse -Filter candle.exe |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+          if (-not $wixBin) {
+            throw "WiX candle.exe not found after installation"
+          }
+          Add-Content $env:GITHUB_PATH $wixBin
+
+      - name: Build MSI
+        run: |
+          candle.exe -nologo -ext WixUIExtension -ext WixUtilExtension `
+            -dCargoTargetBinDir=target\release `
+            -dVersion="${{ env.WIX_VERSION }}" `
+            wix\main.wxs
+          light.exe -nologo -ext WixUIExtension -ext WixUtilExtension `
+            -sval -spdb `
+            -out yabcompiler-${{ env.VERSION }}-x86_64-windows.msi `
+            main.wixobj
+
+      - name: Create Portable Package
+        run: |
+          New-Item -ItemType Directory -Force -Path portable-package
+          Copy-Item target\release\yabcompiler-gui.exe portable-package\
+          Copy-Item target\release\yabcompiler.exe portable-package\
+          Copy-Item external-utils\vcruntime140.dll portable-package\
+          Copy-Item README.md portable-package\
+          Copy-Item CHANGELOG.md portable-package\
+          Copy-Item LICENSE portable-package\
+
+          @"
+          YABCompiler - Portable Edition
+          ==============================
+
+          Version: ${{ env.VERSION }}
+
+          This is a portable version that requires no installation.
+
+          INCLUDED FILES:
+          - yabcompiler-gui.exe   (GUI version)
+          - yabcompiler.exe       (Command-line version)
+          - vcruntime140.dll      (Runtime library)
+          - README.md             (Documentation)
+          - CHANGELOG.md          (Version history)
+          - LICENSE               (MIT License)
+
+          HOW TO USE (GUI):
+          1. Extract this ZIP file to any folder you like
+          2. Run yabcompiler-gui.exe
+          3. Done!
+
+          HOW TO USE (CLI):
+          1. Open Command Prompt or PowerShell
+          2. Navigate to the extracted folder
+          3. Run: yabcompiler.exe compile input.bas output.prg
+          4. For help: yabcompiler.exe
+
+          REQUIREMENTS:
+          - Windows 8 or later (64-bit)
+          - Visual C++ Redistributable 2015-2022
+            (included as vcruntime140.dll if not already installed)
+
+          To completely remove: just delete the extracted folder.
+          "@ | Out-File -FilePath portable-package\README-PORTABLE.txt -Encoding UTF8
+
+          Compress-Archive -Force -Path portable-package\* `
+            -DestinationPath yabcompiler-${{ env.VERSION }}-x86_64-windows-portable.zip
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            yabcompiler-${{ env.VERSION }}-x86_64-windows.msi
+            yabcompiler-${{ env.VERSION }}-x86_64-windows-portable.zip
+          retention-days: 7
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies (egui + rfd)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libgtk-3-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build Release (GUI + CLI)
+        run: cargo build --release ${{ env.BUILD_PACKAGES }}
+
+      - name: Verify binaries exist
+        run: |
+          for bin in yabcompiler-gui yabcompiler; do
+            if [ ! -f "target/release/$bin" ]; then
+              echo "Error: $bin not found!"
+              exit 1
+            fi
+            echo "✓ $bin found"
+          done
+
+      - name: Create tar.gz package
+        run: |
+          mkdir -p package
+          cp target/release/yabcompiler-gui package/
+          cp target/release/yabcompiler package/
+          cp README.md package/
+          cp CHANGELOG.md package/
+          cp LICENSE package/
+
+          cat > package/README-LINUX.txt << 'EOF'
+          YABCompiler - Linux Edition
+          ===========================
+
+          INCLUDED FILES:
+          - yabcompiler-gui   (GUI version)
+          - yabcompiler       (Command-line version)
+          - README.md         (Documentation)
+          - CHANGELOG.md      (Version history)
+          - LICENSE           (MIT License)
+
+          HOW TO USE (GUI):
+          1. Extract this archive
+          2. chmod +x yabcompiler-gui
+          3. Run: ./yabcompiler-gui
+
+          HOW TO USE (CLI):
+          1. chmod +x yabcompiler
+          2. Run: ./yabcompiler compile input.bas output.prg
+          3. For help: ./yabcompiler
+          EOF
+
+          cd package
+          tar -czf ../yabcompiler-${{ env.VERSION }}-x86_64-linux.tar.gz *
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: yabcompiler-${{ env.VERSION }}-x86_64-linux.tar.gz
+          retention-days: 7
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build Release (GUI + CLI)
+        run: cargo build --release ${{ env.BUILD_PACKAGES }}
+
+      - name: Verify binaries exist
+        run: |
+          for bin in yabcompiler-gui yabcompiler; do
+            if [ ! -f "target/release/$bin" ]; then
+              echo "Error: $bin not found!"
+              exit 1
+            fi
+            echo "✓ $bin found"
+          done
+
+      - name: Create tar.gz package
+        run: |
+          mkdir -p package
+          cp target/release/yabcompiler-gui package/
+          cp target/release/yabcompiler package/
+          cp README.md package/
+          cp CHANGELOG.md package/
+          cp LICENSE package/
+
+          cat > package/README-MACOS.txt << 'EOF'
+          YABCompiler - macOS Edition
+          ===========================
+
+          INCLUDED FILES:
+          - yabcompiler-gui   (GUI version)
+          - yabcompiler       (Command-line version)
+          - README.md         (Documentation)
+          - CHANGELOG.md      (Version history)
+          - LICENSE           (MIT License)
+
+          HOW TO USE (GUI):
+          1. Extract this archive
+          2. chmod +x yabcompiler-gui
+          3. Run: ./yabcompiler-gui
+
+          HOW TO USE (CLI):
+          1. chmod +x yabcompiler
+          2. Run: ./yabcompiler compile input.bas output.prg
+
+          SECURITY WARNING:
+          If you get a security warning, go to System Settings > Privacy & Security
+          and allow the application to run.
+          EOF
+
+          cd package
+          tar -czf ../yabcompiler-${{ env.VERSION }}-x86_64-macos.tar.gz *
+
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: yabcompiler-${{ env.VERSION }}-x86_64-macos.tar.gz
+          retention-days: 7
+
+  create-release:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.inputs.create_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            windows-release/*
+            linux-release/*
+            macos-release/*
+          body: |
+            ## YABCompiler ${{ env.VERSION }}
+
+            Yet Another Basic Compiler — compiles Commodore BASIC V2
+            (plus a TSB Neo subset) to native 6502 machine code that runs
+            on a stock C64.
+
+            ### Installation Options
+
+            **Windows:**
+            - **MSI Installer (Recommended):** installs the GUI and CLI to
+              Program Files with Desktop and Start Menu shortcuts.
+            - **Portable ZIP:** extract and run anywhere; includes both
+              GUI and CLI.
+
+            **Linux / macOS:**
+            - **tar.gz:** extract and run the binaries directly (GUI + CLI).
+
+            ### What's Included
+
+            - **GUI:** `yabcompiler-gui` — graphical front-end.
+            - **CLI:** `yabcompiler` — command-line compiler.
+
+            ### Windows Security Warning
+
+            Windows may show a SmartScreen warning because the installer
+            is not code-signed. Click "More info" → "Run anyway".
+
+            ### Changes
+
+            See [CHANGELOG.md](https://github.com/tommyo123/YABCompiler/blob/master/CHANGELOG.md).
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

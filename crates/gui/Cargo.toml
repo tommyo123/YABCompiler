@@ -1,0 +1,21 @@
+[package]
+name = "yabcompiler-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "egui frontend for YABCompiler."
+
+[[bin]]
+name = "yabcompiler-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+yabcompiler-core.workspace = true
+rfd = "0.15"
+
+[build-dependencies]
+# Embeds the Windows application icon (taskbar / Explorer / Alt-Tab)
+# into the .exe via a resource script. No-op on non-Windows targets.
+winres = "0.1"

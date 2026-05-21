@@ -1,0 +1,10 @@
+# `cargo msi` builds the Windows installer from wix/main.wxs.
+#
+# The MSI bundles two binaries from two crates, so build both first:
+#   cargo build --release -p yabcompiler-gui -p yabcompiler-cli
+#   cargo msi
+#
+# Needs cargo-wix (`cargo install cargo-wix`) and the WiX Toolset 3.x.
+# The MSI lands in target\wix\.
+[alias]
+msi = "wix -p yabcompiler-gui -n yabcompiler --no-build --target-bin-dir target/release -I wix/main.wxs -o target/wix/"

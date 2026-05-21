@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  YABCompiler - WiX Installer Configuration
+
+  Installs to:
+  Program Files\YABCompiler\
+  ├── yabcompiler-gui.exe (GUI)
+  ├── yabcompiler.exe     (CLI)
+  └── vcruntime140.dll    (only if VC++ Redistributable not installed)
+
+  Shortcuts:
+  - Desktop:    YABCompiler (GUI)
+  - Start Menu: YABCompiler (GUI)
+-->
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+    <Product
+        Id="*"
+        Name="YABCompiler"
+        UpgradeCode="EA7203DC-B20F-4499-92EE-9E6A36BA829A"
+        Manufacturer="Tommy Olsen"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package Id="*"
+            Keywords="Installer"
+            Description="Compiles Commodore BASIC V2 (plus a TSB Neo subset) to native 6502 machine code"
+            Manufacturer="Tommy Olsen"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252"
+            Platform="x64"
+            />
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit."/>
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1"/>
+        <Property Id="DiskPrompt" Value="YABCompiler Installation"/>
+
+        <!-- Check if VC++ Redistributable is already installed -->
+        <Property Id="VCREDIST_INSTALLED">
+            <RegistrySearch Id="VCRedist2015Plus_x64"
+                Root="HKLM"
+                Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                Name="Installed"
+                Type="raw" />
+        </Property>
+
+        <!-- Set the installation directory property for WixUI_InstallDir -->
+        <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
+
+        <!-- Set default installation location -->
+        <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize"/>
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="YABCompiler">
+
+                    <!-- Main GUI executable -->
+                    <Component Id="MainExecutable" Guid="*">
+                        <File
+                            Id="MainExe"
+                            Name="yabcompiler-gui.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\yabcompiler-gui.exe"
+                            KeyPath="yes"/>
+                    </Component>
+
+                    <!-- CLI executable -->
+                    <Component Id="CliExecutable" Guid="*">
+                        <File
+                            Id="CliExe"
+                            Name="yabcompiler.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\yabcompiler.exe"
+                            KeyPath="yes"/>
+                    </Component>
+
+                    <!-- VC++ Runtime DLL - only installed if VC++ Redistributable is not present -->
+                    <Component Id="VCRuntime" Guid="*">
+                        <Condition>NOT VCREDIST_INSTALLED</Condition>
+                        <File
+                            Id="VCRuntime140"
+                            Name="vcruntime140.dll"
+                            DiskId="1"
+                            Source="external-utils\vcruntime140.dll"
+                            KeyPath="yes"/>
+                    </Component>
+
+                </Directory>
+            </Directory>
+
+            <!-- Desktop shortcut (GUI only) -->
+            <Directory Id="DesktopFolder" Name="Desktop">
+                <Component Id="DesktopShortcut" Guid="03DE5C2C-97AC-4880-868F-C6DFA616B249">
+                    <Shortcut
+                        Id="DesktopShortcut"
+                        Name="YABCompiler"
+                        Description="Compile Commodore BASIC to native 6502 machine code"
+                        Target="[APPLICATIONFOLDER]yabcompiler-gui.exe"
+                        WorkingDirectory="APPLICATIONFOLDER"/>
+                    <RemoveFolder Id="RemoveDesktopFolder" On="uninstall"/>
+                    <RegistryValue
+                        Root="HKCU"
+                        Key="Software\Commodore 64 Tools\YABCompiler"
+                        Name="DesktopShortcut"
+                        Type="integer"
+                        Value="1"
+                        KeyPath="yes"/>
+                </Component>
+            </Directory>
+
+            <!-- Start Menu shortcuts -->
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="YABCompiler">
+                    <Component Id="StartMenuShortcuts" Guid="DA8F4F56-7FEC-41FD-B2FA-035FBD6BD34C">
+                        <!-- GUI shortcut -->
+                        <Shortcut
+                            Id="ApplicationStartMenuShortcut"
+                            Name="YABCompiler"
+                            Description="Compile Commodore BASIC to native 6502 machine code"
+                            Target="[APPLICATIONFOLDER]yabcompiler-gui.exe"
+                            WorkingDirectory="APPLICATIONFOLDER"/>
+                        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall"/>
+                        <RegistryValue
+                            Root="HKCU"
+                            Key="Software\Commodore 64 Tools\YABCompiler"
+                            Name="StartMenuShortcut"
+                            Type="integer"
+                            Value="1"
+                            KeyPath="yes"/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id="Complete"
+            Title="YABCompiler"
+            Description="Complete installation of YABCompiler (GUI and CLI)."
+            Level="1"
+            ConfigurableDirectory="APPLICATIONFOLDER"
+            AllowAdvertise="no"
+            Display="expand"
+            Absent="disallow">
+
+            <!-- Main application -->
+            <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="CliExecutable"/>
+            <ComponentRef Id="VCRuntime"/>
+
+            <!-- Shortcuts -->
+            <Feature
+                Id="Shortcuts"
+                Title="Desktop and Start Menu Shortcuts"
+                Description="Creates shortcuts on the Desktop and in the Start Menu for easy access."
+                Level="1">
+                <ComponentRef Id="DesktopShortcut"/>
+                <ComponentRef Id="StartMenuShortcuts"/>
+            </Feature>
+        </Feature>
+
+        <!-- Add/Remove Programs properties -->
+        <Property Id="ARPPRODUCTICON" Value="ProductICO" />
+        <Property Id="ARPURLINFOABOUT" Value="https://github.com/tommyo123/YABCompiler/"/>
+        <Property Id="ARPNOREPAIR" Value="yes" Secure="yes" />
+
+        <!-- Product icon -->
+        <Icon Id="ProductICO" SourceFile="icons\icon.ico"/>
+
+        <UI>
+            <!-- Use InstallDir UI to allow directory selection -->
+            <UIRef Id="WixUI_InstallDir"/>
+
+            <!-- Skip the license dialog -->
+            <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+            <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>

@@ -1,0 +1,15 @@
+FOLDED:
+5 AND 3 = 1 
+12 OR 5 = 13 
+NOT 0 =-1 
+NOT -1 = 0 
+NOT 5 =-6 
+RUNTIME:
+A AND B = 2 
+A OR B = 7 
+NOT A =-7 
+BOOLEAN:
+BOTH OK
+ONE OK
+NOT EQUAL
+DONE

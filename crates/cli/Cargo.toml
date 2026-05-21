@@ -1,0 +1,14 @@
+[package]
+name = "yabcompiler-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command-line frontend for YABCompiler."
+
+[[bin]]
+name = "yabcompiler"
+path = "src/main.rs"
+
+[dependencies]
+yabcompiler-core.workspace = true

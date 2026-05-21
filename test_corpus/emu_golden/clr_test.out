@@ -1,0 +1,3 @@
+BEFORE CLR: A= 42  B$=HELLO N(0)= 7  N(1)= 14 
+AFTER CLR:  A= 0  B$=() N(0)= 0  N(1)= 0 
+AFTER RE-ASSIGN: A= 99 

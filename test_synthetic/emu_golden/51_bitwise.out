@@ -1,0 +1,19 @@
+ 1 
+ 7 
+ 4 
+ 15 
+ 15 
+ 255 
+ 0 
+ 100 
+-1 
+-2 
+ 0 BIT0= 0 BIT1= 0 BIT2= 0 
+ 1 BIT0= 1 BIT1= 0 BIT2= 0 
+ 2 BIT0= 0 BIT1= 2 BIT2= 0 
+ 3 BIT0= 1 BIT1= 2 BIT2= 0 
+ 4 BIT0= 0 BIT1= 0 BIT2= 4 
+ 5 BIT0= 1 BIT1= 0 BIT2= 4 
+ 6 BIT0= 0 BIT1= 2 BIT2= 4 
+ 7 BIT0= 1 BIT1= 2 BIT2= 4 
+ 0  255 

@@ -1,0 +1,8 @@
+ADD 3  6 
+SUB 7  25 
+MUL 12  49 
+DIV 2.5  4 
+PREC 7  9 
+NEG-5 -5 
+POW 256  81 
+MIX 5  15 

@@ -1,0 +1,11 @@
+10 REM CHR$ via int-island truncation paths
+20 A=PEEK(53281):POKE 53281,1
+30 PRINT CHR$(64+(A AND 15));
+40 PRINT CHR$((A+1) AND 255)
+50 REM expr that needs i16 + AND 255 truncate
+60 FOR I=0 TO 7
+70 PRINT CHR$(48+(I*2 AND 7));
+80 NEXT:PRINT
+90 REM PEEK as direct CHR$ arg
+100 POKE 1024,86
+110 PRINT CHR$(PEEK(1024))

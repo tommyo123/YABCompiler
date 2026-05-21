@@ -1,0 +1,9 @@
+A% = 42 
+B% =-17 
+SUM: 25 
+A%*3 = 126 
+TRUNC 7.9 = 7.9 
+D%=7.9 STORED: 7 
+ 1  2  3  4  5 
+AFTER LOOP I% = 6 
+FLOAT 100 TO INT: 100 

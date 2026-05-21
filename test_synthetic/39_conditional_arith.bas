@@ -1,0 +1,11 @@
+10 A=5:B=10
+20 PRINT (A<B);(A>B);(A=B);(A<>B)
+30 PRINT (A<B)+(A>B);(A<B)*100
+40 X=(A<B)*A+(A>=B)*B
+50 PRINT "MIN:";X
+60 Y=(A>B)*A+(A<=B)*B
+70 PRINT "MAX:";Y
+80 FOR I=-3 TO 3
+90 S=SGN(I)
+100 PRINT I,S,(I>0)*1,(I<0)*-1,(I=0)*0
+110 NEXT

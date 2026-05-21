@@ -1,0 +1,13 @@
+[package]
+name = "emu64"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal in-process C64 / 6510 emulator (vendored from zig65 for fast in-process test execution)."
+
+[[bin]]
+name = "emu64"
+path = "src/main.rs"
+
+[lib]
+name = "emu64"
+path = "src/lib.rs"

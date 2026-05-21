@@ -1,0 +1,18 @@
+[package]
+name = "yabcompiler-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core compiler library for YABCompiler."
+
+[lib]
+name = "yabcompiler_core"
+path = "src/lib.rs"
+
+[dependencies]
+asm6502.workspace = true
+
+[dev-dependencies]
+# In-process C64 emulator used by integration tests.
+emu64 = { path = "../emu64" }

@@ -1,0 +1,8 @@
+ROW MAJOR DUMP:
+ 0  1  2  3 
+ 10  11  12  13 
+ 20  21  22  23 
+DIAGONAL:
+ 0  11  22 
+SUM:
+ 138 
