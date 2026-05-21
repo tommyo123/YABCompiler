@@ -2,7 +2,7 @@
 
 Yet Another Basic Compiler. Compiles Commodore BASIC V2 programs to
 native 6502 machine code that runs on a stock C64. It also compiles
-the subset of Simons' BASIC and Tuned Simons' BASIC commands that make
+the subset of Simons' BASIC (Tuned Simons' BASIC dialect) commands that make
 sense in a compiled program (see below).
 
 Input can be either a tokenized `.prg` (as saved by an emulator or a
