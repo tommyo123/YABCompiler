@@ -13260,11 +13260,14 @@ impl Codegen {
     fn array_label(name: &VarName) -> String {
         // Include the kind suffix so `A()`, `A%()` and `A$()` (which
         // are three independent arrays in BASIC v2) get distinct
-        // storage labels.
+        // storage labels. The suffix is separated by `_` so it cannot
+        // merge into the base name: without it, the string array `L$`
+        // (base `L`, suffix `S`) and the float array `LS` would both
+        // mangle to `__ARR_LS` and alias the same storage.
         let suffix = match name.kind {
             VarKind::Float => "",
-            VarKind::Integer => "I",
-            VarKind::String => "S",
+            VarKind::Integer => "_I",
+            VarKind::String => "_S",
         };
         format!("__ARR_{}{}", name.base, suffix)
     }
@@ -13282,10 +13285,12 @@ impl Codegen {
     }
 
     fn base_label_suffix(name: &VarName) -> String {
+        // Separator matches `array_label`: keeps the string/float kinds
+        // from colliding (e.g. `L$` vs `LS`).
         let suffix = match name.kind {
             VarKind::Float => "",
-            VarKind::Integer => "I",
-            VarKind::String => "S",
+            VarKind::Integer => "_I",
+            VarKind::String => "_S",
         };
         format!("{}{}", name.base, suffix)
     }
@@ -29381,9 +29386,37 @@ mod tests {
             "3D float array should be allocated\n{asm}"
         );
         assert!(
-            asm.contains("__ARR_BI"),
+            asm.contains("__ARR_B_I"),
             "4D integer array should be allocated\n{asm}"
         );
+    }
+
+    #[test]
+    fn string_array_does_not_alias_float_array() {
+        // `L$(4)` and `LS(4)` are independent arrays. Their storage
+        // labels must differ; otherwise writing the numeric `LS(I)`
+        // overwrites the `L$` string pointers (the BrightonStrand
+        // line-336 illegal-quantity corruption).
+        let l_str = svar("L"); // L$
+        let ls_float = fvar("LS"); // LS
+        let m = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![Stmt::Dim(vec![
+                    DimSpec {
+                        name: l_str,
+                        dims: vec![Expr::Number(4.0)],
+                    },
+                    DimSpec {
+                        name: ls_float,
+                        dims: vec![Expr::Number(4.0)],
+                    },
+                ])],
+            }],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        assert!(asm.contains("__ARR_L_S"), "L$ array label missing\n{asm}");
+        assert!(asm.contains("__ARR_LS"), "LS array label missing\n{asm}");
     }
 
     #[test]
