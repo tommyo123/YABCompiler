@@ -28,7 +28,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set version
         id: version
@@ -143,7 +143,7 @@ jobs:
             -DestinationPath yabcompiler-${{ env.VERSION }}-x86_64-windows-portable.zip
 
       - name: Upload Windows Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-release
           path: |
@@ -155,7 +155,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set version
         id: version
@@ -238,7 +238,7 @@ jobs:
           tar -czf ../yabcompiler-${{ env.VERSION }}-x86_64-linux.tar.gz *
 
       - name: Upload Linux Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-release
           path: yabcompiler-${{ env.VERSION }}-x86_64-linux.tar.gz
@@ -248,7 +248,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set version
         id: version
@@ -318,7 +318,7 @@ jobs:
           tar -czf ../yabcompiler-${{ env.VERSION }}-x86_64-macos.tar.gz *
 
       - name: Upload macOS Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: macos-release
           path: yabcompiler-${{ env.VERSION }}-x86_64-macos.tar.gz
@@ -343,10 +343,10 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             windows-release/*
