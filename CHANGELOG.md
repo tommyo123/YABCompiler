@@ -5,6 +5,16 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-05-22
+
+### Fixed
+
+- `LOAD`, `SAVE` and `VERIFY` now accept a string expression as the
+  filename — a string variable (`LOAD A$,8,1`), a parenthesised
+  expression (`LOAD (F$),8`) or a concatenation (`LOAD N$+".C",8,1`) —
+  instead of only a literal quoted string. Programs that build the
+  filename at runtime now compile and run correctly.
+
 ## [0.9.0] - 2026-05-21
 
 First public release.
@@ -35,4 +45,5 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.1]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.1
 [0.9.0]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.0
