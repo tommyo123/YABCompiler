@@ -555,18 +555,18 @@ pub enum Stmt {
         newline: bool,
     },
     Load {
-        filename: Vec<u8>,
+        filename: StrExpr,
         device: Option<Expr>,
         secondary: Option<Expr>,
         load_addr: Option<Expr>,
     },
     Verify {
-        filename: Vec<u8>,
+        filename: StrExpr,
         device: Option<Expr>,
         secondary: Option<Expr>,
     },
     Save {
-        filename: Vec<u8>,
+        filename: StrExpr,
         device: Option<Expr>,
         secondary: Option<Expr>,
     },
@@ -1481,7 +1481,7 @@ fn lower_stmt(
             secondary,
             load_addr,
         } => Stmt::Load {
-            filename: filename.clone(),
+            filename: lower_str(filename),
             device: device.as_ref().map(lower_expr),
             secondary: secondary.as_ref().map(lower_expr),
             load_addr: load_addr.as_ref().map(lower_expr),
@@ -1491,7 +1491,7 @@ fn lower_stmt(
             device,
             secondary,
         } => Stmt::Verify {
-            filename: filename.clone(),
+            filename: lower_str(filename),
             device: device.as_ref().map(lower_expr),
             secondary: secondary.as_ref().map(lower_expr),
         },
@@ -1500,7 +1500,7 @@ fn lower_stmt(
             device,
             secondary,
         } => Stmt::Save {
-            filename: filename.clone(),
+            filename: lower_str(filename),
             device: device.as_ref().map(lower_expr),
             secondary: secondary.as_ref().map(lower_expr),
         },

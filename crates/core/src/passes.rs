@@ -874,11 +874,12 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
             }
         }
         Statement::Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
+            rewrite_vars_in_str_expr(filename, map);
             if let Some(e) = device {
                 rewrite_vars_in_expr(e, map);
             }
@@ -890,11 +891,16 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
             }
         }
         Statement::Verify {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         }
         | Statement::Save {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         } => {
+            rewrite_vars_in_str_expr(filename, map);
             if let Some(e) = device {
                 rewrite_vars_in_expr(e, map);
             }
@@ -3600,22 +3606,28 @@ fn stmt_reads_var(stmt: &Stmt, var: &VarName) -> bool {
                 })
         }
         Stmt::Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
-            device.as_ref().map_or(false, |e| expr_reads_var(e, var))
+            str_reads_var(filename, var)
+                || device.as_ref().map_or(false, |e| expr_reads_var(e, var))
                 || secondary.as_ref().map_or(false, |e| expr_reads_var(e, var))
                 || load_addr.as_ref().map_or(false, |e| expr_reads_var(e, var))
         }
         Stmt::Verify {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         }
         | Stmt::Save {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         } => {
-            device.as_ref().map_or(false, |e| expr_reads_var(e, var))
+            str_reads_var(filename, var)
+                || device.as_ref().map_or(false, |e| expr_reads_var(e, var))
                 || secondary.as_ref().map_or(false, |e| expr_reads_var(e, var))
         }
         Stmt::Disk { command } => str_reads_var(command, var),
@@ -4992,18 +5004,20 @@ fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
                 })
         }
         Stmt::Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
-            device.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
+            str_is_int_safe(filename, loop_var)
+                && device.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
                 && secondary.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
                 && load_addr.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
         }
-        Stmt::Verify { device, secondary, .. }
-        | Stmt::Save { device, secondary, .. } => {
-            device.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
+        Stmt::Verify { filename, device, secondary }
+        | Stmt::Save { filename, device, secondary } => {
+            str_is_int_safe(filename, loop_var)
+                && device.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
                 && secondary.as_ref().map_or(true, |e| expr_is_int_safe(e, loop_var))
         }
         Stmt::Disk { command } => str_is_int_safe(command, loop_var),
@@ -7053,11 +7067,12 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
             }
         }
         Stmt::Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
+            local_const_str(filename, env);
             if let Some(e) = device {
                 local_const_expr(e, env);
             }
@@ -7069,11 +7084,16 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
             }
         }
         Stmt::Verify {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         }
         | Stmt::Save {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         } => {
+            local_const_str(filename, env);
             if let Some(e) = device {
                 local_const_expr(e, env);
             }

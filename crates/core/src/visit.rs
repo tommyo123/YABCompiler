@@ -638,11 +638,12 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
             }
         }
         Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
+            v.visit_str_expr(filename);
             if let Some(e) = device {
                 v.visit_expr(e);
             }
@@ -654,11 +655,16 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
             }
         }
         Verify {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         }
         | Save {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         } => {
+            v.visit_str_expr(filename);
             if let Some(e) = device {
                 v.visit_expr(e);
             }
@@ -1472,11 +1478,12 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
             }
         }
         Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
+            v.visit_str_expr_mut(filename);
             if let Some(e) = device {
                 v.visit_expr_mut(e);
             }
@@ -1488,11 +1495,16 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
             }
         }
         Verify {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         }
         | Save {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         } => {
+            v.visit_str_expr_mut(filename);
             if let Some(e) = device {
                 v.visit_expr_mut(e);
             }

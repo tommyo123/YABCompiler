@@ -3944,16 +3944,15 @@ enum FileOp {
 /// programs and we reject it here with a clearer error.
 fn file_op_stmt(p: &mut Cursor<'_>, op: FileOp) -> Result<Statement, ParseError> {
     p.skip_spaces();
-    if p.peek() != Some(b'"') {
-        // BASIC v2 accepts a string expression as the filename
-        // (`LOAD N$+".C",8,1`), but our codegen only supports a
-        // literal string. In lenient mode treat the rest of the
-        // statement as a REM so the surrounding program still
-        // compiles — the program will reach this point at runtime
-        // expecting a chain-load that the compiled output can't
-        // perform anyway, so dropping the LOAD is no worse than
-        // failing to compile the whole file. Strict mode keeps
-        // the error.
+    // The filename is the only string-typed argument here, so a leading
+    // `(` can only be a parenthesised string expression — `LOAD (F$),8`.
+    // (OPEN can't assume this, which is why the shared heuristic omits it.)
+    if !peek_starts_string_expr(p) && p.peek() != Some(b'(') {
+        // BASIC v2's bare `LOAD` (chain the next program from tape)
+        // and the directory form `LOAD "$",8` aren't meaningful in a
+        // compiled single-binary program. In lenient mode drop the
+        // statement to a REM so the rest of the program still
+        // compiles; strict mode reports it.
         if p.lenient_syntax {
             while let Some(b) = p.peek() {
                 if b == b':' || b == b';' {
@@ -3969,8 +3968,7 @@ fn file_op_stmt(p: &mut Cursor<'_>, op: FileOp) -> Result<Statement, ParseError>
             what: "string filename after LOAD/SAVE/VERIFY",
         });
     }
-    p.advance(1);
-    let filename = p.take_string_body();
+    let filename = string_expression(p)?;
     let mut device = None;
     let mut secondary = None;
     let mut load_addr = None;
@@ -7254,6 +7252,32 @@ mod tests {
         assert!(matches!(exprs[2], Expr::Number(n) if *n == 0xD000 as f64));
         assert!(matches!(exprs[3], Expr::Bin(BinOp::Mul, _, _)));
         assert!(matches!(exprs[4], Expr::Inst { .. }));
+    }
+
+    #[test]
+    fn load_accepts_string_expression_filename() {
+        // `LOAD A$, 8, 1` — filename held in a string variable.
+        let stmts = line_body(10, &[TOK_LOAD, b'A', b'$', b',', b'8', b',', b'1']).unwrap();
+        assert!(matches!(
+            &stmts[0],
+            Statement::Load {
+                filename: StrExpr::Var(_),
+                device: Some(Expr::Number(8.0)),
+                secondary: Some(Expr::Number(1.0)),
+                ..
+            }
+        ));
+
+        // `LOAD (A$), 8` — a parenthesised string expression.
+        let stmts = line_body(20, &[TOK_LOAD, b'(', b'A', b'$', b')', b',', b'8']).unwrap();
+        assert!(matches!(
+            &stmts[0],
+            Statement::Load {
+                filename: StrExpr::Var(_),
+                device: Some(Expr::Number(8.0)),
+                ..
+            }
+        ));
     }
 
     #[test]

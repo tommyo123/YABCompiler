@@ -709,7 +709,7 @@ pub enum Statement {
     /// the load address from the file header). For raw-byte data
     /// loads from disk a typical invocation is `LOAD "name", 8, 1`.
     Load {
-        filename: Vec<u8>,
+        filename: StrExpr,
         device: Option<Expr>,
         secondary: Option<Expr>,
         /// `LOAD ... USE,0,addr` — force KERNAL LOAD to place
@@ -718,7 +718,7 @@ pub enum Statement {
     },
     /// `VERIFY ...` — same shape as LOAD but with .A=1.
     Verify {
-        filename: Vec<u8>,
+        filename: StrExpr,
         device: Option<Expr>,
         secondary: Option<Expr>,
     },
@@ -727,7 +727,7 @@ pub enum Statement {
     /// targets the BASIC text area; in our compiled context we save
     /// the same physical range (which IS our compiled binary).
     Save {
-        filename: Vec<u8>,
+        filename: StrExpr,
         device: Option<Expr>,
         secondary: Option<Expr>,
     },

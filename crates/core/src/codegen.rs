@@ -22061,19 +22061,14 @@ impl Codegen {
         Ok(())
     }
 
-    fn emit_open(
-        &mut self,
-        file_num: &Expr,
-        device: Option<&Expr>,
-        secondary: Option<&Expr>,
-        filename: Option<&StrExpr>,
-    ) -> Result<(), CodegenError> {
-        // SETNAM first — even with no filename we set length to 0 so
-        // KERNAL doesn't read leftover state from a prior call.
+    /// Sets the KERNAL filename (SETNAM) from a string expression.
+    /// Shared by OPEN, LOAD, SAVE and VERIFY. `None` clears the name to
+    /// length 0 so KERNAL doesn't read leftover state from a prior call.
+    fn emit_setnam(&mut self, filename: Option<&StrExpr>) -> Result<(), CodegenError> {
         match filename {
             Some(StrExpr::Literal(name)) => {
                 // Constant filename — bypass the runtime string path so
-                // the binary is the same size as before this feature.
+                // the binary is the same size as a plain literal LOAD.
                 let label = self.intern_string(name.clone());
                 writeln!(self.code, "    LDA #${:02X}", name.len().min(255) as u8).unwrap();
                 writeln!(self.code, "    LDX #<({label}+1)").unwrap();
@@ -22093,7 +22088,7 @@ impl Codegen {
                 // ptr += 1 (advance past length byte)
                 writeln!(self.code, "    INC ${:02X}", rt::STR_OP_LHS_LO).unwrap();
                 let id = self.fresh_id();
-                let nc = format!("__OPEN_NAME_NC_{id}");
+                let nc = format!("__SETNAM_NC_{id}");
                 writeln!(self.code, "    BNE {nc}").unwrap();
                 writeln!(self.code, "    INC ${:02X}", rt::STR_OP_LHS_HI).unwrap();
                 writeln!(self.code, "{nc}:").unwrap();
@@ -22108,6 +22103,17 @@ impl Codegen {
             }
         }
         writeln!(self.code, "    JSR ${:04X}", rt::SETNAM).unwrap();
+        Ok(())
+    }
+
+    fn emit_open(
+        &mut self,
+        file_num: &Expr,
+        device: Option<&Expr>,
+        secondary: Option<&Expr>,
+        filename: Option<&StrExpr>,
+    ) -> Result<(), CodegenError> {
+        self.emit_setnam(filename)?;
 
         // SETLFS — load file/device/secondary into a 3-byte scratch
         // first so the JSR isn't stuck with eval-time register churn.
@@ -22346,18 +22352,14 @@ impl Codegen {
     /// it as a logical-file slot, just as the SETLFS argument).
     fn emit_setnam_and_setlfs(
         &mut self,
-        filename: &[u8],
+        filename: &StrExpr,
         device: Option<&Expr>,
         secondary: Option<&Expr>,
         default_secondary: u8,
     ) -> Result<(), CodegenError> {
-        // SETNAM — string pool stores [len, bytes...]; KERNAL wants
-        // raw-bytes pointer, so offset past the length prefix.
-        let label = self.intern_string(filename.to_vec());
-        writeln!(self.code, "    LDA #${:02X}", filename.len().min(255) as u8).unwrap();
-        writeln!(self.code, "    LDX #<({label}+1)").unwrap();
-        writeln!(self.code, "    LDY #>({label}+1)").unwrap();
-        writeln!(self.code, "    JSR ${:04X}", rt::SETNAM).unwrap();
+        // SETNAM — literal names take a direct pool pointer, string
+        // expressions are evaluated to a runtime buffer first.
+        self.emit_setnam(Some(filename))?;
 
         // SETLFS — file_num=0 since we don't track these as logical
         // files (no later CLOSE for LOAD/SAVE/VERIFY).
@@ -22388,7 +22390,7 @@ impl Codegen {
 
     fn emit_load_or_verify(
         &mut self,
-        filename: &[u8],
+        filename: &StrExpr,
         device: Option<&Expr>,
         secondary: Option<&Expr>,
         load_addr: Option<&Expr>,
@@ -22421,7 +22423,7 @@ impl Codegen {
 
     fn emit_save(
         &mut self,
-        filename: &[u8],
+        filename: &StrExpr,
         device: Option<&Expr>,
         secondary: Option<&Expr>,
     ) -> Result<(), CodegenError> {
@@ -27834,7 +27836,7 @@ mod tests {
                         command: StrExpr::Literal(b"I0".to_vec()),
                     },
                     Stmt::Load {
-                        filename: b"DATA".to_vec(),
+                        filename: StrExpr::Literal(b"DATA".to_vec()),
                         device: Some(Expr::Number(8.0)),
                         secondary: None,
                         load_addr: Some(Expr::Number(4096.0)),
@@ -27852,6 +27854,55 @@ mod tests {
         assert!(asm.contains("LDX $14"));
         assert!(asm.contains("LDY $15"));
         assert!(asm.contains("__INST:"));
+        assert_assembles(&asm);
+    }
+
+    #[test]
+    fn load_literal_filename_uses_pool_pointer() {
+        let m = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![Stmt::Load {
+                    filename: StrExpr::Literal(b"DATA".to_vec()),
+                    device: Some(Expr::Number(8.0)),
+                    secondary: Some(Expr::Number(1.0)),
+                    load_addr: None,
+                }],
+            }],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        // Constant name passes a direct string-pool pointer to SETNAM,
+        // not the runtime string-evaluation path.
+        assert!(asm.contains("LDA #$04")); // filename length
+        assert!(asm.contains("JSR $FFBD")); // SETNAM
+        assert!(asm.contains("JSR $FFD5")); // KERNAL LOAD
+        assert!(!asm.contains("__SETNAM_NC_"));
+        assert_assembles(&asm);
+    }
+
+    #[test]
+    fn load_runtime_filename_evaluates_string_for_setnam() {
+        // `LOAD N$+"TA", 8, 1` — the name is built at runtime, so the
+        // string expression is evaluated and its length/pointer fed to
+        // SETNAM via the shared runtime path.
+        let m = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![Stmt::Load {
+                    filename: StrExpr::Concat(
+                        Box::new(StrExpr::Var(svar("N"))),
+                        Box::new(StrExpr::Literal(b"TA".to_vec())),
+                    ),
+                    device: Some(Expr::Number(8.0)),
+                    secondary: Some(Expr::Number(1.0)),
+                    load_addr: None,
+                }],
+            }],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        assert!(asm.contains("__SETNAM_NC_")); // runtime ptr += 1
+        assert!(asm.contains("JSR $FFBD")); // SETNAM
+        assert!(asm.contains("JSR $FFD5")); // KERNAL LOAD
         assert_assembles(&asm);
     }
 

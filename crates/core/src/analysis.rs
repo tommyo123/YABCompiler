@@ -1202,11 +1202,12 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
             out.writes.insert(EffectRegion::IoState);
         }
         Stmt::Load {
+            filename,
             device,
             secondary,
             load_addr,
-            ..
         } => {
+            summarize_str(filename, &mut out);
             if let Some(e) = device {
                 summarize_expr(e, &mut out);
             }
@@ -1221,11 +1222,16 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
             out.opaque_write = true;
         }
         Stmt::Verify {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         }
         | Stmt::Save {
-            device, secondary, ..
+            filename,
+            device,
+            secondary,
         } => {
+            summarize_str(filename, &mut out);
             if let Some(e) = device {
                 summarize_expr(e, &mut out);
             }
