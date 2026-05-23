@@ -5,7 +5,9 @@
 
 use asm6502::Assembler6502;
 
-use crate::{ast, codegen, extraram, ir, pack, parse, prg};
+use crate::{ast, codegen, extraram, ir, pack, parse, prg, rem_hints};
+
+pub use crate::rem_hints::BasicHintDialect;
 
 pub use crate::codegen::Profile;
 
@@ -54,6 +56,10 @@ pub struct CompileOptions {
     /// page would otherwise corrupt the program's variable storage.
     /// Off by default; opt in when calling third-party ML.
     pub safe_sys_calls: bool,
+    /// Which third-party compiler's REM-hint syntax to honour. Only
+    /// one dialect may be active at a time; `BasicHintDialect::None`
+    /// (the default) treats REM as plain comment text.
+    pub rem_hint_dialect: BasicHintDialect,
     /// Place machine code at a custom origin and ship a raw .prg with
     /// no SYS launcher. The user is expected to start the program
     /// manually (`SYS <address>` from BASIC, or load+jmp from ML).
@@ -84,6 +90,7 @@ impl Default for CompileOptions {
             auto_reserve: true,
             lenient_syntax: false,
             safe_sys_calls: false,
+            rem_hint_dialect: BasicHintDialect::None,
             custom_start_address: None,
         }
     }
@@ -374,8 +381,29 @@ pub fn compile_with_options(
             load_address: prg.load_address,
         });
     }
+    // REM-hint pre-pass: extract dialect-specific pragmas, then
+    // trial-parse without applying them so we can see which hinted
+    // vars receive float-typed RHS values. Force-promoting those
+    // would cost more in conversion code than it saves; drop them
+    // from the set before the real parse.
+    let raw_hints = rem_hints::extract_hints_from(
+        prg.lines.iter().map(|l| l.body.as_slice()),
+        options.rem_hint_dialect,
+    );
+    let hints = if raw_hints.int_vars.is_empty() {
+        raw_hints
+    } else {
+        let trial_opts = parse::ParseOptions {
+            lenient_syntax: options.lenient_syntax,
+            int_hint_vars: std::collections::HashSet::new(),
+        };
+        let trial_ast =
+            parse::program_with_options(&prg, trial_opts).map_err(CompileError::Parse)?;
+        rem_hints::filter_safe(&trial_ast, raw_hints)
+    };
     let parse_opts = parse::ParseOptions {
         lenient_syntax: options.lenient_syntax,
+        int_hint_vars: hints.int_vars.clone(),
     };
     let ast = parse::program_with_options(&prg, parse_opts).map_err(CompileError::Parse)?;
     let module = lower_and_optimize(&ast, options.profile)?;
@@ -388,6 +416,7 @@ pub fn compile_with_options(
         options.profile,
         origin as u16,
         options.safe_sys_calls,
+        &hints,
     )
     .map_err(CompileError::Codegen)?;
     // Run asm-level peephole passes before extraram rewrites so

@@ -74,6 +74,7 @@ pub struct YabApp {
     auto_reserve: bool,
     lenient_syntax: bool,
     safe_sys_calls: bool,
+    rem_hint_dialect: yabcompiler_core::BasicHintDialect,
     reserved_ranges: String,
     custom_start_enabled: bool,
     custom_start_address: String,
@@ -112,6 +113,7 @@ impl Default for YabApp {
             auto_reserve: true,
             lenient_syntax: false,
             safe_sys_calls: false,
+            rem_hint_dialect: yabcompiler_core::BasicHintDialect::None,
             reserved_ranges: String::new(),
             custom_start_enabled: false,
             custom_start_address: "$C000".to_string(),
@@ -608,6 +610,38 @@ impl YabApp {
                  ML routines that may clobber zero page.",
             );
 
+        ui.add_space(4.0);
+        ui.label(RichText::new("REM-hint dialect").strong());
+        let current = self.rem_hint_dialect;
+        let label = match current {
+            yabcompiler_core::BasicHintDialect::None => "None",
+            yabcompiler_core::BasicHintDialect::Basic64 => "Basic 64",
+            yabcompiler_core::BasicHintDialect::BasicBoss => "Basic-Boss",
+        };
+        egui::ComboBox::from_id_salt("rem_hint_dialect")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.rem_hint_dialect,
+                    yabcompiler_core::BasicHintDialect::None,
+                    "None",
+                );
+                ui.selectable_value(
+                    &mut self.rem_hint_dialect,
+                    yabcompiler_core::BasicHintDialect::Basic64,
+                    "Basic 64",
+                )
+                .on_hover_text("Honour `REM@i=...` (integer) and `REM@b=...` (byte).");
+                ui.selectable_value(
+                    &mut self.rem_hint_dialect,
+                    yabcompiler_core::BasicHintDialect::BasicBoss,
+                    "Basic-Boss",
+                )
+                .on_hover_text(
+                    "Honour `REM@ \\BYTE ...`, `\\WORD ...`, and the `=FAST` zero-page suffix.",
+                );
+            });
+
         ui.add_space(6.0);
         ui.label(RichText::new("Manual ranges").strong());
         ui.label(
@@ -770,6 +804,7 @@ impl YabApp {
             self.auto_reserve = true;
             self.lenient_syntax = false;
             self.safe_sys_calls = false;
+            self.rem_hint_dialect = yabcompiler_core::BasicHintDialect::None;
             self.reserved_ranges.clear();
             self.custom_start_enabled = false;
             self.custom_start_address = "$C000".to_string();
@@ -893,6 +928,7 @@ impl YabApp {
             auto_reserve: self.auto_reserve,
             lenient_syntax: self.lenient_syntax,
             safe_sys_calls: self.safe_sys_calls,
+            rem_hint_dialect: self.rem_hint_dialect,
             reserved_text: &self.reserved_ranges,
             custom_start_text: custom_start,
         };

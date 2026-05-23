@@ -393,13 +393,18 @@ pub fn program(prg: &prg::Program) -> Result<Program, ParseError> {
 }
 
 /// Options recognised by [`program_with_options`].
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct ParseOptions {
     /// Accept source typos that v2 would only catch at runtime —
     /// `GOT1200` (=> GOTO 1200), `CLOSE n, sa, dev` (extra args),
     /// etc. Off by default; opt in via the CLI or GUI when the user
     /// knows the offending line is dead code.
     pub lenient_syntax: bool,
+    /// Base names (canonicalised upper-case, 1-2 chars) that REM hints
+    /// have declared as integer. The parser rewrites Float `VarName`s
+    /// whose base appears here to Integer kind, so the rest of the
+    /// pipeline sees them as if the user had written the `%` suffix.
+    pub int_hint_vars: std::collections::HashSet<String>,
 }
 
 pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Program, ParseError> {
@@ -407,7 +412,7 @@ pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Pr
     for raw in &prg.lines {
         lines.push(Line {
             number: raw.number,
-            statements: line_body_with_options(raw.number, &raw.body, opts)?,
+            statements: line_body_with_options(raw.number, &raw.body, &opts)?,
         });
     }
     Ok(Program { lines })
@@ -415,16 +420,17 @@ pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Pr
 
 #[cfg(test)]
 fn line_body(line_no: u16, body: &[u8]) -> Result<Vec<Statement>, ParseError> {
-    line_body_with_options(line_no, body, ParseOptions::default())
+    line_body_with_options(line_no, body, &ParseOptions::default())
 }
 
 fn line_body_with_options(
     line_no: u16,
     body: &[u8],
-    opts: ParseOptions,
+    opts: &ParseOptions,
 ) -> Result<Vec<Statement>, ParseError> {
     let mut p = Cursor::new(body, line_no);
     p.lenient_syntax = opts.lenient_syntax;
+    p.int_hint_vars = &opts.int_hint_vars;
     let mut out = Vec::new();
     loop {
         p.skip_spaces();
@@ -5114,7 +5120,7 @@ fn var_name(p: &mut Cursor<'_>) -> Result<VarName, ParseError> {
             }
         }
     }
-    let kind = match p.peek() {
+    let mut kind = match p.peek() {
         Some(b'%') => {
             p.advance(1);
             VarKind::Integer
@@ -5125,6 +5131,13 @@ fn var_name(p: &mut Cursor<'_>) -> Result<VarName, ParseError> {
         }
         _ => VarKind::Float,
     };
+    // REM-hint promotion: a Float var whose base appears in the
+    // active hint set was declared as integer via `REM@i=...` or
+    // `REM@ \WORD ...`. Lift it to Integer so the rest of the
+    // pipeline sees it as if the user had typed the `%` suffix.
+    if kind == VarKind::Float && p.int_hint_vars.contains(&base) {
+        kind = VarKind::Integer;
+    }
     Ok(VarName { base, kind })
 }
 
@@ -6366,15 +6379,21 @@ struct Cursor<'a> {
     /// the CLI/GUI surface a `--lenient-syntax` opt-in for the cases
     /// where the user knows the broken line never executes.
     lenient_syntax: bool,
+    /// Base names that REM hints have declared as integer. `var_name`
+    /// consults this to rewrite Float-kind vars whose base matches.
+    int_hint_vars: &'a std::collections::HashSet<String>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8], line: u16) -> Self {
+        static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+            std::sync::OnceLock::new();
         Self {
             bytes,
             pos: 0,
             line,
             lenient_syntax: false,
+            int_hint_vars: EMPTY.get_or_init(std::collections::HashSet::new),
         }
     }
     fn peek(&self) -> Option<u8> {

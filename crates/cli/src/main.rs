@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use yabcompiler_core::{
-    CompileOptions, Profile, compile, config, is_basic_source_path, parse_reserved_ranges,
-    parse_start_address, prg, tokenize_program,
+    BasicHintDialect, CompileOptions, Profile, compile, config, is_basic_source_path,
+    parse_reserved_ranges, parse_start_address, prg, tokenize_program,
 };
 
 fn usage(program: &str) {
@@ -28,6 +28,9 @@ fn usage(program: &str) {
     eprintln!("    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
     eprintln!(
         "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
+    );
+    eprintln!(
+        "    --rem-hints=<d>       Honour third-party compiler REM hints: basic64 | basic-boss."
     );
     eprintln!();
     eprintln!("Memory layout:");
@@ -200,6 +203,17 @@ fn run_compile(args: &[String]) -> ExitCode {
             }
             "--safe-sys-calls" => {
                 options.safe_sys_calls = true;
+                i += 1;
+            }
+            arg if arg.starts_with("--rem-hints=") => {
+                let value = &arg["--rem-hints=".len()..];
+                match BasicHintDialect::parse(value) {
+                    Ok(d) => options.rem_hint_dialect = d,
+                    Err(e) => {
+                        eprintln!("compile: --rem-hints: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
                 i += 1;
             }
             arg if arg.starts_with("--reserved=") => {

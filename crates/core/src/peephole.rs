@@ -6441,8 +6441,16 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
 // ----- Driver --------------------------------------------------------------
 
 /// Run the peephole pass to fixpoint and return the rewritten asm.
+///
+/// The "factoring" pass family (PH106/107/109/110/111/112/113/301)
+/// rewrites repeated 2-7 item sequences into shared `__JSR2_<n>` /
+/// `__SEQ_<n>` helpers. Each helper saves 3+ bytes per call site at
+/// the cost of one extra `JSR + RTS` (~12 cycles) per call. Programs
+/// dominated by inner loops over those sequences pay that cost on
+/// every iteration; we suppress the family on Speed profile so hot
+/// loops stay inlined.
 pub fn run(asm: &str, profile: Profile) -> String {
-    let _ = profile; // size-only rules land later
+    let factor_helpers = profile != Profile::Speed;
     let mut items = parse(asm);
     // Bound the iteration count — most realistic asm settles in 2-3
     // rounds, but malformed input shouldn't be able to spin forever.
@@ -6493,33 +6501,36 @@ pub fn run(asm: &str, profile: Profile) -> String {
     // Helper-factoring rules run after the main fixpoint loop:
     // they introduce new helpers (which `ph303` would otherwise
     // misjudge as dead) and benefit from being applied after the
-    // upstream rules have already minimised the call sites.
-    ph106_factor_int_byte_to_fac(&mut items);
-    // PH109 must run AFTER PH106 — it specialises the helper
-    // PH106 just produced.
-    ph109_factor_per_imm_byte_fac(&mut items);
-    ph107_factor_chrout_byte(&mut items);
-    ph111_factor_lda_ldy_jsr(&mut items);
-    ph112_factor_varptr_jsr(&mut items);
-    ph301_factor_repeated_sequences(&mut items);
-    // PH110 runs LAST — it relies on the JSR helpers PH106/107/109/301
-    // have just produced; consecutive helper-call pairs become a
-    // single helper-call-pair stub. Iterate to fixpoint: each pass
-    // creates new `__JSR2_<n>` helpers; subsequent passes catch
-    // pairs of those new helpers when they themselves co-occur.
-    for _ in 0..16 {
-        if !ph110_factor_jsr_pair(&mut items) {
-            break;
-        }
-    }
-    // PH113 captures triples that PH110's pair-fixpoint missed
-    // (e.g. when neither (A,B) nor (B,C) hit threshold individually
-    // but (A,B,C) does). Re-run PH110 fixpoint after to fold any
-    // new pairs that emerge.
-    if ph113_factor_jsr_triple(&mut items) {
-        for _ in 0..8 {
+    // upstream rules have already minimised the call sites. Skipped
+    // on Speed profile so inner loops avoid the JSR/RTS hop.
+    if factor_helpers {
+        ph106_factor_int_byte_to_fac(&mut items);
+        // PH109 must run AFTER PH106 — it specialises the helper
+        // PH106 just produced.
+        ph109_factor_per_imm_byte_fac(&mut items);
+        ph107_factor_chrout_byte(&mut items);
+        ph111_factor_lda_ldy_jsr(&mut items);
+        ph112_factor_varptr_jsr(&mut items);
+        ph301_factor_repeated_sequences(&mut items);
+        // PH110 runs LAST — it relies on the JSR helpers PH106/107/109/301
+        // have just produced; consecutive helper-call pairs become a
+        // single helper-call-pair stub. Iterate to fixpoint: each pass
+        // creates new `__JSR2_<n>` helpers; subsequent passes catch
+        // pairs of those new helpers when they themselves co-occur.
+        for _ in 0..16 {
             if !ph110_factor_jsr_pair(&mut items) {
                 break;
+            }
+        }
+        // PH113 captures triples that PH110's pair-fixpoint missed
+        // (e.g. when neither (A,B) nor (B,C) hit threshold individually
+        // but (A,B,C) does). Re-run PH110 fixpoint after to fold any
+        // new pairs that emerge.
+        if ph113_factor_jsr_triple(&mut items) {
+            for _ in 0..8 {
+                if !ph110_factor_jsr_pair(&mut items) {
+                    break;
+                }
             }
         }
     }
@@ -6528,9 +6539,9 @@ pub fn run(asm: &str, profile: Profile) -> String {
     // to a single JSR per window. This catches the long tail of
     // "address-compute + helper-call + store" 4-windows that don't
     // fit the pair/triple shapes. We re-run PH110 once after to fold
-    // any new pairs that the late
-    // factoring just created.
-    if ph301_factor_late_with_jsr(&mut items) {
+    // any new pairs that the late factoring just created. Same
+    // Speed-gate as the helper-factoring family above.
+    if factor_helpers && ph301_factor_late_with_jsr(&mut items) {
         for _ in 0..8 {
             if !ph110_factor_jsr_pair(&mut items) {
                 break;

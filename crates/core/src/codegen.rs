@@ -149,21 +149,32 @@ pub fn emit_with_profile_at(
     profile: Profile,
     origin: u16,
 ) -> Result<String, CodegenError> {
-    emit_with_profile_at_opts(module, profile, origin, false)
+    emit_with_profile_at_opts(
+        module,
+        profile,
+        origin,
+        false,
+        &crate::rem_hints::VarTypeHints::default(),
+    )
 }
 
-/// Full form: includes `safe_sys_calls` so every `SYS` brackets the
-/// call with stack-save/restore of $FB-$FE and allocated ZP-pool cells.
+/// Full form: includes `safe_sys_calls` plus REM-hint sets that
+/// force-promote named vars to byte storage and bias them into the
+/// ZP pool regardless of what the dataflow analysis would have
+/// chosen on its own.
 pub fn emit_with_profile_at_opts(
     module: &ir::Module,
     profile: Profile,
     origin: u16,
     safe_sys_calls: bool,
+    hints: &crate::rem_hints::VarTypeHints,
 ) -> Result<String, CodegenError> {
     let analysis = CodegenAnalysis::from_module(module);
     let mut cg = Codegen::new(profile, analysis);
     cg.code_origin = origin;
     cg.safe_sys_calls = safe_sys_calls;
+    cg.forced_byte_bases = hints.byte_vars.clone();
+    cg.forced_zp_bases = hints.zp_vars.clone();
     cg.run(module)?;
     cg.finish()
 }
@@ -318,6 +329,13 @@ struct Codegen {
     /// when the program has no DATA at all (skips data-block emission
     /// and pointer-init prelude entirely).
     data_values: Vec<ast::DataValue>,
+    /// How the DATA pool is laid out. Picked once per program after
+    /// `collect_data` runs: binary i16 when every value is a small
+    /// integer and no string READ exists; binary MFLPT when every
+    /// value is numeric (but some don't fit i16); ASCII-length-prefix
+    /// otherwise. The binary forms skip the BASIC ROM VAL parser and
+    /// fixed-advance the DATA pointer with a `CLC + ADC #N` pair.
+    data_pool_layout: DataPoolLayout,
     /// Per-line DATA-pool offsets. Filled by `collect_data` for
     /// every line that contributes DATA values; consumed when
     /// emitting the pool to drop a `__DATA_LINE_<n>:` label so
@@ -781,6 +799,15 @@ struct Codegen {
     /// When true, every emitted `SYS` PHA-saves $FB-$FE and the bytes
     /// in `zp_claimed`, restoring them after the JSR.
     safe_sys_calls: bool,
+    /// Variable bases the user declared as single-byte via REM hints.
+    /// `collect_u8_int_vars` adds these to the u8 set without the
+    /// usual range proof; an out-of-range write wraps at runtime, as
+    /// it would under the source compiler.
+    forced_byte_bases: std::collections::HashSet<String>,
+    /// Variable bases the user asked to live in zero page via REM
+    /// hints (Basic-Boss `=FAST`). `collect_zp_int_vars` promotes
+    /// these ahead of the hotness-based ranking.
+    forced_zp_bases: std::collections::HashSet<String>,
     /// `for_int_slots` IDs whose FI_<n> slot landed in zero page
     /// (populated by the FOR-counter pre-pass and consumed at
     /// `emit_for_int`).
@@ -1021,6 +1048,28 @@ pub enum Profile {
     Size,
 }
 
+/// DATA pool layout. Decided once per program from the value mix:
+/// binary entries skip the BASIC ROM VAL parser, but only work when
+/// the program never READs into a string variable from this pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DataPoolLayout {
+    /// Length-prefixed ASCII. `<len>, <bytes...>`. Works for any mix
+    /// of numeric and string values; READ calls `__VAL_HELPER` for
+    /// numeric targets and copies the entry pointer for string ones.
+    #[default]
+    AsciiTagged,
+    /// Fixed 2-byte little-endian i16 entries. Selected when every
+    /// DATA value is an integer in `-32768..=32767` and the program
+    /// has no string READ targets. READ to int = direct 2-byte
+    /// load; READ to float = GIVAYF; advance = `+2`.
+    BinaryI16,
+    /// Fixed 5-byte MFLPT entries (the BASIC ROM float format).
+    /// Selected when every DATA value is numeric but at least one
+    /// doesn't fit i16. READ to float = MOVFM; READ to int = MOVFM
+    /// + FAC_TO_INT16; advance = `+5`.
+    BinaryMflpt,
+}
+
 /// Where the int-FOR's end value lives at runtime. Keeps the
 /// fast-path bytes tight when end folds to a literal (NEXT uses
 /// `CMP #imm`); falls back to a 2-byte BSS slot when the expression
@@ -1195,6 +1244,7 @@ impl Codegen {
             used_input_str: false,
             data_values: Vec::new(),
             data_line_offsets: Vec::new(),
+            data_pool_layout: DataPoolLayout::AsciiTagged,
             arrays: HashMap::new(),
             arrays_order: Vec::new(),
             runtime_arrays: HashMap::new(),
@@ -1326,6 +1376,8 @@ impl Codegen {
             zp_pool: Vec::new(),
             zp_claimed: Vec::new(),
             safe_sys_calls: false,
+            forced_byte_bases: std::collections::HashSet::new(),
+            forced_zp_bases: std::collections::HashSet::new(),
             zp_int_for_assignments: HashMap::new(),
             zp_u8_for_assignments: HashMap::new(),
             zp_for_reuse_slots: Vec::new(),
@@ -1754,6 +1806,15 @@ impl Codegen {
         }
         candidates.retain(|v| !rejected.contains(v));
         signed.retain(|v| candidates.contains(v));
+        // REM-hint force-promotion: every integer scalar whose base
+        // the user marked `\BYTE` (or `@b=`) goes in regardless of
+        // the range proof. The user takes the wrap risk; the source
+        // compilers behave the same way.
+        if !self.forced_byte_bases.is_empty() {
+            for line in &module.lines {
+                collect_hinted_byte_vars(&line.stmts, &self.forced_byte_bases, &mut candidates);
+            }
+        }
         self.u8_int_vars = candidates;
         self.signed_byte_int_vars = signed;
     }
@@ -1860,8 +1921,37 @@ impl Codegen {
             .int_var_zp_hotness
             .iter()
             .filter(|(v, _)| v.kind == VarKind::Integer && v.base != "TI" && v.base != "ST")
-            .map(|(v, &c)| (v.clone(), c))
+            .map(|(v, &c)| {
+                // REM-hint `=FAST` request: inflate the count past any
+                // organic hotness so the var jumps to the head of the
+                // queue and grabs a fresh pool slot before the
+                // dataflow-ranked vars get their pick.
+                let boost = if self.forced_zp_bases.contains(&v.base) {
+                    u32::MAX / 2
+                } else {
+                    0
+                };
+                (v.clone(), c.saturating_add(boost))
+            })
             .collect();
+        // Forced-ZP vars that the hotness map missed entirely (a `=FAST`
+        // var that the program never reads after the hint, or that
+        // appears only in store positions) won't show up above. Add
+        // them with the boost count so they still get pool priority.
+        if !self.forced_zp_bases.is_empty() {
+            let seen: HashSet<VarName> = candidates.iter().map(|(v, _)| v.clone()).collect();
+            for var in self
+                .zp_int_vars
+                .iter()
+                .chain(self.u8_int_vars.iter())
+                .cloned()
+                .collect::<HashSet<_>>()
+            {
+                if self.forced_zp_bases.contains(&var.base) && !seen.contains(&var) {
+                    candidates.push((var, u32::MAX / 2));
+                }
+            }
+        }
         candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.label().cmp(&b.0.label())));
 
         const MIN_LOADS: u32 = 3;
@@ -9421,20 +9511,25 @@ impl Codegen {
             }
         }
 
-        // DATA pool — every entry is a length-prefixed string. READ
-        // dispatches: numeric target → __VAL_HELPER on the bytes;
-        // string target → V_var pointed straight at this entry's
-        // length byte (pool strings are immutable, so multiple READs
-        // can share the pointer). DATA_PTR walks past entries by
-        // (1 + length) bytes per advance.
+        // DATA pool. Layout was chosen in `collect_data` based on the
+        // value mix and the program's READ targets:
+        //
+        // * AsciiTagged: `<len>, <bytes...>` per entry. Generic
+        //   form; READ calls `__VAL_HELPER` for numerics, copies
+        //   the pointer for strings.
+        // * BinaryI16: two raw little-endian bytes per entry. READ
+        //   to int = direct 2-byte load; advance = `+2`.
+        // * BinaryMflpt: five raw MFLPT bytes per entry. READ to
+        //   float = MOVFM; advance = `+5`.
         if !self.data_values.is_empty() {
             writeln!(self.code).unwrap();
-            writeln!(self.code, "; --- DATA pool ---").unwrap();
+            let layout_note = match self.data_pool_layout {
+                DataPoolLayout::AsciiTagged => "ASCII length-prefixed",
+                DataPoolLayout::BinaryI16 => "binary i16, 2 bytes/entry",
+                DataPoolLayout::BinaryMflpt => "binary MFLPT, 5 bytes/entry",
+            };
+            writeln!(self.code, "; --- DATA pool ({layout_note}) ---").unwrap();
             writeln!(self.code, "__DATA:").unwrap();
-            // Build a quick lookup of (item-index → line-no) for
-            // RESET targets so we can drop a `__DATA_LINE_<n>:`
-            // label right at the byte boundary that line's first
-            // DATA value starts on.
             let mut next_label = 0;
             for (i, v) in self.data_values.iter().enumerate() {
                 while next_label < self.data_line_offsets.len()
@@ -9444,7 +9539,7 @@ impl Codegen {
                     writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
                     next_label += 1;
                 }
-                let bytes = data_value_pool_bytes(v);
+                let bytes = data_value_pool_bytes(v, self.data_pool_layout);
                 write!(self.code, "    .byte ").unwrap();
                 for b in &bytes {
                     write!(self.code, "${b:02X},").unwrap();
@@ -13163,6 +13258,7 @@ impl Codegen {
                 self.data_line_offsets.push((line.number, before));
             }
         }
+        self.data_pool_layout = choose_data_pool_layout(&self.data_values, module);
     }
 
     fn collect_dims(&mut self, module: &ir::Module) -> Result<(), CodegenError> {
@@ -14195,16 +14291,15 @@ impl Codegen {
     /// the pointer by 5 bytes (one MFLPT slot).
     fn emit_read(&mut self, targets: &[ir::ReadTarget]) -> Result<(), CodegenError> {
         for tgt in targets {
-            // Stage DATA_PTR in STR_OP_LHS for indirect (),Y access:
-            // both the type-specific consumer (VAL or pointer-copy)
-            // and the post-advance length-byte read use it. Done up
-            // front so it's set before we maybe compute an array
-            // address (which clobbers ARRAY_ADDR but not STR_OP_LHS).
+            // Stage DATA_PTR in STR_OP_LHS for indirect (),Y access
+            // used by the type-specific consumer and (for the ASCII
+            // layout) the post-advance length-byte read. The binary
+            // layouts know their entry size at compile time and
+            // advance with a fixed `CLC + ADC #N`.
             writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
             writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_HI).unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
-            // Dispatch by target kind, then by element type.
             match tgt {
                 ir::ReadTarget::Scalar(v) => {
                     let label = self.intern_var(v.clone());
@@ -14214,46 +14309,69 @@ impl Codegen {
                     self.emit_read_array(name, indices)?;
                 }
             }
-            // Advance DATA_PTR by (1 + length). The pre-advance value
-            // is still in STR_OP_LHS, so we can read the length byte
-            // from there — the type-specific code above didn't clobber
-            // STR_OP_LHS (VAL just reads from it; array-store only
-            // touched ARRAY_ADDR).
-            writeln!(self.code, "    LDY #$00").unwrap();
-            writeln!(self.code, "    LDA (${:02X}),Y", rt::STR_OP_LHS_LO).unwrap();
-            writeln!(self.code, "    SEC").unwrap(); // SEC adds the +1 for the length byte
-            writeln!(self.code, "    ADC ${:02X}", rt::DATA_PTR_LO).unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::DATA_PTR_LO).unwrap();
-            let id = self.fresh_id();
-            let no_carry = format!("__READ_NC_{id}");
-            writeln!(self.code, "    BCC {no_carry}").unwrap();
-            writeln!(self.code, "    INC ${:02X}", rt::DATA_PTR_HI).unwrap();
-            writeln!(self.code, "{no_carry}:").unwrap();
+            self.emit_data_advance();
         }
         Ok(())
     }
 
+    /// Advance DATA_PTR past the entry just consumed. ASCII layout
+    /// reads the length byte at STR_OP_LHS (which the caller staged
+    /// pre-read) and adds `length + 1`; binary layouts know the
+    /// fixed entry size at compile time and add it directly.
+    fn emit_data_advance(&mut self) {
+        match self.data_pool_layout {
+            DataPoolLayout::AsciiTagged => {
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::STR_OP_LHS_LO).unwrap();
+                writeln!(self.code, "    SEC").unwrap();
+                writeln!(self.code, "    ADC ${:02X}", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    STA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                let id = self.fresh_id();
+                let no_carry = format!("__READ_NC_{id}");
+                writeln!(self.code, "    BCC {no_carry}").unwrap();
+                writeln!(self.code, "    INC ${:02X}", rt::DATA_PTR_HI).unwrap();
+                writeln!(self.code, "{no_carry}:").unwrap();
+            }
+            DataPoolLayout::BinaryI16 | DataPoolLayout::BinaryMflpt => {
+                let step: u8 = if self.data_pool_layout == DataPoolLayout::BinaryI16 {
+                    2
+                } else {
+                    5
+                };
+                writeln!(self.code, "    CLC").unwrap();
+                writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    ADC #${step:02X}").unwrap();
+                writeln!(self.code, "    STA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                let id = self.fresh_id();
+                let no_carry = format!("__READ_NC_{id}");
+                writeln!(self.code, "    BCC {no_carry}").unwrap();
+                writeln!(self.code, "    INC ${:02X}", rt::DATA_PTR_HI).unwrap();
+                writeln!(self.code, "{no_carry}:").unwrap();
+            }
+        }
+    }
+
     /// Read the next DATA entry into a scalar variable slot. Caller
-    /// has already staged DATA_PTR into STR_OP_LHS.
+    /// has already staged DATA_PTR into STR_OP_LHS. Binary layouts
+    /// skip the VAL parser entirely; ASCII layout calls __VAL_HELPER.
     fn emit_read_scalar(&mut self, var: &VarName, label: &str) {
-        match var.kind {
-            VarKind::String => {
+        match (self.data_pool_layout, var.kind) {
+            // String layout entries can only feed string targets.
+            (DataPoolLayout::AsciiTagged, VarKind::String) => {
                 writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
                 writeln!(self.code, "    STA {label}").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_HI).unwrap();
                 writeln!(self.code, "    STA {label}+1").unwrap();
             }
-            VarKind::Float => {
+            (DataPoolLayout::AsciiTagged, VarKind::Float) => {
                 writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
                 writeln!(self.code, "    LDX #<{label}").unwrap();
                 writeln!(self.code, "    LDY #>{label}").unwrap();
                 writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
                 self.used_val = true;
-                // Sync shadow-int alias when promoted (DATA range
-                // proved i16, so FAC_TO_INT16 won't trap here).
                 self.emit_sync_shadow_from_fac(var);
             }
-            VarKind::Integer => {
+            (DataPoolLayout::AsciiTagged, VarKind::Integer) => {
                 writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
                 writeln!(self.code, "    JSR __FAC_TO_INT16").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
@@ -14263,20 +14381,74 @@ impl Codegen {
                 self.used_val = true;
                 self.used_fac_to_int16 = true;
             }
+            // Binary i16: 2-byte load, fast paths for both int and
+            // float targets. String target is filtered out at layout
+            // choice; if we somehow get here it's a `?TYPE MISMATCH`
+            // anyway, so emit nothing and let runtime confusion catch
+            // it.
+            (DataPoolLayout::BinaryI16, VarKind::Integer) => {
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    STA {label}").unwrap();
+                writeln!(self.code, "    INY").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    STA {label}+1").unwrap();
+            }
+            (DataPoolLayout::BinaryI16, VarKind::Float) => {
+                // GIVAYF wants A=high, Y=low. Pull the high byte
+                // first (offset 1), then drop Y back to the low.
+                writeln!(self.code, "    LDY #$01").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    PHA").unwrap();
+                writeln!(self.code, "    DEY").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    TAY").unwrap();
+                writeln!(self.code, "    PLA").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+                writeln!(self.code, "    LDX #<{label}").unwrap();
+                writeln!(self.code, "    LDY #>{label}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
+                self.emit_sync_shadow_from_fac(var);
+            }
+            // Binary MFLPT: 5-byte MOVFM-style load. For int target
+            // we still need FAC_TO_INT16 after the MOVFM.
+            (DataPoolLayout::BinaryMflpt, VarKind::Float) => {
+                writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    LDY ${:02X}", rt::DATA_PTR_HI).unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                writeln!(self.code, "    LDX #<{label}").unwrap();
+                writeln!(self.code, "    LDY #>{label}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
+                self.emit_sync_shadow_from_fac(var);
+            }
+            (DataPoolLayout::BinaryMflpt, VarKind::Integer) => {
+                writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    LDY ${:02X}", rt::DATA_PTR_HI).unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                writeln!(self.code, "    JSR __FAC_TO_INT16").unwrap();
+                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+                writeln!(self.code, "    STA {label}").unwrap();
+                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+                writeln!(self.code, "    STA {label}+1").unwrap();
+                self.used_fac_to_int16 = true;
+            }
+            // Binary pool meeting a string target: layout choice
+            // already excluded this, but keep an emit-nothing arm
+            // for defensiveness in case future passes inject reads.
+            (DataPoolLayout::BinaryI16, VarKind::String)
+            | (DataPoolLayout::BinaryMflpt, VarKind::String) => {}
         }
     }
 
     /// Read the next DATA entry into one element of an array. The
-    /// element address is computed via the regular array-address path
-    /// (which lands in ARRAY_ADDR_LO/HI); STR_OP_LHS stays valid since
-    /// emit_array_address only touches ARRAY_ADDR + LINNUM + FAC.
+    /// element address is computed via the regular array-address
+    /// path (which lands in ARRAY_ADDR_LO/HI); STR_OP_LHS stays
+    /// valid because `emit_array_address` only touches ARRAY_ADDR +
+    /// LINNUM + FAC. Binary layouts can store the entry directly
+    /// once the address is known, bypassing VAL and the FAC stash.
     fn emit_read_array(&mut self, name: &VarName, indices: &[Expr]) -> Result<(), CodegenError> {
-        match name.kind {
-            VarKind::String => {
-                // Compute address first, THEN stage DATA_PTR into the
-                // slot. (The address calc clobbers FAC but not
-                // STR_OP_LHS, which still holds DATA_PTR for the
-                // post-advance length read.)
+        match (self.data_pool_layout, name.kind) {
+            (DataPoolLayout::AsciiTagged, VarKind::String) => {
                 self.emit_array_address(name, indices)?;
                 writeln!(self.code, "    LDY #$00").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
@@ -14285,28 +14457,71 @@ impl Codegen {
                 writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_HI).unwrap();
                 writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
             }
-            VarKind::Float => {
-                // Parse first (uses STR_OP_LHS), THEN compute address
-                // (clobbers FAC but the parsed value is now in FAC).
-                // Wait — emit_array_address calls emit_expr_to_fac for
-                // the indices, which clobbers FAC. So we must compute
-                // the address first, stash it, then VAL into FAC, then
-                // store. The cleanest is: compute address, then VAL
-                // (which reads from STR_OP_LHS without touching ARRAY_ADDR),
-                // then MOVMF to ARRAY_ADDR.
+            (DataPoolLayout::AsciiTagged, VarKind::Float) => {
                 self.emit_array_address(name, indices)?;
                 writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
                 writeln!(self.code, "    JSR __ST_ARR").unwrap();
                 self.used_val = true;
                 self.used_st_arr = true;
             }
-            VarKind::Integer => {
+            (DataPoolLayout::AsciiTagged, VarKind::Integer) => {
                 self.emit_array_address(name, indices)?;
                 writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
                 writeln!(self.code, "    JSR __ST_ARR_INT").unwrap();
                 self.used_val = true;
                 self.used_fac_to_int16 = true;
                 self.used_st_arr_int = true;
+            }
+            (DataPoolLayout::BinaryI16, VarKind::Integer) => {
+                // Two-byte direct copy from DATA into the array
+                // element. No FAC, no parsing.
+                self.emit_array_address(name, indices)?;
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+                writeln!(self.code, "    INY").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+            }
+            (DataPoolLayout::BinaryI16, VarKind::Float) => {
+                // Materialise the i16 in FAC, then store via the
+                // shared 5-byte array helper.
+                self.emit_array_address(name, indices)?;
+                // GIVAYF wants A=high, Y=low. Pull the high byte
+                // first (offset 1), then drop Y back to the low.
+                writeln!(self.code, "    LDY #$01").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    PHA").unwrap();
+                writeln!(self.code, "    DEY").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    TAY").unwrap();
+                writeln!(self.code, "    PLA").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+                writeln!(self.code, "    JSR __ST_ARR").unwrap();
+                self.used_st_arr = true;
+            }
+            (DataPoolLayout::BinaryMflpt, VarKind::Float) => {
+                self.emit_array_address(name, indices)?;
+                writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    LDY ${:02X}", rt::DATA_PTR_HI).unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                writeln!(self.code, "    JSR __ST_ARR").unwrap();
+                self.used_st_arr = true;
+            }
+            (DataPoolLayout::BinaryMflpt, VarKind::Integer) => {
+                self.emit_array_address(name, indices)?;
+                writeln!(self.code, "    LDA ${:02X}", rt::DATA_PTR_LO).unwrap();
+                writeln!(self.code, "    LDY ${:02X}", rt::DATA_PTR_HI).unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                writeln!(self.code, "    JSR __ST_ARR_INT").unwrap();
+                self.used_fac_to_int16 = true;
+                self.used_st_arr_int = true;
+            }
+            (DataPoolLayout::BinaryI16, VarKind::String)
+            | (DataPoolLayout::BinaryMflpt, VarKind::String) => {
+                // Layout choice excluded any string READ; reaching
+                // here would be a compiler bug, so leave the slot
+                // unchanged rather than emit incoherent code.
             }
         }
         Ok(())
@@ -15557,24 +15772,33 @@ impl Codegen {
         if indices.len() != dims.len() || indices.len() < 2 {
             return Ok(false);
         }
-        // All non-leading strides must be either a power of two
-        // (single ASL/ROL chain), `2^k ± 1` (shift + add or
-        // shift + sub), or — under Speed profile — `2^low + 2^high`
-        // (two-stage shift + save + shift + add). The Sum2Pow form
-        // grows the call site by ~17 bytes vs the FAC FMULT route
-        // (which uses factored helpers like `__JSR2_*`); only worth
-        // it when the per-access cycle saving pays back, so gate it
-        // on profile.
+        // All non-leading strides must lower to one of the
+        // shift/add forms (`ShiftPow2`, `ShiftAddSelf`,
+        // `ShiftSubSelf`, `Sum2Pow`, `Sum3Pow`). Anything else
+        // means the stride doesn't fit the native shift-and-add
+        // patterns, and the caller drops to the FAC FMULT route.
         let mut plans: Vec<StrideLowering> = Vec::with_capacity(indices.len() - 1);
         for &d in &dims[1..] {
             let stride = (d as u32) + 1;
             let Some(plan) = stride_lowering(stride) else {
                 return Ok(false);
             };
-            if matches!(plan, StrideLowering::Sum2Pow { .. }) && self.profile != Profile::Speed {
-                return Ok(false);
-            }
             plans.push(plan);
+        }
+        // Sum2Pow / Sum3Pow inline ~17 / ~50 bytes per site versus
+        // a 3-byte JSR into the factored FAC helper, so under the
+        // default size-conscious profile we restrict them to access
+        // sites where at least one index is an active FOR counter
+        // (a strong proxy for "this access lives inside a loop and
+        // the cycle saving will pay back many times"). Speed
+        // profile takes them unconditionally.
+        if self.profile != Profile::Speed
+            && plans
+                .iter()
+                .any(|p| matches!(p, StrideLowering::Sum2Pow { .. } | StrideLowering::Sum3Pow { .. }))
+            && !indices.iter().any(|e| self.expr_reads_active_for_counter(e))
+        {
+            return Ok(false);
         }
         // All indices must be int-island.
         if !indices.iter().all(|e| self.is_int_island_addsub_only(e)) {
@@ -15889,6 +16113,24 @@ impl Codegen {
             }
         }
         None
+    }
+
+    /// True iff any leaf of `e` reads an active FOR counter (int or
+    /// u8). Used to decide whether an array-index site is hot
+    /// enough to justify the inline shift-and-add stride lowerings
+    /// versus the smaller FAC factored helper.
+    fn expr_reads_active_for_counter(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Var(v) => {
+                self.int_for_counter_label(v).is_some()
+                    || self.u8_for_counter_label(v).is_some()
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => self.expr_reads_active_for_counter(inner),
+            Expr::Bin(_, l, r) => {
+                self.expr_reads_active_for_counter(l) || self.expr_reads_active_for_counter(r)
+            }
+            _ => false,
+        }
     }
 
     /// True iff `var` is the counter of an active u8-FOR whose
@@ -25229,16 +25471,148 @@ fn stmt_owns_heap_alloc(s: &Stmt) -> bool {
 /// debug-format string (close enough to BASIC for typical decimals
 /// and integers; programs that depend on a specific text rendering
 /// can use string-form DATA literals directly).
-fn data_value_pool_bytes(v: &DataValue) -> Vec<u8> {
-    let text = match v {
-        DataValue::Float(n) => format_data_float(*n).into_bytes(),
-        DataValue::String(b) => b.clone(),
-    };
-    let len = text.len().min(255) as u8;
-    let mut out = Vec::with_capacity(1 + len as usize);
-    out.push(len);
-    out.extend_from_slice(&text[..len as usize]);
-    out
+fn data_value_pool_bytes(v: &DataValue, layout: DataPoolLayout) -> Vec<u8> {
+    match layout {
+        DataPoolLayout::AsciiTagged => {
+            let text = match v {
+                DataValue::Float(n) => format_data_float(*n).into_bytes(),
+                DataValue::String(b) => b.clone(),
+            };
+            let len = text.len().min(255) as u8;
+            let mut out = Vec::with_capacity(1 + len as usize);
+            out.push(len);
+            out.extend_from_slice(&text[..len as usize]);
+            out
+        }
+        DataPoolLayout::BinaryI16 => {
+            let DataValue::Float(n) = v else {
+                // Layout choice already excluded mixed pools; reach
+                // here only on a bug.
+                return vec![0u8, 0u8];
+            };
+            let i = *n as i16;
+            vec![(i as u16 & 0xFF) as u8, ((i as u16) >> 8) as u8]
+        }
+        DataPoolLayout::BinaryMflpt => {
+            let DataValue::Float(n) = v else {
+                return vec![0u8; 5];
+            };
+            float_to_mflpt(*n).to_vec()
+        }
+    }
+}
+
+/// 5-byte MFLPT (Microsoft Binary Format) as used by the BASIC ROM
+/// floating-point routines: byte 0 is the exponent biased by 129
+/// (`$00` = zero), bytes 1-4 are a 31-bit normalised mantissa with
+/// the implicit leading `1` replaced by the sign bit. Returns all
+/// zeros for `0.0` and any non-finite input.
+fn float_to_mflpt(n: f64) -> [u8; 5] {
+    if n == 0.0 || !n.is_finite() {
+        return [0u8; 5];
+    }
+    let sign = if n < 0.0 { 0x80u8 } else { 0x00u8 };
+    let abs = n.abs();
+    let exp_unbiased = abs.log2().floor() as i32;
+    let mantissa = abs / (2.0f64).powi(exp_unbiased) - 1.0;
+    let mut m = (mantissa * ((1u64 << 31) as f64)).round() as u64;
+    let mut exponent = exp_unbiased + 129;
+    // Round-up that bumps mantissa past 2^31 carries into the
+    // exponent; reset the mantissa to 0 in the next binade.
+    if m >= (1u64 << 31) {
+        m = 0;
+        exponent += 1;
+    }
+    if !(1..=255).contains(&exponent) {
+        return [0u8; 5];
+    }
+    let b1 = ((m >> 24) & 0xFF) as u8 | sign;
+    let b2 = ((m >> 16) & 0xFF) as u8;
+    let b3 = ((m >> 8) & 0xFF) as u8;
+    let b4 = (m & 0xFF) as u8;
+    [exponent as u8, b1, b2, b3, b4]
+}
+
+#[cfg(test)]
+mod mflpt_tests {
+    use super::float_to_mflpt;
+
+    #[test]
+    fn known_values() {
+        assert_eq!(float_to_mflpt(0.0), [0, 0, 0, 0, 0]);
+        assert_eq!(float_to_mflpt(1.0), [0x81, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(float_to_mflpt(-1.0), [0x81, 0x80, 0x00, 0x00, 0x00]);
+        assert_eq!(float_to_mflpt(2.0), [0x82, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(float_to_mflpt(0.5), [0x80, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(float_to_mflpt(1.5), [0x81, 0x40, 0x00, 0x00, 0x00]);
+        assert_eq!(float_to_mflpt(-1.5), [0x81, 0xC0, 0x00, 0x00, 0x00]);
+        // 100 = 2^6 * 1.5625, exponent = 135 ($87), mantissa frac = 0.5625
+        // 0.5625 * 2^31 = 0x48000000 → b1 = 0x48
+        assert_eq!(float_to_mflpt(100.0), [0x87, 0x48, 0x00, 0x00, 0x00]);
+    }
+}
+
+/// Pick the most aggressive DATA pool layout that's safe for this
+/// program. Binary layouts let READ skip the BASIC ROM VAL parser,
+/// but they don't carry string semantics, so anything that READs
+/// into a string variable (or anything that DATAs a string) forces
+/// the ASCII fallback.
+fn choose_data_pool_layout(data: &[DataValue], module: &ir::Module) -> DataPoolLayout {
+    if data.is_empty() {
+        return DataPoolLayout::AsciiTagged;
+    }
+    if data.iter().any(|v| matches!(v, DataValue::String(_))) {
+        return DataPoolLayout::AsciiTagged;
+    }
+    if program_has_string_read(module) {
+        return DataPoolLayout::AsciiTagged;
+    }
+    let all_fit_i16 = data.iter().all(|v| {
+        let DataValue::Float(n) = v else {
+            return false;
+        };
+        n.is_finite() && n.fract() == 0.0 && (-32768.0..=32767.0).contains(n)
+    });
+    if all_fit_i16 {
+        DataPoolLayout::BinaryI16
+    } else {
+        DataPoolLayout::BinaryMflpt
+    }
+}
+
+/// True iff any statement in the module READs into a string-typed
+/// target (scalar or array element). Binary DATA layouts can't
+/// satisfy a string READ, so the presence of one forces the ASCII
+/// fallback.
+fn program_has_string_read(module: &ir::Module) -> bool {
+    fn scan_targets(targets: &[ir::ReadTarget]) -> bool {
+        targets.iter().any(|t| match t {
+            ir::ReadTarget::Scalar(v) => v.kind == VarKind::String,
+            ir::ReadTarget::Array { name, .. } => name.kind == VarKind::String,
+        })
+    }
+    fn scan_stmts(stmts: &[Stmt]) -> bool {
+        for s in stmts {
+            match s {
+                Stmt::Read(t) => {
+                    if scan_targets(t) {
+                        return true;
+                    }
+                }
+                Stmt::If {
+                    then: ThenIr::Stmts(inner),
+                    ..
+                } => {
+                    if scan_stmts(inner) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    module.lines.iter().any(|line| scan_stmts(&line.stmts))
 }
 
 /// Comment-only label shown alongside the bytes in the emitted pool.
@@ -26173,6 +26547,83 @@ fn reject_u8_read_targets(
     }
 }
 
+/// Walk `stmts` and add every integer scalar whose base appears in
+/// `forced_bases` to `out`. Used by `collect_u8_int_vars` to honour
+/// REM `\BYTE` declarations without re-running the dataflow proof.
+fn collect_hinted_byte_vars(
+    stmts: &[Stmt],
+    forced_bases: &std::collections::HashSet<String>,
+    out: &mut HashSet<VarName>,
+) {
+    struct Collector<'a> {
+        out: &'a mut HashSet<VarName>,
+        forced: &'a std::collections::HashSet<String>,
+    }
+
+    impl<'a> crate::visit::Visitor for Collector<'a> {
+        fn visit_var_read(&mut self, v: &VarName) {
+            if is_integer_scalar(v) && self.forced.contains(&v.base) {
+                self.out.insert(v.clone());
+            }
+        }
+    }
+
+    let mut c = Collector {
+        out,
+        forced: forced_bases,
+    };
+    for stmt in stmts {
+        crate::visit::walk_stmt(&mut c, 0, stmt);
+    }
+    // Writes never go through `visit_var_read`; scan assignment LHS
+    // separately so a hinted byte var that is only written counts too.
+    for stmt in stmts {
+        for_each_int_scalar_write(stmt, &mut |v| {
+            if forced_bases.contains(&v.base) {
+                out.insert(v.clone());
+            }
+        });
+    }
+}
+
+/// Invoke `f` on every integer scalar that `stmt` writes to (LET,
+/// FOR counter, GET, READ, INPUT targets). Doesn't recurse into IF
+/// branches — `collect_hinted_byte_vars` is called with the full
+/// statement list at the line level, which is sufficient because
+/// the rewrite walks every line.
+fn for_each_int_scalar_write(stmt: &Stmt, f: &mut impl FnMut(&VarName)) {
+    match stmt {
+        Stmt::Let { var, .. } if is_integer_scalar(var) => f(var),
+        Stmt::For { var, .. } if is_integer_scalar(var) => f(var),
+        Stmt::Get { var } if is_integer_scalar(var) => f(var),
+        Stmt::Read(targets) | Stmt::Input { targets, .. } => {
+            for t in targets {
+                if let ir::ReadTarget::Scalar(v) = t
+                    && is_integer_scalar(v)
+                {
+                    f(v);
+                }
+            }
+        }
+        Stmt::GetFile { vars, .. } => {
+            for v in vars {
+                if is_integer_scalar(v) {
+                    f(v);
+                }
+            }
+        }
+        Stmt::If {
+            then: ThenIr::Stmts(inner),
+            ..
+        } => {
+            for s in inner {
+                for_each_int_scalar_write(s, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_integer_scalar_reads_stmt(stmt: &Stmt, out: &mut HashSet<VarName>) {
     struct Collector<'a> {
         out: &'a mut HashSet<VarName>,
@@ -26999,6 +27450,31 @@ fn stride_lowering(stride: u32) -> Option<StrideLowering> {
             }
         }
     }
+    // `stride = 2^low + 2^mid + 2^high` with low < mid < high.
+    // Covers a wide class of small odd strides — 11, 13, 19, 21,
+    // 25, 35, ... — that otherwise drop to the FAC FMULT route.
+    // The three-term form is what makes 2D integer arrays with
+    // typical BASIC dims (`DIM A(20,20)` => stride 21) competitive
+    // with int-loop indexing.
+    for high in 2..16 {
+        let high_val = 1u32 << high;
+        if high_val >= stride {
+            break;
+        }
+        for mid in 1..high {
+            let mid_val = 1u32 << mid;
+            if high_val + mid_val >= stride {
+                break;
+            }
+            let remainder = stride - high_val - mid_val;
+            if remainder.is_power_of_two() {
+                let low = remainder.trailing_zeros();
+                if low < mid {
+                    return Some(StrideLowering::Sum3Pow { low, mid, high });
+                }
+            }
+        }
+    }
     None
 }
 
@@ -27066,13 +27542,43 @@ mod stride_lowering_tests {
         ));
     }
     #[test]
-    fn unsupported_strides() {
-        // 11 = 8 + 2 + 1 — three pow2 terms, not handled.
-        assert!(stride_lowering(11).is_none());
-        // 13 = 8 + 4 + 1 — three pow2 terms.
-        assert!(stride_lowering(13).is_none());
-        // 14 = 8 + 4 + 2 — three pow2 terms.
-        assert!(stride_lowering(14).is_none());
+    fn three_pow_strides() {
+        // 11 = 8 + 2 + 1 — three pow2 terms via Sum3Pow.
+        assert!(matches!(
+            stride_lowering(11),
+            Some(StrideLowering::Sum3Pow {
+                low: 0,
+                mid: 1,
+                high: 3
+            })
+        ));
+        // 13 = 8 + 4 + 1.
+        assert!(matches!(
+            stride_lowering(13),
+            Some(StrideLowering::Sum3Pow {
+                low: 0,
+                mid: 2,
+                high: 3
+            })
+        ));
+        // 14 = 8 + 4 + 2.
+        assert!(matches!(
+            stride_lowering(14),
+            Some(StrideLowering::Sum3Pow {
+                low: 1,
+                mid: 2,
+                high: 3
+            })
+        ));
+        // 21 = 16 + 4 + 1 — the BASIC `DIM A(20, ...)` stride.
+        assert!(matches!(
+            stride_lowering(21),
+            Some(StrideLowering::Sum3Pow {
+                low: 0,
+                mid: 2,
+                high: 4
+            })
+        ));
     }
     #[test]
     fn degenerate_strides() {
