@@ -381,7 +381,7 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
             rewrite_vars_in_expr(addr, map);
             rewrite_vars_in_expr(value, map);
         }
-        Statement::Sys { addr, regs } => {
+        Statement::Sys { addr, regs, .. } => {
             rewrite_vars_in_expr(addr, map);
             for r in regs {
                 rewrite_vars_in_expr(r, map);
@@ -2276,7 +2276,10 @@ impl ir::Pass for IntForBodyAnalysis {
 
         // Step 2: scan each body for the safety flag and for whether it
         // ever reads the loop variable. Held in two HashSets so we can
-        // mutate the IR safely afterwards.
+        // mutate the IR safely afterwards. The routine-write map lets a
+        // GOSUB in the body stay int-safe when the called routine never
+        // writes the counter.
+        let routines = build_routine_writes(module);
         let mut unsafe_positions: HashSet<(usize, usize)> = HashSet::new();
         let mut unread_positions: HashSet<(usize, usize)> = HashSet::new();
         for ((fli, fsi), (nli, nsi)) in &pairs {
@@ -2296,7 +2299,10 @@ impl ir::Pass for IntForBodyAnalysis {
                 _ => unreachable!("position came from FOR scan"),
             };
             let body = collect_body(module, *fli, *fsi, *nli, *nsi);
-            if !body.iter().all(|s| stmt_is_int_safe(s, &loop_var)) {
+            if !body
+                .iter()
+                .all(|s| stmt_is_int_safe_with(s, &loop_var, Some(&routines)))
+            {
                 unsafe_positions.insert((*fli, *fsi));
             }
             // V_var doesn't need to be synced with the int counter
@@ -3557,7 +3563,7 @@ fn stmt_reads_var(stmt: &Stmt, var: &VarName) -> bool {
                 || expr_reads_var(dst_end, var)
                 || expr_reads_var(value, var)
         }
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             expr_reads_var(addr, var) || regs.iter().any(|e| expr_reads_var(e, var))
         }
         Stmt::Wait { addr, mask, eor } => {
@@ -3808,7 +3814,7 @@ fn stmt_loop_var_needs_fac(
                 || expr_loop_var_needs_fac(dst_end, target, true, induction)
                 || expr_loop_var_needs_fac(value, target, true, induction)
         }
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             expr_loop_var_needs_fac(addr, target, true, induction)
                 || regs
                     .iter()
@@ -4384,6 +4390,7 @@ fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
         }
     }
 
+    let routines = build_routine_writes(module);
     let mut unsafe_counters: HashSet<VarName> = HashSet::new();
     for ((fli, fsi), (nli, nsi)) in pairs {
         let (loop_var, start_lit, end_lit, step_lit) = match &module.lines[fli].stmts[fsi] {
@@ -4415,7 +4422,10 @@ fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
             continue;
         }
         let body = collect_body(module, fli, fsi, nli, nsi);
-        if !body.iter().all(|s| stmt_is_int_safe(s, &loop_var)) {
+        if !body
+            .iter()
+            .all(|s| stmt_is_int_safe_with(s, &loop_var, Some(&routines)))
+        {
             unsafe_counters.insert(loop_var);
         }
     }
@@ -4455,16 +4465,370 @@ fn expr_is_i16_nonzero_literal(e: &Expr) -> bool {
     }
 }
 
-fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
-    match stmt {
-        // GOSUB / ON ... GOSUB: callee might write loop_var.
-        Stmt::GoSub { .. } => false,
-        Stmt::OnBranch { kind: OnBranchKind::GoSub, value, .. } => {
-            // Even an unreachable target can be reached from elsewhere
-            // by GOTO, so we can't reason about callees. Bail.
-            let _ = value; // value is read-only; the GOSUB itself is the issue
-            false
+/// Per-GOSUB-target summary: the variables a routine may write, or
+/// `Unknown` when control flow escapes what we can follow (computed
+/// GOTO, RESUME, CLR, recursion, a missing target line, an opaque
+/// `FnCall`, etc.). Over-approximating the write set is sound for the
+/// "does this routine touch the loop counter" question — extra entries
+/// only make a GOSUB look unsafe, never the reverse.
+#[derive(Clone)]
+enum RoutineEffect {
+    Writes(HashSet<VarName>),
+    Unknown,
+}
+
+type RoutineWrites = HashMap<u16, RoutineEffect>;
+
+enum RoutineCf {
+    FallThrough,
+    Stop,
+    Escaped,
+}
+
+/// Build a write-set summary for every line referenced as a GOSUB
+/// target. Lets `stmt_is_int_safe` resolve a GOSUB instead of always
+/// bailing: a GOSUB is safe for an int-FOR counter when the routine it
+/// (transitively) reaches never writes that counter.
+fn build_routine_writes(module: &ir::Module) -> RoutineWrites {
+    let line_index: HashMap<u16, usize> = module
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.number, i))
+        .collect();
+    let mut targets: HashSet<u16> = HashSet::new();
+    for line in &module.lines {
+        for s in &line.stmts {
+            gather_routine_gosub_targets(s, &mut targets);
         }
+    }
+    let mut memo: RoutineWrites = HashMap::new();
+    for t in targets {
+        let mut visiting = HashSet::new();
+        routine_effect(t, module, &line_index, &mut memo, &mut visiting);
+    }
+    memo
+}
+
+fn gather_routine_gosub_targets(stmt: &Stmt, out: &mut HashSet<u16>) {
+    match stmt {
+        Stmt::GoSub { target } => {
+            out.insert(*target);
+        }
+        Stmt::OnBranch {
+            kind: OnBranchKind::GoSub,
+            targets,
+            ..
+        } => out.extend(targets.iter().copied()),
+        Stmt::If { then, .. } => gather_routine_gosub_targets_in_then(then, out),
+        Stmt::IfElse {
+            then, else_then, ..
+        } => {
+            gather_routine_gosub_targets_in_then(then, out);
+            gather_routine_gosub_targets_in_then(else_then, out);
+        }
+        Stmt::Rcomp { then, else_then } => {
+            gather_routine_gosub_targets_in_then(then, out);
+            if let Some(b) = else_then {
+                gather_routine_gosub_targets_in_then(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn gather_routine_gosub_targets_in_then(then: &ThenIr, out: &mut HashSet<u16>) {
+    if let ThenIr::Stmts(inner) = then {
+        for s in inner {
+            gather_routine_gosub_targets(s, out);
+        }
+    }
+}
+
+fn routine_effect(
+    target: u16,
+    module: &ir::Module,
+    line_index: &HashMap<u16, usize>,
+    memo: &mut RoutineWrites,
+    visiting: &mut HashSet<u16>,
+) -> RoutineEffect {
+    if let Some(e) = memo.get(&target) {
+        return e.clone();
+    }
+    if !visiting.insert(target) {
+        return RoutineEffect::Unknown; // recursion — bail conservatively
+    }
+    let result = compute_routine_effect(target, module, line_index, memo, visiting);
+    visiting.remove(&target);
+    memo.insert(target, result.clone());
+    result
+}
+
+fn compute_routine_effect(
+    target: u16,
+    module: &ir::Module,
+    line_index: &HashMap<u16, usize>,
+    memo: &mut RoutineWrites,
+    visiting: &mut HashSet<u16>,
+) -> RoutineEffect {
+    let Some(&start) = line_index.get(&target) else {
+        return RoutineEffect::Unknown;
+    };
+    let mut writes = HashSet::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(li) = stack.pop() {
+        if !seen.insert(li) {
+            continue;
+        }
+        let stmts = &module.lines[li].stmts;
+        match scan_routine_stmts(
+            stmts, false, module, line_index, memo, visiting, &mut writes, &mut stack,
+        ) {
+            RoutineCf::Escaped => return RoutineEffect::Unknown,
+            RoutineCf::FallThrough => {
+                if li + 1 < module.lines.len() {
+                    stack.push(li + 1);
+                }
+            }
+            RoutineCf::Stop => {}
+        }
+    }
+    RoutineEffect::Writes(writes)
+}
+
+/// Walk one line's statements (or an inline IF body when `conditional`),
+/// collecting writes and pushing reachable line indices. A synthetic
+/// probe var detects statement-level hazards that don't depend on a
+/// specific variable (opaque `FnCall`, etc.): `stmt_is_int_safe` against
+/// a name no real code writes is false only for those.
+fn scan_routine_stmts(
+    stmts: &[Stmt],
+    conditional: bool,
+    module: &ir::Module,
+    line_index: &HashMap<u16, usize>,
+    memo: &mut RoutineWrites,
+    visiting: &mut HashSet<u16>,
+    writes: &mut HashSet<VarName>,
+    stack: &mut Vec<usize>,
+) -> RoutineCf {
+    let probe = VarName {
+        base: "\u{1}probe".to_string(),
+        kind: VarKind::Float,
+    };
+    let push_target = |t: &u16, stack: &mut Vec<usize>| -> bool {
+        match line_index.get(t) {
+            Some(&idx) => {
+                stack.push(idx);
+                true
+            }
+            None => false,
+        }
+    };
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return | Stmt::End | Stmt::Stop => {
+                if conditional {
+                    continue;
+                }
+                return RoutineCf::Stop;
+            }
+            Stmt::Goto { target } => {
+                if !push_target(target, stack) {
+                    return RoutineCf::Escaped;
+                }
+                if conditional {
+                    continue;
+                }
+                return RoutineCf::Stop;
+            }
+            Stmt::GoSub { target } => match routine_effect(*target, module, line_index, memo, visiting) {
+                RoutineEffect::Writes(s) => writes.extend(s),
+                RoutineEffect::Unknown => return RoutineCf::Escaped,
+            },
+            Stmt::OnBranch { kind, targets, value } => {
+                if !expr_is_int_safe(value, &probe) {
+                    return RoutineCf::Escaped;
+                }
+                match kind {
+                    OnBranchKind::Goto => {
+                        // ON x GOTO falls through when x is out of range,
+                        // so keep scanning after pushing the targets.
+                        for t in targets {
+                            if !push_target(t, stack) {
+                                return RoutineCf::Escaped;
+                            }
+                        }
+                    }
+                    OnBranchKind::GoSub => {
+                        for t in targets {
+                            match routine_effect(*t, module, line_index, memo, visiting) {
+                                RoutineEffect::Writes(s) => writes.extend(s),
+                                RoutineEffect::Unknown => return RoutineCf::Escaped,
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::If { cond, then } => {
+                if !expr_is_int_safe(cond, &probe) {
+                    return RoutineCf::Escaped;
+                }
+                if let RoutineCf::Escaped =
+                    scan_routine_then(then, module, line_index, memo, visiting, writes, stack)
+                {
+                    return RoutineCf::Escaped;
+                }
+            }
+            Stmt::IfElse {
+                cond,
+                then,
+                else_then,
+            } => {
+                if !expr_is_int_safe(cond, &probe) {
+                    return RoutineCf::Escaped;
+                }
+                if let RoutineCf::Escaped =
+                    scan_routine_then(then, module, line_index, memo, visiting, writes, stack)
+                {
+                    return RoutineCf::Escaped;
+                }
+                if let RoutineCf::Escaped =
+                    scan_routine_then(else_then, module, line_index, memo, visiting, writes, stack)
+                {
+                    return RoutineCf::Escaped;
+                }
+            }
+            Stmt::Rcomp { then, else_then } => {
+                if let RoutineCf::Escaped =
+                    scan_routine_then(then, module, line_index, memo, visiting, writes, stack)
+                {
+                    return RoutineCf::Escaped;
+                }
+                if let Some(b) = else_then
+                    && let RoutineCf::Escaped =
+                        scan_routine_then(b, module, line_index, memo, visiting, writes, stack)
+                {
+                    return RoutineCf::Escaped;
+                }
+            }
+            // Constructs we can't follow or that touch every variable.
+            Stmt::ComputedGoto { .. }
+            | Stmt::Resume { .. }
+            | Stmt::OnError { .. }
+            | Stmt::OnKey { .. }
+            | Stmt::ErrorRaise { .. }
+            | Stmt::Disable
+            | Stmt::Clr
+            | Stmt::Run(_) => return RoutineCf::Escaped,
+            // Any other statement: a leftover statement-level hazard
+            // (opaque FnCall, etc.) poisons the routine; otherwise just
+            // record the variables it writes.
+            other => {
+                if !stmt_is_int_safe(other, &probe) {
+                    return RoutineCf::Escaped;
+                }
+                collect_stmt_direct_writes(other, writes);
+            }
+        }
+    }
+    RoutineCf::FallThrough
+}
+
+fn scan_routine_then(
+    then: &ThenIr,
+    module: &ir::Module,
+    line_index: &HashMap<u16, usize>,
+    memo: &mut RoutineWrites,
+    visiting: &mut HashSet<u16>,
+    writes: &mut HashSet<VarName>,
+    stack: &mut Vec<usize>,
+) -> RoutineCf {
+    match then {
+        ThenIr::Goto(t) => match line_index.get(t) {
+            Some(&idx) => {
+                stack.push(idx);
+                RoutineCf::FallThrough
+            }
+            None => RoutineCf::Escaped,
+        },
+        ThenIr::Stmts(inner) => {
+            scan_routine_stmts(inner, true, module, line_index, memo, visiting, writes, stack)
+        }
+    }
+}
+
+/// Variables a single statement writes directly (not following any
+/// control transfer). Used by the routine-write analysis. Must be
+/// complete for soundness: a missed write would let a GOSUB look safe
+/// for a counter it actually clobbers.
+fn collect_stmt_direct_writes(stmt: &Stmt, out: &mut HashSet<VarName>) {
+    let note_target = |t: &ir::ReadTarget, out: &mut HashSet<VarName>| match t {
+        ir::ReadTarget::Scalar(v) => {
+            out.insert(v.clone());
+        }
+        ir::ReadTarget::Array { name, .. } => {
+            out.insert(name.clone());
+        }
+    };
+    match stmt {
+        Stmt::Let { var, .. } | Stmt::LetStr { var, .. } => {
+            out.insert(var.clone());
+        }
+        Stmt::ArrayLet { name, .. } | Stmt::ArrayLetStr { name, .. } => {
+            out.insert(name.clone());
+        }
+        Stmt::For { var, .. } => {
+            out.insert(var.clone());
+        }
+        Stmt::Next { vars } => out.extend(vars.iter().flatten().cloned()),
+        Stmt::Get { var } | Stmt::KeyGet { var } => {
+            out.insert(var.clone());
+        }
+        Stmt::GetFile { vars, .. } => out.extend(vars.iter().cloned()),
+        Stmt::Fetch { target, .. } => {
+            out.insert(target.clone());
+        }
+        Stmt::SwapStr { lhs, rhs } => {
+            out.insert(lhs.clone());
+            out.insert(rhs.clone());
+        }
+        Stmt::Read(targets) | Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+            for t in targets {
+                note_target(t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
+    stmt_is_int_safe_with(stmt, loop_var, None)
+}
+
+fn stmt_is_int_safe_with(
+    stmt: &Stmt,
+    loop_var: &VarName,
+    routines: Option<&RoutineWrites>,
+) -> bool {
+    match stmt {
+        // GOSUB / ON ... GOSUB: safe only when the routine's write set
+        // is known and excludes the loop counter. Without a routine map
+        // (None) we keep the old conservative bail.
+        Stmt::GoSub { target } => match routines.and_then(|r| r.get(target)) {
+            Some(RoutineEffect::Writes(s)) => !s.contains(loop_var),
+            _ => false,
+        },
+        Stmt::OnBranch {
+            kind: OnBranchKind::GoSub,
+            targets,
+            ..
+        } => match routines {
+            Some(r) => targets.iter().all(|t| {
+                matches!(r.get(t), Some(RoutineEffect::Writes(s)) if !s.contains(loop_var))
+            }),
+            None => false,
+        },
         // Direct writes to the loop variable.
         Stmt::Let { var, value } => {
             var != loop_var && expr_is_int_safe(value, loop_var)
@@ -4531,7 +4895,7 @@ fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
                 && match then {
                     ThenIr::Goto(_) => true,
                     ThenIr::Stmts(inner) => {
-                        inner.iter().all(|s| stmt_is_int_safe(s, loop_var))
+                        inner.iter().all(|s| stmt_is_int_safe_with(s, loop_var, routines))
                     }
                 }
         }
@@ -4540,13 +4904,13 @@ fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
                 && match then {
                     ThenIr::Goto(_) => true,
                     ThenIr::Stmts(inner) => {
-                        inner.iter().all(|s| stmt_is_int_safe(s, loop_var))
+                        inner.iter().all(|s| stmt_is_int_safe_with(s, loop_var, routines))
                     }
                 }
                 && match else_then {
                     ThenIr::Goto(_) => true,
                     ThenIr::Stmts(inner) => {
-                        inner.iter().all(|s| stmt_is_int_safe(s, loop_var))
+                        inner.iter().all(|s| stmt_is_int_safe_with(s, loop_var, routines))
                     }
                 }
         }
@@ -4556,10 +4920,10 @@ fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
         Stmt::Rcomp { then, else_then } => {
             (match then {
                 ThenIr::Goto(_) => true,
-                ThenIr::Stmts(inner) => inner.iter().all(|s| stmt_is_int_safe(s, loop_var)),
+                ThenIr::Stmts(inner) => inner.iter().all(|s| stmt_is_int_safe_with(s, loop_var, routines)),
             }) && else_then.as_ref().map_or(true, |branch| match branch {
                 ThenIr::Goto(_) => true,
-                ThenIr::Stmts(inner) => inner.iter().all(|s| stmt_is_int_safe(s, loop_var)),
+                ThenIr::Stmts(inner) => inner.iter().all(|s| stmt_is_int_safe_with(s, loop_var, routines)),
             })
         }
         Stmt::Print { items, .. } => items.iter().all(|p| match p {
@@ -4952,7 +5316,7 @@ fn stmt_is_int_safe(stmt: &Stmt, loop_var: &VarName) -> bool {
         Stmt::Cset { mode } => expr_is_int_safe(mode, loop_var),
         Stmt::Nrm | Stmt::MemModeOn => true,
         Stmt::Pause { ticks, .. } => expr_is_int_safe(ticks, loop_var),
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             expr_is_int_safe(addr, loop_var)
                 && regs.iter().all(|e| expr_is_int_safe(e, loop_var))
         }
@@ -7028,7 +7392,7 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
         }
         Stmt::Cset { mode } => local_const_expr(mode, env),
         Stmt::Pause { ticks, .. } => local_const_expr(ticks, env),
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             local_const_expr(addr, env);
             for r in regs {
                 local_const_expr(r, env);
@@ -8573,7 +8937,7 @@ impl<'a> UseClassifier<'a> {
             }
             Stmt::ComputedGoto { target } => self.walk_expr(target, UseRole::Addr),
             Stmt::OnBranch { value, .. } => self.walk_expr(value, UseRole::Cond),
-            Stmt::Sys { addr, regs } => {
+            Stmt::Sys { addr, regs, .. } => {
                 self.walk_expr(addr, UseRole::Addr);
                 for r in regs {
                     self.walk_expr(r, UseRole::Addr);
@@ -9313,7 +9677,7 @@ impl<'a> VarKindPromoter<'a> {
             }
             Stmt::Cset { mode } => self.rewrite_expr(mode),
             Stmt::Pause { ticks, .. } => self.rewrite_expr(ticks),
-            Stmt::Sys { addr, regs } => {
+            Stmt::Sys { addr, regs, .. } => {
                 self.rewrite_expr(addr);
                 for r in regs {
                     self.rewrite_expr(r);
@@ -11214,6 +11578,79 @@ mod tests {
             induction_const: None,
             array_inductions: Vec::new(),
         }
+    }
+
+    fn for_body_int_safe(module: &Module) -> bool {
+        module
+            .lines
+            .iter()
+            .flat_map(|l| &l.stmts)
+            .find_map(|s| match s {
+                Stmt::For { body_int_safe, .. } => Some(*body_int_safe),
+                _ => None,
+            })
+            .expect("module has a FOR")
+    }
+
+    /// `FOR I … : GOSUB 100 … : NEXT` where line 100 itself does
+    /// `GOSUB 200`, and neither routine writes I. The interprocedural
+    /// routine-write analysis should keep the body int-safe.
+    fn module_for_nested_gosub(callee_writes_counter: bool) -> Module {
+        let i = fvar("I");
+        Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![
+                        for_stmt(i.clone(), 1.0, 10.0, 1.0),
+                        Stmt::GoSub { target: 100 },
+                        Stmt::Poke {
+                            addr: Expr::Var(i.clone()),
+                            value: Expr::Var(i.clone()),
+                        },
+                        Stmt::Next {
+                            vars: vec![Some(i.clone())],
+                        },
+                    ],
+                },
+                Line { number: 20, stmts: vec![Stmt::End] },
+                Line {
+                    number: 100,
+                    stmts: vec![Stmt::GoSub { target: 200 }, Stmt::Return],
+                },
+                Line {
+                    number: 200,
+                    stmts: vec![
+                        Stmt::Let {
+                            // Writes the counter only in the "unsafe" variant.
+                            var: if callee_writes_counter { i } else { fvar("Q") },
+                            value: Expr::Number(5.0),
+                        },
+                        Stmt::Return,
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn int_for_body_clean_nested_gosub_stays_safe() {
+        let mut module = module_for_nested_gosub(false);
+        IntForBodyAnalysis.run(&mut module).unwrap();
+        assert!(
+            for_body_int_safe(&module),
+            "nested GOSUB whose routines never write the counter must stay int-safe"
+        );
+    }
+
+    #[test]
+    fn int_for_body_nested_gosub_writing_counter_is_unsafe() {
+        let mut module = module_for_nested_gosub(true);
+        IntForBodyAnalysis.run(&mut module).unwrap();
+        assert!(
+            !for_body_int_safe(&module),
+            "a transitively-reached routine that writes the counter must mark the body unsafe"
+        );
     }
 
     #[test]

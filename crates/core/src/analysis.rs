@@ -1061,7 +1061,7 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
                 out.writes.insert(EffectRegion::IoState);
             }
         }
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             summarize_expr(addr, &mut out);
             for r in regs {
                 summarize_expr(r, &mut out);

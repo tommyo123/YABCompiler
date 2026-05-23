@@ -601,7 +601,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
             }
             v.visit_expr(ticks);
         }
-        Sys { addr, regs } => {
+        Sys { addr, regs, .. } => {
             v.visit_expr(addr);
             for r in regs {
                 v.visit_expr(r);
@@ -1441,7 +1441,7 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
             }
             v.visit_expr_mut(ticks);
         }
-        Sys { addr, regs } => {
+        Sys { addr, regs, .. } => {
             v.visit_expr_mut(addr);
             for r in regs {
                 v.visit_expr_mut(r);

@@ -618,6 +618,31 @@ impl IntRange {
         let max = *vals.iter().max().unwrap();
         Some(Self::new(clamp_fact_i64(min)?, clamp_fact_i64(max)?))
     }
+
+    /// Range of `INT(self / other)` — floor of real division. Returns
+    /// `None` when the divisor range straddles zero (the quotient is
+    /// then unbounded near 0, and a literal 0 divisor would trap at
+    /// runtime anyway). Division is monotone in each operand away from
+    /// zero, so the extrema sit at the four corners. f64 is exact for
+    /// the magnitudes we model (`clamp_fact_i64` keeps them ≤ 1e6).
+    fn div_floor(self, other: Self) -> Option<Self> {
+        if other.min <= 0 && other.max >= 0 {
+            return None;
+        }
+        let corners = [
+            self.min as f64 / other.min as f64,
+            self.min as f64 / other.max as f64,
+            self.max as f64 / other.min as f64,
+            self.max as f64 / other.max as f64,
+        ];
+        let lo = corners.iter().copied().fold(f64::INFINITY, f64::min).floor();
+        let hi = corners
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            .floor();
+        Some(Self::new(clamp_fact_i64(lo as i64)?, clamp_fact_i64(hi as i64)?))
+    }
 }
 
 /// Keep ranges inside a practical interval. Wider facts are still
@@ -1561,6 +1586,17 @@ pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
             }
         }
         Expr::Func1(f, arg) => {
+            // INT always yields a whole number, so even when the
+            // argument itself has no integer range — most importantly
+            // `INT(a/b)`, since plain division is fractional and bails —
+            // the floored quotient is bounded by interval division.
+            if matches!(f, Func1::Int)
+                && let Expr::Bin(BinOp::Div, l, r) = arg.as_ref()
+            {
+                let a = expr_int_range(l, state)?;
+                let b = expr_int_range(r, state)?;
+                return a.div_floor(b);
+            }
             let r = expr_int_range(arg, state)?;
             match f {
                 Func1::Abs => r.abs(),
@@ -2111,7 +2147,7 @@ fn collect_shadow_stmt(
             }
             collect_shadow_expr(ticks, ShadowCtx::Int, info);
         }
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             collect_shadow_expr(addr, ShadowCtx::Int, info);
             for r in regs {
                 collect_shadow_expr(r, ShadowCtx::Int, info);

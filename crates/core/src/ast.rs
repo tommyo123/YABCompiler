@@ -654,6 +654,14 @@ pub enum Statement {
     Sys {
         addr: Expr,
         regs: Vec<Expr>,
+        /// BASIC v2 SYS-with-parameters form (`SYS49152"text",8`): the
+        /// raw tokenised bytes after the address up to colon/end-of-line.
+        /// The compiler places them in a low-memory data area and sets
+        /// TXTPTR (`$7A/$7B`) at them before the JSR, so the ML target
+        /// can use ROM helpers (CHRGOT, FRMEVL, GETADR, FRESTR) to parse
+        /// them just as it would under the interpreter. Empty when the
+        /// SYS has no trailing tokens.
+        params: Vec<u8>,
     },
     /// `WAIT addr, mask [, eor]` — busy-poll memory at `addr` until
     /// `(byte XOR eor) AND mask` is non-zero. `eor` defaults to 0.

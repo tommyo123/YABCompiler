@@ -5,13 +5,41 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-05-23
+
+### Added
+
+- `SYS` with parameters in BASIC v2 mode (`SYS49152"text",8`). The
+  trailing tokens are stashed inline and TXTPTR is pointed at them
+  before the call, so ML routines can parse the arguments with the
+  usual ROM helpers (CHRGOT, FRMEVL, FRESTR, CHKCOM, FRMNUM, GETADR).
+- `--safe-sys-calls` (CLI flag and matching GUI checkbox, off by
+  default). When on, every `SYS` saves and restores `$FB-$FE` plus
+  the zero-page cells the codegen allocated, so ML targets that
+  clobber zero page no longer corrupt program state.
+- Dynamic start and step values in integer `FOR` loops. Loops like
+  `FOR I=A TO B STEP S` with non-literal `A` or `S` now use the
+  integer path instead of falling back to the floating-point loop.
+
+### Changed
+
+- Under `--extraram`, every `SYS` call is bracketed with
+  `INC $01` / `DEC $01` so the target sees BASIC ROM banked in. SYS
+  targets that call ROM helpers (FRMEVL, CHROUT, etc.) no longer
+  crash under extraram.
+
+### Fixed
+
+- `INPUT A$` followed by RETURN now returns an empty string instead
+  of reprompting with `??`, matching the interpreter.
+
 ## [0.9.1] - 2026-05-22
 
 ### Fixed
 
 - `LOAD`, `SAVE` and `VERIFY` now accept a string expression as the
-  filename — a string variable (`LOAD A$,8,1`), a parenthesised
-  expression (`LOAD (F$),8`) or a concatenation (`LOAD N$+".C",8,1`) —
+  filename, a string variable (`LOAD A$,8,1`), a parenthesised
+  expression (`LOAD (F$),8`) or a concatenation (`LOAD N$+".C",8,1`),
   instead of only a literal quoted string. Programs that build the
   filename at runtime now compile and run correctly.
 
@@ -45,5 +73,6 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.2]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.2
 [0.9.1]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.1
 [0.9.0]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.0

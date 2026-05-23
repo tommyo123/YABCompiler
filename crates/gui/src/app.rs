@@ -73,6 +73,7 @@ pub struct YabApp {
     force_extraram_off: bool,
     auto_reserve: bool,
     lenient_syntax: bool,
+    safe_sys_calls: bool,
     reserved_ranges: String,
     custom_start_enabled: bool,
     custom_start_address: String,
@@ -110,6 +111,7 @@ impl Default for YabApp {
             force_extraram_off: false,
             auto_reserve: true,
             lenient_syntax: false,
+            safe_sys_calls: false,
             reserved_ranges: String::new(),
             custom_start_enabled: false,
             custom_start_address: "$C000".to_string(),
@@ -599,6 +601,12 @@ impl YabApp {
                  (e.g. `GOT1200` instead of `GOTO1200`, `CLOSE 4,4`). Use when\n\
                  you know the offending line is dead code.",
             );
+        ui.checkbox(&mut self.safe_sys_calls, "Safe SYS calls")
+            .on_hover_text(
+                "Save/restore $FB-$FE and every ZP-pool cell the compiler\n\
+                 allocated around each SYS. Turn on when calling third-party\n\
+                 ML routines that may clobber zero page.",
+            );
 
         ui.add_space(6.0);
         ui.label(RichText::new("Manual ranges").strong());
@@ -761,6 +769,7 @@ impl YabApp {
             self.force_extraram_off = false;
             self.auto_reserve = true;
             self.lenient_syntax = false;
+            self.safe_sys_calls = false;
             self.reserved_ranges.clear();
             self.custom_start_enabled = false;
             self.custom_start_address = "$C000".to_string();
@@ -883,6 +892,7 @@ impl YabApp {
             force_extraram_off: self.force_extraram_off,
             auto_reserve: self.auto_reserve,
             lenient_syntax: self.lenient_syntax,
+            safe_sys_calls: self.safe_sys_calls,
             reserved_text: &self.reserved_ranges,
             custom_start_text: custom_start,
         };

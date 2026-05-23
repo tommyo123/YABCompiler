@@ -37,6 +37,7 @@ pub struct BuildRequest<'a> {
     pub force_extraram_off: bool,
     pub auto_reserve: bool,
     pub lenient_syntax: bool,
+    pub safe_sys_calls: bool,
     pub reserved_text: &'a str,
     /// `Some(text)` enables the custom-start path; the text is parsed
     /// via [`yabcompiler_core::parse_start_address`]. `None` keeps the
@@ -68,6 +69,7 @@ impl BuildRequest<'_> {
             force_extraram_off: self.force_extraram_off,
             auto_reserve: self.auto_reserve,
             lenient_syntax: self.lenient_syntax,
+            safe_sys_calls: self.safe_sys_calls,
             ..CompileOptions::default()
         };
         let trimmed = self.reserved_text.trim();

@@ -521,6 +521,9 @@ pub enum Stmt {
         /// Optional A / X / Y / SR pre-load values, in that order.
         /// See [`crate::ast::Statement::Sys`]; empty for plain SYS.
         regs: Vec<Expr>,
+        /// Raw tokenised BASIC bytes that followed the address — see
+        /// [`crate::ast::Statement::Sys::params`]. Empty for plain SYS.
+        params: Vec<u8>,
     },
     Wait {
         addr: Expr,
@@ -1408,9 +1411,14 @@ fn lower_stmt(
             message: message.as_ref().map(lower_str),
             ticks: lower_expr(ticks),
         },
-        ast::Statement::Sys { addr, regs } => Stmt::Sys {
+        ast::Statement::Sys {
+            addr,
+            regs,
+            params,
+        } => Stmt::Sys {
             addr: lower_expr(addr),
             regs: regs.iter().map(lower_expr).collect(),
+            params: params.clone(),
         },
         ast::Statement::Wait { addr, mask, eor } => Stmt::Wait {
             addr: lower_expr(addr),

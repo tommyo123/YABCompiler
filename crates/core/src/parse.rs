@@ -753,7 +753,25 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 regs.push(expression(p)?);
                 p.skip_spaces();
             }
-            Ok(Statement::Sys { addr, regs })
+            // BASIC v2 SYS-with-parameters form (`SYS49152"text",8`):
+            // any remaining tokens up to colon/end-of-statement become
+            // the raw param byte string. Captured verbatim so codegen
+            // can stage them at TXTPTR and let the ML target call ROM
+            // parsers (CHRGOT, FRMEVL, ...) to consume them.
+            let mut params = Vec::new();
+            while let Some(b) = p.peek() {
+                if b == b':' || b == b';' {
+                    break;
+                }
+                params.push(b);
+                p.advance(1);
+            }
+            // Trim trailing whitespace so an interpreter-style listing
+            // with a stray space before the colon doesn't carry it.
+            while matches!(params.last(), Some(b' ')) {
+                params.pop();
+            }
+            Ok(Statement::Sys { addr, regs, params })
         }
         TOK_OPEN => {
             p.advance(1);
@@ -3721,6 +3739,7 @@ fn tsb_call_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             Ok(Statement::Sys {
                 addr: expression(p)?,
                 regs: Vec::new(),
+                params: Vec::new(),
             })
         }
         // CALL is a tail call: it replaces the current PROC frame

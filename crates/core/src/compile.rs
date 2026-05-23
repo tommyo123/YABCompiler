@@ -49,6 +49,11 @@ pub struct CompileOptions {
     /// these at runtime, so they're harmless when the offending line
     /// is dead code; off by default to keep real syntax errors loud.
     pub lenient_syntax: bool,
+    /// Save and restore $FB-$FE plus every ZP-pool cell the codegen
+    /// allocated, around each `SYS` call. ML routines that touch zero
+    /// page would otherwise corrupt the program's variable storage.
+    /// Off by default; opt in when calling third-party ML.
+    pub safe_sys_calls: bool,
     /// Place machine code at a custom origin and ship a raw .prg with
     /// no SYS launcher. The user is expected to start the program
     /// manually (`SYS <address>` from BASIC, or load+jmp from ML).
@@ -78,6 +83,7 @@ impl Default for CompileOptions {
             // having to know about the flag.
             auto_reserve: true,
             lenient_syntax: false,
+            safe_sys_calls: false,
             custom_start_address: None,
         }
     }
@@ -377,8 +383,13 @@ pub fn compile_with_options(
         .custom_start_address
         .map(u32::from)
         .unwrap_or(CODE_ORIGIN);
-    let asm = codegen::emit_with_profile_at(&module, options.profile, origin as u16)
-        .map_err(CompileError::Codegen)?;
+    let asm = codegen::emit_with_profile_at_opts(
+        &module,
+        options.profile,
+        origin as u16,
+        options.safe_sys_calls,
+    )
+    .map_err(CompileError::Codegen)?;
     // Run asm-level peephole passes before extraram rewrites so
     // liveness analysis sees raw ROM calls.
     let asm = crate::peephole::run(&asm, options.profile);

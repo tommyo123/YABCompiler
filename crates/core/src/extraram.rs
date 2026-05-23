@@ -391,6 +391,23 @@ fn parse_rom_call(line: &str) -> Option<u16> {
 /// that needs banking. Pure KERNAL calls (CHROUT, GETIN, etc.) pass
 /// through — they don't depend on the BASIC ROM bank state.
 fn rewrite_line(line: &str) -> Option<String> {
+    // SYS-call bank markers emitted by `emit_sys`. Under extraram the
+    // program holds `$01 = $36` (BASIC ROM out), so a SYS routine that
+    // calls back into BASIC ROM (FRMEVL, CHROUT, …) would land on
+    // banked-out RAM. INC/DEC $01 around the JSR bank ROM in for the
+    // duration of the user routine and back out on return. Replacing
+    // the marker line (rather than inserting a new one) leaves the
+    // self-modify offsets `<label>+1/+2` intact — the marker sits
+    // outside the label/JSR pair, never between them.
+    let trimmed = line.trim_start();
+    if trimmed == "; YAB_SYS_WRAP_IN" {
+        let leading = &line[..line.len() - trimmed.len()];
+        return Some(format!("{leading}INC $01"));
+    }
+    if trimmed == "; YAB_SYS_WRAP_OUT" {
+        let leading = &line[..line.len() - trimmed.len()];
+        return Some(format!("{leading}DEC $01"));
+    }
     let addr = parse_rom_call(line)?;
     if !needs_jt_wrapping(addr) {
         return None;

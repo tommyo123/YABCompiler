@@ -26,6 +26,9 @@ fn usage(program: &str) {
     eprintln!("    --asm <file>          Also write the generated 6502 assembly.");
     eprintln!("    --profile=<p>         default | speed | size  (default: default)");
     eprintln!("    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
+    eprintln!(
+        "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
+    );
     eprintln!();
     eprintln!("Memory layout:");
     eprintln!("    --extraram            Force RAM under BASIC ROM ($A000-$BFFF) on.");
@@ -193,6 +196,10 @@ fn run_compile(args: &[String]) -> ExitCode {
             }
             "--lenient-syntax" => {
                 options.lenient_syntax = true;
+                i += 1;
+            }
+            "--safe-sys-calls" => {
+                options.safe_sys_calls = true;
                 i += 1;
             }
             arg if arg.starts_with("--reserved=") => {

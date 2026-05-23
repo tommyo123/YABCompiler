@@ -149,9 +149,21 @@ pub fn emit_with_profile_at(
     profile: Profile,
     origin: u16,
 ) -> Result<String, CodegenError> {
+    emit_with_profile_at_opts(module, profile, origin, false)
+}
+
+/// Full form: includes `safe_sys_calls` so every `SYS` brackets the
+/// call with stack-save/restore of $FB-$FE and allocated ZP-pool cells.
+pub fn emit_with_profile_at_opts(
+    module: &ir::Module,
+    profile: Profile,
+    origin: u16,
+    safe_sys_calls: bool,
+) -> Result<String, CodegenError> {
     let analysis = CodegenAnalysis::from_module(module);
     let mut cg = Codegen::new(profile, analysis);
     cg.code_origin = origin;
+    cg.safe_sys_calls = safe_sys_calls;
     cg.run(module)?;
     cg.finish()
 }
@@ -762,6 +774,13 @@ struct Codegen {
     /// $16-$21); everything else is conditionally added when the
     /// program demonstrably doesn't use the feature that owns it.
     zp_pool: Vec<u8>,
+    /// Pool bytes handed out by `alloc_zp_word` / `alloc_zp_byte`,
+    /// recorded so `emit_sys` can save/restore them under
+    /// `--safe-sys-calls`. Append-only.
+    zp_claimed: Vec<u8>,
+    /// When true, every emitted `SYS` PHA-saves $FB-$FE and the bytes
+    /// in `zp_claimed`, restoring them after the JSR.
+    safe_sys_calls: bool,
     /// `for_int_slots` IDs whose FI_<n> slot landed in zero page
     /// (populated by the FOR-counter pre-pass and consumed at
     /// `emit_for_int`).
@@ -1013,13 +1032,33 @@ enum IntForEnd {
     Slot(String),
 }
 
+/// How the int-FOR's start value is produced. A literal start keeps
+/// the counter init as two immediate stores; a dynamic start whose
+/// range analysis proves it fits i16 is evaluated once into the
+/// counter slot at the FOR header.
+#[derive(Clone)]
+enum IntForStart {
+    Literal(i16),
+    Dynamic,
+}
+
 #[derive(Clone)]
 struct IntForFrame {
     var: VarName,
     counter_label: String,
     start_value: i16,
+    /// True when the start was a dynamic expression (start_value is
+    /// then a placeholder). Disables the literal-bounds shortcut in
+    /// `index_provably_in_bounds`, which can't reason about it.
+    dynamic_start: bool,
     end: IntForEnd,
     step_value: i16,
+    /// When `Some(label)`, the step is a runtime value held in the
+    /// 2-byte slot `label` (range-proved i16). NEXT then adds the slot
+    /// and picks the exit direction from the slot's high-byte sign at
+    /// runtime, rather than from `step_value`. Disables the literal-step
+    /// strength reductions (induction / array pointers / bounds proofs).
+    step_slot: Option<String>,
     top_label: String,
     exit_label: String,
     /// If false, the loop body never reads V_var, so the per-iteration
@@ -1285,6 +1324,8 @@ impl Codegen {
             // default is the safe baseline for the rare case that
             // run() isn't called before any allocator (testing, etc.).
             zp_pool: Vec::new(),
+            zp_claimed: Vec::new(),
+            safe_sys_calls: false,
             zp_int_for_assignments: HashMap::new(),
             zp_u8_for_assignments: HashMap::new(),
             zp_for_reuse_slots: Vec::new(),
@@ -1325,6 +1366,18 @@ impl Codegen {
 
     fn emit_facword_rom(&mut self) {
         writeln!(self.code, "    JSR ${:04X}", rt::FACWORD).unwrap();
+        self.invalidate_fac_cache();
+    }
+
+    /// Signed FAC → 16-bit two's-complement into LINNUM ($14/$15) via
+    /// the `__FAC_TO_INT16` helper. Use this (not `emit_facword_rom`,
+    /// which is unsigned and traps on a negative FAC) when loading an
+    /// int-FOR start/end/step whose range can be negative — the result
+    /// round-trips with GIVAYF (also signed) and the signed NEXT compare.
+    /// Only valid for values in the signed i16 range; callers gate on it.
+    fn emit_fac_to_i16_signed(&mut self) {
+        writeln!(self.code, "    JSR __FAC_TO_INT16").unwrap();
+        self.used_fac_to_int16 = true;
         self.invalidate_fac_cache();
     }
 
@@ -1432,10 +1485,34 @@ impl Codegen {
                 let (lo_idx, hi_idx) = if i < j { (i, j) } else { (j, i) };
                 self.zp_pool.remove(hi_idx);
                 self.zp_pool.remove(lo_idx);
-                return Some(b.min(neighbour_b));
+                let lo = b.min(neighbour_b);
+                self.note_zp_claim(lo);
+                self.note_zp_claim(lo + 1);
+                return Some(lo);
             }
         }
         None
+    }
+
+    fn note_zp_claim(&mut self, addr: u8) {
+        if !self.zp_claimed.contains(&addr) {
+            self.zp_claimed.push(addr);
+        }
+    }
+
+    /// Cells `--safe-sys-calls` backs up around every SYS: $FB-$FE
+    /// plus every byte handed out by the ZP-pool allocators. Sorted
+    /// and deduped so push/pull stay balanced across rebuilds.
+    fn collect_safe_sys_cells(&self) -> Vec<u8> {
+        let mut cells: Vec<u8> = self
+            .zp_claimed
+            .iter()
+            .copied()
+            .chain([0xFB, 0xFC, 0xFD, 0xFE])
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells
     }
 
     /// Take the highest-priority single byte from the pool — used
@@ -1448,7 +1525,9 @@ impl Codegen {
         if self.zp_pool.is_empty() {
             None
         } else {
-            Some(self.zp_pool.remove(0))
+            let b = self.zp_pool.remove(0);
+            self.note_zp_claim(b);
+            Some(b)
         }
     }
 
@@ -9059,7 +9138,16 @@ impl Codegen {
             writeln!(self.code, "    CPX __INPUT_LEN").unwrap();
             writeln!(self.code, "    BCC __EF_HAS_DATA").unwrap();
             writeln!(self.code, "    BEQ __EF_HAS_DATA").unwrap();
-            // Buffer exhausted — print "?? " and refill, then retry.
+            // Buffer exhausted at the start of a field. If nothing has
+            // been consumed from this line yet (pos still 1), it was an
+            // empty line — yield an empty field, matching the C64 where
+            // `INPUT A$` + RETURN gives A$="" (and `INPUT A` gives 0) with
+            // no "?? " reprompt. The reprompt is only for a partially
+            // filled line: data was read (pos advanced past 1) but more
+            // fields are still needed.
+            writeln!(self.code, "    CPX #$01").unwrap();
+            writeln!(self.code, "    BEQ __EF_EMPTY").unwrap();
+            // Buffer exhausted mid-line — print "?? " and refill, then retry.
             writeln!(self.code, "__EF_REPROMPT:").unwrap();
             writeln!(self.code, "    LDA #$3F").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
@@ -9071,6 +9159,13 @@ impl Codegen {
             writeln!(self.code, "    LDA #$01").unwrap();
             writeln!(self.code, "    STA __INPUT_POS").unwrap();
             writeln!(self.code, "    JMP __EF_SKIP_WS").unwrap();
+            // Empty field: length-0 string at __FIELD_BUF, pos left as-is
+            // so any further variables on the same empty line also read
+            // empty (matches `INPUT A$,B$` + RETURN → both "").
+            writeln!(self.code, "__EF_EMPTY:").unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    STY __FIELD_BUF").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
             writeln!(self.code, "__EF_HAS_DATA:").unwrap();
             writeln!(self.code, "    LDA __INPUT_BUF,X").unwrap();
             writeln!(self.code, "    CMP #$20").unwrap();
@@ -11248,7 +11343,7 @@ impl Codegen {
             Stmt::MemModeOn => self.emit_mem_mode_on(),
             Stmt::Cset { mode } => self.emit_cset(mode)?,
             Stmt::Pause { message, ticks } => self.emit_pause(message.as_ref(), ticks)?,
-            Stmt::Sys { addr, regs } => self.emit_sys(addr, regs)?,
+            Stmt::Sys { addr, regs, params } => self.emit_sys(addr, regs, params)?,
             Stmt::Wait { addr, mask, eor } => self.emit_wait(addr, mask, eor.as_ref())?,
             Stmt::Open {
                 file_num,
@@ -13788,7 +13883,12 @@ impl Codegen {
                             // the range-fact path (the catch-all
                             // `current_expr_int_range` check below
                             // handles this case via the var's
-                            // statement-IN range).
+                            // statement-IN range). A dynamic start has
+                            // no literal `start_value` to bound with, so
+                            // it also gives up here.
+                            if int_frame.dynamic_start || int_frame.step_slot.is_some() {
+                                return false;
+                            }
                             let end_lit = match &int_frame.end {
                                 IntForEnd::Literal(e) => *e,
                                 IntForEnd::Slot(_) => return false,
@@ -15759,6 +15859,12 @@ impl Codegen {
             if let ForFrame::Int(int_frame) = frame
                 && int_frame.var == *var
             {
+                // A dynamic start or dynamic step has no literal value to
+                // bound, so the counter could be anything in i16 — can't
+                // claim u8.
+                if int_frame.dynamic_start || int_frame.step_slot.is_some() {
+                    return false;
+                }
                 let end_lit = match &int_frame.end {
                     IntForEnd::Literal(e) => *e,
                     IntForEnd::Slot(_) => return false,
@@ -17462,9 +17568,10 @@ impl Codegen {
                         }
                         return self.emit_for_int(
                             var,
-                            s,
+                            IntForStart::Literal(s),
                             IntForEnd::Literal(e),
                             st,
+                            None,
                             top_label,
                             exit_label,
                             body_reads_loop_var,
@@ -17504,24 +17611,25 @@ impl Codegen {
                         && range.min >= i16::MIN as i32
                         && range.max <= i16::MAX as i32
                     {
-                        // Dynamic end with range proven to fit i16:
-                        // promote to int-FOR with a slot-stored end.
+                        // Dynamic end with range proven to fit signed i16
+                        // (incl. negative): promote to int-FOR with a
+                        // slot-stored end loaded via the signed FAC→i16
+                        // conversion (FACWORD would trap on a negative).
                         let slot_id = self.for_end_slots;
                         self.for_end_slots += 1;
                         let end_slot_label = format!("FE_{slot_id}");
-                        // Evaluate end → FAC → LINNUM (16-bit), then
-                        // copy to the slot.
                         self.emit_expr_to_fac(end)?;
-                        self.emit_facword_rom();
+                        self.emit_fac_to_i16_signed();
                         writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
                         writeln!(self.code, "    STA {end_slot_label}").unwrap();
                         writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
                         writeln!(self.code, "    STA {end_slot_label}+1").unwrap();
                         return self.emit_for_int(
                             var,
-                            s,
+                            IntForStart::Literal(s),
                             IntForEnd::Slot(end_slot_label),
                             st,
+                            None,
                             top_label,
                             exit_label,
                             body_reads_loop_var,
@@ -17530,6 +17638,121 @@ impl Codegen {
                             array_inductions,
                         );
                     }
+                }
+            } else if let Some(st) = step_const.and_then(f64_to_i16_literal)
+                && st != 0
+                && self
+                    .current_expr_int_range(start)
+                    .map_or(false, |r| r.min >= i16::MIN as i32 && r.max <= i16::MAX as i32)
+            {
+                // Dynamic start (not a literal, but range analysis pins
+                // it to signed i16, incl. negative) with a literal step.
+                // The end must also be a literal or a range-proved-i16
+                // slot. Start and end load via the signed FAC→i16
+                // conversion; the float fallback is avoided. Induction /
+                // array-pointer reductions are skipped (no known offset).
+                let end_for = if let Some(e) = as_i16_literal(end) {
+                    Some(IntForEnd::Literal(e))
+                } else if let Some(range) = self.current_expr_int_range(end)
+                    && range.min >= i16::MIN as i32
+                    && range.max <= i16::MAX as i32
+                {
+                    let slot_id = self.for_end_slots;
+                    self.for_end_slots += 1;
+                    let end_slot_label = format!("FE_{slot_id}");
+                    self.emit_expr_to_fac(end)?;
+                    self.emit_fac_to_i16_signed();
+                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+                    writeln!(self.code, "    STA {end_slot_label}").unwrap();
+                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+                    writeln!(self.code, "    STA {end_slot_label}+1").unwrap();
+                    Some(IntForEnd::Slot(end_slot_label))
+                } else {
+                    None
+                };
+                if let Some(end_for) = end_for {
+                    return self.emit_for_int(
+                        var,
+                        IntForStart::Dynamic,
+                        end_for,
+                        st,
+                        None,
+                        top_label,
+                        exit_label,
+                        body_reads_loop_var,
+                        induction_const,
+                        start,
+                        array_inductions,
+                    );
+                }
+            } else if step_const.is_none()
+                && self
+                    .current_expr_int_range(step)
+                    .is_some_and(|r| r.min >= 1 && r.max <= i16::MAX as i32)
+            {
+                // Dynamic STEP proved positive (≥ 1), with a literal or
+                // range-proved-i16 start and end. NEXT adds the step slot
+                // and reads its high-byte sign at runtime for the exit
+                // direction (signed compare throughout — no unsigned
+                // representation). Bounds may be negative (loaded via the
+                // signed FAC→i16 conversion); the step is positive so its
+                // load can't trap. All three operands are range-provable,
+                // hence side-effect free, so evaluating end and step into
+                // slots before the counter init matches BASIC's
+                // start/end/step order observationally.
+                let start_for = if let Some(s) = as_i16_literal(start) {
+                    Some(IntForStart::Literal(s))
+                } else if self
+                    .current_expr_int_range(start)
+                    .is_some_and(|r| r.min >= i16::MIN as i32 && r.max <= i16::MAX as i32)
+                {
+                    Some(IntForStart::Dynamic)
+                } else {
+                    None
+                };
+                let end_for = if let Some(e) = as_i16_literal(end) {
+                    Some(IntForEnd::Literal(e))
+                } else if self
+                    .current_expr_int_range(end)
+                    .is_some_and(|r| r.min >= i16::MIN as i32 && r.max <= i16::MAX as i32)
+                {
+                    let slot_id = self.for_end_slots;
+                    self.for_end_slots += 1;
+                    let end_slot_label = format!("FE_{slot_id}");
+                    self.emit_expr_to_fac(end)?;
+                    self.emit_fac_to_i16_signed();
+                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+                    writeln!(self.code, "    STA {end_slot_label}").unwrap();
+                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+                    writeln!(self.code, "    STA {end_slot_label}+1").unwrap();
+                    Some(IntForEnd::Slot(end_slot_label))
+                } else {
+                    None
+                };
+                if let (Some(start_for), Some(end_for)) = (start_for, end_for) {
+                    // Evaluate the (positive) step once into a 2-byte slot.
+                    let slot_id = self.for_end_slots;
+                    self.for_end_slots += 1;
+                    let step_slot_label = format!("FE_{slot_id}");
+                    self.emit_expr_to_fac(step)?;
+                    self.emit_facword_rom();
+                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+                    writeln!(self.code, "    STA {step_slot_label}").unwrap();
+                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+                    writeln!(self.code, "    STA {step_slot_label}+1").unwrap();
+                    return self.emit_for_int(
+                        var,
+                        start_for,
+                        end_for,
+                        0,
+                        Some(step_slot_label),
+                        top_label,
+                        exit_label,
+                        body_reads_loop_var,
+                        induction_const,
+                        start,
+                        array_inductions,
+                    );
                 }
             }
         }
@@ -17863,12 +18086,14 @@ impl Codegen {
     /// Emit the integer-FOR setup (counter init, V_var sync, top label).
     /// Caller already verified that all three loop parameters are i16
     /// literals and that step != 0.
+    #[allow(clippy::too_many_arguments)]
     fn emit_for_int(
         &mut self,
         var: &VarName,
-        start: i16,
+        start: IntForStart,
         end: IntForEnd,
         step: i16,
+        step_slot: Option<String>,
         top_label: String,
         exit_label: String,
         body_reads_loop_var: bool,
@@ -17890,23 +18115,52 @@ impl Codegen {
         let _ = self.zp_int_for_assignments.get(&counter_id);
         self.used_int_for = true;
 
-        // counter = start
-        let s = start as u16;
-        writeln!(self.code, "    LDA #${:02X}", s & 0xFF).unwrap();
-        writeln!(self.code, "    STA {counter_label}").unwrap();
-        writeln!(self.code, "    LDA #${:02X}", (s >> 8) & 0xFF).unwrap();
-        writeln!(self.code, "    STA {counter_label}+1").unwrap();
+        // counter = start. A literal start is two immediate stores; a
+        // dynamic start is evaluated once into LINNUM and copied in.
+        let dynamic_start = matches!(start, IntForStart::Dynamic);
+        match start {
+            IntForStart::Literal(s) => {
+                let s = s as u16;
+                writeln!(self.code, "    LDA #${:02X}", s & 0xFF).unwrap();
+                writeln!(self.code, "    STA {counter_label}").unwrap();
+                writeln!(self.code, "    LDA #${:02X}", (s >> 8) & 0xFF).unwrap();
+                writeln!(self.code, "    STA {counter_label}+1").unwrap();
+            }
+            IntForStart::Dynamic => {
+                self.emit_expr_to_fac(start_expr)?;
+                self.emit_fac_to_i16_signed();
+                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+                writeln!(self.code, "    STA {counter_label}").unwrap();
+                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+                writeln!(self.code, "    STA {counter_label}+1").unwrap();
+            }
+        }
         // Sync only if body actually reads V_var. Otherwise the only
         // observable read is post-loop, which we cover by syncing once
         // at the exit label.
         if body_reads_loop_var {
             self.emit_int_counter_to_var(&counter_label, var);
         }
-        let induction = self.emit_induction_init(induction_const, start_expr);
-        let array_pointers = self.emit_array_pointers_init(start as i32, array_inductions);
+        // Induction and running-array-pointer slots need a known start
+        // offset and a literal stride; a dynamic start or dynamic step
+        // has neither, so skip both (the detection pass only proposes
+        // them for literal-start, literal-step loops anyway).
+        let (induction, array_pointers) = if dynamic_start || step_slot.is_some() {
+            (None, Vec::new())
+        } else {
+            let induction = self.emit_induction_init(induction_const, start_expr);
+            let start_off = match start {
+                IntForStart::Literal(s) => s as i32,
+                IntForStart::Dynamic => 0,
+            };
+            (induction, self.emit_array_pointers_init(start_off, array_inductions))
+        };
         writeln!(self.code, "{top_label}:").unwrap();
 
-        let start_value = start;
+        let start_value = match start {
+            IntForStart::Literal(s) => s,
+            IntForStart::Dynamic => 0,
+        };
         // For the index_provably_in_bounds shortcut we still want a
         // representative end-value for the literal path. Dynamic
         // slots give up that proof.
@@ -17914,8 +18168,10 @@ impl Codegen {
             var: var.clone(),
             counter_label,
             start_value,
+            dynamic_start,
             end,
             step_value: step,
+            step_slot,
             top_label,
             exit_label,
             body_reads_loop_var,
@@ -18357,6 +18613,58 @@ impl Codegen {
         let top = &frame.top_label;
         let id = self.fresh_id();
         let nv_label = format!("__FOR_NV_{id}");
+
+        // Dynamic step: add the runtime step slot (16-bit), then pick
+        // the exit direction from the step's sign at runtime. The
+        // literal +1/-1/imm fast paths and the strength reductions don't
+        // apply.
+        if let Some(step_label) = frame.step_slot.clone() {
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    LDA {counter}").unwrap();
+            writeln!(self.code, "    ADC {step_label}").unwrap();
+            writeln!(self.code, "    STA {counter}").unwrap();
+            writeln!(self.code, "    LDA {counter}+1").unwrap();
+            writeln!(self.code, "    ADC {step_label}+1").unwrap();
+            writeln!(self.code, "    STA {counter}+1").unwrap();
+            if frame.body_reads_loop_var {
+                self.emit_int_counter_to_var(&counter, &frame.var);
+            }
+            // diff = counter - end (signed, overflow-corrected high in A).
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    LDA {counter}").unwrap();
+            match &frame.end {
+                IntForEnd::Literal(e) => {
+                    writeln!(self.code, "    SBC #${:02X}", (*e as u16) & 0xFF).unwrap();
+                }
+                IntForEnd::Slot(label) => writeln!(self.code, "    SBC {label}").unwrap(),
+            }
+            writeln!(self.code, "    STA __FOR_DIFF_LO").unwrap();
+            writeln!(self.code, "    LDA {counter}+1").unwrap();
+            match &frame.end {
+                IntForEnd::Literal(e) => {
+                    writeln!(self.code, "    SBC #${:02X}", ((*e as u16) >> 8) & 0xFF).unwrap();
+                }
+                IntForEnd::Slot(label) => writeln!(self.code, "    SBC {label}+1").unwrap(),
+            }
+            writeln!(self.code, "    BVC {nv_label}").unwrap();
+            writeln!(self.code, "    EOR #$80").unwrap();
+            writeln!(self.code, "{nv_label}:").unwrap();
+            // .A = sign of (counter-end). Continue while diff==0.
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    ORA __FOR_DIFF_LO").unwrap();
+            writeln!(self.code, "    BEQ {top}").unwrap();
+            // Exit when sign(diff) == sign(step): EOR the diff-sign with
+            // the step's high byte; bit 7 clear means same sign → exit.
+            writeln!(self.code, "    TXA").unwrap();
+            writeln!(self.code, "    EOR {step_label}+1").unwrap();
+            writeln!(self.code, "    BPL {exit}").unwrap();
+            writeln!(self.code, "    JMP {top}").unwrap();
+            writeln!(self.code, "{exit}:").unwrap();
+            if !frame.body_reads_loop_var {
+                self.emit_int_counter_to_var(&counter, &frame.var);
+            }
+            return;
+        }
 
         // counter += step (16-bit). For step=±1 use INC/DEC chains —
         // 8 bytes vs the 17-byte CLC/ADC pair for arbitrary steps.
@@ -22473,13 +22781,54 @@ impl Codegen {
     /// $030C-$030E — fine for most uses; we'll wrap save/restore in
     /// the call when a real program hits a routine that depends on
     /// those slots.
-    fn emit_sys(&mut self, addr: &Expr, regs: &[Expr]) -> Result<(), CodegenError> {
+    fn emit_sys(
+        &mut self,
+        addr: &Expr,
+        regs: &[Expr],
+        params: &[u8],
+    ) -> Result<(), CodegenError> {
         // Mirror BASIC's `SYS` dispatch ($E12A): load A/X/Y/SR from
         // the save area ($030C-$030F) before JSR-ing the target, and
         // store them back on return ($E146). Programs preset those
         // slots with `POKE 780,a:POKE 781,x:POKE 782,y`, so we must
         // honour them even without explicit SYS register arguments.
         const SADRA: u16 = 0x030C; // A=$030C, X=$030D, Y=$030E, SR=$030F
+        // BASIC v2 SYS-with-parameters form (e.g. `SYS49152"text",8`).
+        // Inline the trailing tokens (the extraram pass hoists them to
+        // low memory automatically) and point TXTPTR ($7A/$7B) at them
+        // so the ML target can use ROM helpers to parse them as if
+        // under the interpreter. Trailing $00 marks end-of-line.
+        if !params.is_empty() {
+            let id = self.fresh_id();
+            let data_lbl = format!("__SYS_PARAMS_{id}");
+            let end_lbl = format!("__SYS_PARAMS_END_{id}");
+            // Jump over the inline bytes — they're data, not code.
+            writeln!(self.code, "    JMP {end_lbl}").unwrap();
+            writeln!(self.code, "{data_lbl}:").unwrap();
+            let mut line = String::from("    .byte ");
+            for (i, b) in params.iter().enumerate() {
+                if i > 0 {
+                    line.push(',');
+                }
+                use std::fmt::Write;
+                let _ = write!(line, "${b:02X}");
+            }
+            line.push_str(",$00");
+            self.code.push_str(&line);
+            self.code.push('\n');
+            writeln!(self.code, "{end_lbl}:").unwrap();
+            // Save BASIC's TXTPTR so the final RTS-back-to-BASIC resumes
+            // from the right place; the ML target will scribble it.
+            writeln!(self.code, "    LDA $7A").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+            writeln!(self.code, "    LDA $7B").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+            // TXTPTR ($7A low, $7B high) -> first param byte.
+            writeln!(self.code, "    LDA #<{data_lbl}").unwrap();
+            writeln!(self.code, "    STA $7A").unwrap();
+            writeln!(self.code, "    LDA #>{data_lbl}").unwrap();
+            writeln!(self.code, "    STA $7B").unwrap();
+        }
         // Explicit `SYS addr, a [, x [, y]]` args: stamp them into
         // the save slots first, exactly like `POKE 780.. : SYS` would.
         for (i, e) in regs.iter().enumerate() {
@@ -22498,6 +22847,19 @@ impl Codegen {
         } else {
             None
         };
+        // `--safe-sys-calls`: save $FB-$FE and the ZP-pool cells we
+        // allocated so an ML target that clobbers zero page can't
+        // corrupt our state. PHA-based so the backup itself doesn't
+        // need a ZP slot; pulled in reverse after the JSR.
+        let safe_cells = if self.safe_sys_calls {
+            self.collect_safe_sys_cells()
+        } else {
+            Vec::new()
+        };
+        for cell in &safe_cells {
+            writeln!(self.code, "    LDA ${cell:02X}").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+        }
         // Restore SR last so the A/X/Y loads don't clobber it.
         writeln!(self.code, "    LDA ${:04X}", SADRA + 3).unwrap(); // SR
         writeln!(self.code, "    PHA").unwrap();
@@ -22505,12 +22867,20 @@ impl Codegen {
         writeln!(self.code, "    LDX ${:04X}", SADRA + 1).unwrap(); // X
         writeln!(self.code, "    LDY ${:04X}", SADRA + 2).unwrap(); // Y
         writeln!(self.code, "    PLP").unwrap();
+        // SYS-call markers. Stay as comments in default builds; the
+        // `--extraram` injection pass rewrites them to `INC $01` /
+        // `DEC $01` so SYS targets see BASIC ROM banked in. Placed
+        // outside the label/JSR pair: the self-modify patch writes to
+        // `<label>+1/+2`, so anything inserted between would corrupt
+        // the operand.
+        writeln!(self.code, "    ; YAB_SYS_WRAP_IN").unwrap();
         if let Some(p) = &patch {
             writeln!(self.code, "{p}:").unwrap();
             writeln!(self.code, "    JSR $FFFF").unwrap();
         } else {
             writeln!(self.code, "    JSR ${:04X}", target_literal.unwrap()).unwrap();
         }
+        writeln!(self.code, "    ; YAB_SYS_WRAP_OUT").unwrap();
         // Save A/X/Y, then SR (PLA after PHP clobbers A — already saved).
         writeln!(self.code, "    STA ${:04X}", SADRA).unwrap();
         writeln!(self.code, "    STX ${:04X}", SADRA + 1).unwrap();
@@ -22518,6 +22888,18 @@ impl Codegen {
         writeln!(self.code, "    PHP").unwrap();
         writeln!(self.code, "    PLA").unwrap();
         writeln!(self.code, "    STA ${:04X}", SADRA + 3).unwrap();
+        // Pull ZP backups in reverse — see comment near the push above.
+        for cell in safe_cells.iter().rev() {
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    STA ${cell:02X}").unwrap();
+        }
+        // Restore TXTPTR (only pushed when params were inlined).
+        if !params.is_empty() {
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    STA $7B").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    STA $7A").unwrap();
+        }
         Ok(())
     }
 
@@ -23675,7 +24057,7 @@ fn scan_module_uses_usr(module: &ir::Module) -> bool {
             }
             Stmt::Cset { mode } => expr_has_usr(mode),
             Stmt::Pause { ticks, .. } => expr_has_usr(ticks),
-            Stmt::Sys { addr, regs } => expr_has_usr(addr) || regs.iter().any(expr_has_usr),
+            Stmt::Sys { addr, regs, .. } => expr_has_usr(addr) || regs.iter().any(expr_has_usr),
             Stmt::Wait { addr, mask, eor } => {
                 expr_has_usr(addr) || expr_has_usr(mask) || eor.as_ref().is_some_and(expr_has_usr)
             }
@@ -24083,7 +24465,7 @@ fn stmts_use_heap(stmts: &[Stmt]) -> bool {
         Stmt::Pause { message, ticks } => {
             message.as_ref().is_some_and(str_uses_heap) || expr_uses_heap(ticks)
         }
-        Stmt::Sys { addr, regs } => expr_uses_heap(addr) || regs.iter().any(expr_uses_heap),
+        Stmt::Sys { addr, regs, .. } => expr_uses_heap(addr) || regs.iter().any(expr_uses_heap),
         // INPUT to a string variable copies the line buffer onto the
         // heap so subsequent INPUTs don't overwrite the variable's data.
         Stmt::Input { targets, .. } => targets.iter().any(|t| match t {
@@ -25447,7 +25829,7 @@ fn visit_exprs_in_stmt(stmt: &Stmt, cb: &mut impl FnMut(&Expr)) {
             cb(end);
             cb(step);
         }
-        Stmt::Sys { addr, regs } => {
+        Stmt::Sys { addr, regs, .. } => {
             cb(addr);
             for r in regs {
                 cb(r);
@@ -27907,6 +28289,33 @@ mod tests {
     }
 
     #[test]
+    fn codegen_empty_input_yields_empty_field_not_reprompt() {
+        // `INPUT A$` + RETURN must give A$="" (matching the C64), so the
+        // field extractor needs an empty-line path that returns a
+        // zero-length field instead of printing "?? " and re-reading.
+        // The reprompt must stay for the genuinely-partial case.
+        let m = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![Stmt::Input {
+                    prompt: None,
+                    targets: vec![ReadTarget::Scalar(svar("A"))],
+                }],
+            }],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        assert!(
+            asm.contains("__EF_EMPTY:") && asm.contains("BEQ __EF_EMPTY"),
+            "empty-line INPUT must yield an empty field, not reprompt:\n{asm}"
+        );
+        assert!(
+            asm.contains("__EF_REPROMPT:"),
+            "the partial-input \"?? \" reprompt must be preserved:\n{asm}"
+        );
+        assert_assembles(&asm);
+    }
+
+    #[test]
     fn tsbneo_helpers_are_on_demand_and_assemble() {
         let empty = Module {
             lines: vec![Line {
@@ -28816,9 +29225,12 @@ mod tests {
             lines: vec![
                 Line {
                     number: 10,
+                    // PEEK range is 0..255 — includes 0, so the step
+                    // isn't provably positive and stays on the float
+                    // dynamic-step path this test covers.
                     stmts: vec![Stmt::Let {
                         var: s.clone(),
-                        value: Expr::Number(2.0),
+                        value: Expr::Peek(Box::new(Expr::Number(820.0))),
                     }],
                 },
                 Line {
@@ -28855,6 +29267,146 @@ mod tests {
             asm.contains("__FOR_DYN_NEG_"),
             "NEXT should branch by runtime STEP sign\n{asm}"
         );
+    }
+
+    #[test]
+    fn codegen_positive_dynamic_step_uses_int_for() {
+        // STEP S where S is range-proved positive (1..9) and the bounds
+        // are non-negative literals → integer FOR with a runtime step
+        // slot: 16-bit ADD of the slot, signed compare, EOR-sign exit.
+        // No float FADD/FSUB per iteration.
+        let i = fvar("I");
+        let s = fvar("S");
+        let m = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![
+                        Stmt::Let {
+                            var: s.clone(),
+                            value: Expr::Peek(Box::new(Expr::Number(820.0))),
+                        },
+                        // Clamp to 1..9 so the range analysis proves S ≥ 1.
+                        Stmt::If {
+                            cond: Expr::Bin(
+                                BinOp::Lt,
+                                Box::new(Expr::Var(s.clone())),
+                                Box::new(Expr::Number(1.0)),
+                            ),
+                            then: ThenIr::Stmts(vec![Stmt::Let {
+                                var: s.clone(),
+                                value: Expr::Number(1.0),
+                            }]),
+                        },
+                        Stmt::If {
+                            cond: Expr::Bin(
+                                BinOp::Gt,
+                                Box::new(Expr::Var(s.clone())),
+                                Box::new(Expr::Number(9.0)),
+                            ),
+                            then: ThenIr::Stmts(vec![Stmt::Let {
+                                var: s.clone(),
+                                value: Expr::Number(9.0),
+                            }]),
+                        },
+                    ],
+                },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::For {
+                        var: i.clone(),
+                        start: Expr::Number(0.0),
+                        end: Expr::Number(18.0),
+                        step: Expr::Var(s),
+                        body_int_safe: true,
+                        body_reads_loop_var: true,
+                        induction_const: None,
+                        array_inductions: Vec::new(),
+                    }],
+                },
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::Poke {
+                        addr: Expr::Bin(
+                            BinOp::Add,
+                            Box::new(Expr::Number(1024.0)),
+                            Box::new(Expr::Var(i.clone())),
+                        ),
+                        value: Expr::Number(90.0),
+                    }],
+                },
+                Line {
+                    number: 40,
+                    stmts: vec![Stmt::Next { vars: vec![Some(i)] }],
+                },
+            ],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        assert!(asm.contains("FI_0"), "expected int FOR counter:\n{asm}");
+        // Integer step add from the slot + EOR-sign exit; no float math
+        // and no float-path sign slot.
+        assert!(
+            !asm.contains("JSR $B850") && !asm.contains("FS_SIGN_"),
+            "positive dynamic step should stay integer (no float FSUB/sign slot):\n{asm}"
+        );
+        assert_assembles(&asm);
+    }
+
+    #[test]
+    fn codegen_negative_dynamic_bound_uses_signed_int_for() {
+        // `FOR I = N TO N+4` where N's range includes negatives takes the
+        // int-FOR path with the SIGNED FAC→i16 conversion (__FAC_TO_INT16,
+        // two's complement) — not FACWORD (unsigned, traps on negative),
+        // and not the float fallback. The signed counter round-trips with
+        // GIVAYF (also signed) and the signed NEXT compare.
+        let i = fvar("I");
+        let n = fvar("N");
+        let m = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::Let {
+                        var: n.clone(),
+                        value: Expr::Bin(
+                            BinOp::Sub,
+                            Box::new(Expr::Peek(Box::new(Expr::Number(820.0)))),
+                            Box::new(Expr::Number(100.0)),
+                        ),
+                    }],
+                },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::For {
+                        var: i.clone(),
+                        start: Expr::Var(n.clone()),
+                        end: Expr::Bin(
+                            BinOp::Add,
+                            Box::new(Expr::Var(n)),
+                            Box::new(Expr::Number(4.0)),
+                        ),
+                        step: Expr::Number(1.0),
+                        body_int_safe: true,
+                        body_reads_loop_var: false,
+                        induction_const: None,
+                        array_inductions: Vec::new(),
+                    }],
+                },
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::Next { vars: vec![Some(i)] }],
+                },
+            ],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        assert!(
+            asm.contains("FI_0"),
+            "negative-capable dynamic bound should use a 16-bit int counter:\n{asm}"
+        );
+        assert!(
+            asm.contains("JSR __FAC_TO_INT16"),
+            "dynamic bound must load via the signed FAC→i16 conversion, not FACWORD:\n{asm}"
+        );
+        assert_assembles(&asm);
     }
 
     #[test]
@@ -30647,6 +31199,77 @@ mod tests {
         };
         let asm = emit_with_profile(&m, Profile::default()).unwrap();
         assert_no_8bit_indexed_against(&asm, &[0xD000, 0x3000], "dynamic-end FOR");
+        assert_assembles(&asm);
+    }
+
+    #[test]
+    fn dynamic_start_for_uses_integer_counter() {
+        // `N = PEEK(...)` gives N a provable 0..255 range, so the
+        // runtime start `FOR I = N TO N+5` still takes the 16-bit
+        // integer-counter path (no per-iteration float FADD), not the
+        // float fallback. The body indexes an integer array so the
+        // counter is consumed in an int context (same shape the
+        // dynamic-end path already supports).
+        let i = fvar("I");
+        let n = ivar("N");
+        let b = ivar("B");
+        let m = Module {
+            lines: vec![
+                Line {
+                    number: 5,
+                    stmts: vec![Stmt::Dim(vec![DimSpec {
+                        name: b.clone(),
+                        dims: vec![Expr::Number(300.0)],
+                    }])],
+                },
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::Let {
+                        var: n.clone(),
+                        value: Expr::Peek(Box::new(Expr::Number(820.0))),
+                    }],
+                },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::For {
+                        var: i.clone(),
+                        start: Expr::Var(n.clone()),
+                        end: Expr::Bin(
+                            BinOp::Add,
+                            Box::new(Expr::Var(n)),
+                            Box::new(Expr::Number(5.0)),
+                        ),
+                        step: Expr::Number(1.0),
+                        body_int_safe: true,
+                        body_reads_loop_var: true,
+                        induction_const: None,
+                        array_inductions: Vec::new(),
+                    }],
+                },
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::ArrayLet {
+                        name: b,
+                        indices: vec![Expr::Var(i.clone())],
+                        value: Expr::Var(i.clone()),
+                    }],
+                },
+                Line {
+                    number: 40,
+                    stmts: vec![Stmt::Next { vars: vec![Some(i)] }],
+                },
+            ],
+        };
+        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        // Integer counter slot, integer INC step, and an integer SBC
+        // limit compare — i.e. the loop runs on the 16-bit counter, not
+        // the float fallback (which would emit FSUB $B850 every NEXT).
+        assert!(asm.contains("FI_0"), "expected int FOR counter:\n{asm}");
+        assert!(asm.contains("INC FI_0"), "expected integer INC step:\n{asm}");
+        assert!(
+            !asm.contains("JSR $B850"),
+            "dynamic-start loop should not use the float FSUB compare:\n{asm}"
+        );
         assert_assembles(&asm);
     }
 

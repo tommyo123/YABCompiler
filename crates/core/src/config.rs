@@ -5,7 +5,7 @@
 
 /// Application version. The one place the version is defined; keep the
 /// workspace `Cargo.toml` `version` in sync so packaged artifacts match.
-pub const VERSION: &str = "0.9.1";
+pub const VERSION: &str = "0.9.2";
 
 /// Short program name.
 pub const APP_NAME: &str = "YABCompiler";
