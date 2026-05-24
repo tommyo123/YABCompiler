@@ -5,6 +5,51 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-05-24
+
+### Added
+
+- `--rem-hints=<dialect>` (CLI flag and matching GUI dropdown).
+  Honours REM-based optimisation pragmas from two third-party
+  compilers:
+  - `basic64` (Data Becker): `REM@i=A,B,C` for integer scalars,
+    `REM@b=...` for bytes, `REM@r=...` for reals (no-op).
+  - `basic-boss`: `REM@ \BYTE A,B,C` and `REM@ \WORD A,B,C`, with
+    an optional `=FAST` suffix for zero-page placement.
+
+  Hinted vars skip the range proof that normally guards byte and
+  integer promotion, so the user takes responsibility for keeping
+  values in range.
+
+### Performance
+
+- Multi-dim integer-array indexing handles strides 11, 13, 14, 19,
+  21 and 22 natively. Typical `DIM A(N, M)` shapes no longer fall
+  back to the ROM float multiplier on each access.
+- Numeric DATA pools get a binary layout (2 bytes per integer,
+  5 per float). READ stores directly instead of going through the
+  ROM VAL parser.
+- `--profile=speed` keeps shared peephole helpers inlined instead
+  of factoring them into `__JSR2_<n>` stubs. The default profile
+  still factors, preferring compact code.
+- Shadow-int promotion handles u16 alongside i16, so address vars
+  like `UC=55296` get a 2-byte slot. Variables used as
+  `POKE`/`PEEK`/`DPOKE` addresses are promoted regardless of
+  read-count.
+- Shadow-int promotion no longer double-counts writes inside `IF`,
+  `IFELSE` and `RCOMP` bodies, which previously disqualified almost
+  every conditionally assigned scalar.
+
+### Changed
+
+- REM hints are now honoured strictly. A hinted-int var stays
+  integer even when the RHS is a float expression; the store
+  converts via `FAC_TO_INT16`, matching Basic 64 and Basic-Boss.
+- New `SplitMultiTypeVars` pass: a Float scalar with disjoint
+  float-only and int-only lifetimes is split into independent vars
+  so each cluster can be typed on its own. FOR-counter vars are
+  skipped.
+
 ## [0.9.2] - 2026-05-23
 
 ### Added
@@ -73,6 +118,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.3]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.3
 [0.9.2]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.2
 [0.9.1]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.1
 [0.9.0]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.0

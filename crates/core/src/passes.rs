@@ -12088,3 +12088,756 @@ mod tests {
         );
     }
 }
+
+// ===== Multi-type scalar var splitting (SSA-style) ========================
+//
+// A scalar var with disjoint def-use lifetimes is split into one
+// variable per lifetime so each can be typed independently. The
+// canonical case is UBL's `U`: line 9500 does `U=RND(0)` (float),
+// then later code uses U as an integer index in POKE / array reads.
+// The float lifetime never feeds the int reads, but YAB's shadow-int
+// gate previously rejected the whole var because one write was float.
+//
+// Algorithm: per scalar Float var, run forward reaching-defs on the
+// CFG, then union-find on writes by shared readers. If the writes
+// fall into multiple disjoint clusters, each cluster gets its own
+// renamed variable. Reads see only one cluster by construction (the
+// union-find merges any cluster that shares a reader).
+//
+// Renamed bases use a double underscore (`U__1`, `U__2`); BASIC v2's
+// parser rejects `_` so the new names can't collide with anything
+// the user typed.
+
+pub struct SplitMultiTypeVars;
+
+impl ir::Pass for SplitMultiTypeVars {
+    fn name(&self) -> &'static str {
+        "split-multi-type-vars"
+    }
+
+    fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        let cfg = crate::cfg::Cfg::build(module);
+        let (writes_by_var, reads_by_var) = collect_var_io(module, &cfg);
+        // FOR/NEXT counters can't be split: the FOR-init write, the
+        // NEXT-step write, AND any body LET to the loop var all share
+        // one storage slot at runtime, and codegen pairs NEXT to FOR
+        // by name. A program that writes the loop var inside its own
+        // body (`120 FOR I=1 TO 5: 130 I=I+1: 140 NEXT I`) needs the
+        // body's write to land in the same slot the FOR reads from
+        // next iteration — splitting it would let the loop run with
+        // a stale counter. Conservatively skip any var that ever
+        // appears as a FOR counter or a NEXT-named counter.
+        let mut skip: HashSet<VarName> = HashSet::new();
+        for line in &module.lines {
+            scan_skip_vars(&line.stmts, &mut skip);
+        }
+        let mut rename_writes: HashMap<(VarName, usize), VarName> = HashMap::new();
+        let mut rename_reads: HashMap<(VarName, usize), VarName> = HashMap::new();
+        for (var, writes) in &writes_by_var {
+            if var.kind != VarKind::Float {
+                continue;
+            }
+            if var.base == "TI" || var.base == "ST" {
+                continue;
+            }
+            if skip.contains(var) {
+                continue;
+            }
+            if writes.len() < 2 {
+                continue;
+            }
+            // Skip vars that are also used as arrays — splitting the
+            // scalar would still leave the array slot, but the var
+            // identity used by `intern_var` is the same shape so we
+            // play it safe and stay clear.
+            let Some(reads) = reads_by_var.get(var) else {
+                continue;
+            };
+            let writes_set: HashSet<usize> = writes.iter().copied().collect();
+            let reach = reaching_defs(&cfg, &writes_set);
+            // Each write starts as its own partition. Union by shared
+            // reader: if a read sees writes {a, b}, union(a, b).
+            let mut idx_of_write: HashMap<usize, usize> = HashMap::new();
+            for (i, &w) in writes.iter().enumerate() {
+                idx_of_write.insert(w, i);
+            }
+            let mut uf = UnionFind::new(writes.len());
+            for &r in reads {
+                let Some(reaching) = reach.get(&r) else {
+                    continue;
+                };
+                let in_writes: Vec<usize> = reaching
+                    .iter()
+                    .filter_map(|w| idx_of_write.get(w).copied())
+                    .collect();
+                for i in 1..in_writes.len() {
+                    uf.union(in_writes[0], in_writes[i]);
+                }
+            }
+            let partitions = uf.partitions();
+            if partitions.len() <= 1 {
+                continue;
+            }
+            // Stable cluster ordering: the cluster containing the
+            // first write keeps the original name, others get a
+            // `__<n>` suffix in source order.
+            let mut clusters: Vec<Vec<usize>> = partitions
+                .into_iter()
+                .map(|set| {
+                    let mut v: Vec<usize> = set.into_iter().collect();
+                    v.sort_unstable();
+                    v
+                })
+                .collect();
+            clusters.sort_by_key(|c| c[0]);
+            for (cluster_idx, cluster) in clusters.iter().enumerate() {
+                let new_var = if cluster_idx == 0 {
+                    var.clone()
+                } else {
+                    VarName {
+                        base: format!("{}__{}", var.base, cluster_idx),
+                        kind: VarKind::Float,
+                    }
+                };
+                for &write_local in cluster {
+                    let write_node = writes[write_local];
+                    rename_writes.insert((var.clone(), write_node), new_var.clone());
+                }
+                let cluster_writes: HashSet<usize> =
+                    cluster.iter().map(|&i| writes[i]).collect();
+                for &r in reads {
+                    let Some(reaching) = reach.get(&r) else {
+                        continue;
+                    };
+                    if !reaching.is_disjoint(&cluster_writes) {
+                        rename_reads.insert((var.clone(), r), new_var.clone());
+                    }
+                }
+            }
+        }
+        if rename_writes.is_empty() && rename_reads.is_empty() {
+            return Ok(());
+        }
+        apply_var_split_renames(module, &cfg, &rename_writes, &rename_reads);
+        Ok(())
+    }
+}
+
+/// Tiny union-find specialised for the cluster pass.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        let (small, big) = if self.rank[ra] < self.rank[rb] {
+            (ra, rb)
+        } else {
+            (rb, ra)
+        };
+        self.parent[small] = big;
+        if self.rank[small] == self.rank[big] {
+            self.rank[big] += 1;
+        }
+    }
+
+    fn partitions(mut self) -> Vec<HashSet<usize>> {
+        let n = self.parent.len();
+        let roots: Vec<usize> = (0..n).map(|i| self.find(i)).collect();
+        let mut groups: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for (i, root) in roots.iter().enumerate() {
+            groups.entry(*root).or_default().insert(i);
+        }
+        groups.into_values().collect()
+    }
+}
+
+/// Walk every CFG node and collect, per scalar var, which nodes
+/// write and which nodes read it. A node that does both is recorded
+/// in both maps. Arrays are out of scope here; the splitter targets
+/// scalars only.
+fn collect_var_io(
+    module: &ir::Module,
+    cfg: &crate::cfg::Cfg,
+) -> (HashMap<VarName, Vec<usize>>, HashMap<VarName, Vec<usize>>) {
+    let mut writes: HashMap<VarName, Vec<usize>> = HashMap::new();
+    let mut reads: HashMap<VarName, Vec<usize>> = HashMap::new();
+    for (node_id, node) in cfg.nodes.iter().enumerate() {
+        let stmt = cfg.stmt_at(node_id, module);
+        let mut node_writes: HashSet<VarName> = HashSet::new();
+        let mut node_reads: HashSet<VarName> = HashSet::new();
+        collect_stmt_writes_reads(stmt, &mut node_writes, &mut node_reads);
+        for v in node_writes {
+            writes.entry(v).or_default().push(node_id);
+        }
+        for v in node_reads {
+            reads.entry(v).or_default().push(node_id);
+        }
+        let _ = node;
+    }
+    (writes, reads)
+}
+
+/// Collect vars whose name is structural rather than purely a
+/// storage slot. Splitting these by dataflow would break the
+/// pairing that codegen depends on:
+///
+/// * FOR counter: NEXT references the same name to close the loop.
+/// * GOSUB targets aren't named, so no entry here.
+/// * String swap, INPUT vars: kept conservatively for the first
+///   version; future tightening could allow these once we audit
+///   their downstream consumers.
+fn scan_skip_vars(stmts: &[Stmt], skip: &mut HashSet<VarName>) {
+    for s in stmts {
+        match s {
+            Stmt::For { var, .. } => {
+                skip.insert(var.clone());
+            }
+            Stmt::Next { vars } => {
+                for v in vars.iter().flatten() {
+                    skip.insert(v.clone());
+                }
+            }
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => scan_skip_vars(inner, skip),
+            Stmt::IfElse {
+                then,
+                else_then,
+                ..
+            } => {
+                if let ThenIr::Stmts(inner) = then {
+                    scan_skip_vars(inner, skip);
+                }
+                if let ThenIr::Stmts(inner) = else_then {
+                    scan_skip_vars(inner, skip);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_stmt_writes_reads(
+    stmt: &Stmt,
+    writes: &mut HashSet<VarName>,
+    reads: &mut HashSet<VarName>,
+) {
+    match stmt {
+        Stmt::Let { var, value } => {
+            writes.insert(var.clone());
+            collect_expr_reads(value, reads);
+        }
+        Stmt::For {
+            var, start, end, step, ..
+        } => {
+            writes.insert(var.clone());
+            collect_expr_reads(start, reads);
+            collect_expr_reads(end, reads);
+            collect_expr_reads(step, reads);
+        }
+        Stmt::Read(targets) | Stmt::Input { targets, .. } => {
+            for t in targets {
+                if let ir::ReadTarget::Scalar(v) = t {
+                    writes.insert(v.clone());
+                }
+            }
+        }
+        Stmt::Get { var } => {
+            writes.insert(var.clone());
+        }
+        Stmt::GetFile { vars, file_num, .. } => {
+            for v in vars {
+                writes.insert(v.clone());
+            }
+            collect_expr_reads(file_num, reads);
+        }
+        Stmt::If { cond, then } => {
+            collect_expr_reads(cond, reads);
+            if let ThenIr::Stmts(_) = then {
+                // body stmts get their own CFG nodes
+            }
+        }
+        Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
+            collect_expr_reads(addr, reads);
+            collect_expr_reads(value, reads);
+        }
+        Stmt::Sys { addr, regs, .. } => {
+            collect_expr_reads(addr, reads);
+            for e in regs {
+                collect_expr_reads(e, reads);
+            }
+        }
+        Stmt::OnBranch { value, .. } => collect_expr_reads(value, reads),
+        Stmt::Print { items, .. } => {
+            for piece in items {
+                collect_print_piece_reads(piece, reads);
+            }
+        }
+        Stmt::Cmd { items, file_num, .. } => {
+            collect_expr_reads(file_num, reads);
+            for piece in items {
+                collect_print_piece_reads(piece, reads);
+            }
+        }
+        Stmt::LetStr { value, .. } => collect_str_expr_reads(value, reads),
+        Stmt::ArrayLet { indices, value, .. } => {
+            for e in indices {
+                collect_expr_reads(e, reads);
+            }
+            collect_expr_reads(value, reads);
+        }
+        Stmt::ArrayLetStr { indices, value, .. } => {
+            for e in indices {
+                collect_expr_reads(e, reads);
+            }
+            collect_str_expr_reads(value, reads);
+        }
+        _ => {
+            // Generic read-side fallback: traverse expressions via
+            // the visitor. We don't need a perfectly exhaustive list
+            // for correctness — missing reads are conservative
+            // (they look like "unused def" → potentially over-split,
+            // which still produces correct code).
+            struct R<'a> {
+                reads: &'a mut HashSet<VarName>,
+            }
+            impl<'a> crate::visit::Visitor for R<'a> {
+                fn visit_var_read(&mut self, v: &VarName) {
+                    self.reads.insert(v.clone());
+                }
+            }
+            let mut r = R { reads };
+            crate::visit::walk_stmt(&mut r, 0, stmt);
+        }
+    }
+}
+
+fn collect_expr_reads(e: &Expr, reads: &mut HashSet<VarName>) {
+    use Expr::*;
+    match e {
+        Var(v) => {
+            reads.insert(v.clone());
+        }
+        Number(_) | String(_) => {}
+        Neg(inner) | Not(inner) | Func1(_, inner) | Peek(inner) | MemPeek(inner)
+        | Pos(inner) | Fre(inner) | Usr(inner) | Joy(inner)
+        | Pot(inner) => collect_expr_reads(inner, reads),
+        Bin(_, l, r) => {
+            collect_expr_reads(l, reads);
+            collect_expr_reads(r, reads);
+        }
+        ArrayRef(_, idx) => {
+            for x in idx {
+                collect_expr_reads(x, reads);
+            }
+        }
+        _ => collect_expr_reads_fallback(e, reads),
+    }
+}
+
+fn collect_print_piece_reads(piece: &PrintPiece, reads: &mut HashSet<VarName>) {
+    match piece {
+        PrintPiece::Expr(e)
+        | PrintPiece::CharOut(e)
+        | PrintPiece::TabTo(e)
+        | PrintPiece::Spc(e) => collect_expr_reads(e, reads),
+        PrintPiece::PositionAt(a, b) => {
+            collect_expr_reads(a, reads);
+            collect_expr_reads(b, reads);
+        }
+        PrintPiece::UseField { value, .. } => collect_expr_reads(value, reads),
+        PrintPiece::StrExpr(s) => collect_str_expr_reads(s, reads),
+        PrintPiece::LiteralString(_) | PrintPiece::Tab => {}
+    }
+}
+
+/// Walk a StrExpr collecting Var reads from its numeric sub-trees.
+/// String-typed Var leaves are out of scope — the splitter targets
+/// numeric scalars only.
+fn collect_str_expr_reads(s: &StrExpr, reads: &mut HashSet<VarName>) {
+    match s {
+        StrExpr::Literal(_) | StrExpr::Var(_) | StrExpr::GetKey => {}
+        StrExpr::Chr(e) | StrExpr::Str(e) | StrExpr::HexFmt(e) | StrExpr::BinFmt(e) => {
+            collect_expr_reads(e, reads);
+        }
+        StrExpr::Concat(a, b) => {
+            collect_str_expr_reads(a, reads);
+            collect_str_expr_reads(b, reads);
+        }
+        StrExpr::Left(s, n) | StrExpr::Right(s, n) => {
+            collect_str_expr_reads(s, reads);
+            collect_expr_reads(n, reads);
+        }
+        StrExpr::Mid(s, st, n) => {
+            collect_str_expr_reads(s, reads);
+            collect_expr_reads(st, reads);
+            if let Some(boxed) = n {
+                collect_expr_reads(boxed, reads);
+            }
+        }
+        StrExpr::Dup(s, n) => {
+            collect_str_expr_reads(s, reads);
+            collect_expr_reads(n, reads);
+        }
+        StrExpr::Insert(s, t, pos) => {
+            collect_str_expr_reads(s, reads);
+            collect_str_expr_reads(t, reads);
+            collect_expr_reads(pos, reads);
+        }
+        StrExpr::ArrayRef(_, idx) => {
+            for e in idx {
+                collect_expr_reads(e, reads);
+            }
+        }
+    }
+}
+
+fn collect_expr_reads_fallback(e: &Expr, reads: &mut HashSet<VarName>) {
+    struct R<'a> {
+        reads: &'a mut HashSet<VarName>,
+    }
+    impl<'a> crate::visit::Visitor for R<'a> {
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.reads.insert(v.clone());
+        }
+    }
+    let mut r = R { reads };
+    crate::visit::walk_expr(&mut r, e);
+}
+
+/// Forward reaching-defs for ONE variable. `writes` is the set of
+/// CFG node ids that write the var. Returns, per node, the set of
+/// writes that can reach it on entry (i.e. before executing the
+/// node's own write, if any).
+///
+/// A write GENs itself and KILLs every other write of the same var,
+/// so once a write executes, only that write is "live" downstream
+/// until the next assignment.
+fn reaching_defs(
+    cfg: &crate::cfg::Cfg,
+    writes: &HashSet<usize>,
+) -> HashMap<usize, HashSet<usize>> {
+    let n = cfg.nodes.len();
+    let mut in_: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+    let mut out: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+    let mut worklist: Vec<usize> = (0..n).collect();
+    let mut in_worklist: Vec<bool> = vec![true; n];
+    while let Some(node) = worklist.pop() {
+        in_worklist[node] = false;
+        let mut new_in: HashSet<usize> = HashSet::new();
+        for &pred in &cfg.nodes[node].predecessors {
+            for &w in &out[pred] {
+                new_in.insert(w);
+            }
+        }
+        let mut new_out = if writes.contains(&node) {
+            let mut s = HashSet::new();
+            s.insert(node);
+            s
+        } else {
+            new_in.clone()
+        };
+        if writes.contains(&node) {
+            // GEN-set already in new_out; KILL is implicit because we
+            // discarded `new_in` and only keep this write.
+            let _ = &mut new_out;
+        }
+        let in_changed = new_in != in_[node];
+        let out_changed = new_out != out[node];
+        in_[node] = new_in;
+        out[node] = new_out;
+        if out_changed || in_changed {
+            for &succ in &cfg.nodes[node].successors {
+                if !in_worklist[succ] {
+                    in_worklist[succ] = true;
+                    worklist.push(succ);
+                }
+            }
+        }
+    }
+    let mut result = HashMap::new();
+    for (i, s) in in_.into_iter().enumerate() {
+        if !s.is_empty() {
+            result.insert(i, s);
+        }
+    }
+    result
+}
+
+/// Rewrite var references in the IR according to the per-(var, node)
+/// rename maps produced by `SplitMultiTypeVars::run`. Writes lookup
+/// `rename_writes`; reads lookup `rename_reads`.
+fn apply_var_split_renames(
+    module: &mut ir::Module,
+    cfg: &crate::cfg::Cfg,
+    rename_writes: &HashMap<(VarName, usize), VarName>,
+    rename_reads: &HashMap<(VarName, usize), VarName>,
+) {
+    // CFG nodes carry StmtPaths; resolve each to the actual Stmt
+    // and mutate it. We do this without a generic mut visitor
+    // because the rename is per-node, not whole-program.
+    for (node_id, node) in cfg.nodes.iter().enumerate() {
+        let path = &node.stmt;
+        let stmt = stmt_at_mut(module, path);
+        rename_stmt(stmt, node_id, rename_writes, rename_reads);
+    }
+}
+
+/// Mutable variant of `Cfg::stmt_at`.
+fn stmt_at_mut<'a>(module: &'a mut ir::Module, path: &crate::cfg::StmtPath) -> &'a mut Stmt {
+    let mut s = &mut module.lines[path.line_idx].stmts[path.path[0]];
+    for &idx in &path.path[1..] {
+        match s {
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => s = &mut inner[idx],
+            Stmt::IfElse {
+                then,
+                else_then,
+                ..
+            } => {
+                let then_len = match then {
+                    ThenIr::Stmts(inner) => {
+                        if idx < inner.len() {
+                            s = &mut inner[idx];
+                            continue;
+                        }
+                        inner.len()
+                    }
+                    _ => 0,
+                };
+                if let ThenIr::Stmts(inner) = else_then {
+                    s = &mut inner[idx - then_len];
+                } else {
+                    unreachable!("invalid IF/ELSE path");
+                }
+            }
+            Stmt::Rcomp { then, else_then } => {
+                let then_len = match then {
+                    ThenIr::Stmts(inner) => {
+                        if idx < inner.len() {
+                            s = &mut inner[idx];
+                            continue;
+                        }
+                        inner.len()
+                    }
+                    _ => 0,
+                };
+                if let Some(ThenIr::Stmts(inner)) = else_then {
+                    s = &mut inner[idx - then_len];
+                } else {
+                    unreachable!("invalid RCOMP path");
+                }
+            }
+            _ => panic!("split-pass StmtPath traversed non-IF/Stmts statement"),
+        }
+    }
+    s
+}
+
+/// Rewrite both write-side and read-side var references in `stmt`
+/// according to the per-(var, node) rename maps. Writes are handled
+/// per-variant; reads use a generic MutVisitor that walks every
+/// numeric expression in the stmt and rewrites Var leaves.
+fn rename_stmt(
+    stmt: &mut Stmt,
+    node_id: usize,
+    rename_writes: &HashMap<(VarName, usize), VarName>,
+    rename_reads: &HashMap<(VarName, usize), VarName>,
+) {
+    // Write-side: only LHS of writing statements.
+    match stmt {
+        Stmt::Let { var, .. } => {
+            if let Some(new) = rename_writes.get(&(var.clone(), node_id)) {
+                *var = new.clone();
+            }
+        }
+        Stmt::For { var, .. } => {
+            if let Some(new) = rename_writes.get(&(var.clone(), node_id)) {
+                *var = new.clone();
+            }
+        }
+        Stmt::Read(targets) | Stmt::Input { targets, .. } => {
+            for t in targets {
+                if let ir::ReadTarget::Scalar(v) = t {
+                    if let Some(new) = rename_writes.get(&(v.clone(), node_id)) {
+                        *v = new.clone();
+                    }
+                }
+            }
+        }
+        Stmt::Get { var } => {
+            if let Some(new) = rename_writes.get(&(var.clone(), node_id)) {
+                *var = new.clone();
+            }
+        }
+        Stmt::GetFile { vars, .. } => {
+            for v in vars {
+                if let Some(new) = rename_writes.get(&(v.clone(), node_id)) {
+                    *v = new.clone();
+                }
+            }
+        }
+        Stmt::Next { vars } => {
+            for v in vars.iter_mut().flatten() {
+                if let Some(new) = rename_writes.get(&(v.clone(), node_id)) {
+                    *v = new.clone();
+                }
+            }
+        }
+        _ => {}
+    }
+    // Read-side: walk every Expr / StrExpr in the stmt via a
+    // MutVisitor and rewrite Var leaves. The IF-body recursion is
+    // OFF because each inner stmt has its own CFG node and is
+    // processed separately by the outer caller.
+    struct Renamer<'a> {
+        node_id: usize,
+        rename_reads: &'a HashMap<(VarName, usize), VarName>,
+    }
+    impl<'a> crate::visit::MutVisitor for Renamer<'a> {
+        fn visit_expr_mut(&mut self, e: &mut Expr) {
+            if let Expr::Var(v) = e {
+                if let Some(new) = self.rename_reads.get(&(v.clone(), self.node_id)) {
+                    *v = new.clone();
+                }
+                return;
+            }
+            crate::visit::walk_expr_mut(self, e);
+        }
+        fn visit_str_expr_mut(&mut self, s: &mut StrExpr) {
+            crate::visit::walk_str_expr_mut(self, s);
+        }
+        fn visit_stmt_mut(&mut self, _line_no: u16, _stmt: &mut Stmt) {
+            // Stop at stmt boundary — caller drives the per-node
+            // dispatch; nested-if bodies are separate CFG nodes
+            // and will be visited with their own rename maps.
+        }
+    }
+    let mut r = Renamer {
+        node_id,
+        rename_reads,
+    };
+    // Walk only the immediate expressions of this stmt, NOT inner
+    // stmts. We achieve that by using the dedicated expression-
+    // visitor entries for each variant.
+    walk_stmt_exprs_mut(stmt, &mut r);
+}
+
+/// Walk only the EXPRESSIONS directly held by `stmt` (skip inner
+/// statement bodies). Mirrors `walk_stmt_mut` minus the
+/// recursion into IF/IFELSE/RCOMP bodies.
+fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) {
+    use Stmt::*;
+    match stmt {
+        Let { value, .. } => v.visit_expr_mut(value),
+        LetStr { value, .. } => v.visit_str_expr_mut(value),
+        ArrayLet { indices, value, .. } => {
+            for e in indices {
+                v.visit_expr_mut(e);
+            }
+            v.visit_expr_mut(value);
+        }
+        ArrayLetStr { indices, value, .. } => {
+            for e in indices {
+                v.visit_expr_mut(e);
+            }
+            v.visit_str_expr_mut(value);
+        }
+        If { cond, .. } => v.visit_expr_mut(cond),
+        IfElse { cond, .. } => v.visit_expr_mut(cond),
+        For { start, end, step, .. } => {
+            v.visit_expr_mut(start);
+            v.visit_expr_mut(end);
+            v.visit_expr_mut(step);
+        }
+        DoIf { cond } | Until { cond } => v.visit_expr_mut(cond),
+        ExitLoop { cond } => {
+            if let Some(c) = cond {
+                v.visit_expr_mut(c);
+            }
+        }
+        ComputedGoto { target } => v.visit_expr_mut(target),
+        Poke { addr, value } | Dpoke { addr, value } => {
+            v.visit_expr_mut(addr);
+            v.visit_expr_mut(value);
+        }
+        Sys { addr, regs, .. } => {
+            v.visit_expr_mut(addr);
+            for e in regs {
+                v.visit_expr_mut(e);
+            }
+        }
+        OnBranch { value, .. } => v.visit_expr_mut(value),
+        Print { items, .. } => {
+            for piece in items {
+                match piece {
+                    PrintPiece::Expr(e)
+                    | PrintPiece::CharOut(e)
+                    | PrintPiece::TabTo(e)
+                    | PrintPiece::Spc(e) => v.visit_expr_mut(e),
+                    PrintPiece::PositionAt(a, b) => {
+                        v.visit_expr_mut(a);
+                        v.visit_expr_mut(b);
+                    }
+                    PrintPiece::UseField { value, .. } => v.visit_expr_mut(value),
+                    PrintPiece::StrExpr(s) => v.visit_str_expr_mut(s),
+                    _ => {}
+                }
+            }
+        }
+        GetFile { file_num, .. } => v.visit_expr_mut(file_num),
+        InputFile { file_num, .. } => v.visit_expr_mut(file_num),
+        Cmd { file_num, items, .. } => {
+            v.visit_expr_mut(file_num);
+            for piece in items {
+                match piece {
+                    PrintPiece::Expr(e)
+                    | PrintPiece::CharOut(e)
+                    | PrintPiece::TabTo(e)
+                    | PrintPiece::Spc(e) => v.visit_expr_mut(e),
+                    PrintPiece::PositionAt(a, b) => {
+                        v.visit_expr_mut(a);
+                        v.visit_expr_mut(b);
+                    }
+                    PrintPiece::UseField { value, .. } => v.visit_expr_mut(value),
+                    PrintPiece::StrExpr(s) => v.visit_str_expr_mut(s),
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            // Long-tail variants: many wrap expressions in odd
+            // ways. Fall back to the generic walker which DOES
+            // visit inner stmts, but the renamer's
+            // `visit_stmt_mut` is a no-op so the recursion is
+            // harmless — only this stmt's own expressions get
+            // visited.
+            crate::visit::walk_stmt_mut(v, 0, stmt);
+        }
+    }
+}

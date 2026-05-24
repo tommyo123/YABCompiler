@@ -565,6 +565,15 @@ impl IntRange {
         self.min >= i16::MIN as i32 && self.max <= i16::MAX as i32
     }
 
+    /// True iff the range fits the unsigned 16-bit window
+    /// `0..=65535`. Used by the shadow-int promotion gate to capture
+    /// memory-address scalars (UV=1024, UC=55296) whose values are
+    /// integers but exceed `i16::MAX` — the bit pattern is the same
+    /// either way, and ADC/SBC arithmetic works unchanged.
+    pub fn fits_u16(self) -> bool {
+        self.min >= 0 && self.max <= u16::MAX as i32
+    }
+
     pub fn fits_u8(self) -> bool {
         self.min >= 0 && self.max <= u8::MAX as i32
     }
@@ -710,7 +719,7 @@ impl crate::analysis::Analysis for NumericFactAnalysis {
             .enumerate()
             .map(|(id, node)| (node.stmt.clone(), id))
             .collect();
-        let (shadow_int_vars, shadow_int_read_counts, shadow_only_vars) =
+        let (shadow_int_vars, shadow_int_read_counts, shadow_only_vars, shadow_unsigned_vars) =
             compute_shadow_int_vars(module, &cfg, &per_node, data_range);
         NumericFactsResult {
             per_node,
@@ -718,6 +727,7 @@ impl crate::analysis::Analysis for NumericFactAnalysis {
             shadow_int_vars,
             shadow_int_read_counts,
             shadow_only_vars,
+            shadow_unsigned_vars,
         }
     }
 }
@@ -745,6 +755,13 @@ pub struct NumericFactsResult {
     /// observable copy of the value. Saves ~150 cycles per write
     /// in tight loops.
     pub shadow_only_vars: HashSet<VarName>,
+    /// Subset of `shadow_int_vars` whose value range doesn't fit
+    /// `i16` (e.g. `UC=55296` for the C64 color-RAM base) but does
+    /// fit `u16`. Bit-pattern arithmetic is identical for signed and
+    /// unsigned, so ADC/SBC chains work either way; codegen only
+    /// needs the sign tag when converting the shadow back to FAC
+    /// (signed via `$B391` GIVAYF / unsigned via `$B3A2` SNGFLT-pair).
+    pub shadow_unsigned_vars: HashSet<VarName>,
 }
 
 #[allow(dead_code)] // codegen consumes the entry-range subset first; the rest is analysis API.
@@ -1669,6 +1686,13 @@ struct ShadowWriteInfo {
     /// candidate, codegen can skip the V_var MOVMF sync at every
     /// write (the shadow holds the only observable copy).
     fac_ctx_reads: HashMap<VarName, usize>,
+    /// Vars that appear ANYWHERE inside a POKE/PEEK address
+    /// expression, regardless of whether the rest of the tree
+    /// currently qualifies as an int-island. Used to break the
+    /// chicken-and-egg where two u16-range vars (e.g. `UC` + `U`)
+    /// would each block the other from shadow promotion under the
+    /// strict int-context gate.
+    address_ctx_reads: HashSet<VarName>,
     /// Vars whose write set includes a READ — those writes are
     /// always preceded by a FAC roundtrip (\`__VAL_HELPER\` produces
     /// FAC), so the shadow sync needs an extra \`__FAC_TO_INT16\` +
@@ -1696,7 +1720,12 @@ fn compute_shadow_int_vars(
     cfg: &Cfg,
     per_node: &[(NumericState, NumericState)],
     data_range: Option<IntRange>,
-) -> (HashSet<VarName>, HashMap<VarName, usize>, HashSet<VarName>) {
+) -> (
+    HashSet<VarName>,
+    HashMap<VarName, usize>,
+    HashSet<VarName>,
+    HashSet<VarName>,
+) {
     let mut info = ShadowWriteInfo::default();
     for (id, _node) in cfg.nodes.iter().enumerate() {
         let stmt = cfg.stmt_at(id, module);
@@ -1708,6 +1737,7 @@ fn compute_shadow_int_vars(
     }
 
     let mut out = HashSet::new();
+    let mut unsigned_out = HashSet::new();
     for (var, writes) in &info.writes {
         if var.kind != VarKind::Float || var.base == "TI" || var.base == "ST" {
             continue;
@@ -1716,37 +1746,39 @@ fn compute_shadow_int_vars(
             continue;
         }
         let input_fed = info.input_writes.contains(var);
-        let all_i16 = writes.iter().all(|&node_id| {
-            // Standard path: out-state's range for `var` fits i16.
-            let direct = per_node
+        // Track whether every write fits i16, OR (if some don't) at
+        // least fits u16 — we'd then shadow as unsigned. Default to
+        // signed when both work; only fall back to unsigned when an
+        // i16-only path would reject the var entirely.
+        let mut all_i16 = true;
+        let mut all_u16 = true;
+        for &node_id in writes {
+            let range = per_node
                 .get(node_id)
-                .and_then(|(_, out_state)| out_state.get(var))
-                .map_or(false, IntRange::fits_i16);
-            if direct {
-                return true;
-            }
-            // Self-modifying write (`var = var ± const`) escape
-            // hatch: the dataflow's range-clamp eventually kills
-            // self-incrementing vars in unbounded loops, but typical
-            // BASIC programs bound the iteration count via an IF
-            // exit condition that the analysis doesn't model.
-            // Accept the step if it's `var ± const` with a small
-            // constant — runtime stays in i16 for any sensible loop.
+                .and_then(|(_, out_state)| out_state.get(var));
+            let direct_i16 = range.map_or(false, IntRange::fits_i16);
+            let direct_u16 = range.map_or(false, IntRange::fits_u16);
             let stmt = cfg.stmt_at(node_id, module);
-            if stmt_self_modify_small_step(stmt, var) {
-                return true;
+            let self_step_ok = stmt_self_modify_small_step(stmt, var);
+            let input_escape = input_fed && matches!(stmt, Stmt::Input { .. });
+            // Self-step and INPUT are i16-safe by construction
+            // (small-constant increment, or non-trapping helper that
+            // clamps to 0 on overflow). They don't help the unsigned
+            // path on their own — a self-step that ranges past i16
+            // would also blow past u16 unless we widen the analysis.
+            let i16_ok = direct_i16 || self_step_ok || input_escape;
+            let u16_ok = direct_u16 || self_step_ok || input_escape;
+            if !i16_ok {
+                all_i16 = false;
             }
-            // INPUT writes leave the post-state unbounded; the
-            // codegen syncs the shadow via the non-trapping helper,
-            // which stamps 0 on overflow rather than trapping. The
-            // shadow's low byte is correct for any value the user
-            // could have entered (FACWORD wraps mod 65536 inside
-            // the safe-range check), so we accept INPUT as a sound
-            // "i16 fact" for the purposes of this gate. Other
-            // writes still need to fit i16 the standard way.
-            input_fed && matches!(stmt, Stmt::Input { .. })
-        });
-        if !all_i16 {
+            if !u16_ok {
+                all_u16 = false;
+            }
+            if !all_i16 && !all_u16 {
+                break;
+            }
+        }
+        if !all_i16 && !all_u16 {
             continue;
         }
         // Cost model: each shadowed write adds ~6 bytes (sync to
@@ -1760,7 +1792,19 @@ fn compute_shadow_int_vars(
         // Float scalar that doesn't end up shadowed).
         let n_writes = writes.len();
         let n_int_reads = info.int_ctx_reads.get(var).copied().unwrap_or(0);
-        if n_int_reads == 0 {
+        // u16-only vars (failed i16, fit u16) are typically memory
+        // addresses or screen coordinates above 32767. They reach
+        // codegen wrapped in POKE/PEEK expressions whose other operand
+        // is itself a float — so `expr_potential_int_island_for`
+        // refuses them, and the int-ctx read count stays at zero. Skip
+        // that gate for the u16 path: shadow them based on appearing
+        // in any POKE-style address read at all, even if the surrounding
+        // tree isn't yet int-island. Once the var has a shadow,
+        // subsequent int-island gating sees the shadow and promotes
+        // the rest of the tree on the next round.
+        let u16_only = !all_i16;
+        let has_address_read = info.address_ctx_reads.contains(var);
+        if n_int_reads == 0 && !(u16_only && has_address_read) {
             continue;
         }
         // Cost gate. Each int-context read of a shadowed var saves
@@ -1786,17 +1830,33 @@ fn compute_shadow_int_vars(
         } else {
             n_writes
         };
-        if n_int_reads < min_reads {
+        // Same exception as the n_int_reads==0 gate above: u16-only
+        // address-position vars get a shadow regardless of the cost
+        // model, since the cost gate's whole input (`n_int_reads`)
+        // would be artificially zero before any shadow exists.
+        let bypass_cost_gate = u16_only && has_address_read;
+        if !bypass_cost_gate && n_int_reads < min_reads {
             continue;
         }
         out.insert(var.clone());
+        // Tag unsigned when the i16 gate failed; signed by default.
+        if !all_i16 {
+            unsigned_out.insert(var.clone());
+        }
     }
+    // Unsigned shadow vars can coexist with FAC reads: the FAC path
+    // loads from `V_<v>` (the 5-byte float slot kept in sync at every
+    // write), not from the shadow itself. The signed `GIVAYF`-from-
+    // shadow shortcut at the bottom of `emit_expr_to_fac_uncached` is
+    // already gated on `shadow_only`, so unsigned vars with FAC reads
+    // (which fail the shadow-only check) naturally fall through to
+    // the safe `MOVFM V_<v>` path. No extra filter needed here.
     let shadow_only_vars: HashSet<VarName> = out
         .iter()
         .filter(|v| !info.fac_ctx_reads.contains_key(*v))
         .cloned()
         .collect();
-    (out, info.int_ctx_reads, shadow_only_vars)
+    (out, info.int_ctx_reads, shadow_only_vars, unsigned_out)
 }
 
 fn collect_shadow_stmt(
@@ -1966,10 +2026,12 @@ fn collect_shadow_stmt(
             collect_shadow_expr(body, ShadowCtx::Float, info);
         }
         Stmt::Poke { addr, value } => {
+            tag_address_reads(addr, info);
             collect_shadow_expr(addr, ShadowCtx::Int, info);
             collect_shadow_expr(value, ShadowCtx::Int, info);
         }
         Stmt::Dpoke { addr, value } => {
+            tag_address_reads(addr, info);
             collect_shadow_expr(addr, ShadowCtx::Int, info);
             collect_shadow_expr(value, ShadowCtx::Int, info);
         }
@@ -2161,7 +2223,7 @@ fn collect_shadow_stmt(
             }
         }
         Stmt::OnBranch { value, .. } => collect_shadow_expr(value, ShadowCtx::Int, info),
-        Stmt::If { cond, then } => {
+        Stmt::If { cond, then: _ } => {
             // IF cond reads are int-context when codegen will take
             // the int-compare fast path (`try_emit_if_int_compare`),
             // which fires whenever both compare operands route
@@ -2172,20 +2234,19 @@ fn collect_shadow_stmt(
             // int compare is both smaller AND faster than the FAC
             // alternative.
             collect_shadow_expr(cond, ShadowCtx::Int, info);
-            if let crate::ir::ThenIr::Stmts(stmts) = then {
-                for s in stmts {
-                    collect_shadow_stmt(s, node_id, data_range, info);
-                }
-            }
+            // The body stmts get their own CFG nodes; the outer
+            // `compute_shadow_int_vars` loop visits them directly with
+            // their actual node_id, so recursing here would double-
+            // count every write and tag them at the IF's node_id where
+            // `per_node` lacks the assigned range.
         }
         Stmt::IfElse {
             cond,
-            then,
-            else_then,
+            then: _,
+            else_then: _,
         } => {
             collect_shadow_expr(cond, ShadowCtx::Int, info);
-            collect_shadow_then(then, node_id, data_range, info);
-            collect_shadow_then(else_then, node_id, data_range, info);
+            // Body stmts get their own CFG nodes — see Stmt::If above.
         }
         Stmt::DoIf { cond } | Stmt::Until { cond } => {
             collect_shadow_expr(cond, ShadowCtx::Int, info);
@@ -2196,11 +2257,8 @@ fn collect_shadow_stmt(
             }
         }
         Stmt::ComputedGoto { target } => collect_shadow_expr(target, ShadowCtx::Int, info),
-        Stmt::Rcomp { then, else_then } => {
-            collect_shadow_then(then, node_id, data_range, info);
-            if let Some(else_then) = else_then {
-                collect_shadow_then(else_then, node_id, data_range, info);
-            }
+        Stmt::Rcomp { then: _, else_then: _ } => {
+            // Body stmts get their own CFG nodes — see Stmt::If above.
         }
         Stmt::OnKey { keys, .. } => collect_shadow_str(keys, info),
         _ => {
@@ -2213,19 +2271,6 @@ fn collect_shadow_stmt(
                 ctx: ShadowCtx::Float,
             };
             crate::visit::Visitor::visit_stmt(&mut collector, 0, stmt);
-        }
-    }
-}
-
-fn collect_shadow_then(
-    then: &crate::ir::ThenIr,
-    node_id: usize,
-    data_range: Option<IntRange>,
-    info: &mut ShadowWriteInfo,
-) {
-    if let crate::ir::ThenIr::Stmts(stmts) = then {
-        for s in stmts {
-            collect_shadow_stmt(s, node_id, data_range, info);
         }
     }
 }
@@ -2245,6 +2290,35 @@ fn collect_shadow_read_targets(targets: &[ReadTarget], info: &mut ShadowWriteInf
                 }
             }
         }
+    }
+}
+
+/// Walk `e` recording every scalar var it references as an
+/// address-context read. The walker doesn't care about int-island
+/// gating — the goal is to let `compute_shadow_int_vars` recognise
+/// "this var participates in a POKE address" so it can break the
+/// chicken-and-egg in two-float-vars-add patterns. We also dive
+/// through PEEK so its inner index variable picks up the tag too.
+fn tag_address_reads(e: &Expr, info: &mut ShadowWriteInfo) {
+    match e {
+        Expr::Var(v) => {
+            info.address_ctx_reads.insert(v.clone());
+        }
+        Expr::Number(_) | Expr::String(_) => {}
+        Expr::Neg(inner) | Expr::Not(inner) | Expr::Func1(_, inner) => {
+            tag_address_reads(inner, info);
+        }
+        Expr::Bin(_, l, r) => {
+            tag_address_reads(l, info);
+            tag_address_reads(r, info);
+        }
+        Expr::Peek(inner) | Expr::MemPeek(inner) => tag_address_reads(inner, info),
+        Expr::ArrayRef(_, idx) => {
+            for x in idx {
+                tag_address_reads(x, info);
+            }
+        }
+        _ => {}
     }
 }
 

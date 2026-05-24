@@ -751,6 +751,13 @@ struct Codegen {
     /// without a FAC roundtrip while ordinary BASIC-visible reads still
     /// see the float slot.
     shadow_int_vars: HashMap<VarName, String>,
+    /// Subset of `shadow_int_vars` whose value range needed u16 (not
+    /// i16) to fit. The 2-byte storage is identical and ADC/SBC
+    /// arithmetic works bit-pattern-wise either way, so most int-
+    /// island consumers don't care. The flag exists for paths that
+    /// DO interpret signedness — comparisons, FAC sync — so they
+    /// can refuse to lower these vars or pick an unsigned helper.
+    shadow_unsigned: HashSet<VarName>,
     /// Labels promoted to zero-page slots. Each entry maps a slot
     /// label (e.g., `__SI_V_A`) to its ZP base address. ZP-resident
     /// labels emit as `<label> = $XX` near the binary's start so
@@ -1365,6 +1372,7 @@ impl Codegen {
             profile,
             code_origin: CODE_ORIGIN,
             shadow_int_vars: HashMap::new(),
+            shadow_unsigned: HashSet::new(),
             zp_promotions: Vec::new(),
             zp_int_vars: HashSet::new(),
             u8_int_vars: HashSet::new(),
@@ -1514,6 +1522,14 @@ impl Codegen {
                 self.vars_order.push((l.clone(), 2));
                 l
             };
+            if self
+                .analysis
+                .numeric_facts
+                .shadow_unsigned_vars
+                .contains(&var)
+            {
+                self.shadow_unsigned.insert(var.clone());
+            }
             self.shadow_int_vars.insert(var, label);
         }
     }

@@ -381,26 +381,17 @@ pub fn compile_with_options(
             load_address: prg.load_address,
         });
     }
-    // REM-hint pre-pass: extract dialect-specific pragmas, then
-    // trial-parse without applying them so we can see which hinted
-    // vars receive float-typed RHS values. Force-promoting those
-    // would cost more in conversion code than it saves; drop them
-    // from the set before the real parse.
-    let raw_hints = rem_hints::extract_hints_from(
+    // REM-hint pre-pass: extract dialect-specific pragmas. We honour
+    // the declarations strictly — exactly how Basic 64 / Basic-Boss
+    // treat them: a hinted var becomes integer-typed, and assignments
+    // from float expressions auto-convert via FAC_TO_INT16 at the
+    // store. This matches the user's mental model ("I said it's int,
+    // make it int") and lets follow-on shadow-int and int-island
+    // analysis pick up the rest of the chain.
+    let hints = rem_hints::extract_hints_from(
         prg.lines.iter().map(|l| l.body.as_slice()),
         options.rem_hint_dialect,
     );
-    let hints = if raw_hints.int_vars.is_empty() {
-        raw_hints
-    } else {
-        let trial_opts = parse::ParseOptions {
-            lenient_syntax: options.lenient_syntax,
-            int_hint_vars: std::collections::HashSet::new(),
-        };
-        let trial_ast =
-            parse::program_with_options(&prg, trial_opts).map_err(CompileError::Parse)?;
-        rem_hints::filter_safe(&trial_ast, raw_hints)
-    };
     let parse_opts = parse::ParseOptions {
         lenient_syntax: options.lenient_syntax,
         int_hint_vars: hints.int_vars.clone(),
@@ -1865,6 +1856,14 @@ fn lower_and_optimize(ast: &ast::Program, _profile: Profile) -> Result<ir::Modul
     // pure — we can't drop a LET whose RHS could raise or have a
     // side effect, e.g. `LET X = SQR(-1)` or anything calling FN/USR).
     pipeline.add(crate::passes::DeadStoreElim);
+    // Split multi-type scalars (SSA-style): when a Float var has
+    // disjoint def-use lifetimes (one float-assigned, one int-
+    // assigned with no shared readers), rename each lifetime to its
+    // own VarName so later type analyses can promote them
+    // independently. Run before `IntPromote` so the int lifetime
+    // can demote to int16; UBL's overloaded `U` is the canonical
+    // case.
+    pipeline.add(crate::passes::SplitMultiTypeVars);
     // Integer promotion: demote float scalars to int16 storage
     // wherever every assigned value is i16-range integer AND the
     // per-var cost/benefit gate inside `compute_int_promotable`
