@@ -784,8 +784,16 @@ pub fn tokenize_program_at(source: &str, load_addr: u16) -> Result<Vec<u8>, Toke
     out.push((load_addr & 0xFF) as u8);
     out.push(((load_addr >> 8) & 0xFF) as u8);
 
+    // C64-native dumps use bare CR; `str::lines` only splits on `\n`
+    // and `\r\n`.
+    let normalized = if source.contains('\r') {
+        source.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        source.to_string()
+    };
+
     let mut cur_addr: u32 = load_addr as u32;
-    for (idx, raw_line) in source.lines().enumerate() {
+    for (idx, raw_line) in normalized.lines().enumerate() {
         let trimmed = raw_line.trim_end();
         if trimmed.trim().is_empty() {
             continue;
@@ -1102,6 +1110,24 @@ mod tests {
     fn missing_line_number_errors() {
         let err = tokenize_program("PRINT\n").unwrap_err();
         assert!(matches!(err, TokenizeError::MissingLineNumber(1)));
+    }
+
+    #[test]
+    fn cr_only_line_endings() {
+        // C64-native dumps use bare CR as the separator. Must produce
+        // the same .prg as the LF-separated form.
+        let prg = tokenize_program("10 PRINT\r20 END\r").unwrap();
+        let parsed = crate::prg::Program::parse(&prg).unwrap();
+        let line_numbers: Vec<u16> = parsed.lines.iter().map(|l| l.number).collect();
+        assert_eq!(line_numbers, vec![10, 20]);
+    }
+
+    #[test]
+    fn crlf_line_endings() {
+        let prg = tokenize_program("10 PRINT\r\n20 END\r\n").unwrap();
+        let parsed = crate::prg::Program::parse(&prg).unwrap();
+        let line_numbers: Vec<u16> = parsed.lines.iter().map(|l| l.number).collect();
+        assert_eq!(line_numbers, vec![10, 20]);
     }
 
     #[test]

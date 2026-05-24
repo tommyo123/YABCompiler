@@ -1855,6 +1855,9 @@ fn lower_and_optimize(ast: &ast::Program, _profile: Profile) -> Result<ir::Modul
     // whose target is unread on every forward path (and whose RHS is
     // pure — we can't drop a LET whose RHS could raise or have a
     // side effect, e.g. `LET X = SQR(-1)` or anything calling FN/USR).
+    // ResolveBareNext first so bare `NEXT` carries its loop var
+    // before liveness analysis runs.
+    pipeline.add(crate::passes::ResolveBareNext);
     pipeline.add(crate::passes::DeadStoreElim);
     // Split multi-type scalars (SSA-style): when a Float var has
     // disjoint def-use lifetimes (one float-assigned, one int-

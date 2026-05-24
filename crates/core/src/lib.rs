@@ -7,6 +7,7 @@ pub mod config;
 pub mod dataflow;
 pub mod expr_type;
 pub mod extraram;
+pub mod for_next_runtime;
 pub mod ir;
 pub mod opt_model;
 pub mod pack;

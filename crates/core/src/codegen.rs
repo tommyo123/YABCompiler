@@ -32,6 +32,7 @@ use crate::ir::{
     self, ArrayInduction, ArrayInductionIndex, Expr, MemTransferOp, PrintPiece, ReadTarget, Stmt,
     StrExpr, ThenIr,
 };
+use crate::for_next_runtime::OrphanAnalysis;
 use crate::runtime as rt;
 
 /// Where the machine code lives in memory after the SYS stub. Keep in
@@ -39,6 +40,9 @@ use crate::runtime as rt;
 /// is `None`; otherwise the user-supplied address takes over and the
 /// SYS launcher is omitted from the packed .prg.
 pub const CODE_ORIGIN: u16 = 0x080D;
+
+/// Depth of the runtime FOR-stack (one byte per frame).
+const FOR_STACK_DEPTH: usize = 32;
 
 #[derive(Debug)]
 pub enum CodegenError {
@@ -170,11 +174,13 @@ pub fn emit_with_profile_at_opts(
     hints: &crate::rem_hints::VarTypeHints,
 ) -> Result<String, CodegenError> {
     let analysis = CodegenAnalysis::from_module(module);
+    let orphan_for_next = crate::for_next_runtime::analyze(module);
     let mut cg = Codegen::new(profile, analysis);
     cg.code_origin = origin;
     cg.safe_sys_calls = safe_sys_calls;
     cg.forced_byte_bases = hints.byte_vars.clone();
     cg.forced_zp_bases = hints.zp_vars.clone();
+    cg.orphan_for_next = orphan_for_next;
     cg.run(module)?;
     cg.finish()
 }
@@ -840,6 +846,12 @@ struct Codegen {
     /// via the analysis registry so later codegen fast paths can query
     /// facts without running their own ad-hoc walks.
     analysis: CodegenAnalysis,
+    /// FORs, GOSUBs and RETURNs that opt into the runtime FOR-stack.
+    /// Empty for programs without an orphan NEXT.
+    orphan_for_next: OrphanAnalysis,
+    /// FOR frames captured at emit time, consumed in finish() to emit
+    /// the per-FOR handler and dispatch table.
+    runtime_for_frames: std::collections::HashMap<u8, ForFrame>,
     /// CFG node/path for the statement currently being emitted. These
     /// are set by `emit_stmt_at_path`, including nested IF bodies, and
     /// let expression-level helpers read per-statement numeric facts.
@@ -1391,9 +1403,90 @@ impl Codegen {
             zp_for_reuse_slots: Vec::new(),
             zp_int_reuse_slots: Vec::new(),
             analysis,
+            orphan_for_next: OrphanAnalysis::default(),
+            runtime_for_frames: std::collections::HashMap::new(),
             current_stmt_node: None,
             current_stmt_path: None,
         }
+    }
+
+    /// Runtime FOR id for the current statement, or `None` for static
+    /// FORs that keep the inline fast path.
+    fn current_runtime_for_id(&self, line_no: u16) -> Option<u8> {
+        let path = self.current_stmt_path.as_ref()?;
+        self.orphan_for_next
+            .runtime_for_id(line_no, path.line_idx, &path.path)
+    }
+
+    fn current_is_runtime_gosub(&self, line_no: u16) -> bool {
+        let Some(path) = self.current_stmt_path.as_ref() else {
+            return false;
+        };
+        self.orphan_for_next
+            .is_runtime_gosub(line_no, path.line_idx, &path.path)
+    }
+
+    fn current_is_runtime_return(&self, line_no: u16) -> bool {
+        let Some(path) = self.current_stmt_path.as_ref() else {
+            return false;
+        };
+        self.orphan_for_next
+            .is_runtime_return(line_no, path.line_idx, &path.path)
+    }
+
+    fn current_is_orphan_next(&self, line_no: u16) -> bool {
+        let Some(path) = self.current_stmt_path.as_ref() else {
+            return false;
+        };
+        self.orphan_for_next
+            .is_orphan_next(line_no, path.line_idx, &path.path)
+    }
+
+    /// Push one byte onto the runtime FOR-stack. Trashes A and X.
+    fn emit_for_stack_push(&mut self, byte: u8) {
+        writeln!(self.code, "    LDX __FOR_STACK_PTR").unwrap();
+        writeln!(self.code, "    LDA #${byte:02X}").unwrap();
+        writeln!(self.code, "    STA __FOR_STACK,X").unwrap();
+        writeln!(self.code, "    INC __FOR_STACK_PTR").unwrap();
+    }
+
+    /// Dispatcher for an orphan NEXT: peek top of stack, look up the
+    /// handler in `__FOR_HANDLER_TABLE`, JMP indirect. The handler
+    /// returns via `__FOR_EXIT_VEC` set up here.
+    fn emit_orphan_next_dispatch(&mut self) {
+        let id = self.fresh_id();
+        let after = format!("__FOR_RT_AFTER_{id}");
+        writeln!(self.code, "    LDA #<{after}").unwrap();
+        writeln!(self.code, "    STA __FOR_EXIT_VEC").unwrap();
+        writeln!(self.code, "    LDA #>{after}").unwrap();
+        writeln!(self.code, "    STA __FOR_EXIT_VEC+1").unwrap();
+        writeln!(self.code, "    LDX __FOR_STACK_PTR").unwrap();
+        writeln!(self.code, "    DEX").unwrap();
+        writeln!(self.code, "    LDA __FOR_STACK,X").unwrap();
+        writeln!(self.code, "    ASL").unwrap();
+        writeln!(self.code, "    TAX").unwrap();
+        writeln!(self.code, "    LDA __FOR_HANDLER_TABLE,X").unwrap();
+        writeln!(self.code, "    STA __FOR_DISP_VEC").unwrap();
+        writeln!(self.code, "    LDA __FOR_HANDLER_TABLE+1,X").unwrap();
+        writeln!(self.code, "    STA __FOR_DISP_VEC+1").unwrap();
+        writeln!(self.code, "    JMP (__FOR_DISP_VEC)").unwrap();
+        writeln!(self.code, "{after}:").unwrap();
+    }
+
+    /// Walk the runtime FOR-stack down to (and past) the 0 marker
+    /// pushed by the matching GOSUB. Trashes A and X.
+    fn emit_for_stack_walk_to_marker(&mut self) {
+        let id = self.fresh_id();
+        let loop_lbl = format!("__FOR_RT_WALK_{id}");
+        let done_lbl = format!("__FOR_RT_WALK_DONE_{id}");
+        writeln!(self.code, "    LDX __FOR_STACK_PTR").unwrap();
+        writeln!(self.code, "{loop_lbl}:").unwrap();
+        writeln!(self.code, "    BEQ {done_lbl}").unwrap();
+        writeln!(self.code, "    DEX").unwrap();
+        writeln!(self.code, "    LDA __FOR_STACK,X").unwrap();
+        writeln!(self.code, "    BNE {loop_lbl}").unwrap();
+        writeln!(self.code, "{done_lbl}:").unwrap();
+        writeln!(self.code, "    STX __FOR_STACK_PTR").unwrap();
     }
 
     fn invalidate_array_addr_cache(&mut self) {
@@ -2477,6 +2570,11 @@ impl Codegen {
             writeln!(self.code, "    JSR __HEAP_INIT").unwrap();
             writeln!(self.code).unwrap();
         }
+        if self.orphan_for_next.needs_runtime_stack() {
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __FOR_STACK_PTR").unwrap();
+            writeln!(self.code).unwrap();
+        }
 
         // Track the last CURLIN_HI we wrote so we can skip re-stamping
         // it when consecutive lines share a high byte (the common case
@@ -3122,6 +3220,10 @@ impl Codegen {
             }
             if !self.data_values.is_empty() {
                 writeln!(self.code, "    JSR __DATA_INIT").unwrap();
+            }
+            if self.orphan_for_next.needs_runtime_stack() {
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    STA __FOR_STACK_PTR").unwrap();
             }
             writeln!(self.code, "    RTS").unwrap();
         }
@@ -9527,6 +9629,56 @@ impl Codegen {
             }
         }
 
+        // Runtime FOR-stack. One byte per frame: a FOR id (1..=255)
+        // or 0 (GOSUB marker). Emitted only when an orphan NEXT was
+        // found.
+        if self.orphan_for_next.needs_runtime_stack() {
+            // Per-FOR handler: re-runs the inline NEXT body with a
+            // runtime-private exit label, then pops the stack and
+            // JMPs through `__FOR_EXIT_VEC` set by the caller.
+            writeln!(self.code).unwrap();
+            writeln!(self.code, "; --- runtime FOR-NEXT handlers ---").unwrap();
+            let mut handlers: Vec<(u8, ForFrame)> =
+                self.runtime_for_frames.drain().collect();
+            handlers.sort_by_key(|(id, _)| *id);
+            let max_id = handlers.last().map(|(id, _)| *id).unwrap_or(0);
+            for (id, frame) in &handlers {
+                writeln!(self.code, "__FOR_NEXT_HANDLER_{id}:").unwrap();
+                let runtime_exit = format!("__FOR_EXIT_RT{id}");
+                let frame = frame.with_fresh_exit(runtime_exit);
+                match frame {
+                    ForFrame::Float(f) => self.emit_next_float(f),
+                    ForFrame::Int(f) => self.emit_next_int(f),
+                    ForFrame::U8(f) => self.emit_next_u8(f),
+                }
+                writeln!(self.code, "    DEC __FOR_STACK_PTR").unwrap();
+                writeln!(self.code, "    JMP (__FOR_EXIT_VEC)").unwrap();
+            }
+            // 2 bytes per entry; entry 0 is the GOSUB marker.
+            writeln!(self.code).unwrap();
+            writeln!(self.code, "; --- runtime FOR handler table ---").unwrap();
+            writeln!(self.code, "__FOR_HANDLER_TABLE:").unwrap();
+            writeln!(self.code, "    .word $0000").unwrap();
+            for id in 1..=max_id {
+                if handlers.iter().any(|(h, _)| *h == id) {
+                    writeln!(self.code, "    .word __FOR_NEXT_HANDLER_{id}").unwrap();
+                } else {
+                    writeln!(self.code, "    .word $0000").unwrap();
+                }
+            }
+
+            writeln!(self.code).unwrap();
+            writeln!(self.code, "; --- runtime FOR-stack ---").unwrap();
+            writeln!(self.code, "__FOR_STACK_PTR:").unwrap();
+            emit_byte_run(&mut self.code, &[0u8; 1], false);
+            writeln!(self.code, "__FOR_STACK:").unwrap();
+            emit_byte_run(&mut self.code, &[0u8; FOR_STACK_DEPTH], false);
+            writeln!(self.code, "__FOR_EXIT_VEC:").unwrap();
+            emit_byte_run(&mut self.code, &[0u8; 2], false);
+            writeln!(self.code, "__FOR_DISP_VEC:").unwrap();
+            emit_byte_run(&mut self.code, &[0u8; 2], false);
+        }
+
         // DATA pool. Layout was chosen in `collect_data` based on the
         // value mix and the program's READ targets:
         //
@@ -11094,8 +11246,20 @@ impl Codegen {
         match stmt {
             Stmt::Print { items, newline } => self.emit_print(items, *newline)?,
             Stmt::Goto { target } => self.emit_goto_or_undef_trap(*target, false),
-            Stmt::GoSub { target } => self.emit_goto_or_undef_trap(*target, true),
-            Stmt::Return => writeln!(self.code, "    RTS").unwrap(),
+            Stmt::GoSub { target } => {
+                if self.current_is_runtime_gosub(line_no) {
+                    // 0 marker so the matching RETURN can drop any FOR
+                    // frames the sub leaves on the stack.
+                    self.emit_for_stack_push(0);
+                }
+                self.emit_goto_or_undef_trap(*target, true);
+            }
+            Stmt::Return => {
+                if self.current_is_runtime_return(line_no) {
+                    self.emit_for_stack_walk_to_marker();
+                }
+                writeln!(self.code, "    RTS").unwrap();
+            }
             Stmt::End => {
                 // Unhook the IRQ wedge before handing control back
                 // to BASIC's READY loop. Without this the KERNAL
@@ -11175,22 +11339,42 @@ impl Codegen {
                 body_reads_loop_var,
                 induction_const,
                 array_inductions,
-            } => self.emit_for(
-                var,
-                start,
-                end,
-                step,
-                *body_int_safe,
-                *body_reads_loop_var,
-                *induction_const,
-                array_inductions,
-            )?,
+            } => {
+                let runtime_id = self.current_runtime_for_id(line_no);
+                if let Some(id) = runtime_id {
+                    self.emit_for_stack_push(id);
+                }
+                self.emit_for(
+                    var,
+                    start,
+                    end,
+                    step,
+                    *body_int_safe,
+                    *body_reads_loop_var,
+                    *induction_const,
+                    array_inductions,
+                )?;
+                if let Some(id) = runtime_id {
+                    let frame = self
+                        .for_stack
+                        .last()
+                        .cloned()
+                        .expect("emit_for pushed a frame onto self.for_stack");
+                    self.runtime_for_frames.insert(id, frame);
+                }
+            }
             Stmt::Next { vars } => {
                 // NEXT I, J, K closes loops in the listed order. Each
                 // iteration pops the current FOR frame (innermost when
                 // var is None).
                 for var in vars {
-                    self.emit_next(var.as_ref(), line_no)?;
+                    if self.current_is_orphan_next(line_no) && self.for_stack.is_empty() {
+                        // NEXT with no static FOR partner — dispatch
+                        // through the runtime FOR-stack.
+                        self.emit_orphan_next_dispatch();
+                    } else {
+                        self.emit_next(var.as_ref(), line_no)?;
+                    }
                 }
             }
             Stmt::Poke { addr, value } => self.emit_poke(addr, value)?,
@@ -18592,11 +18776,14 @@ impl Codegen {
             }
             writeln!(self.code, "    JMP {top}").unwrap();
             writeln!(self.code, "{exit}:").unwrap();
-            // Post-loop sync: BASIC v2 leaves the visible counter at
-            // the first value past the inclusive END. Exact-hit mode
-            // exits before updating the one-byte FU slot, so write the
-            // i16 END+STEP value explicitly.
-            self.emit_i16_imm_to_var(end_value as i16 + frame.step_value, &frame.var);
+            // Post-loop sync: v2 leaves the counter at END+STEP. The
+            // FU slot has to be updated too, since byte-context reads
+            // (POKE S,N etc.) read it directly while the frame is
+            // still on the compile-time stack.
+            let post_loop = end_value as i16 + frame.step_value;
+            writeln!(self.code, "    LDA #${:02X}", (post_loop as u16) & 0xFF).unwrap();
+            writeln!(self.code, "    STA {counter}").unwrap();
+            self.emit_i16_imm_to_var(post_loop, &frame.var);
             return;
         }
 
@@ -18823,17 +19010,26 @@ impl Codegen {
             writeln!(self.code, "    LDY #>{var_label}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::FSUB).unwrap();
         }
-        // For STEP > 0 the loop exits when counter > end (FAC positive,
-        // exp != 0). For STEP < 0 it exits when counter < end (negative).
+        // STEP > 0: exit when counter > end. STEP < 0: exit when
+        // counter < end. STEP 0 (v2 edge case): exit when counter ==
+        // end; any other FAC sign continues, since the counter won't
+        // change.
         let cont_label = format!(
             "__FOR_CONT_{}",
             frame.exit_label.trim_start_matches("__FOR_EXIT_")
         );
+        let step_is_zero = matches!(step_const_value, Some(v) if v == 0.0);
         writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
+        if step_is_zero {
+            writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
+            writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
+            writeln!(self.code, "{}:", frame.exit_label).unwrap();
+            return;
+        }
         writeln!(self.code, "    BEQ {cont_label}").unwrap();
         writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
         match (step_const_value, &frame.step_loc) {
-            (Some(v), _) if v >= 0.0 => {
+            (Some(v), _) if v > 0.0 => {
                 writeln!(self.code, "    BPL {}", frame.exit_label).unwrap();
             }
             (Some(_), _) => {
@@ -30024,9 +30220,16 @@ mod tests {
             ],
         };
         let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        // V_I gets END+STEP via __LD_BYTE_FAC + MOVMF; the FU counter
+        // slot is sync'd to the same byte so later byte-context reads
+        // of the FOR var (POKE A,I etc.) see the post-loop value.
         assert!(
-            asm.contains("__FOR_EXIT_0:\n    LDA #$00\n    LDY #$06"),
-            "u8 exact FOR should expose END+STEP after NEXT\n{asm}"
+            asm.contains("__FOR_EXIT_0:\n    LDA #$06\n    STA FU_0"),
+            "u8 exact FOR should sync counter slot to END+STEP\n{asm}"
+        );
+        assert!(
+            asm.contains("LDY #$06"),
+            "u8 exact FOR should expose END+STEP through V_I\n{asm}"
         );
     }
 

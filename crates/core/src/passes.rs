@@ -6159,6 +6159,11 @@ pub fn run_str_const_var_prop(module: &mut ir::Module) -> bool {
         if var.kind != VarKind::String {
             continue;
         }
+        if var.base == "TI" || var.base == "ST" {
+            // Reserved system vars: `TI$ = "..."` resets the jiffy
+            // clock, reads return live values. Never fold.
+            continue;
+        }
         if vi.let_count != 1 || vi.has_nonlet_write {
             continue;
         }
@@ -9903,6 +9908,85 @@ impl<'a> VarKindPromoter<'a> {
 /// raise an error or call user code (Rnd is non-deterministic but
 /// observation-only — also kept since dropping it changes the RNG
 /// stream).
+/// Rewrites bare `NEXT` (`vars = [None]`) into `NEXT V` by threading
+/// a compile-time FOR-stack. Liveness analysis can then see that
+/// NEXT reads its loop counter.
+pub struct ResolveBareNext;
+
+impl ir::Pass for ResolveBareNext {
+    fn name(&self) -> &'static str {
+        "resolve-bare-next"
+    }
+
+    fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        let mut for_stack: Vec<VarName> = Vec::new();
+        for line in &mut module.lines {
+            for stmt in &mut line.stmts {
+                resolve_bare_next_stmt(stmt, &mut for_stack);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolve_bare_next_stmt(stmt: &mut Stmt, for_stack: &mut Vec<VarName>) {
+    match stmt {
+        Stmt::For { var, .. } => {
+            for_stack.push(var.clone());
+        }
+        Stmt::Next { vars } => {
+            for v in vars.iter_mut() {
+                match v {
+                    None => {
+                        if let Some(top) = for_stack.pop() {
+                            *v = Some(top);
+                        }
+                    }
+                    Some(name) => {
+                        while let Some(top) = for_stack.last() {
+                            if top == name {
+                                for_stack.pop();
+                                break;
+                            }
+                            for_stack.pop();
+                        }
+                    }
+                }
+            }
+        }
+        Stmt::If { then, .. } => resolve_bare_next_then(then, for_stack),
+        Stmt::IfElse {
+            then, else_then, ..
+        } => {
+            // Snapshot so a NEXT in one branch doesn't drain the
+            // sibling branch's view of the stack.
+            let snapshot = for_stack.clone();
+            resolve_bare_next_then(then, for_stack);
+            *for_stack = snapshot.clone();
+            resolve_bare_next_then(else_then, for_stack);
+            *for_stack = snapshot;
+        }
+        Stmt::Rcomp { then, else_then } => {
+            let snapshot = for_stack.clone();
+            resolve_bare_next_then(then, for_stack);
+            *for_stack = snapshot.clone();
+            if let Some(et) = else_then {
+                resolve_bare_next_then(et, for_stack);
+                *for_stack = snapshot;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_bare_next_then(then: &mut crate::ir::ThenIr, for_stack: &mut Vec<VarName>) {
+    if let crate::ir::ThenIr::Stmts(inner) = then {
+        for s in inner {
+            resolve_bare_next_stmt(s, for_stack);
+        }
+    }
+}
+
 pub struct DeadStoreElim;
 
 impl ir::Pass for DeadStoreElim {

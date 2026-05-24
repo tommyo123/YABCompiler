@@ -5,6 +5,25 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-05-24
+
+### Fixed
+
+- CR-only line endings (C64 native) no longer collapse the source to
+  one line (issue #1).
+- `NEXT` that can't be statically paired with a `FOR` now compiles
+  through a runtime FOR-stack. The inline fast path is kept for
+  programs that don't need it (issue #2).
+- `TI$ = "..."` is no longer constant-folded, so the assignment
+  reaches `__SET_TI` and `PRINT TI$` reads the live jiffy clock
+  (issue #3).
+- u8-FOR exit syncs the counter slot to `END+STEP`, so post-loop
+  byte reads (`POKE S,N`) see the right value (issue #3).
+- `FOR X=… TO … STEP 0` exits when the counter equals `END`,
+  matching v2 (issue #4).
+- Bare `NEXT` is resolved to its loop variable before liveness
+  analysis, so `LET I=…` doesn't get dropped as dead (issue #4).
+
 ## [0.9.3] - 2026-05-24
 
 ### Added
@@ -118,6 +137,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.4]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.4
 [0.9.3]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.3
 [0.9.2]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.2
 [0.9.1]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.1

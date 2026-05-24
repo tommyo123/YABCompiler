@@ -4861,6 +4861,14 @@ fn ph303_drop_unreferenced_trampolines(items: &mut Vec<Item>) -> bool {
                     }
                 }
             }
+            Item::Directive(raw) => {
+                // `.word __FOO` references the target as data.
+                if let Some(rest) = raw.trim_start().strip_prefix(".word") {
+                    for label in extract_labels_from_operand(rest) {
+                        *refs.entry(label).or_insert(0) += 1;
+                    }
+                }
+            }
             Item::Label(name) => {
                 label_pos.insert(name.clone(), idx);
             }
