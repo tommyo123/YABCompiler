@@ -4123,9 +4123,10 @@ fn ph111_factor_lda_ldy_jsr(items: &mut Vec<Item>) -> bool {
 ///     break if L1 later moves. Pure hex / register operands only.
 ///
 /// Cycle cost: each fired call adds ~12 cycles per execution
-/// (JSR + RTS overhead vs inline). Profile-aware: enabled in
-/// `Default` and `Size`; can be disabled if a hot-loop benchmark
-/// shows regression.
+/// (JSR + RTS overhead vs inline). The early pass is currently
+/// gated off; the late pass below (`ph301_factor_late_with_jsr`)
+/// is the only live caller path.
+#[allow(dead_code)]
 fn ph301_factor_repeated_sequences(items: &mut Vec<Item>) -> bool {
     // Try windows of decreasing size. Larger windows are tried first
     // so they claim sites before smaller ones (a 7-instr helper
