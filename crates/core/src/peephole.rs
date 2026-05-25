@@ -6513,13 +6513,13 @@ pub fn run(asm: &str, profile: Profile) -> String {
     // on Speed profile so inner loops avoid the JSR/RTS hop.
     if factor_helpers {
         ph106_factor_int_byte_to_fac(&mut items);
-        // PH109 must run AFTER PH106 — it specialises the helper
-        // PH106 just produced.
         ph109_factor_per_imm_byte_fac(&mut items);
         ph107_factor_chrout_byte(&mut items);
         ph111_factor_lda_ldy_jsr(&mut items);
         ph112_factor_varptr_jsr(&mut items);
-        ph301_factor_repeated_sequences(&mut items);
+        // Early PH301 is intentionally skipped here. The late PH301
+        // pass below uses the tighter `JsrPolicy::AllowOne` gate and
+        // recovers most of the size benefit on its own.
         // PH110 runs LAST — it relies on the JSR helpers PH106/107/109/301
         // have just produced; consecutive helper-call pairs become a
         // single helper-call-pair stub. Iterate to fixpoint: each pass

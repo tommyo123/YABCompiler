@@ -852,6 +852,10 @@ struct Codegen {
     /// FOR frames captured at emit time, consumed in finish() to emit
     /// the per-FOR handler and dispatch table.
     runtime_for_frames: std::collections::HashMap<u8, ForFrame>,
+    /// `top_label`s of FORs that pushed onto the runtime FOR-stack.
+    /// Their static NEXT also pops the stack on exit so frames don't
+    /// leak across re-entries.
+    runtime_for_top_labels: HashSet<String>,
     /// CFG node/path for the statement currently being emitted. These
     /// are set by `emit_stmt_at_path`, including nested IF bodies, and
     /// let expression-level helpers read per-statement numeric facts.
@@ -1191,6 +1195,14 @@ impl ForFrame {
         }
     }
 
+    fn top_label(&self) -> &str {
+        match self {
+            ForFrame::Float(f) => &f.top_label,
+            ForFrame::Int(f) => &f.top_label,
+            ForFrame::U8(f) => &f.top_label,
+        }
+    }
+
     fn with_fresh_exit(&self, exit_label: String) -> ForFrame {
         match self {
             ForFrame::Float(f) => {
@@ -1405,6 +1417,7 @@ impl Codegen {
             analysis,
             orphan_for_next: OrphanAnalysis::default(),
             runtime_for_frames: std::collections::HashMap::new(),
+            runtime_for_top_labels: HashSet::new(),
             current_stmt_node: None,
             current_stmt_path: None,
         }
@@ -11360,6 +11373,8 @@ impl Codegen {
                         .last()
                         .cloned()
                         .expect("emit_for pushed a frame onto self.for_stack");
+                    self.runtime_for_top_labels
+                        .insert(frame.top_label().to_string());
                     self.runtime_for_frames.insert(id, frame);
                 }
             }
@@ -13580,16 +13595,9 @@ impl Codegen {
     }
 
     fn emit_store_fac_to_float_var(&mut self, var: &VarName, label: &str) {
-        // Skip the V_var MOVMF entirely when this var is shadow-
-        // only — every observable read goes through the shadow
-        // slot, so the float copy is dead. We DO still need V_var
-        // to exist as a label (per-var stubs / FAC operand
-        // pointers reference it) — that's handled by `intern_var`
-        // at allocation time.
-        if self.analysis.numeric_facts.shadow_only_vars.contains(var) {
-            self.emit_sync_shadow_from_fac(var);
-            return;
-        }
+        // Mirror FAC into V_var, and sync the shadow when one exists.
+        // The float slot must stay current so FAC ops that take this
+        // var as a memory operand read a valid MFLPT.
         let preserves_fac = self.shadow_int_label(var).is_none();
         self.emit_store_fac_to_float_var_raw(var, label);
         self.emit_sync_shadow_from_fac(var);
@@ -14931,19 +14939,11 @@ impl Codegen {
         if var.kind == VarKind::Float {
             if let Some(shadow_label) = self.shadow_int_label(var).map(str::to_string) {
                 if self.try_emit_int16_let(value, &shadow_label) {
-                    // Always reserve the V_var BSS slot — its
-                    // address can still be referenced by per-var
-                    // stub helpers and FAC ROM operand-pointer
-                    // shapes — but skip the actual MOVMF when
-                    // every read of this var routes through the
-                    // shadow. Saves ~150 cycles per write in
-                    // tight loops.
+                    // Always mirror the shadow value into V_var. The
+                    // float slot has to stay consistent for any later
+                    // FAC op that takes the var as its mem operand.
                     let label = self.intern_var(var.clone());
-                    if !self.analysis.numeric_facts.shadow_only_vars.contains(var) {
-                        self.emit_shadow_to_float_var(&shadow_label, var, &label);
-                    } else {
-                        self.invalidate_fac_cache();
-                    }
+                    self.emit_shadow_to_float_var(&shadow_label, var, &label);
                     return Ok(());
                 }
             }
@@ -18905,10 +18905,18 @@ impl Codegen {
             };
             if matched {
                 self.last_popped_for = Some(frame.clone());
+                let pops_runtime_stack = self
+                    .runtime_for_top_labels
+                    .contains(frame.top_label());
                 match frame {
                     ForFrame::Float(f) => self.emit_next_float(f),
                     ForFrame::Int(f) => self.emit_next_int(f),
                     ForFrame::U8(f) => self.emit_next_u8(f),
+                }
+                if pops_runtime_stack {
+                    // The FOR pushed onto the runtime stack at its
+                    // header; the loop-exit path pops it back.
+                    writeln!(self.code, "    DEC __FOR_STACK_PTR").unwrap();
                 }
                 return Ok(());
             }

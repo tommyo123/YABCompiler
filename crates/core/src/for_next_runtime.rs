@@ -96,15 +96,19 @@ pub fn analyze(module: &Module) -> OrphanAnalysis {
     });
     let mut next_id: u8 = 1;
     for (for_id, body_lines) in sorted {
+        // A FOR reaches an orphan NEXT when (a) something in its body
+        // GOTOs the orphan's line, or (b) the orphan sits on a line
+        // the FOR's body covers — body lines collected by the nested-
+        // aware walk so a FOR with a nested static NEXT can still
+        // have its body extend past it.
         let reaches_orphan = body_lines
             .goto_targets
             .iter()
             .any(|t| orphan_lines.contains(t))
-            || (body_lines.no_static_match
-                && body_lines
-                    .lines_in_body
-                    .iter()
-                    .any(|l| orphan_lines.contains(l)));
+            || body_lines
+                .lines_in_body
+                .iter()
+                .any(|l| orphan_lines.contains(l));
         if reaches_orphan {
             analysis.runtime_fors.insert(for_id.clone(), next_id);
             next_id = next_id
@@ -315,6 +319,9 @@ fn recurse_then(
 }
 
 /// Per-FOR body info: lines covered, GOTO targets, static-match flag.
+/// Only top-level NEXTs close a FOR's lexical body; NEXTs inside an
+/// IF/IFELSE/RCOMP body fire conditionally, so the FOR can stay
+/// active past them at runtime.
 fn collect_goto_targets_by_enclosing_for(module: &Module) -> HashMap<StmtId, ForBodyInfo> {
     let mut result: HashMap<StmtId, ForBodyInfo> = HashMap::new();
     let mut for_stack: Vec<(StmtId, ForBodyInfo)> = Vec::new();
@@ -329,7 +336,7 @@ fn collect_goto_targets_by_enclosing_for(module: &Module) -> HashMap<StmtId, For
                 line_idx,
                 path: vec![top_idx],
             };
-            walk_stmt_for_body_info(stmt, &here, &mut for_stack, &mut result);
+            walk_stmt_for_body_info(stmt, &here, &mut for_stack, &mut result, false);
         }
     }
     while let Some((id, mut info)) = for_stack.pop() {
@@ -344,15 +351,20 @@ fn walk_stmt_for_body_info(
     here: &StmtId,
     for_stack: &mut Vec<(StmtId, ForBodyInfo)>,
     result: &mut HashMap<StmtId, ForBodyInfo>,
+    nested: bool,
 ) {
     match stmt {
         Stmt::For { .. } => {
-            for_stack.push((here.clone(), ForBodyInfo::default()));
+            if !nested {
+                for_stack.push((here.clone(), ForBodyInfo::default()));
+            }
         }
         Stmt::Next { vars } => {
-            for _ in vars {
-                if let Some((id, info)) = for_stack.pop() {
-                    result.insert(id, info);
+            if !nested {
+                for _ in vars {
+                    if let Some((id, info)) = for_stack.pop() {
+                        result.insert(id, info);
+                    }
                 }
             }
         }
@@ -361,9 +373,7 @@ fn walk_stmt_for_body_info(
                 info.goto_targets.insert(*target);
             }
         }
-        Stmt::ComputedGoto { .. } => {
-            // ON GOTO/GOSUB inside a runtime FOR — not yet modelled.
-        }
+        Stmt::ComputedGoto { .. } => {}
         Stmt::If { then, .. } => walk_then_body(then, here, for_stack, result),
         Stmt::IfElse {
             then, else_then, ..
@@ -397,7 +407,7 @@ fn walk_then_body(
                     line_idx: parent.line_idx,
                     path,
                 };
-                walk_stmt_for_body_info(inner, &id, for_stack, result);
+                walk_stmt_for_body_info(inner, &id, for_stack, result, true);
             }
         }
         ThenIr::Goto(target) => {
@@ -612,8 +622,7 @@ mod tests {
 
     #[test]
     fn shared_next_between_two_fors() {
-        // Issue #2 in skeleton form. Two FORs share one orphan NEXT
-        // via GOTO / GOSUB / RETURN.
+        // Two FORs sharing one orphan NEXT via GOTO / GOSUB / RETURN.
         let m = Module {
             lines: vec![
                 line(10, vec![Stmt::Goto { target: 30 }]),

@@ -5,6 +5,20 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-05-25
+
+### Fixed
+
+- Float vars with a shadow-int slot also mirror FAC to the float slot
+  on every write, so FAC ops that take the var as a memory operand
+  always read a valid MFLPT.
+- A FOR whose static NEXT lives inside an `IF` / `IFELSE` / `RCOMP`
+  body joins the runtime FOR-stack when a later orphan NEXT can
+  reach the same loop. The static exit also pops the runtime frame.
+- Early helper-factoring of repeated 3-7 instruction windows is
+  disabled. The late factoring pass keeps running with its tighter
+  JSR-budget gate.
+
 ## [0.9.4] - 2026-05-24
 
 ### Fixed
@@ -137,6 +151,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.5]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.5
 [0.9.4]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.4
 [0.9.3]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.3
 [0.9.2]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.2
