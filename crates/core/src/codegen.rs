@@ -9334,15 +9334,82 @@ impl Codegen {
             writeln!(self.code, "    CMP #$0D").unwrap();
             writeln!(self.code, "    BEQ __ILF_DONE").unwrap();
             writeln!(self.code, "    LDX __INPUT_LEN").unwrap();
+            // Cap the line at 254 chars so __INPUT_POS (a single byte,
+            // 1-based) can't wrap to 0 while the field cutter scans.
+            writeln!(self.code, "    CPX #$FE").unwrap();
+            writeln!(self.code, "    BCS __ILF_LOOP").unwrap();
             writeln!(self.code, "    INX").unwrap();
-            // X==0 here means we wrapped from 255 — buffer full, drop char.
-            writeln!(self.code, "    BEQ __ILF_LOOP").unwrap();
             writeln!(self.code, "    STX __INPUT_LEN").unwrap();
             writeln!(self.code, "    STA __INPUT_BUF,X").unwrap();
             writeln!(self.code, "    JMP __ILF_LOOP").unwrap();
             writeln!(self.code, "__ILF_DONE:").unwrap();
             writeln!(self.code, "    LDA __INPUT_LEN").unwrap();
             writeln!(self.code, "    STA __INPUT_BUF").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            // __INPUT_FILE_FIELD: like __EXTRACT_FIELD but the refill
+            // path reads another line from the file (reopening the
+            // input channel) instead of reprompting the keyboard.
+            // Cuts the next comma-separated field of __INPUT_BUF (from
+            // __INPUT_POS) into __FIELD_BUF. A field that starts past
+            // end-of-line refills from the file and retries; an empty
+            // refilled line (EOF) yields an empty field, matching the
+            // way the interpreter returns 0 / "" once a file runs dry.
+            writeln!(self.code, "__INPUT_FILE_FIELD:").unwrap();
+            writeln!(self.code, "__IFF_SKIP_WS:").unwrap();
+            writeln!(self.code, "    LDX __INPUT_POS").unwrap();
+            writeln!(self.code, "    CPX __INPUT_LEN").unwrap();
+            writeln!(self.code, "    BCC __IFF_HAS_DATA").unwrap();
+            writeln!(self.code, "    BEQ __IFF_HAS_DATA").unwrap();
+            // Buffer exhausted at the start of a field. pos==1 means a
+            // freshly read (or empty) line had nothing — yield an
+            // empty field. Otherwise the line was partially consumed,
+            // so read the next line and retry.
+            writeln!(self.code, "    CPX #$01").unwrap();
+            writeln!(self.code, "    BEQ __IFF_EMPTY").unwrap();
+            writeln!(self.code, "    LDX __IFF_FNUM").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
+            writeln!(self.code, "    JSR __INPUT_LINE_FILE").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __INPUT_POS").unwrap();
+            writeln!(self.code, "    JMP __IFF_SKIP_WS").unwrap();
+            writeln!(self.code, "__IFF_EMPTY:").unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    STY __FIELD_BUF").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__IFF_HAS_DATA:").unwrap();
+            writeln!(self.code, "    LDA __INPUT_BUF,X").unwrap();
+            writeln!(self.code, "    CMP #$20").unwrap();
+            writeln!(self.code, "    BNE __IFF_COPY_INIT").unwrap();
+            writeln!(self.code, "    INC __INPUT_POS").unwrap();
+            writeln!(self.code, "    JMP __IFF_SKIP_WS").unwrap();
+            writeln!(self.code, "__IFF_COPY_INIT:").unwrap();
+            writeln!(self.code, "    LDY #$01").unwrap();
+            writeln!(self.code, "__IFF_COPY_LOOP:").unwrap();
+            writeln!(self.code, "    LDX __INPUT_POS").unwrap();
+            writeln!(self.code, "    CPX __INPUT_LEN").unwrap();
+            writeln!(self.code, "    BCC __IFF_NOT_END").unwrap();
+            writeln!(self.code, "    BEQ __IFF_NOT_END").unwrap();
+            writeln!(self.code, "    JMP __IFF_DONE").unwrap();
+            writeln!(self.code, "__IFF_NOT_END:").unwrap();
+            writeln!(self.code, "    LDA __INPUT_BUF,X").unwrap();
+            writeln!(self.code, "    CMP #$2C").unwrap(); // ','
+            writeln!(self.code, "    BEQ __IFF_COMMA").unwrap();
+            // Clamp the field to __FIELD_BUF's 80-byte capacity: stop
+            // storing past 80 chars but keep advancing so the rest of
+            // an over-long field is consumed up to the comma/EOL.
+            writeln!(self.code, "    CPY #$51").unwrap();
+            writeln!(self.code, "    BCS __IFF_ADV").unwrap();
+            writeln!(self.code, "    STA __FIELD_BUF,Y").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "__IFF_ADV:").unwrap();
+            writeln!(self.code, "    INC __INPUT_POS").unwrap();
+            writeln!(self.code, "    JMP __IFF_COPY_LOOP").unwrap();
+            writeln!(self.code, "__IFF_COMMA:").unwrap();
+            writeln!(self.code, "    INC __INPUT_POS").unwrap();
+            writeln!(self.code, "__IFF_DONE:").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    STY __FIELD_BUF").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_input_field {
@@ -9407,10 +9474,16 @@ impl Codegen {
             writeln!(self.code, "    LDA __INPUT_BUF,X").unwrap();
             writeln!(self.code, "    CMP #$2C").unwrap(); // ','
             writeln!(self.code, "    BEQ __EF_COMMA").unwrap();
+            // Clamp to __FIELD_BUF's 80-byte capacity; keep advancing
+            // past the cap so an over-long field is consumed to the
+            // comma/EOL without overrunning the buffer.
+            writeln!(self.code, "    CPY #$51").unwrap();
+            writeln!(self.code, "    BCS __EF_ADV").unwrap();
             writeln!(self.code, "    STA __FIELD_BUF,Y").unwrap();
-            writeln!(self.code, "    INC __INPUT_POS").unwrap();
             writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    BNE __EF_COPY_LOOP").unwrap(); // wraps at 256 — safety
+            writeln!(self.code, "__EF_ADV:").unwrap();
+            writeln!(self.code, "    INC __INPUT_POS").unwrap();
+            writeln!(self.code, "    JMP __EF_COPY_LOOP").unwrap();
             writeln!(self.code, "__EF_COMMA:").unwrap();
             writeln!(self.code, "    INC __INPUT_POS").unwrap(); // skip the comma
             writeln!(self.code, "__EF_DONE:").unwrap();
@@ -10958,6 +11031,12 @@ impl Codegen {
             for _ in 0..80 / 8 {
                 writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00",).unwrap();
             }
+        }
+        // INPUT# logical file number, kept so the field cutter can
+        // reopen the input channel when a line needs refilling.
+        if self.used_input_file {
+            writeln!(self.code, "__IFF_FNUM:").unwrap();
+            writeln!(self.code, "    .byte $00").unwrap();
         }
 
         // Mark the start of the string heap. The label stays at offset
@@ -22985,135 +23064,52 @@ impl Codegen {
     }
 
     /// `INPUT# file_num, var [, var ...]` — read one CR-terminated
-    /// line via CHRIN into the shared INPUT_BUF, then dispatch each var
-    /// through the same path INPUT uses (VAL for numerics, heap-copy
-    /// for strings). Reuses __INPUT_BUF and __INPUT_LEN.
+    /// line into __INPUT_BUF, then cut comma-separated fields for each
+    /// variable. When the line is spent and more variables remain,
+    /// another line is read from the same file. The file number is
+    /// stashed in __IFF_FNUM so the field cutter can reopen the input
+    /// channel for refills. The channel is only held open across the
+    /// line reads themselves, never across the per-variable stores
+    /// (which may run the string-heap collector). Field cutting and
+    /// per-type storage are shared with keyboard INPUT.
     fn emit_input_file(
         &mut self,
         file_num: &Expr,
         targets: &[ir::ReadTarget],
     ) -> Result<(), CodegenError> {
+        self.emit_expr_to_fac(file_num)?;
+        self.emit_facword_rom();
+        writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+        writeln!(self.code, "    STA __IFF_FNUM").unwrap();
+        // Read the first line with the channel open, then close it.
+        writeln!(self.code, "    TAX").unwrap();
+        writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
+        writeln!(self.code, "    JSR __INPUT_LINE_FILE").unwrap();
+        writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
+        writeln!(self.code, "    LDA #$01").unwrap();
+        writeln!(self.code, "    STA __INPUT_POS").unwrap();
         for tgt in targets {
-            self.emit_expr_to_fac(file_num)?;
-            self.emit_facword_rom();
-            writeln!(self.code, "    LDX ${:02X}", rt::LINNUM_LO).unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
-            writeln!(self.code, "    JSR __INPUT_LINE_FILE").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
-            // Stage __INPUT_BUF as the source for parsing/copying.
-            writeln!(self.code, "    LDA #<__INPUT_BUF").unwrap();
+            // Cut the next field; if the line is spent, the helper
+            // reopens the channel, reads another line, closes it,
+            // and retries.
+            writeln!(self.code, "    JSR __INPUT_FILE_FIELD").unwrap();
+            writeln!(self.code, "    LDA #<__FIELD_BUF").unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
-            writeln!(self.code, "    LDA #>__INPUT_BUF").unwrap();
+            writeln!(self.code, "    LDA #>__FIELD_BUF").unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
             match tgt {
                 ir::ReadTarget::Scalar(var) => {
                     let label = self.intern_var(var.clone());
-                    self.emit_input_file_to_scalar(var.kind, &label);
+                    self.emit_input_to_scalar(var, &label);
                 }
                 ir::ReadTarget::Array { name, indices } => {
-                    self.emit_input_file_to_array(name, indices)?;
+                    self.emit_input_to_array(name, indices)?;
                 }
             }
         }
         self.used_input = true;
         self.used_input_file = true;
-        Ok(())
-    }
-
-    /// Store the parsed __INPUT_BUF into a scalar variable. Caller has
-    /// already staged STR_OP_LHS = __INPUT_BUF.
-    fn emit_input_file_to_scalar(&mut self, kind: VarKind, label: &str) {
-        match kind {
-            VarKind::String => {
-                writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
-                writeln!(self.code, "    LDA #<{label}").unwrap();
-                writeln!(self.code, "    STA __STR_OWNER_LO").unwrap();
-                writeln!(self.code, "    LDA #>{label}").unwrap();
-                writeln!(self.code, "    STA __STR_OWNER_HI").unwrap();
-                self.emit_restore_heap_to_save();
-                writeln!(self.code, "    JSR __INPUT_COPY_TO_HEAP").unwrap();
-                writeln!(self.code, "    STA {label}").unwrap();
-                writeln!(self.code, "    STY {label}+1").unwrap();
-                self.used_input_str = true;
-                self.use_str_assign_owned();
-            }
-            VarKind::Float => {
-                writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
-                writeln!(self.code, "    LDX #<{label}").unwrap();
-                writeln!(self.code, "    LDY #>{label}").unwrap();
-                writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
-                self.used_val = true;
-            }
-            VarKind::Integer => {
-                writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
-                writeln!(self.code, "    JSR __FAC_TO_INT16").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                writeln!(self.code, "    STA {label}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                writeln!(self.code, "    STA {label}+1").unwrap();
-                self.used_val = true;
-                self.used_fac_to_int16 = true;
-            }
-        }
-    }
-
-    /// Store the parsed __INPUT_BUF into one element of an array. The
-    /// address calculation may clobber STR_OP_LHS, so we re-stage
-    /// __INPUT_BUF after each emit_array_address call.
-    fn emit_input_file_to_array(
-        &mut self,
-        name: &VarName,
-        indices: &[Expr],
-    ) -> Result<(), CodegenError> {
-        match name.kind {
-            VarKind::String => {
-                writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
-                self.invalidate_fac_cache();
-                self.emit_array_address(name, indices)?;
-                writeln!(self.code, "    LDA ${:02X}", rt::ARRAY_ADDR_LO).unwrap();
-                writeln!(self.code, "    STA __STR_OWNER_LO").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
-                writeln!(self.code, "    STA __STR_OWNER_HI").unwrap();
-                writeln!(self.code, "    LDA #<__INPUT_BUF").unwrap();
-                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
-                writeln!(self.code, "    LDA #>__INPUT_BUF").unwrap();
-                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
-                self.emit_restore_heap_to_save();
-                writeln!(self.code, "    JSR __INPUT_COPY_TO_HEAP").unwrap();
-                self.emit_store_ay_to_owner_slot();
-                self.used_input_str = true;
-                self.used_array_let_str = true;
-                self.use_str_assign_owned();
-            }
-            VarKind::Float => {
-                self.emit_array_address(name, indices)?;
-                writeln!(self.code, "    LDA #<__INPUT_BUF").unwrap();
-                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
-                writeln!(self.code, "    LDA #>__INPUT_BUF").unwrap();
-                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
-                writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
-                writeln!(self.code, "    JSR __ST_ARR").unwrap();
-                self.used_val = true;
-                self.used_st_arr = true;
-            }
-            VarKind::Integer => {
-                self.emit_array_address(name, indices)?;
-                writeln!(self.code, "    LDA #<__INPUT_BUF").unwrap();
-                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
-                writeln!(self.code, "    LDA #>__INPUT_BUF").unwrap();
-                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
-                writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
-                writeln!(self.code, "    JSR __FAC_TO_INT16").unwrap();
-                writeln!(self.code, "    LDY #$00").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-                writeln!(self.code, "    INY").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-                self.used_val = true;
-                self.used_fac_to_int16 = true;
-            }
-        }
+        self.used_input_field = true;
         Ok(())
     }
 
@@ -24534,9 +24530,14 @@ fn scan_module_uses_usr(module: &ir::Module) -> bool {
                     || secondary.as_ref().is_some_and(expr_has_usr)
                     || filename.as_ref().is_some_and(str_has_usr)
             }
-            Stmt::Close { file_num }
-            | Stmt::GetFile { file_num, .. }
-            | Stmt::InputFile { file_num, .. } => expr_has_usr(file_num),
+            Stmt::Close { file_num } | Stmt::GetFile { file_num, .. } => expr_has_usr(file_num),
+            Stmt::InputFile { file_num, targets } => {
+                expr_has_usr(file_num)
+                    || targets.iter().any(|t| match t {
+                        ir::ReadTarget::Scalar(_) => false,
+                        ir::ReadTarget::Array { indices, .. } => indices.iter().any(expr_has_usr),
+                    })
+            }
             Stmt::Load {
                 device,
                 secondary,
@@ -24930,10 +24931,14 @@ fn stmts_use_heap(stmts: &[Stmt]) -> bool {
         Stmt::Sys { addr, regs, .. } => expr_uses_heap(addr) || regs.iter().any(expr_uses_heap),
         // INPUT to a string variable copies the line buffer onto the
         // heap so subsequent INPUTs don't overwrite the variable's data.
-        Stmt::Input { targets, .. } => targets.iter().any(|t| match t {
-            ir::ReadTarget::Scalar(v) => matches!(v.kind, VarKind::String),
-            ir::ReadTarget::Array { name, .. } => matches!(name.kind, VarKind::String),
-        }),
+        // INPUT# and GET# from a file do the same for string targets.
+        Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+            targets.iter().any(|t| match t {
+                ir::ReadTarget::Scalar(v) => matches!(v.kind, VarKind::String),
+                ir::ReadTarget::Array { name, .. } => matches!(name.kind, VarKind::String),
+            })
+        }
+        Stmt::GetFile { vars, .. } => vars.iter().any(|v| matches!(v.kind, VarKind::String)),
         Stmt::OnKey { keys, .. } => str_uses_heap(keys),
         // String args may be Concat/Left/Right/Chr$/etc., all of
         // which need the heap up to allocate the temporary buffer.
@@ -26816,7 +26821,9 @@ fn for_each_int_scalar_write(stmt: &Stmt, f: &mut impl FnMut(&VarName)) {
         Stmt::Let { var, .. } if is_integer_scalar(var) => f(var),
         Stmt::For { var, .. } if is_integer_scalar(var) => f(var),
         Stmt::Get { var } if is_integer_scalar(var) => f(var),
-        Stmt::Read(targets) | Stmt::Input { targets, .. } => {
+        Stmt::Read(targets)
+        | Stmt::Input { targets, .. }
+        | Stmt::InputFile { targets, .. } => {
             for t in targets {
                 if let ir::ReadTarget::Scalar(v) = t
                     && is_integer_scalar(v)
