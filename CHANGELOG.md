@@ -5,6 +5,12 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-06-02
+
+### Fixed
+
+- `INPUT#` now reads all comma-separated values on a line, not just the first.
+
 ## [0.9.5] - 2026-05-25
 
 ### Fixed
@@ -151,6 +157,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.6]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.6
 [0.9.5]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.5
 [0.9.4]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.4
 [0.9.3]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.3
