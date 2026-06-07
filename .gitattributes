@@ -1,0 +1,11 @@
+# The corpus tests compare emulator output against committed golden
+# files byte for byte, so goldens must stay LF even when checked out
+# under core.autocrlf or edited on Windows.
+*.out text eol=lf
+
+# C64 binary fixtures must never be line-ending converted.
+*.prg binary
+*.bin binary
+*.png binary
+*.ico binary
+*.dll binary

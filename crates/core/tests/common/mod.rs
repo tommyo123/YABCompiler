@@ -189,6 +189,12 @@ pub fn check_behavior(
         match std::fs::read_to_string(&golden) {
             Ok(expected) => {
                 report.checked += 1;
+                // Goldens are written with `\n`, but a checkout under
+                // core.autocrlf or an edit in a Windows editor can store
+                // them with `\r\n`. Emulator output only ever uses `\n`
+                // (the C64 line terminator $0D is decoded to `\n`), so
+                // normalise the golden's line endings before comparing.
+                let expected = expected.replace("\r\n", "\n").replace('\r', "\n");
                 if expected != out {
                     report.mismatches.push((name, expected, out));
                 }
