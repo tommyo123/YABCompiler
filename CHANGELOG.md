@@ -5,6 +5,13 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-06-07
+
+### Fixed
+
+- PETSCII string escapes accept the hex form (`{$A6}`) the detokenizer
+  emits, so a `list` listing tokenizes back to the same bytes.
+
 ## [0.9.7] - 2026-06-07
 
 ### Fixed
@@ -164,6 +171,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.8]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.8
 [0.9.7]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.7
 [0.9.6]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.6
 [0.9.5]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.5
