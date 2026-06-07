@@ -515,12 +515,10 @@ fn line_body_with_options(
             Some(b':') | Some(b';') => {
                 p.advance(1);
             }
-            // BASIC v2 quirk: a token byte ($80+) directly after a
-            // numeric-argument statement is also treated as the start
-            // of a new statement, with no `:` separator required.
-            // E.g. `GOSUB 10000PRINT"X"` is the same as
-            // `GOSUB 10000:PRINT"X"`. Accept it here so legacy
-            // programs parse without modification.
+            // A token byte ($80+) directly after a statement that ended
+            // on a numeric argument starts the next statement with no
+            // `:` separator. Accept it so legacy tokenised listings parse
+            // without modification.
             Some(b) if is_statement_start_byte(b) => { /* fall through, no advance */ }
             Some(_) => {
                 // Trailing-junk recovery. Stray bytes after a valid
@@ -625,12 +623,16 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 // tail as an empty statement.
                 return Ok(Statement::Rem(Vec::new()));
             }
-            Ok(Statement::Goto(line_number(p)?))
+            let target = line_number(p)?;
+            skip_line_target_label(p);
+            Ok(Statement::Goto(target))
         }
         TOK_GOSUB => {
             p.advance(1);
             p.skip_spaces();
-            Ok(Statement::GoSub(line_number(p)?))
+            let target = line_number(p)?;
+            skip_line_target_label(p);
+            Ok(Statement::GoSub(target))
         }
         TOK_GO => {
             // `GO TO` (CB A4) or `GO SUB` (CB then ASCII "SUB"). In
@@ -5029,6 +5031,7 @@ fn on_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             break;
         }
     }
+    skip_line_target_label(p);
     Ok(Statement::OnBranch {
         value,
         kind,
@@ -5084,6 +5087,28 @@ fn line_number(p: &mut Cursor<'_>) -> Result<u16, ParseError> {
         });
     }
     Ok(n as u16)
+}
+
+/// After a `GOTO`, `GOSUB` or `ON … GOTO/GOSUB` line-number target,
+/// BASIC v2 ignores any characters baked onto the end of the number up
+/// to the next statement separator. Renumber and label tools rely on
+/// this to tag a target with a readable name (`GOSUB 500DEFGFX`), where
+/// the tokeniser may even turn a leading keyword in the label into a
+/// token byte. Skip that label so the leftover bytes are not taken as a
+/// following statement. Stop at `:` / `;` (statements past those are
+/// still reachable on return) and at the TSB `ELSE` that ends a `THEN`
+/// body.
+fn skip_line_target_label(p: &mut Cursor<'_>) {
+    p.skip_spaces();
+    while let Some(b) = p.peek() {
+        if b == b':' || b == b';' {
+            break;
+        }
+        if b == TOK_TSB_PREFIX && p.peek_at(1).map(normalize_tsb_token) == Some(TSB_ELSE) {
+            break;
+        }
+        p.advance(1);
+    }
 }
 
 fn var_name(p: &mut Cursor<'_>) -> Result<VarName, ParseError> {
@@ -6549,6 +6574,78 @@ mod tests {
         let stmts = line_body(3250, &[TOK_PRINT, b'"', b'X', b'"', b':', TOK_GOTO]).unwrap();
         assert_eq!(stmts.len(), 2);
         assert!(matches!(stmts[1], Statement::Rem(_)));
+    }
+
+    #[test]
+    fn gosub_ignores_baked_label_after_target() {
+        // `GOSUB 500DEFGFX` — the tokeniser turns the leading `DEF` of
+        // the label into a token byte; v2 reads the 500 and ignores the
+        // rest, so it must not be parsed as a `DEF` statement.
+        let stmts = line_body(10, &[TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X']).unwrap();
+        assert!(matches!(stmts.as_slice(), [Statement::GoSub(500)]));
+    }
+
+    #[test]
+    fn gosub_label_stops_at_colon() {
+        // The label is dropped but a `:`-separated statement still runs
+        // when the subroutine returns.
+        let stmts = line_body(
+            10,
+            &[
+                TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X', b':', TOK_PRINT, b'"', b'X',
+                b'"',
+            ],
+        )
+        .unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(stmts[0], Statement::GoSub(500)));
+        assert!(matches!(stmts[1], Statement::Print(_)));
+    }
+
+    #[test]
+    fn gosub_drops_trailing_text_to_end_of_line() {
+        // v2 ignores everything after the line number, even when it would
+        // tokenise to a valid statement; only `GOSUB 10000` survives.
+        let stmts =
+            line_body(10, &[TOK_GOSUB, b'1', b'0', b'0', b'0', b'0', TOK_PRINT, b'"', b'X', b'"'])
+                .unwrap();
+        assert!(matches!(stmts.as_slice(), [Statement::GoSub(10000)]));
+    }
+
+    #[test]
+    fn gosub_label_inside_then_body() {
+        let stmts = line_body(
+            10,
+            &[
+                TOK_IF, b'1', b' ', TOK_THEN, TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X',
+            ],
+        )
+        .unwrap();
+        match &stmts[0] {
+            Statement::If {
+                then_branch: ThenBranch::Stmts(inner),
+                ..
+            } => assert!(matches!(inner.as_slice(), [Statement::GoSub(500)])),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_gosub_ignores_label_after_last_target() {
+        let stmts = line_body(
+            10,
+            &[
+                TOK_ON, b'A', b' ', TOK_GOSUB, b'1', b'0', b'0', TOK_DEF, b'G', b'F', b'X',
+            ],
+        )
+        .unwrap();
+        match &stmts[0] {
+            Statement::OnBranch { targets, kind, .. } => {
+                assert_eq!(targets.as_slice(), &[100]);
+                assert!(matches!(kind, OnBranchKind::GoSub));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
     }
 
     #[test]
