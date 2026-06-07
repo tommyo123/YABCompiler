@@ -657,6 +657,18 @@ fn resolve_petscii_escape(body: &str) -> Option<(u8, usize)> {
         }
     }
 
+    // Hex byte, e.g. `{$A6}` → $A6. This is the form the detokenizer
+    // emits for bytes that have no named escape, so a listing tokenizes
+    // back to the same bytes.
+    if let Some(hex) = name.strip_prefix('$')
+        && !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && let Ok(v) = u16::from_str_radix(hex, 16)
+        && v <= 255
+    {
+        return Some((v as u8, repeat));
+    }
+
     let lower = name.to_ascii_lowercase();
 
     // Direct hit on the named table (handles "rvs on", "sh asterisk",
@@ -1156,6 +1168,35 @@ mod tests {
         // `{193}` → $C1 (shift-A graphic glyph).
         let out = body("PRINT \"{193}\"");
         assert_eq!(out, vec![0x99, b' ', 0x22, 0xC1, 0x22]);
+    }
+
+    #[test]
+    fn petscii_hex_escape() {
+        // `{$A6}` is the form the detokenizer emits for bytes without a
+        // named escape; it must tokenize back to that byte so a listing
+        // round-trips. Lower-case hex digits are accepted too.
+        assert_eq!(body("PRINT \"{$A6}\""), vec![0x99, b' ', 0x22, 0xA6, 0x22]);
+        assert_eq!(body("PRINT \"{$a6}\""), vec![0x99, b' ', 0x22, 0xA6, 0x22]);
+    }
+
+    #[test]
+    fn petscii_hex_escape_repeat() {
+        // The `*N` repeat suffix works with the hex form as well.
+        assert_eq!(
+            body("PRINT \"{$A6*2}\""),
+            vec![0x99, b' ', 0x22, 0xA6, 0xA6, 0x22]
+        );
+    }
+
+    #[test]
+    fn petscii_listing_round_trips_unmapped_byte() {
+        // Detokenizing byte $A6 yields `{$A6}`; re-tokenizing must
+        // reproduce the original byte.
+        let rendered = crate::petscii::byte_to_string(0xA6);
+        assert_eq!(rendered, "{$A6}");
+        assert_eq!(body(&format!("PRINT \"{rendered}\"")), vec![
+            0x99, b' ', 0x22, 0xA6, 0x22
+        ]);
     }
 
     #[test]
