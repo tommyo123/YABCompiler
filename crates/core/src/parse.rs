@@ -23,8 +23,8 @@
 
 use crate::ast::{
     BinOp, DimSpec, Expr, FnName, Func1, Line, MemTransferOp, OnBranchKind, PrintItem, PrintStmt,
-    ProcName, Program, ResumeTarget, ScreenRectOp, ScreenScrollOp, Statement, StrExpr, ThenBranch,
-    VarKind, VarName,
+    ProcName, Program, ResumeTarget, ScreenRectOp, ScreenScrollOp, SkippedStatement, Statement,
+    StrExpr, ThenBranch, VarKind, VarName,
 };
 use crate::prg;
 
@@ -409,24 +409,26 @@ pub struct ParseOptions {
 
 pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Program, ParseError> {
     let mut lines = Vec::with_capacity(prg.lines.len());
+    let mut skipped = Vec::new();
     for raw in &prg.lines {
         lines.push(Line {
             number: raw.number,
-            statements: line_body_with_options(raw.number, &raw.body, &opts)?,
+            statements: line_body_with_options(raw.number, &raw.body, &opts, &mut skipped)?,
         });
     }
-    Ok(Program { lines })
+    Ok(Program { lines, skipped })
 }
 
 #[cfg(test)]
 fn line_body(line_no: u16, body: &[u8]) -> Result<Vec<Statement>, ParseError> {
-    line_body_with_options(line_no, body, &ParseOptions::default())
+    line_body_with_options(line_no, body, &ParseOptions::default(), &mut Vec::new())
 }
 
 fn line_body_with_options(
     line_no: u16,
     body: &[u8],
     opts: &ParseOptions,
+    skipped: &mut Vec<SkippedStatement>,
 ) -> Result<Vec<Statement>, ParseError> {
     let mut p = Cursor::new(body, line_no);
     p.lenient_syntax = opts.lenient_syntax;
@@ -454,7 +456,17 @@ fn line_body_with_options(
         let stmt = match statement(&mut p) {
             Ok(s) => s,
             Err(err) => {
-                if !p.lenient_syntax {
+                // A keyword from another Commodore BASIC isn't a syntax
+                // error on the target — v2 only looks at those bytes if
+                // it executes them, and listings guard them by machine
+                // (`IF BV=67 THEN SPRDEF ...`). Compile it away and let
+                // the caller report it. Malformed syntax still aborts
+                // unless --lenient-syntax is on.
+                let offending = match err {
+                    ParseError::UnsupportedToken { byte, .. } => Some(byte),
+                    _ => None,
+                };
+                if offending.is_none() && !p.lenient_syntax {
                     return Err(err);
                 }
                 // Universal lenient fallback: any statement that fails
@@ -468,8 +480,17 @@ fn line_body_with_options(
                 // becomes a no-op, the rest of the program still
                 // compiles."
                 p.pos = saved;
+                // Stopping at the next `:` inside a conditional would
+                // re-parse the THEN body as top-level statements, which
+                // then run unconditionally.
+                let owns_line = statement_owns_rest_of_line(&p);
+                skipped.push(SkippedStatement {
+                    line: line_no,
+                    token: offending.or_else(|| p.peek()).unwrap_or(0),
+                    whole_conditional: owns_line,
+                });
                 while let Some(b) = p.peek() {
-                    if b == b':' {
+                    if b == b':' && !owns_line {
                         break;
                     }
                     p.advance(1);
@@ -538,6 +559,20 @@ fn line_body_with_options(
         }
     }
     Ok(out)
+}
+
+/// Whether the statement starting at the cursor takes the rest of its
+/// line as its body. Only the conditionals do — v2 has no way to put an
+/// unconditional statement after `IF ... THEN` on the same line.
+fn statement_owns_rest_of_line(p: &Cursor<'_>) -> bool {
+    match p.peek() {
+        Some(TOK_IF) => true,
+        Some(TOK_TSB_PREFIX) => p
+            .peek_at(1)
+            .map(normalize_tsb_token)
+            .is_some_and(|t| t == TSB_RCOMP),
+        _ => false,
+    }
 }
 
 fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
@@ -6567,6 +6602,27 @@ mod tests {
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
+    }
+
+    /// `IF <false> THEN <BASIC 7.0 keyword>:RETURN` compiles away
+    /// rather than failing the build, the trailing `RETURN` goes with
+    /// the conditional it belonged to, and the drop is reported.
+    #[test]
+    fn unsupported_token_in_conditional_is_dropped_and_reported() {
+        let mut skipped = Vec::new();
+        // 10 IF 1 THEN <$FE $1D = SPRDEF> 1:RETURN
+        let body = [
+            TOK_IF, b'1', b' ', TOK_THEN, 0xFE, 0x1D, b'1', b':', TOK_RETURN,
+        ];
+        let stmts =
+            line_body_with_options(10, &body, &ParseOptions::default(), &mut skipped).unwrap();
+        assert!(
+            !stmts.iter().any(|s| matches!(s, Statement::Return)),
+            "THEN body escaped the conditional: {stmts:?}"
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].token, 0xFE);
+        assert!(skipped[0].whole_conditional);
     }
 
     #[test]

@@ -10759,6 +10759,7 @@ mod tests {
             Statement as AstStmt, VarKind as AstKind, VarName as AstVar,
         };
         let mut prog = AstProgram {
+            skipped: Vec::new(),
             lines: vec![
                 AstLine {
                     number: 10,
@@ -10841,7 +10842,10 @@ mod tests {
             number: 230,
             statements: vec![AstStmt::EndProc],
         });
-        let mut prog = AstProgram { lines };
+        let mut prog = AstProgram {
+            lines,
+            skipped: Vec::new(),
+        };
         crate::passes::inline_procs_ast(&mut prog);
         // None of the call sites should have been inlined.
         let line10 = &prog.lines[0];
@@ -10869,6 +10873,7 @@ mod tests {
             kind: AstKind::Float,
         };
         let mut prog = AstProgram {
+            skipped: Vec::new(),
             lines: vec![
                 // Outside body — must NOT be mangled.
                 AstLine {
@@ -10934,6 +10939,7 @@ mod tests {
             kind: AstKind::Float,
         };
         let mut prog = AstProgram {
+            skipped: Vec::new(),
             lines: vec![
                 AstLine {
                     number: 10,
@@ -10979,6 +10985,7 @@ mod tests {
         // doesn't compose under multiple call sites).
         use crate::ast::{Line as AstLine, ProcName, Program as AstProgram, Statement as AstStmt};
         let mut prog = AstProgram {
+            skipped: Vec::new(),
             lines: vec![
                 AstLine {
                     number: 10,

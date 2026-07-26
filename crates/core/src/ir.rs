@@ -1775,6 +1775,7 @@ mod tests {
         let i = fvar("I");
         let s = fvar("S");
         let prog = ast::Program {
+            skipped: Vec::new(),
             lines: vec![ast::Line {
                 number: 10,
                 statements: vec![ast::Statement::For {
@@ -1800,6 +1801,7 @@ mod tests {
         let n = fvar("N");
         let name = svar("NAME");
         let prog = ast::Program {
+            skipped: Vec::new(),
             lines: vec![
                 ast::Line {
                     number: 10,
@@ -1838,6 +1840,7 @@ mod tests {
     fn lower_resolves_tsb_proc_calls_to_gosub() {
         let proc = ast::ProcName(b"WORK".to_vec());
         let prog = ast::Program {
+            skipped: Vec::new(),
             lines: vec![
                 ast::Line {
                     number: 10,

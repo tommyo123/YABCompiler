@@ -1020,6 +1020,17 @@ fn format_diagnostics(d: &yabcompiler_core::Diagnostics) -> String {
             format_ranges(&d.effective_reserved)
         ));
     }
+    for s in &d.skipped_statements {
+        let scope = if s.whole_conditional {
+            "conditional dropped"
+        } else {
+            "statement dropped"
+        };
+        out.push_str(&format!(
+            "  warning: line {}: token ${:02X} is not supported, {scope}\n",
+            s.line, s.token
+        ));
+    }
     out
 }
 

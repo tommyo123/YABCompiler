@@ -315,6 +315,17 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
             format_ranges(&d.effective_reserved)
         );
     }
+    for s in &d.skipped_statements {
+        let scope = if s.whole_conditional {
+            "conditional dropped"
+        } else {
+            "statement dropped"
+        };
+        eprintln!(
+            "  warning: line {}: token ${:02X} is not supported, {scope}",
+            s.line, s.token
+        );
+    }
 }
 
 fn format_ranges(ranges: &[(u16, u16)]) -> String {

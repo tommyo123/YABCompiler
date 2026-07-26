@@ -325,6 +325,10 @@ pub struct Diagnostics {
     /// source breakdown when the two sets contributed distinct
     /// ranges, but most callers just want the effective layout.
     pub effective_reserved: Vec<(u16, u16)>,
+    /// Statements compiled away because the parser doesn't implement
+    /// the keyword. A live one silently does nothing, so callers
+    /// should surface these.
+    pub skipped_statements: Vec<crate::ast::SkippedStatement>,
 }
 
 /// Heuristic: does this parsed .prg look like genuine tokenized
@@ -397,6 +401,7 @@ pub fn compile_with_options(
         int_hint_vars: hints.int_vars.clone(),
     };
     let ast = parse::program_with_options(&prg, parse_opts).map_err(CompileError::Parse)?;
+    let skipped_statements = ast.skipped.clone();
     let module = lower_and_optimize(&ast, options.profile)?;
     let origin = options
         .custom_start_address
@@ -443,10 +448,24 @@ pub fn compile_with_options(
     // decides "yes extraram", we throw away the probe binary and run
     // the assemble step a second time with the extraram rewrite.
     if options.extraram {
-        return assemble_pass(&asm, &module, true, &options, ExtraRamDecision::ForcedOn);
+        return assemble_pass(
+            &asm,
+            &module,
+            true,
+            &options,
+            ExtraRamDecision::ForcedOn,
+            &skipped_statements,
+        );
     }
     if options.force_extraram_off {
-        return assemble_pass(&asm, &module, false, &options, ExtraRamDecision::ForcedOff);
+        return assemble_pass(
+            &asm,
+            &module,
+            false,
+            &options,
+            ExtraRamDecision::ForcedOff,
+            &skipped_statements,
+        );
     }
     // When the custom origin already sits at or above the BASIC-ROM
     // shadow ($A000-$BFFF), extraram can't add code space — that area
@@ -462,9 +481,17 @@ pub fn compile_with_options(
             false,
             &options,
             ExtraRamDecision::SkippedHighOrigin,
+            &skipped_statements,
         );
     }
-    let probe = assemble_pass(&asm, &module, false, &options, ExtraRamDecision::AutoOff)?;
+    let probe = assemble_pass(
+        &asm,
+        &module,
+        false,
+        &options,
+        ExtraRamDecision::AutoOff,
+        &skipped_statements,
+    )?;
     let probe_end = origin + probe.machine_code.len() as u32;
     if probe_end < AUTO_EXTRARAM_TRIGGER {
         return Ok(probe);
@@ -475,7 +502,14 @@ pub fn compile_with_options(
     // section itself overflows the \$9F00 ceiling, `verify_data_fits`
     // surfaces the error; there is no third pass that could rescue
     // it (extraram is the largest available memory layout).
-    assemble_pass(&asm, &module, true, &options, ExtraRamDecision::AutoOn)
+    assemble_pass(
+        &asm,
+        &module,
+        true,
+        &options,
+        ExtraRamDecision::AutoOn,
+        &skipped_statements,
+    )
 }
 
 /// Run the assemble + extraram-rewrite + reserved-range setup once
@@ -489,6 +523,7 @@ fn assemble_pass(
     extraram_on: bool,
     options: &CompileOptions,
     extraram_decision: ExtraRamDecision,
+    skipped_statements: &[crate::ast::SkippedStatement],
 ) -> Result<Compiled, CompileError> {
     let auto_ranges: Vec<(u16, u16)> = if options.auto_reserve {
         discover_reserved_ranges(module)
@@ -585,6 +620,7 @@ fn assemble_pass(
         auto_reserved: auto_ranges,
         manual_reserved: manual_ranges,
         effective_reserved: merged.clone(),
+        skipped_statements: skipped_statements.to_vec(),
     };
     Ok(Compiled {
         asm: final_asm,

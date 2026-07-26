@@ -80,6 +80,9 @@ assembly on the right.
 * Lenient parser mode tolerates the source-level typos that the C64
   interpreter catches only at runtime, so legacy programs with dead
   code still compile.
+* Keywords from other Commodore BASICs compile away with a warning
+  instead of failing the build, so a listing that picks its graphics
+  routines by machine (`IF BV=67 THEN SPRDEF ...`) compiles.
 
 ## Simons' BASIC support and credits
 

@@ -5,6 +5,18 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.10] - 2026-07-26
+
+### Fixed
+
+- A keyword from another Commodore BASIC compiles away with a warning
+  instead of failing the build, so listings that pick their graphics
+  routines by machine (`IF BV=67 THEN SPRDEF ...`) compile without
+  `--lenient-syntax`. Malformed syntax is still an error without it.
+- Dropping an unparseable statement inside `IF ... THEN` drops the rest
+  of the line with it, instead of leaving the trailing statements to
+  run unconditionally.
+
 ## [0.9.9] - 2026-07-26
 
 ### Fixed
@@ -194,6 +206,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.10]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.10
 [0.9.9]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.9
 [0.9.8]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.8
 [0.9.7]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.7

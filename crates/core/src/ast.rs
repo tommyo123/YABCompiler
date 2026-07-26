@@ -10,9 +10,22 @@
 //! Codegen falls back to a clear "unsupported" error for variants it
 //! hasn't learned yet, so partial coverage is honest rather than silent.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Program {
     pub lines: Vec<Line>,
+    /// Statements the parser could not translate and compiled away.
+    pub skipped: Vec<SkippedStatement>,
+}
+
+/// One statement dropped during parsing, for the caller to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkippedStatement {
+    pub line: u16,
+    /// The token the parser doesn't implement.
+    pub token: u8,
+    /// True when the statement sat in a conditional's body, so the
+    /// whole `IF ... THEN ...` went with it.
+    pub whole_conditional: bool,
 }
 
 #[derive(Debug, Clone)]
