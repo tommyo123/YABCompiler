@@ -9954,7 +9954,15 @@ fn resolve_bare_next_stmt(stmt: &mut Stmt, for_stack: &mut Vec<VarName>) {
                 }
             }
         }
-        Stmt::If { then, .. } => resolve_bare_next_then(then, for_stack),
+        Stmt::If { then, .. } => {
+            // Same snapshot discipline as IfElse: a NEXT under a
+            // condition only closes the FOR when the condition holds,
+            // so the fall-through path still has it open and its own
+            // `NEXT` must still resolve to that loop variable.
+            let snapshot = for_stack.clone();
+            resolve_bare_next_then(then, for_stack);
+            *for_stack = snapshot;
+        }
         Stmt::IfElse {
             then, else_then, ..
         } => {

@@ -1,0 +1,6 @@
+10 C$="AB":N=4
+20 PRINT "1";"2";STR$(N)
+30 PRINT "-"
+40 PRINT "1";C$;N
+50 PRINT "-"
+60 END

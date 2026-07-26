@@ -5,6 +5,29 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-07-26
+
+### Fixed
+
+- `END` reached while a `GOSUB` is still open ends the program instead
+  of returning to the caller and running on.
+- `A(i) = FN f(...)` stores to `A(i)`. The function body's own array
+  indexing no longer overwrites the destination address.
+- A `DEF FN` body is emitted without inheriting the caller's
+  ARRAY_ADDR / FAC / runtime-`DIM` state, so a repeated array
+  reference such as `DEF FN F(X) = A(X)*2+A(X)` reads the right
+  element.
+- `PRINT` with three or more items ending on a non-literal
+  (`PRINT "a";"b";STR$(N)`) emits its trailing newline again.
+- A float comparison no longer reuses a stale FAC value, so chains
+  like `IF X>PX OR Y>PY` with equal bounds evaluate both sides.
+- Every `GOSUB` leaves a marker on the runtime FOR-stack when that
+  stack is in use, matching what `RETURN` unwinds. A `GOSUB` to a
+  subroutine without a `FOR` no longer drops the caller's loop frames.
+- A `NEXT` inside `IF ... THEN` no longer closes the loop for the
+  fall-through path, so a later bare `NEXT` still binds to that loop
+  variable.
+
 ## [0.9.8] - 2026-06-07
 
 ### Fixed
@@ -171,6 +194,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.9]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.9
 [0.9.8]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.8
 [0.9.7]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.7
 [0.9.6]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.6

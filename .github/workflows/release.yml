@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version number (e.g., 0.9.8)'
+        description: 'Version number (e.g., 0.9.9)'
         required: true
-        default: '0.9.8'
+        default: '0.9.9'
       create_release:
         description: 'Create GitHub release?'
         required: true
@@ -44,7 +44,7 @@ jobs:
           if ($fullVersion -match '^(\d+\.\d+\.\d+)') {
             $wixVersion = $matches[1] + '.0'
           } else {
-            $wixVersion = '0.9.8.0'
+            $wixVersion = '0.9.9.0'
           }
 
           echo "VERSION=$fullVersion" >> $env:GITHUB_ENV

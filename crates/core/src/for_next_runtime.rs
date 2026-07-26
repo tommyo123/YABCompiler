@@ -130,9 +130,16 @@ pub fn analyze(module: &Module) -> OrphanAnalysis {
     }
 
     // Conservative: every RETURN participates when any runtime GOSUB
-    // exists.
+    // exists. Push and walk have to stay symmetric — a RETURN walks
+    // the stack down to the first 0 marker, so every GOSUB must leave
+    // one, not just the ones whose subroutine holds a runtime FOR.
+    // Otherwise `GOSUB <sub with no FOR>` inside a runtime FOR body
+    // returns through a walk that eats the live FOR frames instead.
     let _ = (&static_pairs,);
     if !analysis.runtime_gosubs.is_empty() {
+        for g in &all_gosubs {
+            analysis.runtime_gosubs.insert(g.clone());
+        }
         for r in &all_returns {
             analysis.runtime_returns.insert(r.clone());
         }

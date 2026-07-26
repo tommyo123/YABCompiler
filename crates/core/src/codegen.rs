@@ -715,6 +715,10 @@ struct Codegen {
     /// and DATA pointer back to startup state and jumps to the first
     /// line. Also pulls in `__MEMZERO` for clearing arrays.
     used_run: bool,
+    /// True iff the prelude snapshots the SYS-entry stack pointer into
+    /// `__SAVED_SP`. `RUN` and `END` both roll the stack back to it so
+    /// they leave a clean frame for the BASIC-side return.
+    used_saved_sp: bool,
     /// True iff any `CLR` statement was emitted. Pulls in the
     /// `__STATE_RESET` helper (also reused by RUN's restart path).
     used_state_reset: bool,
@@ -1385,6 +1389,7 @@ impl Codegen {
             used_lastvar_str: false,
             used_gc: false,
             used_run: false,
+            used_saved_sp: false,
             used_state_reset: false,
             used_dyn_step: false,
             used_array_int_tmp: false,
@@ -1504,6 +1509,28 @@ impl Codegen {
 
     fn invalidate_array_addr_cache(&mut self) {
         self.last_array_addr = None;
+    }
+
+    /// Roll the stack back to the depth it had at SYS-entry, so the
+    /// `RTS` that follows returns to BASIC. Emitted before every program
+    /// exit; a no-op for programs with no GOSUB, where the stack is
+    /// balanced anyway and the snapshot is never taken.
+    fn emit_restore_saved_sp(&mut self) {
+        if self.used_saved_sp {
+            writeln!(self.code, "    LDX __SAVED_SP").unwrap();
+            writeln!(self.code, "    TXS").unwrap();
+        }
+    }
+
+    /// Drop every "a previous instruction already left this here" fact.
+    /// Used at the head of a code region that is entered by JSR from
+    /// call sites the emitter has no view of — a `DEF FN` body, whose
+    /// caller may hold anything in ARRAY_ADDR ($FD/$FE) and FAC1, and
+    /// may have reached the call without passing the runtime `DIM`.
+    fn reset_entry_caches(&mut self) {
+        self.last_array_addr = None;
+        self.fac_cache.clear();
+        self.runtime_array_base_validated.clear();
     }
 
     fn invalidate_fac_cache(&mut self) {
@@ -2546,6 +2573,14 @@ impl Codegen {
             // re-pointed at __EMPTY_STR. Force the heap-init prelude
             // even on programs that don't otherwise touch the heap.
             self.heap_init_needed = true;
+        }
+        // GOSUB compiles to JSR, so a program can reach END with return
+        // addresses still on the stack (`100 IF X THEN 900` where line
+        // 900 ENDs, called from a subroutine). A bare RTS there pops the
+        // GOSUB frame and resumes the caller instead of ending, so END
+        // rolls the stack back to this snapshot first.
+        if self.used_run || scan_module_uses_gosub(module) {
+            self.used_saved_sp = true;
             writeln!(self.code, "    TSX").unwrap();
             writeln!(self.code, "    STX __SAVED_SP").unwrap();
             writeln!(self.code).unwrap();
@@ -2734,6 +2769,7 @@ impl Codegen {
             if self.used_tsb_irq {
                 writeln!(self.code, "    JSR __TSB_IRQ_UNINSTALL").unwrap();
             }
+            self.emit_restore_saved_sp();
             writeln!(self.code, "    RTS").unwrap();
         }
         Ok(())
@@ -2754,10 +2790,15 @@ impl Codegen {
         let saved_id = self.next_id;
         for name in self.def_fns_order.clone() {
             let info = self.def_fns[&name].clone();
+            self.reset_entry_caches();
             let _ = self.emit_expr_to_fac(&info.body);
         }
         self.code = saved_code;
         self.next_id = saved_id;
+        // The pre-walk's output is thrown away, but its cache state is
+        // not — clear it so the helper section below is emitted from the
+        // same starting point it would have been without the pre-walk.
+        self.reset_entry_caches();
 
         // Some shared helpers call other shared helpers, and a few
         // older emission paths still spell out the helper call inline.
@@ -9641,6 +9682,7 @@ impl Codegen {
             for name in self.def_fns_order.clone() {
                 let info = self.def_fns[&name].clone();
                 writeln!(self.code, "{}:", name.label()).unwrap();
+                self.reset_entry_caches();
                 self.emit_expr_to_fac(&info.body)?;
                 writeln!(self.code, "    RTS").unwrap();
             }
@@ -9954,10 +9996,10 @@ impl Codegen {
             writeln!(self.code, "__SBUF_TMP_LEN:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
-        if self.used_run {
-            // Snapshot of the 6502 stack pointer at SYS-entry. RUN
-            // restores SP to this so a clean END/RTS afterwards still
-            // returns to BASIC instead of falling off the stack.
+        if self.used_saved_sp {
+            // Snapshot of the 6502 stack pointer at SYS-entry. RUN and
+            // END restore SP to this so the following RTS returns to
+            // BASIC instead of to a pending GOSUB frame.
             writeln!(self.code, "__SAVED_SP:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
@@ -11364,6 +11406,7 @@ impl Codegen {
                 if self.used_tsb_irq {
                     writeln!(self.code, "    JSR __TSB_IRQ_UNINSTALL").unwrap();
                 }
+                self.emit_restore_saved_sp();
                 writeln!(self.code, "    RTS").unwrap();
             }
             Stmt::Stop => {
@@ -14821,14 +14864,15 @@ impl Codegen {
         // trip through the pool stay length-prefixed; merging just
         // makes the data block bigger by removing the per-piece JSR.
         let merged = merge_print_literals(items, newline);
-        let body = if merged.is_some() {
-            merged.as_ref().unwrap()
-        } else {
-            items
+        let body = match &merged {
+            Some((pieces, _)) => pieces,
+            None => items,
         };
-        // When we've absorbed CR into the last literal, the caller
-        // shouldn't emit the trailing newline path again.
-        let absorbed_newline = merged.is_some() && newline;
+        // Only skip the trailing newline path when the CR actually went
+        // into the last literal. Folding two literals also counts as a
+        // rewrite, but `PRINT "a";"b";STR$(N)` ends on a non-literal, so
+        // there was nothing for the CR to fuse into.
+        let absorbed_newline = matches!(merged, Some((_, true)));
         for item in body {
             match item {
                 PrintPiece::LiteralString(bytes) => {
@@ -19818,6 +19862,9 @@ impl Codegen {
                     self.emit_expr_to_fac(&info.body)?;
                 } else {
                     writeln!(self.code, "    JSR {}", name.label()).unwrap();
+                    // The body was emitted elsewhere; whatever address it
+                    // left in ARRAY_ADDR is unknown here.
+                    self.invalidate_array_addr_cache();
                 }
                 // Restore param slot — PLA preserves the FAC bytes
                 // ($61-$66) so the result is intact.
@@ -23672,6 +23719,11 @@ impl Codegen {
             writeln!(self.code, "    LDY #>{label}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", op_rom_addr(op)).unwrap();
         }
+        // FAC now holds the result, not the operand the caller just
+        // loaded. `emit_expr_to_fac` re-notes the whole binop after it
+        // returns; the compare paths that call this directly have
+        // nothing left worth caching.
+        self.invalidate_fac_cache();
     }
 
     /// Emit `FAC = FAC <op> <const>` via a per-const stub when the
@@ -23691,6 +23743,7 @@ impl Codegen {
             writeln!(self.code, "    LDY #>{label}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", op_rom_addr(op)).unwrap();
         }
+        self.invalidate_fac_cache();
     }
 
     /// Stash FAC into a temp slot. T0 is the hot one — the outermost
@@ -24262,6 +24315,34 @@ fn scan_module_uses_run(module: &ir::Module) -> bool {
         matches!(then, ThenIr::Stmts(inner) if stmts_have_run(inner))
     }
     module.lines.iter().any(|l| stmts_have_run(&l.stmts))
+}
+
+/// Whether any `GOSUB` (including the `ON x GOSUB` form, which lowers
+/// to the same statement) appears. GOSUB is the only construct that
+/// leaves a frame on the hardware stack across statements — the FOR
+/// bookkeeping lives in `__FOR_STACK` — so it decides whether a
+/// program can reach END with an unbalanced stack.
+fn scan_module_uses_gosub(module: &ir::Module) -> bool {
+    fn stmts_have(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            Stmt::GoSub { .. } => true,
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => stmts_have(inner),
+            Stmt::IfElse {
+                then, else_then, ..
+            } => then_has(then) || then_has(else_then),
+            Stmt::Rcomp { then, else_then } => {
+                then_has(then) || else_then.as_ref().is_some_and(then_has)
+            }
+            _ => false,
+        })
+    }
+    fn then_has(then: &ThenIr) -> bool {
+        matches!(then, ThenIr::Stmts(inner) if stmts_have(inner))
+    }
+    module.lines.iter().any(|l| stmts_have(&l.stmts))
 }
 
 fn scan_module_uses_on_key(module: &ir::Module) -> bool {
@@ -25162,9 +25243,13 @@ fn expr_contains_clobbering_array_ref(e: &Expr, lhs_name: &VarName, lhs_indices:
         Expr::Neg(inner) | Expr::Not(inner) => {
             expr_contains_clobbering_array_ref(inner, lhs_name, lhs_indices)
         }
-        Expr::Func1(_, arg) | Expr::FnCall(_, arg) => {
-            expr_contains_clobbering_array_ref(arg, lhs_name, lhs_indices)
-        }
+        Expr::Func1(_, arg) => expr_contains_clobbering_array_ref(arg, lhs_name, lhs_indices),
+        // A user function's body is not part of this expression tree —
+        // it can index any array, and its address computation lands in
+        // the same $FD/$FE the destination is parked in. `PF(X,0) =
+        // FN RF(X)` with `DEF FN RF(X) = ... R1(X)` was the report:
+        // the store went to R1(X) instead of PF(X,0).
+        Expr::FnCall(_, _) => true,
         Expr::Peek(addr) | Expr::MemPeek(addr) => {
             expr_contains_clobbering_array_ref(addr, lhs_name, lhs_indices)
         }
@@ -27403,10 +27488,13 @@ fn fac_op_stub_worth_it(count: u32) -> bool {
 /// literal, append CR ($0D) so the trailing newline is included in the
 /// __STR_PRINT call instead of an extra LDA+JSR pair.
 ///
-/// Returns `Some(merged_items)` only when at least one merge or CR
-/// fold actually happened. Returns `None` when there's nothing to do
-/// — emit_print stays on the original slice in that case.
-fn merge_print_literals(items: &[PrintPiece], newline: bool) -> Option<Vec<PrintPiece>> {
+/// Returns `Some((merged_items, cr_fused))` only when at least one
+/// merge or CR fold actually happened; `None` when there's nothing to
+/// do — emit_print stays on the original slice in that case. The
+/// `cr_fused` flag is what tells the caller whether it still owes the
+/// trailing newline: a merge alone doesn't fold the CR when the last
+/// piece isn't a literal.
+fn merge_print_literals(items: &[PrintPiece], newline: bool) -> Option<(Vec<PrintPiece>, bool)> {
     fn as_literal(p: &PrintPiece) -> Option<&[u8]> {
         match p {
             PrintPiece::LiteralString(b) => Some(b),
@@ -27433,13 +27521,15 @@ fn merge_print_literals(items: &[PrintPiece], newline: bool) -> Option<Vec<Print
         }
     }
     // CR-fusion: stick $0D on the trailing literal when newline was set.
-    if newline {
-        if let Some(PrintPiece::LiteralString(last)) = out.last_mut() {
-            last.push(0x0D);
-            changed = true;
-        }
+    let mut cr_fused = false;
+    if newline
+        && let Some(PrintPiece::LiteralString(last)) = out.last_mut()
+    {
+        last.push(0x0D);
+        changed = true;
+        cr_fused = true;
     }
-    if changed { Some(out) } else { None }
+    if changed { Some((out, cr_fused)) } else { None }
 }
 
 /// Choose which side of a Var-leaning binop should become the memory
