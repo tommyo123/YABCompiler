@@ -11505,9 +11505,15 @@ impl Codegen {
                 // iteration pops the current FOR frame (innermost when
                 // var is None).
                 for var in vars {
-                    if self.current_is_orphan_next(line_no) && self.for_stack.is_empty() {
-                        // NEXT with no static FOR partner — dispatch
-                        // through the runtime FOR-stack.
+                    if self.current_is_orphan_next(line_no) {
+                        // Dispatch through the runtime FOR-stack. When
+                        // this NEXT also closes a lexical FOR, retire
+                        // that frame without emitting its inline tail —
+                        // the loop runs from the handler the FOR
+                        // registered instead.
+                        if let Some(frame) = self.for_stack.pop() {
+                            self.last_popped_for = Some(frame);
+                        }
                         self.emit_orphan_next_dispatch();
                     } else {
                         self.emit_next(var.as_ref(), line_no)?;

@@ -600,6 +600,12 @@ fn assemble_pass(
             }
         })?;
     }
+    verify_data_pool_unsplit(&merged, |name| assembler.lookup(name)).map_err(|message| {
+        CompileError::Assemble {
+            message,
+            asm: Some(final_asm.clone()),
+        }
+    })?;
 
     let (prg_bytes, start_address) = if let Some(addr) = options.custom_start_address {
         (pack::pack_raw(addr, &machine_code), addr)
@@ -655,15 +661,22 @@ fn relocate_data_past_reservations(asm: &str, merged: &[(u16, u16)]) -> String {
     // Find the DATA pool: from the section comment (or the bare
     // label) up to the next blank-line + new section comment, or up
     // to the next top-level label that isn't a `.byte` continuation.
-    let header = "; --- DATA pool ---\n__DATA:\n";
-    let Some(start) = asm.find(header) else {
+    // The section comment names the pool layout, so anchor on the
+    // label and pick the comment up only when it sits directly above.
+    let header = "__DATA:\n";
+    let Some(label_at) = asm.find(&format!("\n{header}")).map(|p| p + 1) else {
         return asm.to_string();
     };
+    let start = asm[..label_at]
+        .rfind("\n; --- DATA pool")
+        .map(|p| p + 1)
+        .filter(|&p| asm[p..label_at].lines().count() == 1)
+        .unwrap_or(label_at);
     // The pool ends at the next blank line or section comment after
     // the contiguous `.byte` lines under `__DATA:`. `__DATA_LINE_<n>:`
     // labels (added for `RESET <line>`) sit between byte runs and
     // need to count as pool continuation, not as the next section.
-    let body_start = start + header.len();
+    let body_start = label_at + header.len();
     let mut end = body_start;
     for line in asm[body_start..].split_inclusive('\n') {
         let trimmed = line.trim_start();
@@ -757,12 +770,37 @@ const AUTO_RESERVE_HI: u16 = 0xCFFF;
 /// Returns merged inclusive `(start, end)` ranges; close-together
 /// hits get coalesced so we don't waste reserved bytes on dozens of
 /// tiny one-byte islands (see `merge_reserved_ranges`).
+/// Fail when a reserved range lands inside the DATA pool. The
+/// assembler bridges reservations with a `JMP`, which is fine for code
+/// but not for a pool `READ` walks byte by byte — the bridge would be
+/// read as a data value and every later `READ` would return garbage.
+fn verify_data_pool_unsplit<F>(reserved: &[(u16, u16)], lookup: F) -> Result<(), String>
+where
+    F: Fn(&str) -> Option<u16>,
+{
+    let (Some(start), Some(end)) = (lookup("__DATA"), lookup("__DATA_HOISTED_END")) else {
+        return Ok(());
+    };
+    for (lo, hi) in reserved {
+        if *lo < end && *hi >= start {
+            return Err(format!(
+                "reserved range ${lo:04X}-${hi:04X} falls inside the DATA pool \
+                 (${start:04X}-${end:04X}); READ needs the pool in one piece. \
+                 Move the reservation, or compile with --no-auto-reserve if it \
+                 was discovered automatically."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn discover_reserved_ranges(module: &ir::Module) -> Vec<(u16, u16)> {
     use std::collections::{BTreeSet, HashMap};
     let mut points: BTreeSet<u16> = BTreeSet::new();
     let mut ranges: Vec<(u16, u16)> = Vec::new();
     let mut for_stack: Vec<(crate::ast::VarName, i32, i32)> = Vec::new();
     let mut let_ranges: HashMap<crate::ast::VarName, (i32, i32)> = HashMap::new();
+    let d018_is_charset = d018_names_a_charset(module);
     for line in &module.lines {
         for stmt in &line.stmts {
             collect_reserved_in_stmt(
@@ -771,6 +809,7 @@ fn discover_reserved_ranges(module: &ir::Module) -> Vec<(u16, u16)> {
                 &mut ranges,
                 &mut for_stack,
                 &mut let_ranges,
+                d018_is_charset,
             );
         }
     }
@@ -896,6 +935,7 @@ fn collect_reserved_in_stmt(
     ranges: &mut Vec<(u16, u16)>,
     for_stack: &mut Vec<(crate::ast::VarName, i32, i32)>,
     let_ranges: &mut std::collections::HashMap<crate::ast::VarName, (i32, i32)>,
+    d018_is_charset: bool,
 ) {
     use ir::Stmt;
     match stmt {
@@ -907,7 +947,7 @@ fn collect_reserved_in_stmt(
             // and reserve `[min, max]` if the result fits the
             // auto-reserve window.
             note_addr_for_range(addr, for_stack, let_ranges, ranges);
-            note_d018_charset_window(addr, value, ranges);
+            note_d018_charset_window(addr, value, ranges, d018_is_charset);
             note_peek_in_expr(value, points);
         }
         Stmt::Dpoke { addr, value } => {
@@ -967,7 +1007,14 @@ fn collect_reserved_in_stmt(
             note_peek_in_expr(cond, points);
             if let ir::ThenIr::Stmts(inner) = then {
                 for s in inner {
-                    collect_reserved_in_stmt(s, points, ranges, for_stack, let_ranges);
+                    collect_reserved_in_stmt(
+                        s,
+                        points,
+                        ranges,
+                        for_stack,
+                        let_ranges,
+                        d018_is_charset,
+                    );
                 }
             }
         }
@@ -1188,7 +1235,18 @@ fn as_i32_literal(e: &ir::Expr) -> Option<i32> {
 /// Skips ROM character bases ($1000 / $1800) — those are masked
 /// anyway when the VIC reads from the ROM area, and reserving them
 /// would conflict with low-RAM code emission.
-fn note_d018_charset_window(addr: &ir::Expr, value: &ir::Expr, ranges: &mut Vec<(u16, u16)>) {
+///
+/// `d018_is_charset` is false when the program makes those bits mean
+/// something else — see [`d018_names_a_charset`].
+fn note_d018_charset_window(
+    addr: &ir::Expr,
+    value: &ir::Expr,
+    ranges: &mut Vec<(u16, u16)>,
+    d018_is_charset: bool,
+) {
+    if !d018_is_charset {
+        return;
+    }
     // The address check ignores the auto-reserve window — $D018 is
     // outside it (I/O lives at $D000+, which `addr_literal_in_window`
     // intentionally rejects), but the WINDOW we compute from the
@@ -1216,6 +1274,45 @@ fn note_d018_charset_window(addr: &ir::Expr, value: &ir::Expr, ranges: &mut Vec<
     if base >= AUTO_RESERVE_LO && end <= AUTO_RESERVE_HI {
         ranges.push((base, end));
     }
+}
+
+/// Whether the `$D018` bits still name a character set at a known
+/// address. Two things break that reading, and the program tells us
+/// about both:
+///
+/// * Bitmap mode (`$D011` bit 5) repurposes CB13 as the base of an
+///   8 KB bitmap — the 2 KB charset window doesn't exist.
+/// * `$DD00` selects the VIC bank, and `$D018` is relative to it. A
+///   program that moves the bank puts the charset somewhere this
+///   heuristic has no way to compute.
+///
+/// MAD's `POKE V+17,59 : POKE V+24,24` with the bank moved to $4000
+/// was the report: `$D018` read as a charset at `$2000`, the range was
+/// reserved, and the DATA pool — which really lives there — was split
+/// around it.
+fn d018_names_a_charset(module: &ir::Module) -> bool {
+    fn breaks_it(stmt: &ir::Stmt) -> bool {
+        use ir::Stmt;
+        match stmt {
+            Stmt::Poke { addr, value } => match literal_addr(addr) {
+                Some(0xDD00) | Some(0xDD02) => true,
+                Some(0xD011) => as_i32_literal(value).is_some_and(|v| v & 0x20 != 0),
+                _ => false,
+            },
+            Stmt::If { then, .. } => then_breaks_it(then),
+            Stmt::IfElse {
+                then, else_then, ..
+            } => then_breaks_it(then) || then_breaks_it(else_then),
+            Stmt::Rcomp { then, else_then } => {
+                then_breaks_it(then) || else_then.as_ref().is_some_and(then_breaks_it)
+            }
+            _ => false,
+        }
+    }
+    fn then_breaks_it(then: &ir::ThenIr) -> bool {
+        matches!(then, ir::ThenIr::Stmts(inner) if inner.iter().any(breaks_it))
+    }
+    !module.lines.iter().any(|l| l.stmts.iter().any(breaks_it))
 }
 
 fn note_addr_literal(addr: &ir::Expr, points: &mut std::collections::BTreeSet<u16>) {
@@ -1804,6 +1901,88 @@ mod tests {
              $1000-$17FF (VIC reads it from ROM, not RAM); \
              got {ranges:?}"
         );
+    }
+
+    /// Tokenise `body` as line 10 of a one-line program.
+    fn one_line_prg(body: &[u8]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = vec![0x01, 0x08];
+        let next_link: u16 = 0x080B + body.len() as u16 + 5;
+        bytes.extend_from_slice(&next_link.to_le_bytes());
+        bytes.extend_from_slice(&[0x0A, 0x00]);
+        bytes.extend_from_slice(body);
+        bytes.push(0x00);
+        bytes.extend_from_slice(&[0x00, 0x00]);
+        bytes
+    }
+
+    fn reserved_for(body: &[u8]) -> Vec<(u16, u16)> {
+        let bytes = one_line_prg(body);
+        let prg = crate::prg::Program::parse(&bytes).expect("prg parses");
+        let ast = crate::parse::program(&prg).expect("source parses");
+        let module = lower_and_optimize(&ast, Profile::default()).expect("ir lowers");
+        discover_reserved_ranges(&module)
+    }
+
+    /// Regression (MAD): in bitmap mode `$D018`'s CB13 bit picks an
+    /// 8 KB bitmap base relative to the VIC bank, not a 2 KB charset.
+    /// Reserving the charset window anyway put a hole at $2000 that
+    /// the DATA pool had to be bridged around.
+    #[test]
+    fn auto_reserve_skips_d018_window_in_bitmap_mode() {
+        // 10 POKE 53265,59 : POKE 53272,24
+        let plain = reserved_for(b"\x97 53272,24");
+        assert!(
+            plain.iter().any(|(s, e)| *s == 0x2000 && *e == 0x27FF),
+            "text mode still reserves the charset window; got {plain:?}"
+        );
+        let bitmap = reserved_for(b"\x97 53265,59:\x97 53272,24");
+        assert!(
+            !bitmap.iter().any(|(s, _)| *s == 0x2000),
+            "bitmap mode must not reserve a charset window; got {bitmap:?}"
+        );
+    }
+
+    /// Same, for a program that moves the VIC bank — `$D018` is
+    /// relative to it, so the absolute address is unknowable here.
+    #[test]
+    fn auto_reserve_skips_d018_window_when_vic_bank_moves() {
+        let moved = reserved_for(b"\x97 56576,2:\x97 53272,24");
+        assert!(
+            !moved.iter().any(|(s, _)| *s == 0x2000),
+            "a moved VIC bank must not reserve a charset window; got {moved:?}"
+        );
+    }
+
+    /// Regression: the hoist matched a section header that no longer
+    /// existed once the layout note was added to it, so it silently
+    /// did nothing and pools were left to be bridged in place.
+    #[test]
+    fn data_pool_is_hoisted_ahead_of_reservations() {
+        let asm = "*=$080D\n    RTS\n\n; --- DATA pool (ASCII length-prefixed) ---\n\
+                   __DATA:\n    .byte $01,$31  ; #0\n\n; --- next ---\n";
+        let out = relocate_data_past_reservations(asm, &[(0x0900, 0x09FF)]);
+        let jmp = out.find("JMP __DATA_HOISTED_END").expect("bridge emitted");
+        let pool = out.find("__DATA:").expect("pool kept");
+        let rts = out.find("    RTS").expect("code kept");
+        assert!(
+            jmp < pool && pool < rts,
+            "pool moved ahead of the code:\n{out}"
+        );
+    }
+
+    /// A reservation the pool can't be moved clear of has to be an
+    /// error: the assembler's JMP bridge would be read as a value.
+    #[test]
+    fn data_pool_split_by_a_reservation_is_rejected() {
+        let lookup = |name: &str| match name {
+            "__DATA" => Some(0x0810u16),
+            "__DATA_HOISTED_END" => Some(0x2D58u16),
+            _ => None,
+        };
+        assert!(verify_data_pool_unsplit(&[(0x4000, 0x4FFF)], lookup).is_ok());
+        let err = verify_data_pool_unsplit(&[(0x2000, 0x27FF)], lookup)
+            .expect_err("overlap must be rejected");
+        assert!(err.contains("$2000-$27FF"), "names the range: {err}");
     }
 }
 

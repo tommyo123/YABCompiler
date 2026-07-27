@@ -14,7 +14,7 @@ default-members = [
 [workspace.package]
 # Keep in sync with `crates/core/src/config.rs::VERSION` (the runtime
 # source of truth surfaced in the About box and CLI banner).
-version = "0.9.10"
+version = "0.9.11"
 edition = "2024"
 authors = ["Tommy Olsen"]
 license = "MIT"

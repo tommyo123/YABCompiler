@@ -89,9 +89,9 @@ cargo build --release -p yabcompiler-gui -p yabcompiler-cli
 
 $wix = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
 & "$wix\candle.exe" -nologo -ext WixUIExtension -ext WixUtilExtension `
-  -dCargoTargetBinDir=target\release -dVersion=0.9.10.0 wix\main.wxs
+  -dCargoTargetBinDir=target\release -dVersion=0.9.11.0 wix\main.wxs
 & "$wix\light.exe" -nologo -ext WixUIExtension -ext WixUtilExtension -sval `
-  -out yabcompiler-0.9.10-x86_64-windows.msi main.wixobj
+  -out yabcompiler-0.9.11-x86_64-windows.msi main.wixobj
 ```
 
 `-dVersion` takes a four-part `MAJOR.MINOR.PATCH.0` number. Either way

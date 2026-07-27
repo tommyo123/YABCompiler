@@ -71,6 +71,15 @@ impl OrphanAnalysis {
 pub fn analyze(module: &Module) -> OrphanAnalysis {
     let mut analysis = OrphanAnalysis::default();
     let static_pairs = static_pair_walk(module, &mut analysis);
+    let goto_targets_in_for_body = collect_goto_targets_by_enclosing_for(module);
+    // Source-order pairing is a lexical guess. A `GOTO` that leaves one
+    // loop and lands on another loop's `NEXT` breaks it — v2 resolves
+    // that `NEXT` against the runtime stack, so it can't stay inline.
+    for id in cross_reached_nexts(module, &static_pairs, &goto_targets_in_for_body) {
+        if !analysis.orphan_nexts.contains(&id) {
+            analysis.orphan_nexts.push(id);
+        }
+    }
 
     if analysis.orphan_nexts.is_empty() {
         // Common path — no orphans, nothing else to compute.
@@ -80,7 +89,6 @@ pub fn analyze(module: &Module) -> OrphanAnalysis {
     let line_index = build_line_index(module);
     let all_gosubs = collect_all(module, |s| matches!(s, Stmt::GoSub { .. }));
     let all_returns = collect_all(module, |s| matches!(s, Stmt::Return));
-    let goto_targets_in_for_body = collect_goto_targets_by_enclosing_for(module);
 
     // A FOR is runtime-mode if some line inside its lexical body can
     // reach an orphan NEXT via GOTO or fall-through.
@@ -149,6 +157,41 @@ pub fn analyze(module: &Module) -> OrphanAnalysis {
 }
 
 // --- helpers ---------------------------------------------------------------
+
+/// `NEXT`s that some FOR body branches to but that are not that FOR's
+/// own lexical partner. `forty.bas` is the shape: two loops that each
+/// `GOTO` into the other's `NEXT`, so source order pairs them the wrong
+/// way round and both loops would run off their neighbour's counter.
+fn cross_reached_nexts(
+    module: &Module,
+    pairs: &[(StmtId, StmtId)],
+    bodies: &HashMap<StmtId, ForBodyInfo>,
+) -> Vec<StmtId> {
+    let partner_line: HashMap<&StmtId, u16> = pairs.iter().map(|(f, n)| (f, n.line_no)).collect();
+    let nexts = collect_all(module, |s| matches!(s, Stmt::Next { .. }));
+    let mut out: Vec<StmtId> = Vec::new();
+    for (for_id, info) in bodies {
+        let partner = partner_line.get(for_id).copied();
+        for target in &info.goto_targets {
+            if Some(*target) == partner {
+                continue;
+            }
+            for n in nexts.iter().filter(|n| n.line_no == *target) {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+        }
+    }
+    // `bodies` is a HashMap; sort so the output doesn't depend on its
+    // iteration order.
+    out.sort_by(|a, b| {
+        a.line_idx
+            .cmp(&b.line_idx)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
+}
 
 /// Walk in source order with a simulated FOR-stack; unmatched NEXTs
 /// land in `analysis.orphan_nexts`.

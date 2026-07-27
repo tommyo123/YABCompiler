@@ -5,6 +5,20 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.11] - 2026-07-27
+
+### Fixed
+
+- A `NEXT` that another loop's body jumps to no longer stays paired
+  with the `FOR` above it in source order.
+- The DATA pool is hoisted ahead of reserved ranges again. A
+  reservation inside the pool left an assembler `JMP` bridge where
+  `READ` expected a value; one that still overlaps is now a build
+  error.
+- Auto-reserve no longer claims a `$D018` character window in bitmap
+  mode or when the VIC bank has moved — the bits don't name a charset
+  there.
+
 ## [0.9.10] - 2026-07-26
 
 ### Fixed
@@ -206,6 +220,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[0.9.11]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.11
 [0.9.10]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.10
 [0.9.9]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.9
 [0.9.8]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.8
