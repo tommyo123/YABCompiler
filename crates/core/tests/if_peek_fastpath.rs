@@ -23,7 +23,6 @@ fn text_output(src: &str) -> String {
     let prg = common::compile_source(src).expect("compiles");
     common::run_clean(&prg).unwrap_or_else(|| panic!("reaches a clean exit:\n{src}"))
 }
-
 fn insns(asm: &str) -> Vec<String> {
     asm.lines()
         .map(str::trim)
@@ -38,7 +37,6 @@ fn insns(asm: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
-
 fn insn_matches(actual: &str, want: &str) -> bool {
     let mut a = actual.split_whitespace();
     let mut w = want.split_whitespace();
@@ -70,7 +68,6 @@ fn assert_seq(asm: &str, seq: &[&str]) {
 fn assert_no(asm: &str, needle: &str) {
     assert!(!asm.contains(needle), "expected no {needle:?} in\n{asm}");
 }
-
 #[test]
 fn literal_address_vs_literal_byte_still_reaches_the_byte_compare() {
     let asm = asm_of("10 if peek(197)=13 then print \"a\"\n");
@@ -83,7 +80,6 @@ fn literal_address_vs_literal_byte_still_reaches_the_byte_compare() {
     assert_no(&asm, "__PEEK_INT");
     assert_no(&asm, "__IF_PEEK_KEEP");
 }
-
 #[test]
 fn let_form_indexed_peek_still_reaches_abs_x() {
     let asm = asm_of("10 w=1024\n20 for x=0 to 20:c=peek(w+x):next\n");
@@ -93,7 +89,6 @@ fn let_form_indexed_peek_still_reaches_abs_x() {
     );
     assert_no(&asm, "__PEEK_INT");
     assert_no(&asm, "LDA $FFFF");
-
     let asm = asm_of(
         "5 w=1024\n\
          10 for x=0 to 238:poke w+x,238-x:next x\n\
@@ -176,7 +171,6 @@ fn two_literal_peeks_reach_the_byte_compare() {
     assert_seq(&asm, &["LDA $D020", "CMP $D021", "BCS"]);
     assert_no(&asm, "__PEEK_INT");
 }
-
 const TWO_PEEKS_SAME_SLOT: &str = "\
 10 w=49152
 20 for x=0 to 20:poke w+x,20-x:next
@@ -343,14 +337,12 @@ fn peek_vs_wide_var_matches_the_rom() {
     // 32 is neither 288 nor -224; it is less than one and more than the other.
     assert_eq!(text_output(WIDE_VAR), "LT-OK\nGT-OK\nDONE\n");
 }
-
 #[test]
 fn zero_page_base_does_not_reach_the_indexed_compare() {
     let src = "10 poke 828,32\n20 x=peek(828)\n30 if peek(240+x)=77 then print \"hit\"\n";
     let asm = asm_of(src);
     assert_no(&asm, "LDA $00F0,X");
     assert_no(&asm, "CMP $00F0,X");
-
     let asm = asm_of("10 x=peek(828)\n20 if peek(x)=77 then print \"hit\"\n");
     assert_seq(&asm, &["LDX VI_X", "LDA $0000,X", "CMP #$4D", "BNE"]);
 }
@@ -375,7 +367,6 @@ fn and_or_chains_lower_each_leaf_to_a_byte_compare() {
     assert_seq(&asm, &["LDA $C001", "CMP #$14", "BNE"]);
     assert_no(&asm, "__PEEK_INT");
 }
-
 #[test]
 fn and_of_indexed_peeks_still_does_not_short_circuit() {
     let asm = asm_of(

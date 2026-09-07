@@ -988,7 +988,6 @@ S0:
         assert!(lda_pos > code_start, "LDA below CODE_START:\n{out}");
         assert!(out.contains("__EXRAM_DATA_END:"));
     }
-
     #[test]
     fn vars_anchors_hoist_with_their_slots() {
         let input = "\
@@ -1007,9 +1006,7 @@ __VARS_END:
 __HEAP_BOTTOM:
 ";
         let out = inject(input);
-        let code_start = out
-            .find("__EXRAM_CODE_START:")
-            .expect("CODE_START boundary");
+        let code_start = out.find("__EXRAM_CODE_START:").expect("CODE_START boundary");
         let start = out.find("__VARS_START:").expect("__VARS_START present");
         let end = out.find("__VARS_END:").expect("__VARS_END present");
         assert!(start < code_start, "__VARS_START hoisted:\n{out}");
@@ -1021,7 +1018,6 @@ __HEAP_BOTTOM:
             "anchors must still bracket every slot:\n{out}"
         );
     }
-
     #[test]
     fn data_pool_anchors_hoist_with_their_pool() {
         let input = "\
@@ -1037,9 +1033,7 @@ __DATA_END:
 __HEAP_BOTTOM:
 ";
         let out = inject(input);
-        let code_start = out
-            .find("__EXRAM_CODE_START:")
-            .expect("CODE_START boundary");
+        let code_start = out.find("__EXRAM_CODE_START:").expect("CODE_START boundary");
         for anchor in ["__DATA:", "__DATA_LINE_10:", "__DATA_END:"] {
             let pos = out
                 .find(anchor)

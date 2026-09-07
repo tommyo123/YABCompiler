@@ -337,7 +337,6 @@ mod tests {
         assert_eq!(chrout_seq(b"AB\x12\x05").mem.ram[0xD3], 2);
         assert_eq!(chrout_seq(b"AB\x92\x1c\x9e\x0e").mem.ram[0xD3], 2);
     }
-
     #[test]
     fn cursor_tracking_does_not_disturb_the_transcript() {
         let text = b"HI\r\x1D\x1DTHERE\x12!";
@@ -407,7 +406,6 @@ mod tests {
         );
         assert!(!r.error_output.is_empty());
     }
-
     #[test]
     fn clean_program_reports_no_error() {
         let mut prg = vec![0x00, 0xC0];

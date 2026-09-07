@@ -63,12 +63,7 @@ impl OrphanAnalysis {
 
     /// `(handler_id, var_id)` for the runtime-mode `FOR` at this location, or `None` for static
     /// `FOR`s that keep the inline fast path.
-    pub fn runtime_for_id(
-        &self,
-        line_no: u16,
-        line_idx: usize,
-        path: &[usize],
-    ) -> Option<(u8, u8)> {
+    pub fn runtime_for_id(&self, line_no: u16, line_idx: usize, path: &[usize]) -> Option<(u8, u8)> {
         let key = StmtId {
             line_no,
             line_idx,
@@ -142,11 +137,10 @@ impl OrphanAnalysis {
     }
 
     pub fn is_orphan_next(&self, line_no: u16, line_idx: usize, path: &[usize]) -> bool {
-        self.orphan_nexts
-            .iter()
-            .any(|s| s.line_no == line_no && s.line_idx == line_idx && s.path == path)
+        self.orphan_nexts.iter().any(|s| {
+            s.line_no == line_no && s.line_idx == line_idx && s.path == path
+        })
     }
-
     pub fn is_conditional_for(&self, line_no: u16, line_idx: usize, path: &[usize]) -> bool {
         let key = StmtId {
             line_no,
@@ -553,10 +547,10 @@ fn for_body_crossings(module: &Module, pairs: &[(StmtId, StmtId)]) -> Vec<(StmtI
             let Some(&target_idx) = line_index.get(&edge.target) else {
                 continue;
             };
-            let target_inside =
-                target_idx > for_id.line_idx && end.is_none_or(|n| target_idx <= n.line_idx);
-            let src_inside =
-                !before_or_at(&edge.src, for_id) && end.is_none_or(|n| before_or_at(&edge.src, n));
+            let target_inside = target_idx > for_id.line_idx
+                && end.is_none_or(|n| target_idx <= n.line_idx);
+            let src_inside = !before_or_at(&edge.src, for_id)
+                && end.is_none_or(|n| before_or_at(&edge.src, n));
             cross.leaves |= src_inside && !target_inside && !edge.gosub;
             cross.enters |= !src_inside && target_inside;
             if cross.leaves && cross.enters {
@@ -676,21 +670,23 @@ fn assign_var_ids(module: &Module) -> (HashMap<VarName, u8>, bool) {
     let mut ids: HashMap<VarName, u8> = HashMap::new();
     let mut next: u8 = 1;
     let mut exhausted = false;
-    let add =
-        |var: &VarName, ids: &mut HashMap<VarName, u8>, next: &mut u8, exhausted: &mut bool| {
-            if ids.contains_key(var) {
-                return;
-            }
-            if *exhausted {
-                return;
-            }
-            ids.insert(var.clone(), *next);
+    let add = |var: &VarName,
+               ids: &mut HashMap<VarName, u8>,
+               next: &mut u8,
+               exhausted: &mut bool| {
+        if ids.contains_key(var) {
+            return;
+        }
+        if *exhausted {
+            return;
+        }
+        ids.insert(var.clone(), *next);
             // 0 is the GOSUB marker's var slot, so 255 distinct names is the ceiling.
             match next.checked_add(1) {
-                Some(n) => *next = n,
-                None => *exhausted = true,
-            }
-        };
+            Some(n) => *next = n,
+            None => *exhausted = true,
+        }
+    };
     for id in collect_all(module, |s| {
         matches!(s, Stmt::For { .. } | Stmt::Next { .. })
     }) {
@@ -808,7 +804,10 @@ pub(crate) fn gosub_targets_needing_marker(
         let Some(start) = module.lines.iter().position(|l| l.number == target) else {
             continue;
         };
-        if subroutine_region(&succ, start).iter().any(|&i| has_next[i]) {
+        if subroutine_region(&succ, start)
+            .iter()
+            .any(|&i| has_next[i])
+        {
             out.insert(target);
         }
     }
@@ -1188,7 +1187,9 @@ fn collect_branch_edges(module: &Module) -> HashSet<(u16, u16)> {
 /// Does a branch that *lands on this line* necessarily re-run the `FOR` header this `NEXT` is
 /// paired with?
 fn header_reruns_on_line_entry(next_id: &StmtId, for_id: &StmtId) -> bool {
-    for_id.line_idx == next_id.line_idx && for_id.path.len() == 1 && for_id.path < next_id.path
+    for_id.line_idx == next_id.line_idx
+        && for_id.path.len() == 1
+        && for_id.path < next_id.path
 }
 
 /// `NEXT`s that some FOR body branches to but that are not that FOR's
@@ -1201,7 +1202,8 @@ fn cross_reached_nexts(
     bodies: &HashMap<StmtId, ForBodyInfo>,
 ) -> Vec<StmtId> {
     let partner_line: HashMap<&StmtId, u16> = pairs.iter().map(|(f, n)| (f, n.line_no)).collect();
-    let next_partner_for: HashMap<&StmtId, &StmtId> = pairs.iter().map(|(f, n)| (n, f)).collect();
+    let next_partner_for: HashMap<&StmtId, &StmtId> =
+        pairs.iter().map(|(f, n)| (n, f)).collect();
     let nexts = collect_all(module, |s| matches!(s, Stmt::Next { .. }));
     let innermost_open_at = |line: u16| -> Option<&StmtId> {
         bodies
@@ -1484,7 +1486,12 @@ fn collect_all(module: &Module, pred: impl Fn(&Stmt) -> bool + Copy) -> Vec<Stmt
     out
 }
 
-fn collect_stmt(stmt: &Stmt, id: StmtId, out: &mut Vec<StmtId>, pred: &impl Fn(&Stmt) -> bool) {
+fn collect_stmt(
+    stmt: &Stmt,
+    id: StmtId,
+    out: &mut Vec<StmtId>,
+    pred: &impl Fn(&Stmt) -> bool,
+) {
     if pred(stmt) {
         out.push(id.clone());
     }
@@ -1829,7 +1836,6 @@ mod tests {
             a.orphan_nexts
         );
     }
-
     #[test]
     fn next_var_walking_past_an_unconditional_frame_stays_static() {
         // 10 FOR I : 20 FOR J : 30 NEXT I
@@ -1872,7 +1878,6 @@ mod tests {
             "re-entry into a closed loop's NEXT must stay on the runtime path"
         );
     }
-
     #[test]
     fn clr_inside_the_loop_orphans_its_next() {
         // 10 FOR I=1 TO 3 : 20 CLR : 30 NEXT
@@ -1912,7 +1917,6 @@ mod tests {
             a.orphan_nexts
         );
     }
-
     #[test]
     fn clr_and_header_on_one_line_go_by_statement_order() {
         // 10 CLR : FOR I=1 TO 3 : NEXT  -> header re-runs, stays inline
@@ -2044,7 +2048,6 @@ mod tests {
         assert_eq!(a.tier1_handler_id, Some(handler));
         assert!(!a.handler_fors.contains(&w));
     }
-
     #[test]
     fn dispatcher_naming_the_same_variable_forces_tier2() {
         let m = Module {
@@ -2067,7 +2070,6 @@ mod tests {
             "`NEXT W` at line 20 can land on this frame"
         );
     }
-
     #[test]
     fn reachable_bare_dispatcher_forces_tier2() {
         let m = Module {
@@ -2086,7 +2088,6 @@ mod tests {
         let a = analyze(&m);
         assert_eq!(tier_of(&m, &a, 60), ForTier::Dispatched);
     }
-
     #[test]
     fn unreachable_bare_dispatcher_leaves_tier1_intact() {
         let m = Module {
@@ -2127,7 +2128,6 @@ mod tests {
         assert!(a.runtime_fors.is_empty());
         assert_eq!(tier_of(&m, &a, 10), ForTier::Static);
     }
-
     #[test]
     fn on_goto_out_of_a_body_is_a_crossing() {
         let m = Module {
@@ -2255,7 +2255,6 @@ mod tests {
             "the header runs after this NEXT, so entry does not rebuild its frame"
         );
     }
-
     #[test]
     fn every_dispatching_next_has_a_framed_partner() {
         let modules: Vec<(&str, Module)> = vec![

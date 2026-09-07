@@ -73,7 +73,6 @@ fn consecutive_lines_encode_the_low_byte_as_inc() {
         "the +1 run must collapse to two INCs:\n{a}"
     );
 }
-
 #[test]
 fn inc_delta_does_not_disturb_the_high_byte_cache() {
     let a = asm("300 Z=0\n\
@@ -85,7 +84,6 @@ fn inc_delta_does_not_disturb_the_high_byte_cache() {
         "302 is +1 from 301 and shares its high byte:\n{a}"
     );
 }
-
 #[test]
 fn equal_low_bytes_emit_no_store_at_all() {
     let a = asm("44 Z=0\n\
@@ -134,7 +132,6 @@ fn line_after_for_header_restates_both_bytes() {
         "the line after FOR must re-state both bytes:\n{a}"
     );
 }
-
 #[test]
 fn a_line_that_closes_one_loop_and_opens_another_still_guards_the_next() {
     let a = asm("10 FOR A=1 TO 2\n\
@@ -162,7 +159,6 @@ fn a_line_that_closes_one_loop_and_opens_another_still_guards_the_next() {
         "line 31 must re-state its low byte outright:\n{a}"
     );
 }
-
 #[test]
 fn line_after_repeat_head_restates_both_bytes() {
     let a = asm_dialect(
@@ -183,7 +179,6 @@ fn line_after_repeat_head_restates_both_bytes() {
         "UNTIL's back-jump lands past L20's stamp with $3A == 1:\n{a}"
     );
 }
-
 #[test]
 fn line_after_loop_head_restates_both_bytes() {
     let a = asm_dialect(
@@ -227,7 +222,6 @@ fn runtime_computed_goto_turns_both_caches_off() {
         "L301 must re-state both bytes:\n{a}"
     );
 }
-
 #[test]
 fn literal_computed_goto_is_just_a_branch_target() {
     let a = asm_dialect(
@@ -264,7 +258,6 @@ fn on_error_turns_both_caches_off() {
         "RESUME can land on any line; no deltas:\n{a}"
     );
 }
-
 #[test]
 fn on_key_turns_both_caches_off() {
     let a = asm_dialect(
@@ -337,7 +330,6 @@ fn peeking_curlin_disables_the_delta_encoding() {
         "CURLIN as PEEKed must match the ROM:\n{out}"
     );
 }
-
 #[test]
 fn poking_curlin_disables_the_delta_encoding() {
     let a = asm("10 POKE 58,0\n\
@@ -346,7 +338,6 @@ fn poking_curlin_disables_the_delta_encoding() {
          13 PRINT 3/1\n");
     assert!(!a.contains("INC $39"), "POKE 58 is a CURLIN write:\n{a}");
 }
-
 #[test]
 fn the_delta_encoding_is_what_makes_the_run_cheaper() {
     fn size(src: &str) -> usize {

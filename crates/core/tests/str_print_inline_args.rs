@@ -1,3 +1,5 @@
+
+
 use yabcompiler_core::{CompileOptions, Compiled, Profile, compile_with_options, tokenize_program};
 
 fn compile(src: &str) -> Compiled {
@@ -39,7 +41,6 @@ fn many_prints(n: usize) -> (String, String) {
     }
     (src, want)
 }
-
 fn convertible(n: usize) -> usize {
     n - 1
 }

@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -48,7 +50,6 @@ fn assert_path(src: &str, byte: bool, int: bool) {
         );
     }
 }
-
 fn check_output(src: &str, expected: &str) {
     for (profile, extraram) in VARIANTS {
         let bytes = compile_variant(src, profile, extraram).prg_bytes;
@@ -60,7 +61,6 @@ fn check_output(src: &str, expected: &str) {
         );
     }
 }
-
 fn nums(fields: &[&str]) -> String {
     fields.iter().map(|f| format!("{f} \n")).collect()
 }
@@ -105,7 +105,6 @@ fn io_peek_operand_takes_the_byte_path() {
         false,
     );
 }
-
 #[test]
 fn value_context_takes_the_byte_path() {
     assert_path(
@@ -114,7 +113,6 @@ fn value_context_takes_the_byte_path() {
         false,
     );
 }
-
 #[test]
 fn exor_of_two_comparisons_takes_the_byte_path() {
     assert_path(
@@ -123,22 +121,17 @@ fn exor_of_two_comparisons_takes_the_byte_path() {
         false,
     );
 }
-
 #[test]
 fn not_of_a_comparison_stays_in_the_byte_domain() {
-    let asm = compile_variant(
-        "10 DIM C(4)\n20 A=PEEK(53280)\n30 IF NOT(A=1) AND C(1)=2 THEN POKE 1024,1\n40 END\n",
-        Profile::Default,
-        false,
-    )
-    .asm;
+    let asm =
+        compile_variant("10 DIM C(4)\n20 A=PEEK(53280)\n30 IF NOT(A=1) AND C(1)=2 THEN POKE 1024,1\n40 END\n",
+        Profile::Default, false).asm;
     assert!(takes_byte_path(&asm), "byte path must fire:\n{asm}");
     assert!(
         asm.contains("EOR #$FF"),
         "NOT must lower to a byte complement:\n{asm}"
     );
 }
-
 #[test]
 fn the_branch_context_condition_makes_no_float() {
     let src = "10 DIM C(40)\n20 L=PEEK(53280)\n30 IF L=34 AND C(31)=2 THEN POKE 1024,1\n40 END\n";
@@ -190,7 +183,6 @@ fn a_heap_allocating_condition_keeps_the_int_lowering() {
         true,
     );
 }
-
 #[test]
 fn a_non_allocating_string_compare_is_eligible() {
     assert_path(
@@ -199,7 +191,6 @@ fn a_non_allocating_string_compare_is_eligible() {
         false,
     );
 }
-
 #[test]
 fn a_short_circuitable_condition_still_short_circuits() {
     assert_path(
@@ -230,7 +221,6 @@ fn and_or_not_truth_table_in_a_value_context() {
         " 0  0  0 \n 0 -1 -1 \n 0 -1  0 \n-1 -1  0 \n",
     );
 }
-
 #[test]
 fn three_term_chains_and_nested_subconditions() {
     check_output(
@@ -242,7 +232,6 @@ fn three_term_chains_and_nested_subconditions() {
         &nums(&[" 0", " 0", " 0", " 4", " 0", " 6", " 2", " 7"]),
     );
 }
-
 #[test]
 fn exor_truth_table() {
     check_output(
@@ -328,7 +317,6 @@ fn swapping_the_operands_swaps_the_order() {
         FDIV,
     );
 }
-
 #[test]
 fn the_value_context_evaluates_the_left_operand_first() {
     check_order(
@@ -337,7 +325,6 @@ fn the_value_context_evaluates_the_left_operand_first() {
         FN_LOG,
     );
 }
-
 #[test]
 fn a_statically_false_lhs_still_emits_the_right_operand() {
     for (profile, extraram) in VARIANTS {

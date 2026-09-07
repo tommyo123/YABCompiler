@@ -213,9 +213,7 @@ impl ZpEquates {
         for it in items {
             let Item::Directive(raw) = it else { continue };
             let trimmed = raw.trim();
-            let Some(eq) = trimmed.find('=') else {
-                continue;
-            };
+            let Some(eq) = trimmed.find('=') else { continue };
             let lhs = trimmed[..eq].trim();
             if lhs.is_empty()
                 || lhs.contains(char::is_whitespace)
@@ -2247,7 +2245,6 @@ fn peephole_flag_liveness_config() -> FlagLivenessConfig {
         ..FlagLivenessConfig::default()
     })
 }
-
 fn conservative_return_flag_config() -> FlagLivenessConfig {
     with_known_flag_contracts(FlagLivenessConfig::default())
 }
@@ -2671,7 +2668,8 @@ fn ph304_merge_identical_blocks(items: &mut Vec<Item>) -> bool {
         return false;
     }
     let zp = ZpEquates::scan(items);
-    let mut by_sig: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    let mut by_sig: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
     for (i, b) in blocks.iter().enumerate() {
         by_sig.entry(b.sig.as_str()).or_default().push(i);
     }
@@ -3105,7 +3103,9 @@ enum ReadFootprint {
 /// Resolve a plain store target, including zero-page equates.
 fn plain_label_cell(op: &str, equ: &std::collections::HashMap<String, u16>) -> Option<MemCell> {
     if op.is_empty()
-        || !op.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || !op
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         || op.as_bytes()[0].is_ascii_digit()
     {
         return None;
@@ -3118,7 +3118,10 @@ fn plain_label_cell(op: &str, equ: &std::collections::HashMap<String, u16>) -> O
 }
 
 /// Classify a load's memory reads; reject indirect or I/O accesses.
-fn read_footprint(op: &str, equ: &std::collections::HashMap<String, u16>) -> Option<ReadFootprint> {
+fn read_footprint(
+    op: &str,
+    equ: &std::collections::HashMap<String, u16>,
+) -> Option<ReadFootprint> {
     if op.starts_with('#') {
         return Some(ReadFootprint::Imm);
     }
@@ -3160,11 +3163,12 @@ fn mem_cells_may_alias(x: &MemCell, y: &MemCell, origin: Option<u16>) -> bool {
     match (x, y) {
         (MemCell::Known(a), MemCell::Known(b)) => a == b,
         (MemCell::Sym(a), MemCell::Sym(b)) => a == b,
-        (MemCell::Known(v), MemCell::Sym(_)) | (MemCell::Sym(_), MemCell::Known(v)) => match origin
-        {
-            Some(org) => *v >= org,
-            None => true,
-        },
+        (MemCell::Known(v), MemCell::Sym(_)) | (MemCell::Sym(_), MemCell::Known(v)) => {
+            match origin {
+                Some(org) => *v >= org,
+                None => true,
+            }
+        }
     }
 }
 
@@ -3191,10 +3195,11 @@ fn ph031_drop_overwritten_store(items: &mut Vec<Item>) -> bool {
     let mut i = 0;
     'outer: while i < items.len() {
         let is_candidate = match &items[i] {
-            Item::Insn(first) if matches!(first.mnem.as_str(), "STA" | "STX" | "STY") => first
-                .operand
-                .as_deref()
-                .is_some_and(|t| is_label_or_zp_safe(t) && !t.contains('+')),
+            Item::Insn(first) if matches!(first.mnem.as_str(), "STA" | "STX" | "STY") => {
+                first.operand.as_deref().is_some_and(|t| {
+                    is_label_or_zp_safe(t) && !t.contains('+')
+                })
+            }
             _ => false,
         };
         if !is_candidate {
@@ -3245,10 +3250,10 @@ fn window_insn_preserves_cell(
 ) -> bool {
     match insn.mnem.as_str() {
         // Register-only, no memory, no control flow.
-        "TAX" | "TAY" | "TXA" | "TYA" | "INX" | "DEX" | "INY" | "DEY" | "CLC" | "SEC" | "CLV"
-        | "NOP" => true,
-        "LDA" | "LDX" | "LDY" | "CMP" | "CPX" | "CPY" | "AND" | "ORA" | "EOR" | "ADC" | "SBC"
-        | "BIT" => {
+        "TAX" | "TAY" | "TXA" | "TYA" | "INX" | "DEX" | "INY" | "DEY" | "CLC" | "SEC"
+        | "CLV" | "NOP" => true,
+        "LDA" | "LDX" | "LDY" | "CMP" | "CPX" | "CPY" | "AND" | "ORA" | "EOR" | "ADC"
+        | "SBC" | "BIT" => {
             let Some(op) = insn.operand.as_deref() else {
                 return false;
             };
@@ -5254,8 +5259,9 @@ fn ph301_disjoint_sites(
         if !ok {
             continue;
         }
-        let clash = (start..=last)
-            .any(|x| claimed.contains(&x) || consumed.is_some_and(|c| c.contains(&x)));
+        let clash = (start..=last).any(|x| {
+            claimed.contains(&x) || consumed.is_some_and(|c| c.contains(&x))
+        });
         if clash {
             continue;
         }
@@ -5632,7 +5638,9 @@ fn smc_patched_labels(items: &[Item]) -> std::collections::HashSet<String> {
         let label = label.trim();
         if offset.trim().parse::<u16>().is_ok()
             && !label.is_empty()
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
             && !label.as_bytes()[0].is_ascii_digit()
         {
             out.insert(label.to_string());
@@ -5784,7 +5792,12 @@ fn window_signature(items: &[Item], idxs: &[usize]) -> String {
 
 /// Estimate total byte cost of an N-instruction window starting at
 /// `start`. Used by PH301 to decide whether factoring nets bytes.
-fn window_byte_estimate(items: &[Item], start: usize, window_size: usize, zp: &ZpEquates) -> usize {
+fn window_byte_estimate(
+    items: &[Item],
+    start: usize,
+    window_size: usize,
+    zp: &ZpEquates,
+) -> usize {
     let mut total = 0usize;
     let mut cur = start;
     for n in 0..window_size {
@@ -6890,7 +6903,6 @@ fn ph209_plan(
             return None;
         }
     }
-
     let middle_start = *middle.first().unwrap_or(&pla1);
     if regs.is_live_in(middle_start, Reg::A)
         || flags.is_live_in(middle_start, Flag::N)
@@ -6898,7 +6910,6 @@ fn ph209_plan(
     {
         return None;
     }
-
     if !ph209_dead_after(items, sta2, labels, |idx, live_in| match live_in {
         true => regs.is_live_in(idx, Reg::A),
         false => regs.is_live_out(idx, Reg::A),
@@ -9149,7 +9160,8 @@ mod tests {
 
     #[test]
     fn ph025_keeps_store_when_value_changed() {
-        let mut items = parse("    LDA #$05\n    STA tmp\n    LDA #$07\n    STA tmp\n    RTS\n");
+        let mut items =
+            parse("    LDA #$05\n    STA tmp\n    LDA #$07\n    STA tmp\n    RTS\n");
         assert!(
             !ph025_drop_redundant_store(&mut items),
             "different-value store is not redundant"
@@ -9661,7 +9673,6 @@ mod tests {
         // The inline sequence stays only in the helper, not at each site.
         assert_eq!(got.matches("LDA $14").count(), 1, "only helper has LDA $14");
     }
-
     #[test]
     fn factoring_family_fires_on_speed_profile() {
         let mut input = String::new();
@@ -9682,7 +9693,6 @@ mod tests {
             "speed and default agree on the factoring family"
         );
     }
-
     #[test]
     fn jsr_pair_family_fires_on_speed_profile() {
         let mut input = String::new();
@@ -10364,7 +10374,6 @@ mod tests {
         );
         assert!(got.contains("JMP L_far"));
     }
-
     #[test]
     fn ph005_folds_at_the_full_hardware_reach() {
         let mut items = parse(&ph005_reach_probe(30));
@@ -10373,10 +10382,7 @@ mod tests {
             "PH005 must take a target that is 100 < d <= 127 bytes away"
         );
         let got = render(&items);
-        assert!(
-            got.contains("BNE L_far"),
-            "inverted to the JMP target:\n{got}"
-        );
+        assert!(got.contains("BNE L_far"), "inverted to the JMP target:\n{got}");
         assert!(!got.contains("JMP L_far"), "the JMP is gone:\n{got}");
     }
 
@@ -10438,16 +10444,14 @@ mod tests {
             filler.push_str("    LDA VI_J\n    STA VI_T\n");
         }
         let header = "VI_J = $A7\nVI_T = $A8\n";
-        let body = format!(
-            "    BEQ L_t\n    JMP L_far\nL_t:\n    RTS\nL_keep:\n{filler}L_far:\n    RTS\n"
-        );
+        let body =
+            format!("    BEQ L_t\n    JMP L_far\nL_t:\n    RTS\nL_keep:\n{filler}L_far:\n    RTS\n");
 
         let mut with_equates = parse(&format!("{header}{body}"));
         assert!(
             ph005_branch_around_jmp(&mut with_equates),
             "equate table proves the target is in reach"
         );
-
         let mut without = parse(&body);
         assert!(
             !ph005_branch_around_jmp(&mut without),
@@ -10514,7 +10518,6 @@ __JSR2_0:
             "tail-call stub is a legal PH003 target:\n{got}"
         );
     }
-
     #[test]
     fn late_branch_fixpoint_reaches_a_fixpoint() {
         let mut items = parse(
@@ -10658,10 +10661,7 @@ __SEQ_9:
             "    RTS\n",
         );
         let got = run_default(input);
-        assert!(
-            !got.contains("__TAIL_"),
-            "unprofitable tail left alone:\n{got}"
-        );
+        assert!(!got.contains("__TAIL_"), "unprofitable tail left alone:\n{got}");
         assert_eq!(got.matches("INX").count(), 2, "both copies kept:\n{got}");
     }
 
@@ -10717,7 +10717,6 @@ __SEQ_9:
             "reference into the tail preserved:\n{got}"
         );
     }
-
     #[test]
     fn ph305_runs_on_speed_profile() {
         let got = run(SHARED_TAIL, Profile::Speed);
@@ -10750,10 +10749,7 @@ __SEQ_9:
             1,
             "duplicate block deleted:\n{got}"
         );
-        assert!(
-            !got.contains("B1"),
-            "dead label and refs retargeted:\n{got}"
-        );
+        assert!(!got.contains("B1"), "dead label and refs retargeted:\n{got}");
     }
 
     #[test]
@@ -10859,9 +10855,7 @@ __SEQ_9:
         assert!(got.contains("STA V_D"), "body spliced in:\n{got}");
         let tail = &got[got.find("STA V_D").unwrap()..];
         assert!(
-            tail.trim_start_matches(|c| c != '\n')
-                .trim()
-                .starts_with("RTS"),
+            tail.trim_start_matches(|c| c != '\n').trim().starts_with("RTS"),
             "tail-call RTS preserved right after the body:\n{got}"
         );
     }
@@ -11029,11 +11023,7 @@ __SEQ_9:
             "    RTS\n",
         );
         let got = run_default(input);
-        assert_eq!(
-            got.matches("STA $39").count(),
-            1,
-            "dead stamp dropped:\n{got}"
-        );
+        assert_eq!(got.matches("STA $39").count(), 1, "dead stamp dropped:\n{got}");
         assert!(!got.contains("#$0A"), "orphaned feeder load mopped:\n{got}");
         assert!(got.contains("LDA #$14"), "live stamp kept:\n{got}");
     }
@@ -11050,16 +11040,8 @@ __SEQ_9:
             "    RTS\n",
         );
         let got = run_default(input);
-        assert_eq!(
-            got.matches("STA FU_0").count(),
-            1,
-            "dead init dropped:\n{got}"
-        );
-        assert_eq!(
-            got.matches("STA VI_I").count(),
-            1,
-            "dead init dropped:\n{got}"
-        );
+        assert_eq!(got.matches("STA FU_0").count(), 1, "dead init dropped:\n{got}");
+        assert_eq!(got.matches("STA VI_I").count(), 1, "dead init dropped:\n{got}");
         assert!(!got.contains("#$00"), "zero feeder mopped:\n{got}");
     }
 
@@ -11741,7 +11723,6 @@ L2:\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("INC VI_X"), "INC kept (not promoted):\n{got}");
     }
-
     const KILL_TAIL: &str = "    LDA #$00\n    CMP VI_Q\n    RTS\n";
 
     fn ph211_body(body: &str) -> String {
@@ -11989,7 +11970,6 @@ L2:\n{KILL_TAIL}"
         let got = run_default(&input);
         assert!(got.contains("AND #$01"), "carry live, mask kept:\n{got}");
     }
-
     #[test]
     fn ph214_refuses_the_self_modified_wait_mask() {
         let input = format!(
@@ -12030,7 +12010,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         );
         assert!(!got.contains("    TYA\n"), "no transfer left:\n{got}");
     }
-
     #[test]
     fn ph019_still_folds_the_plain_load_transfer_pair() {
         let input = "*=$080D\n    LDA VI_P\n    TAX\n    LDA #$00\n    STA VI_Q\n\
@@ -12039,7 +12018,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         assert!(got.contains("LDX VI_P"), "PH019 still fires:\n{got}");
         assert!(!got.contains("    TAX\n"), "transfer gone:\n{got}");
     }
-
     #[test]
     fn ph020_still_drops_the_equal_valued_reload() {
         let input = "*=$080D\n    LDX #$05\n    STX VI_P\n    LDX #$05\n    STX VI_R\n    RTS\n";
@@ -12052,7 +12030,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         assert!(!got.contains("    INX\n"), "no spurious bump:\n{got}");
         assert!(!got.contains("    DEX\n"), "no spurious bump:\n{got}");
     }
-
     #[test]
     fn ph206_still_cancels_an_adjacent_push_pop() {
         let input = "*=$080D\n    LDY VS_A\n    TYA\n    PHA\n    PLA\n\
@@ -12062,7 +12039,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         assert!(!got.contains("    PLA\n"), "pop gone:\n{got}");
         assert!(got.contains("STY VI_P"), "and PH211 then folds:\n{got}");
     }
-
     #[test]
     fn the_new_rules_reach_a_fixpoint() {
         let input = "*=$080D\n    LDY VS_A\n    TYA\n    STA VI_P\n    LDX #$05\n\

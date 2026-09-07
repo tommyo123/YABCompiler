@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -12,7 +14,6 @@ fn asm_at(src: &str, profile: Profile) -> String {
         .unwrap_or_else(|e| panic!("compiles: {e}"))
         .asm
 }
-
 fn asm(src: &str) -> String {
     asm_at(src, Profile::Speed)
 }
@@ -21,7 +22,6 @@ fn text_output(src: &str) -> String {
     let prg = common::compile_source(src).expect("compiles");
     common::run_clean(&prg).unwrap_or_else(|| panic!("reaches a clean exit:\n{src}"))
 }
-
 fn insns(a: &str) -> Vec<String> {
     a.lines()
         .map(str::trim)
@@ -36,7 +36,6 @@ fn insns(a: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
-
 fn insn_matches(actual: &str, want: &str) -> bool {
     let mut a = actual.split_whitespace();
     let mut w = want.split_whitespace();
@@ -83,7 +82,6 @@ fn fac_compare_materialises_the_boolean_without_a_jmp() {
         assert_no(&a, "LDA $66");
     }
 }
-
 #[test]
 fn fac_compare_ordering_arms_probe_exponent_then_sign() {
     let lt = asm("10 a=peek(1024)/3:b=peek(1025)/7\n20 c=(a<b):print c\n");
@@ -111,7 +109,6 @@ fn fac_compare_booleans_match_the_rom() {
         "-1 -1  0  0  0 -1 \n 0 -1 -1 -1  0  0 \n 0  0  0 -1 -1 -1 \n 0  0  0 -1 -1 -1 \n"
     );
 }
-
 #[test]
 fn int16_compare_fast_path_still_fires() {
     for op in ["<", "<=", "=", ">=", ">", "<>"] {
@@ -177,7 +174,6 @@ fn int16_gt_and_le_transpose_the_sbc_operands() {
     assert_no(&le, "ORA __FOR_DIFF_LO");
     assert_no(&le, "__IF_KEEP");
 }
-
 #[test]
 fn int16_lt_and_ge_are_a_single_branch() {
     for (op, want) in [("<", "BPL"), (">=", "BMI")] {
@@ -205,7 +201,6 @@ fn int16_lt_and_ge_are_a_single_branch() {
         assert_no(&a, "__FOR_DIFF_LO:");
     }
 }
-
 #[test]
 fn int16_equality_skips_the_sign_fixup() {
     for (op, want) in [("=", "BNE"), ("<>", "BEQ")] {
@@ -232,7 +227,6 @@ fn int16_equality_skips_the_sign_fixup() {
         assert_no(&a, "EOR #$80");
     }
 }
-
 #[test]
 fn signed_byte_storage_operand_is_not_transposed() {
     let a = asm("10 for i=0 to 1\n\
@@ -247,7 +241,6 @@ fn signed_byte_storage_operand_is_not_transposed() {
     assert_seq(&a, &["SEC", "LDA VI_A", "SBC VI_B", "STA __FOR_DIFF_LO"]);
     assert_seq(&a, &["TAX", "ORA __FOR_DIFF_LO", "BEQ"]);
 }
-
 const EQ_OVERFLOW: &str = "\
 10 for k=1 to 4
 20 read x%,y%
@@ -290,7 +283,6 @@ const INT16_ORDERINGS: &str = "\
 fn int16_orderings_match_the_rom() {
     assert_eq!(text_output(INT16_ORDERINGS), "LMD\nMEN\nNGD\nNGD\nLMD\n");
 }
-
 #[test]
 fn peek_vs_literal_gt_and_le_are_one_branch() {
     let gt = asm("10 for x=0 to 20\n20 if peek(1024+x)>32 then print \"a\"\n30 next x\n");
@@ -311,7 +303,6 @@ fn peek_vs_peek_keeps_its_read_order() {
                  30 next x\n");
     assert_seq(&a, &["LDA $0400,X", "CMP $0401,X", "BEQ", "BCC"]);
 }
-
 #[test]
 fn u8_var_vs_literal_gt_and_le_are_one_branch() {
     let gt = asm("10 for x=0 to 20:c=peek(1024+x)\n20 if c>32 then print \"a\"\n30 next x\n");

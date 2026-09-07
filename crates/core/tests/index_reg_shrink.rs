@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -39,7 +41,6 @@ fn run(src: &str) -> String {
     assert!(r.clean_exit, "must reach a clean exit");
     common::petscii_to_string(&r.output)
 }
-
 const STR_SRC: &str = "\
 10 A$=\"HELLO\"
 20 B$=A$
@@ -70,7 +71,6 @@ fn ph211_keeps_string_assignment_correct() {
         ["HELLO!", "HELLO!"]
     );
 }
-
 #[test]
 fn ph211_leaves_no_foldable_pair_that_liveness_allows() {
     // A broad program touching strings, arrays, floats and loops.
@@ -102,7 +102,6 @@ const INT_ARR_SRC: &str = "\
 50 PRINT A%(5)+A%(6)+A%(7)+A%(8)
 60 END
 ";
-
 fn doubling_triples(asm: &str) -> usize {
     ops(asm)
         .windows(3)
@@ -138,7 +137,6 @@ fn ph212_keeps_integer_array_arithmetic_correct() {
     let words: Vec<&str> = out.split_whitespace().collect();
     assert_eq!(words, ["1110", "2886"], "got {out:?}");
 }
-
 const STEP_SRC: &str = "\
 10 PRINT \"AB\";
 20 PRINT \"CDE\";
@@ -194,7 +192,6 @@ fn ph214_never_touches_the_self_modified_wait_mask() {
         "no LSR/BCC pair may appear:\n{a}"
     );
 }
-
 #[test]
 fn the_factoring_family_still_produces_helpers() {
     let src = "\
@@ -212,7 +209,6 @@ fn the_factoring_family_still_produces_helpers() {
         .count();
     assert!(helpers > 0, "the factoring family must still fire:\n{a}");
 }
-
 #[test]
 fn ph019_and_ph020_fast_paths_still_fire() {
     let src = "\

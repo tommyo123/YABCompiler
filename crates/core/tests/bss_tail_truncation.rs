@@ -1,3 +1,5 @@
+
+
 use yabcompiler_core::{CompileOptions, Compiled, Profile, compile_with_options, tokenize_program};
 
 fn compile(src: &str) -> Compiled {
@@ -122,7 +124,6 @@ fn no_program_is_left_holding_the_placeholder() {
         );
     }
 }
-
 fn fill_region(asm: &str) -> Option<(usize, usize)> {
     let start = asm.lines().position(|l| l.trim() == "__BSS_START:")?;
     let end = asm.lines().position(|l| l.trim() == "__BSS_END:")?;
@@ -156,7 +157,6 @@ fn non_zero_bytes_inside_the_fill(asm: &str) -> Vec<(usize, String)> {
     }
     out
 }
-
 const NON_ZERO_DEFAULT_CASES: [(&str, &str); 4] = [
     (
         "__MUSIC_TEMPO",

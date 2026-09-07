@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -73,7 +75,6 @@ fn clean_nest_gets_no_frames_at_all() {
 ";
     assert_tiers("clean_nest", src, (0, 0));
 }
-
 #[test]
 fn uncrossed_loop_keeps_the_fast_path_beside_a_dispatcher() {
     // The `k` loop is untouched; the `i` loop is entered and left by GOTO and shares a bare
@@ -91,9 +92,12 @@ fn uncrossed_loop_keeps_the_fast_path_beside_a_dispatcher() {
     assert_tiers("uncrossed_beside_dispatcher", src, (1, 1));
     assert_eq!(
         common::run_clean(
-            &compile_with_options(&tokenize_program(src).unwrap(), CompileOptions::default())
-                .unwrap()
-                .prg_bytes
+            &compile_with_options(
+                &tokenize_program(src).unwrap(),
+                CompileOptions::default()
+            )
+            .unwrap()
+            .prg_bytes
         )
         .as_deref()
         .map(str::trim_end),
@@ -114,7 +118,6 @@ fn crossing_without_a_dispatcher_is_free() {
 ";
     assert_tiers("crossing_no_dispatcher", src, (0, 0));
 }
-
 const TIER1: &str = "\
 10 goto 50
 20 next j:goto 200
@@ -180,13 +183,11 @@ fn tier1_runs_correctly() {
         );
     }
 }
-
 #[test]
 fn a_reachable_bare_dispatcher_promotes_tier1_to_tier2() {
     let src = TIER1.replace("20 next j:", "20 next:");
     assert_tiers("bare_dispatcher", &src, (2, 2));
 }
-
 #[test]
 fn the_dispatcher_variable_decides_which_loop_is_dispatched() {
     let src = TIER1.replace("20 next j:", "20 next w:");
@@ -304,7 +305,6 @@ fn one_line_loop_gosubbed_from_a_body_runs() {
         assert_eq!(got.trim_end(), "K 1 K 2 K 3 DONE", "({profile:?})");
     }
 }
-
 #[test]
 fn a_header_after_the_next_on_its_line_is_a_real_orphan() {
     let src = ONE_LINE_DELAY.replace("100 for z=1 to 5:next", "100 next:for z=1 to 5");

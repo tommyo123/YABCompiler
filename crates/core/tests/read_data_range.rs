@@ -35,7 +35,6 @@ const FRACTIONAL: &str = "\
 80 END
 9000 DATA 2.7,1.6
 ";
-
 #[test]
 fn a_variable_read_from_fractional_data_keeps_its_fraction() {
     for profile in [Profile::Default, Profile::Size, Profile::Speed] {
@@ -46,7 +45,6 @@ fn a_variable_read_from_fractional_data_keeps_its_fraction() {
         );
     }
 }
-
 #[test]
 fn int_is_not_elided_on_a_fractional_read_target() {
     let asm = compile_asm(FRACTIONAL);
@@ -55,7 +53,6 @@ fn int_is_not_elided_on_a_fractional_read_target() {
         "INT() was elided on a value READ from fractional DATA:\n{asm}"
     );
 }
-
 #[test]
 fn one_fractional_entry_is_enough_to_drop_the_range() {
     let src = "\
@@ -67,7 +64,6 @@ fn one_fractional_entry_is_enough_to_drop_the_range() {
     assert!(compile_asm(src).contains("JSR $BCCC"));
     assert_eq!(output_at(src, Profile::Default), " 5  7 \n");
 }
-
 #[test]
 fn integral_data_still_proves_integrality_and_elides_int() {
     let src = "\
@@ -83,7 +79,6 @@ fn integral_data_still_proves_integrality_and_elides_int() {
     );
     assert_eq!(output_at(src, Profile::Default), " 5  7 \n");
 }
-
 #[test]
 fn integral_and_fractional_pools_agree_on_behaviour() {
     let integral = "\

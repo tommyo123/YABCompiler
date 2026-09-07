@@ -70,13 +70,11 @@ fn a_hole_below_the_image_is_not_reported() {
     // A custom origin moves the line with it.
     assert!(reserved_tail_overshoots(0xC000, 0xC050, &[(0x0400, 0x07E7)]).is_empty());
 }
-
 #[test]
 fn a_distant_end_is_not_reported() {
     assert!(!reserved_tail_overshoots(0x0801, 0x40FF, &[(0x3000, 0x3FFF)]).is_empty());
     assert!(reserved_tail_overshoots(0x0801, 0x4100, &[(0x3000, 0x3FFF)]).is_empty());
 }
-
 #[test]
 fn a_hole_smaller_than_the_overshoot_is_not_reported() {
     // 32-byte hole, 100 bytes above it: negative leverage.
@@ -85,7 +83,6 @@ fn a_hole_smaller_than_the_overshoot_is_not_reported() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].recoverable(), 32 + 16);
 }
-
 #[test]
 fn holes_are_ranked_by_what_there_is_to_gain() {
     let got = reserved_tail_overshoots(0x0801, 0x30C4, &[(0x3090, 0x30BF), (0x3000, 0x307F)]);
@@ -99,7 +96,6 @@ fn holes_are_ranked_by_what_there_is_to_gain() {
     assert_eq!(got[0].overshoot, 0x30C4 - 0x307F);
     assert_eq!(got[1].overshoot, 0x30C4 - 0x30BF);
 }
-
 #[test]
 fn the_cap_is_applied_per_hole() {
     let got = reserved_tail_overshoots(0x0801, 0x4020, &[(0x3000, 0x37FF), (0x3F00, 0x3FFF)]);
@@ -128,7 +124,6 @@ fn a_real_overshooting_image_reports_its_hole() {
     );
     assert_eq!(o.recoverable(), o.hole + o.overshoot);
 }
-
 #[test]
 fn an_image_that_clears_the_hole_says_nothing() {
     let c = compile(&filler(143), vec![(0x3000, 0x3FFF)]);
@@ -144,7 +139,6 @@ fn an_image_that_clears_the_hole_says_nothing() {
         c.diagnostics.end_address
     );
 }
-
 #[test]
 fn the_cliff_is_real() {
     let over = compile(&filler(144), vec![(0x3000, 0x3FFF)]);

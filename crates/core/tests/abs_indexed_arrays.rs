@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, compile_with_options, tokenize_program};
@@ -16,7 +18,6 @@ fn run(src: &str) -> String {
     assert!(r.clean_exit, "must reach a clean exit");
     common::petscii_to_string(&r.output)
 }
-
 fn run_err(src: &str) -> (Option<u8>, Option<u16>, String) {
     let prg = common::compile_source(src).expect("compiles");
     let r = emu64::run_prg_to_end(&prg, 80_000_000).expect("runs");
@@ -26,13 +27,11 @@ fn run_err(src: &str) -> (Option<u8>, Option<u16>, String) {
         common::petscii_to_string(&r.output),
     )
 }
-
 const ERR_BAD_SUBSCRIPT: u8 = 18;
 
 fn count(asm: &str, needle: &str) -> usize {
     asm.lines().filter(|l| l.trim() == needle).count()
 }
-
 fn builds_cheap_address(asm: &str, label: &str) -> bool {
     let ops: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
     ops.windows(2)
@@ -101,7 +100,6 @@ fn str_array_read_stmt_takes_absx() {
         "READ into a string array must store via abs,X\n{a}"
     );
 }
-
 const INT_SRC: &str = "\
 10 DIM A%(20)
 20 FOR I=0 TO 20:A%(I)=I*2:NEXT
@@ -128,7 +126,6 @@ fn int_array_still_takes_absx() {
 fn int_array_still_correct() {
     assert_eq!(run(INT_SRC), " 420 \n");
 }
-
 const FLOAT_SRC: &str = "\
 10 DIM A(50)
 20 POKE 679,17:Q=PEEK(679):P=INT(Q)
@@ -160,7 +157,6 @@ fn float_array_takes_cheap_static_address() {
 fn float_array_still_correct() {
     assert_eq!(run(FLOAT_SRC), " 7.5 \n");
 }
-
 #[test]
 fn float_array_scale_reserves_its_stash() {
     let a = asm(FLOAT_SRC);
@@ -313,16 +309,14 @@ fn runtime_dim_string_array_refuses_absx() {
 /// BASIC v2 raises ?BAD SUBSCRIPT for an out-of-range subscript.
 #[test]
 fn absx_string_array_still_raises_bad_subscript() {
-    let (err, line, out) = run_err(
-        "\
+    let (err, line, out) = run_err("\
 10 DIM A$(4)
 20 POKE 679,9:I=PEEK(679)
 30 PRINT \"BEFORE\"
 40 A$(I)=\"X\"
 50 PRINT \"AFTER\"
 60 END
-",
-    );
+");
     assert_eq!(err, Some(ERR_BAD_SUBSCRIPT), "out={out:?}");
     assert_eq!(line, Some(40), "the trap must be attributed to line 40");
     assert!(
@@ -333,15 +327,13 @@ fn absx_string_array_still_raises_bad_subscript() {
 
 #[test]
 fn cheap_address_float_still_raises_bad_subscript() {
-    let (err, line, out) = run_err(
-        "\
+    let (err, line, out) = run_err("\
 10 DIM A(4)
 20 POKE 679,9:I=PEEK(679):J=INT(I)
 30 A(J)=1
 40 PRINT \"AFTER\"
 50 END
-",
-    );
+");
     assert_eq!(err, Some(ERR_BAD_SUBSCRIPT), "out={out:?}");
     assert_eq!(line, Some(30), "the trap must be attributed to line 30");
 }
@@ -350,8 +342,7 @@ fn cheap_address_float_still_raises_bad_subscript() {
 /// the compiler laid out may be wider.
 #[test]
 fn absx_honours_the_post_clr_auto_dim_bound() {
-    let (err, line, out) = run_err(
-        "\
+    let (err, line, out) = run_err("\
 10 DIM A$(30)
 20 CLR
 30 POKE 679,20:I=PEEK(679)
@@ -359,24 +350,21 @@ fn absx_honours_the_post_clr_auto_dim_bound() {
 50 A$(I)=\"X\"
 60 PRINT \"AFTER\"
 70 END
-",
-    );
+");
     assert_eq!(
         err,
         Some(ERR_BAD_SUBSCRIPT),
         "subscript 20 is past the post-CLR auto-DIM bound of 10, out={out:?}"
     );
     assert_eq!(line, Some(50));
-    let (err_ok, _, out_ok) = run_err(
-        "\
+    let (err_ok, _, out_ok) = run_err("\
 10 DIM A$(30)
 20 CLR
 30 POKE 679,10:I=PEEK(679)
 40 A$(I)=\"X\"
 50 PRINT A$(10)
 60 END
-",
-    );
+");
     assert_eq!(err_ok, None, "subscript 10 is in range, out={out_ok:?}");
     assert_eq!(out_ok, "X\n");
 }

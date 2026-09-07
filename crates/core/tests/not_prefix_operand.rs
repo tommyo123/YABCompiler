@@ -19,7 +19,6 @@ fn output_at(src: &str, profile: Profile) -> String {
 fn output(src: &str) -> String {
     output_at(src, Profile::Default)
 }
-
 #[test]
 fn not_is_accepted_after_an_operator() {
     let src = "\
@@ -45,7 +44,6 @@ fn not_binds_looser_than_arithmetic_and_tighter_than_and() {
 ";
     assert_eq!(output(src), "-5 \n 0 \n-1 \n 2 \n");
 }
-
 #[test]
 fn not_in_an_if_condition_operand() {
     let src = "\
@@ -56,7 +54,6 @@ fn not_in_an_if_condition_operand() {
 ";
     assert_eq!(output(src), "YES\n");
 }
-
 #[test]
 fn the_positions_that_already_worked_still_do() {
     let src = "\
@@ -76,10 +73,6 @@ fn the_positions_that_already_worked_still_do() {
 fn all_profiles_agree() {
     let src = "10 PRINT 1+NOT 2+3;3>=NOT 6;NOT 1 AND 2\n20 END\n";
     for profile in [Profile::Default, Profile::Size, Profile::Speed] {
-        assert_eq!(
-            output_at(src, profile),
-            "-5 -1  2 \n",
-            "profile {profile:?}"
-        );
+        assert_eq!(output_at(src, profile), "-5 -1  2 \n", "profile {profile:?}");
     }
 }

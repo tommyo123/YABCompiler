@@ -1,3 +1,5 @@
+
+
 use yabcompiler_core::{CompileOptions, Compiled, compile_with_options, tokenize_program};
 
 /// Eight distinct PRINTs: enough string-pool entries that a reserved byte can be dropped
@@ -136,7 +138,6 @@ fn a_reservation_inside_the_string_pool_still_prints_the_right_text() {
          program prints"
     );
 }
-
 #[test]
 fn every_single_byte_reservation_inside_the_image_still_prints_the_right_text() {
     let plain = compile_reserved(Vec::new());
@@ -188,7 +189,6 @@ fn the_repair_is_deterministic() {
     assert_eq!(a.machine_code, b.machine_code);
     assert_eq!(a.diagnostics.bridge_shims, b.diagnostics.bridge_shims);
 }
-
 #[test]
 fn asm6502_still_strands_a_label_in_front_of_a_bridged_item() {
     use asm6502::Assembler6502;

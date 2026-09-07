@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -25,7 +27,6 @@ fn label_pos(asm: &str, label: &str) -> Option<usize> {
     }
     None
 }
-
 fn byte_count(line: &str) -> usize {
     let t = line.trim();
     match t.strip_prefix(".byte") {
@@ -54,7 +55,6 @@ fn vars_span(asm: &str) -> (usize, Vec<String>) {
     }
     (bytes, labels)
 }
-
 fn defined_var_labels(asm: &str) -> Vec<String> {
     asm.lines()
         .map(str::trim)
@@ -63,7 +63,6 @@ fn defined_var_labels(asm: &str) -> Vec<String> {
         .filter(|l| l.starts_with("V_") || l.starts_with("VI_") || l.starts_with("VS_"))
         .collect()
 }
-
 const MANY: &str = "10 A=5:B$=\"X\":C%=7\n\
                     20 FOR I=1 TO 3:S=S+I:NEXT\n\
                     30 FOR K=1 TO 4:T=T+K:NEXT\n\
@@ -116,7 +115,6 @@ fn extraram_vars_anchors_hoist_with_the_pool() {
         );
     }
 }
-
 #[test]
 fn vars_span_covers_every_slot_in_both_layouts() {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
@@ -149,7 +147,6 @@ fn vars_span_covers_every_slot_in_both_layouts() {
         }
     }
 }
-
 #[test]
 fn state_reset_still_uses_one_memzero_over_the_label_difference() {
     for extraram in [false, true] {
@@ -224,7 +221,6 @@ fn clr_clears_every_variable_kind_in_both_layouts() {
         );
     }
 }
-
 #[test]
 fn const_var_prop_still_fires_without_run_or_clr() {
     let folded = build("10 A=5\n20 PRINT A\n", Profile::Default, false).asm;
@@ -232,7 +228,6 @@ fn const_var_prop_still_fires_without_run_or_clr() {
         !folded.contains("V_A"),
         "A must still fold to a literal when nothing resets variables:\n{folded}"
     );
-
     let kept = build(RUNCLR, Profile::Default, false).asm;
     assert!(
         kept.contains("V_A"),
@@ -244,7 +239,6 @@ fn const_var_prop_still_fires_without_run_or_clr() {
         "A must keep a runtime slot when CLR can clear it:\n{kept_clr}"
     );
 }
-
 #[test]
 fn corpus_clr_programs_agree_across_layouts() {
     for name in ["clr_test", "dim_dyn_clr"] {
@@ -282,7 +276,6 @@ fn corpus_clr_programs_agree_across_layouts() {
         }
     }
 }
-
 #[test]
 fn run_clears_variables_in_both_layouts() {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {

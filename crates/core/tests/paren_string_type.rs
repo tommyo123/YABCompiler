@@ -75,7 +75,6 @@ fn a_parenthesised_string_concatenates_and_measures() {
     assert!(!has_type_mismatch_trap(&asm_of(src)));
     assert_eq!(output(src), "ABC\nABD\n 2 \nABC\n");
 }
-
 #[test]
 fn parenthesised_strings_in_arrays_and_subroutines() {
     let src = "\
@@ -91,7 +90,6 @@ fn parenthesised_strings_in_arrays_and_subroutines() {
     assert!(!has_type_mismatch_trap(&asm_of(src)));
     assert_eq!(output(src), "ZZ\nZZQ\n 12X\nQ-SUB\n");
 }
-
 #[test]
 fn all_profiles_agree_on_parenthesised_strings() {
     let src = "\
@@ -128,7 +126,6 @@ fn a_parenthesised_string_comparison_is_numeric() {
     assert!(!has_type_mismatch_trap(&asm_of(src)));
     assert_eq!(output(src), "-1 \n-1 \n 1 \n");
 }
-
 #[test]
 fn numeric_groups_stay_numeric() {
     let src = "\
@@ -143,7 +140,6 @@ fn numeric_groups_stay_numeric() {
     assert!(!has_type_mismatch_trap(&asm_of(src)));
     assert_eq!(output(src), " 5 \n 6 \n 9 \n 5 \n-1 \n");
 }
-
 #[test]
 fn a_string_group_in_numeric_position_still_traps() {
     for src in [
@@ -157,7 +153,6 @@ fn a_string_group_in_numeric_position_still_traps() {
         );
     }
 }
-
 #[test]
 fn tab_plus_string_still_takes_the_string_path() {
     let src = "10 A$=\"S\"\n20 PRINT TAB(3)+(A$)\n30 END\n";

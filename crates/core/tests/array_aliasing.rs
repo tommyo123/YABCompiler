@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -37,20 +39,16 @@ fn reuse_sites(asm: &str) -> usize {
 /// ROM: ` 4  5`.
 const A1_BOTH_NAMES: &str = "10 A(0)=4:A%(0)=5\n\
                              20 PRINT A(0);A%(0)\n";
-
 const A1_SEPARATE_BOUNDS: &str = "10 DIM A%(2)\n\
                                   20 A(5)=1\n\
                                   30 PRINT A%(0)\n";
-
 const A1_FETCH_TWIN: &str = "10 A(0)=4\n\
                              20 FETCH \"N\",2,A%(0)\n\
                              30 PRINT A(0)\n";
-
 const A1_STILL_PROMOTES: &str = "10 DIM A(5)\n\
                                  20 A(0)=3\n\
                                  30 A(1)=A(0)\n\
                                  40 PRINT A(1)\n";
-
 const A1_STRING_TWIN_OK: &str = "10 DIM A(5)\n\
                                  20 A$(0)=\"Q\"\n\
                                  30 A(0)=3\n\
@@ -145,13 +143,11 @@ const A2_NESTED_TWICE: &str = "10 DIM A(3,3),B(3,3),C(3,3),E(3)\n\
                                40 B(1,2)=2:B(2,2)=1:B(3,3)=.5\n\
                                50 A(1,2)=7:A(2,2)=33:A(1,1)=44:A(3,3)=.5\n\
                                60 PRINT A(1,B(1,C(E(0),E(0))))\n";
-
 const A2_NESTED_FIRST: &str = "10 DIM A(3,3),D(4,4),E(3)\n\
                                20 E(0)=2:E(1)=.5\n\
                                30 D(2,2)=2\n\
                                40 A(1,2)=7:A(2,2)=33:A(3,3)=.5\n\
                                50 PRINT A(E(0)-1,D(2,2))\n";
-
 const A2_UNNESTED: &str = "10 DIM A(3,3),C(3)\n\
                            20 C(0)=2:C(1)=.5\n\
                            30 A(1,2)=7:A(3,3)=.5\n\
@@ -221,15 +217,12 @@ fn unnested_multidim_keeps_the_depth_zero_pair() {
 const A3_PROMPT: &str = "10 A(1)=5.5\n\
                          20 INPUT \"V\";X\n\
                          30 PRINT A(1);X\n";
-
 const A3_NO_PROMPT: &str = "10 A(1)=5.5\n\
                             20 INPUT X\n\
                             30 PRINT A(1);X\n";
-
 const A3_ADJACENT: &str = "10 A(1)=5.5\n\
                            20 A(1)=A(1)+1\n\
                            30 PRINT A(1)\n";
-
 const A3_STRING_INPUT: &str = "10 A(1)=5.5\n\
                                20 INPUT X$\n\
                                30 PRINT A(1)\n";
@@ -297,7 +290,6 @@ const A3_GET_STR_ARRAY: &str = "10 DIM B$(5)\n\
                                 20 B$=\"Z\"\n\
                                 30 GET B$(2)\n\
                                 40 PRINT \"<\";B$(2);\">\";B$\n";
-
 const A3_GET_SCALAR: &str = "10 B=9\n\
                              20 GET B\n\
                              30 PRINT B\n";
@@ -353,7 +345,6 @@ fn get_into_scalar_is_unchanged() {
         assert_eq!(out.trim_end(), " 0", "{p:?}");
     }
 }
-
 const A4_OUT_OF_RANGE_AFTER_CLR: &str = "10 DIM A(20)\n\
                                          20 A(15)=7\n\
                                          30 CLR\n\
@@ -367,19 +358,16 @@ const A4_IN_RANGE_AFTER_CLR: &str = "10 DIM A(20)\n\
                                      30 CLR\n\
                                      40 PRINT A(5)\n\
                                      50 PRINT \"DONE\"\n";
-
 const A4_REDIM_AFTER_CLR: &str = "10 DIM A(20)\n\
                                   20 CLR\n\
                                   30 DIM A(20)\n\
                                   40 A(15)=1\n\
                                   50 PRINT A(15)\n\
                                   60 PRINT \"DONE\"\n";
-
 const A4_NO_CLR: &str = "10 DIM A(20)\n\
                          20 A(15)=7\n\
                          30 PRINT A(15)\n\
                          40 PRINT \"DONE\"\n";
-
 const A4_INT_REDIM: &str = "10 DIM A%(20)\n\
                             20 CLR\n\
                             30 DIM A%(20)\n\

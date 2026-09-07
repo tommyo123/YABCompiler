@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use std::collections::HashMap;
@@ -113,7 +115,6 @@ fn dead_for_counter_program_terminates_with_rom_answer() {
         );
     }
 }
-
 #[test]
 fn zp_slot_sharing_still_fires_after_the_def_edges() {
     let b = build(DEAD_DEF_SHARES_LIVE_SLOT, Profile::Default);
@@ -153,15 +154,9 @@ const ROM_ADJUDICATED: &[(&str, &str)] = &[
         "91  92",
     ),
     // $03/$04 are the string-compare LHS pointer.
-    (
-        "10 a$=\"a\":poke 3,91\n20 if a$=a$ then print peek(3)\n",
-        "91",
-    ),
+    ("10 a$=\"a\":poke 3,91\n20 if a$=a$ then print peek(3)\n", "91"),
     // $A7 is in the RS-232 pool region, where the FOR counter lands.
-    (
-        "20 for i=1 to 5:s=s+i:poke 167,200:next\n30 print s\n",
-        "15",
-    ),
+    ("20 for i=1 to 5:s=s+i:poke 167,200:next\n30 print s\n", "15"),
 ];
 
 #[test]
@@ -255,7 +250,6 @@ fn compiler_never_names_a_byte_the_program_pokes() {
         }
     }
 }
-
 #[test]
 fn poke_proved_clear_of_zero_page_costs_nothing() {
     use yabcompiler_core::{CompileOptions, compile_with_options, tokenize_program};
@@ -296,7 +290,6 @@ fn poke_proved_clear_of_zero_page_costs_nothing() {
         "with no zero-page conflict the compiler should still use its default cells"
     );
 }
-
 #[test]
 fn one_poked_pool_byte_costs_one_pool_byte() {
     use yabcompiler_core::{CompileOptions, compile_with_options, tokenize_program};
@@ -326,7 +319,6 @@ const ZP_PROBE_TAIL: &str = "\
 90 print q;n
 100 data 7
 ";
-
 fn compiler_claimable_zp() -> Vec<u8> {
     let mut v = vec![0x02u8];
     v.extend(0x03..=0x06);
@@ -361,7 +353,6 @@ fn poking_any_compiler_owned_byte_changes_nothing() {
         }
     }
 }
-
 #[test]
 fn peeking_any_compiler_owned_byte_reads_the_programs_value() {
     for b in compiler_claimable_zp() {
@@ -374,7 +365,6 @@ fn peeking_any_compiler_owned_byte_reads_the_programs_value() {
         );
     }
 }
-
 #[test]
 fn unbounded_poke_address_does_not_drain_the_pool() {
     use yabcompiler_core::{CompileOptions, compile_with_options, tokenize_program};
@@ -391,7 +381,6 @@ fn unbounded_poke_address_does_not_drain_the_pool() {
         "and it must be reported"
     );
 }
-
 #[test]
 fn sequential_for_counters_still_reach_zero_page() {
     let src = "\
@@ -403,9 +392,6 @@ fn sequential_for_counters_still_reach_zero_page() {
     assert_eq!(run_text(&b.prg).trim(), "12");
     let eq = zp_equates(&b.asm);
     for v in ["VI_I", "VI_J", "VI_S"] {
-        assert!(
-            eq.contains_key(v),
-            "{v} should be zero-page promoted: {eq:?}"
-        );
+        assert!(eq.contains_key(v), "{v} should be zero-page promoted: {eq:?}");
     }
 }

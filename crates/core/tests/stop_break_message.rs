@@ -54,7 +54,6 @@ fn stop_on_a_line_above_32767_prints_and_returns_to_ready() {
         "Y\n\nBREAK IN 63999"
     );
 }
-
 #[test]
 fn linprt_is_not_followed_by_a_second_strout() {
     let asm = asm_of("10 STOP\n");

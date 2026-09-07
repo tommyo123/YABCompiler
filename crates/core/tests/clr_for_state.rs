@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -40,7 +42,6 @@ const CLR_IN_BODY: &str = "10 FOR I=1 TO 3\n\
                            40 NEXT I\n\
                            50 PRINT \"=\";I\n\
                            60 END\n";
-
 const CLR_VIA_GOTO: &str = "10 F=0\n\
                             20 FOR I=1 TO 5\n\
                             30 IF I=2 AND F=0 THEN F=1:GOTO 200\n\
@@ -55,7 +56,6 @@ const CLR_VIA_GOTO: &str = "10 F=0\n\
 /// statement-order refinement inside the reachability walk has to catch it.
 const CLR_SAME_LINE: &str = "10 FOR I=1 TO 3:PRINT I;:CLR:NEXT I\n\
                              20 PRINT \"=\";I\n";
-
 const CLR_UNDER_THEN: &str = "10 FOR I=1 TO 3\n\
                               20 PRINT I;\n\
                               30 IF I=2 THEN CLR\n\
@@ -109,7 +109,6 @@ fn state_reset_zeroes_the_for_stack_pointer() {
         }
     }
 }
-
 #[test]
 fn a_reset_inside_a_loop_stops_after_one_pass() {
     for profile in PROFILES {
@@ -134,7 +133,6 @@ fn a_reset_inside_a_loop_stops_after_one_pass() {
         }
     }
 }
-
 #[test]
 fn a_reset_reached_by_goto_stops_at_the_next() {
     for profile in PROFILES {
@@ -146,10 +144,7 @@ fn a_reset_reached_by_goto_stops_at_the_next() {
                 "ROM prints ` 1  0 ` then ?NEXT WITHOUT FOR IN 50 \
                  ({profile:?}, extraram={extraram})"
             );
-            assert!(
-                !clean,
-                "stops on the error ({profile:?}, extraram={extraram})"
-            );
+            assert!(!clean, "stops on the error ({profile:?}, extraram={extraram})");
             assert!(
                 insns < common::MAX_INSNS / 100,
                 "must not spin: {insns} instructions ({profile:?}, extraram={extraram})"
@@ -157,7 +152,6 @@ fn a_reset_reached_by_goto_stops_at_the_next() {
         }
     }
 }
-
 #[test]
 fn a_reset_inside_a_subroutine_kills_the_gosub_frame() {
     const SRC: &str = "10 C=0\n\
@@ -190,10 +184,7 @@ fn a_reset_inside_a_subroutine_kills_the_gosub_frame() {
                 "ROM prints nothing and stops with ?RETURN WITHOUT GOSUB IN 120 \
                  ({profile:?}, extraram={extraram})"
             );
-            assert!(
-                !clean,
-                "stops on the error ({profile:?}, extraram={extraram})"
-            );
+            assert!(!clean, "stops on the error ({profile:?}, extraram={extraram})");
             assert!(
                 insns < common::MAX_INSNS / 100,
                 "must not spin: {insns} instructions ({profile:?}, extraram={extraram})"
@@ -201,7 +192,6 @@ fn a_reset_inside_a_subroutine_kills_the_gosub_frame() {
         }
     }
 }
-
 #[test]
 fn a_reset_before_the_loop_keeps_the_inline_lowering() {
     const SRC: &str = "10 CLR\n20 FOR I=1 TO 3:PRINT I;:NEXT\n30 PRINT \"=\";I\n";
@@ -215,10 +205,7 @@ fn a_reset_before_the_loop_keeps_the_inline_lowering() {
                 built.asm
             );
             let (clean, _, out) = run(&built.prg_bytes);
-            assert!(
-                clean,
-                "runs to completion ({profile:?}, extraram={extraram})"
-            );
+            assert!(clean, "runs to completion ({profile:?}, extraram={extraram})");
             assert_eq!(
                 out.trim_end(),
                 " 1  2  3 = 4",
@@ -227,7 +214,6 @@ fn a_reset_before_the_loop_keeps_the_inline_lowering() {
         }
     }
 }
-
 #[test]
 fn a_reset_after_the_loop_keeps_the_inline_lowering() {
     const SRC: &str = "10 FOR I=1 TO 3:S=S+I:NEXT\n20 PRINT S;I\n30 CLR\n40 PRINT S;I\n";
@@ -241,10 +227,7 @@ fn a_reset_after_the_loop_keeps_the_inline_lowering() {
                 built.asm
             );
             let (clean, _, out) = run(&built.prg_bytes);
-            assert!(
-                clean,
-                "runs to completion ({profile:?}, extraram={extraram})"
-            );
+            assert!(clean, "runs to completion ({profile:?}, extraram={extraram})");
             assert_eq!(
                 out.split_whitespace().collect::<Vec<_>>(),
                 vec!["6", "4", "0", "0"],
@@ -253,7 +236,6 @@ fn a_reset_after_the_loop_keeps_the_inline_lowering() {
         }
     }
 }
-
 #[test]
 fn a_reset_between_two_loops_keeps_both_inline() {
     const SRC: &str = "10 N=5\n\
@@ -273,10 +255,7 @@ fn a_reset_between_two_loops_keeps_both_inline() {
                 built.asm
             );
             let (clean, _, out) = run(&built.prg_bytes);
-            assert!(
-                clean,
-                "runs to completion ({profile:?}, extraram={extraram})"
-            );
+            assert!(clean, "runs to completion ({profile:?}, extraram={extraram})");
             assert_eq!(
                 out.split_whitespace().collect::<Vec<_>>(),
                 vec!["15", "6", "6", "4", "0"],
@@ -285,13 +264,13 @@ fn a_reset_between_two_loops_keeps_both_inline() {
         }
     }
 }
-
 #[test]
 fn corpus_dim_dyn_clr_keeps_both_loops_inline() {
     let prg = std::fs::read(common::repo_path("test_corpus/dim_dyn_clr.prg")).expect("read prg");
-    let golden =
-        std::fs::read_to_string(common::repo_path("test_corpus/emu_golden/dim_dyn_clr.out"))
-            .expect("read golden");
+    let golden = std::fs::read_to_string(common::repo_path(
+        "test_corpus/emu_golden/dim_dyn_clr.out",
+    ))
+    .expect("read golden");
     for profile in PROFILES {
         for extraram in [false, true] {
             let built = compile_with_options(
@@ -319,7 +298,6 @@ fn corpus_dim_dyn_clr_keeps_both_loops_inline() {
         }
     }
 }
-
 #[test]
 fn a_reset_ahead_of_the_header_on_the_same_line_is_harmless() {
     for (name, src, expect) in [
@@ -358,7 +336,6 @@ fn a_reset_ahead_of_the_header_on_the_same_line_is_harmless() {
         }
     }
 }
-
 #[test]
 fn a_reset_after_the_header_on_the_same_line_still_stops_the_loop() {
     for profile in PROFILES {
@@ -475,11 +452,9 @@ fn for_limit_and_counter_slots_sit_inside_the_vars_anchors() {
         }
     }
 }
-
 #[test]
 fn the_wipe_is_still_one_memzero_over_the_label_difference() {
-    const SRC: &str =
-        "10 N=3.5\n20 FOR I=1 TO N STEP 0.5\n30 S=S+I\n40 NEXT\n50 CLR\n60 PRINT S;I\n";
+    const SRC: &str = "10 N=3.5\n20 FOR I=1 TO N STEP 0.5\n30 S=S+I\n40 NEXT\n50 CLR\n60 PRINT S;I\n";
     for profile in PROFILES {
         for extraram in [false, true] {
             let asm = build(SRC, profile, extraram).asm;

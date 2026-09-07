@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -15,16 +17,14 @@ fn run_variant(src: &str, profile: Profile, extraram: bool) -> String {
     let bytes = compile_with_options(&prg, opts)
         .unwrap_or_else(|e| panic!("compiles ({profile:?}, extraram={extraram}): {e}"))
         .prg_bytes;
-    common::run_clean(&bytes).unwrap_or_else(|| {
-        panic!("runs to a clean exit ({profile:?}, extraram={extraram}):\n{src}")
-    })
+    common::run_clean(&bytes)
+        .unwrap_or_else(|| panic!("runs to a clean exit ({profile:?}, extraram={extraram}):\n{src}"))
 }
 
 /// Build the expected CHROUT text for a sequence of `PRINT <number>` statements.
 fn nums(fields: &[&str]) -> String {
     fields.iter().map(|f| format!("{f} \n")).collect()
 }
-
 fn check_all_variants(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -36,7 +36,6 @@ fn check_all_variants(src: &str, expected: &str) {
         }
     }
 }
-
 #[test]
 fn two_int_stores_of_float_literals_floor() {
     check_all_variants(
@@ -44,7 +43,6 @@ fn two_int_stores_of_float_literals_floor() {
         &nums(&["-2", " 1"]),
     );
 }
-
 #[test]
 fn one_int_store_of_a_float_literal_floors() {
     check_all_variants("10 A%=-1.5:PRINT A%\n20 END\n", &nums(&["-2"]));
@@ -79,7 +77,6 @@ fn interleaved_int_stores_across_many_statements_floor() {
         &nums(&["-2", " 2", "-1", " 3", "-4", " 0"]),
     );
 }
-
 #[test]
 fn narrowed_int_value_feeds_arithmetic() {
     check_all_variants(
@@ -98,7 +95,6 @@ fn division_into_an_int_var_floors() {
         &nums(&["-2", "-4", " 3"]),
     );
 }
-
 #[test]
 fn int_store_from_a_float_var_floors() {
     check_all_variants(
@@ -106,7 +102,6 @@ fn int_store_from_a_float_var_floors() {
         &nums(&["-2", " 2"]),
     );
 }
-
 #[test]
 fn int_array_element_stores_floor() {
     check_all_variants(
@@ -130,7 +125,6 @@ fn int_narrowing_survives_if_then() {
         &nums(&["-2", " 1", "-3"]),
     );
 }
-
 #[test]
 fn narrowed_int_value_copies_to_other_vars() {
     check_all_variants(
@@ -149,7 +143,6 @@ fn sub_unit_fractions_floor_not_truncate() {
         &nums(&["-1", " 0", "-1"]),
     );
 }
-
 #[test]
 fn narrowed_int_value_feeds_for_bounds() {
     check_all_variants(
@@ -159,7 +152,6 @@ fn narrowed_int_value_feeds_for_bounds() {
         &nums(&["-2", "-1", " 0", " 1", " 2"]),
     );
 }
-
 #[test]
 fn float_var_line_local_forwarding_is_unaffected() {
     check_all_variants(
@@ -167,7 +159,6 @@ fn float_var_line_local_forwarding_is_unaffected() {
         &nums(&[" 1.5", " 2.5", "-1.5", "-2.5"]),
     );
 }
-
 #[test]
 fn string_var_line_local_forwarding_is_unaffected() {
     check_all_variants(

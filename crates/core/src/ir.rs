@@ -1419,7 +1419,11 @@ fn lower_stmt(
             message: message.as_ref().map(lower_str),
             ticks: lower_expr(ticks),
         },
-        ast::Statement::Sys { addr, regs, params } => Stmt::Sys {
+        ast::Statement::Sys {
+            addr,
+            regs,
+            params,
+        } => Stmt::Sys {
             addr: lower_expr(addr),
             regs: regs.iter().map(lower_expr).collect(),
             params: params.clone(),

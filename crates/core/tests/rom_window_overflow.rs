@@ -53,7 +53,6 @@ fn first_refused_items() -> usize {
     }
     hi
 }
-
 #[test]
 fn the_forced_off_layout_stops_at_memsiz() {
     let first_bad = first_refused_items();
@@ -73,7 +72,6 @@ fn the_forced_off_layout_stops_at_memsiz() {
         "the refusal must name the ROM window, got: {err}"
     );
 }
-
 #[test]
 fn the_auto_predictor_never_ships_a_wrong_image() {
     let first_bad = first_refused_items();
@@ -95,7 +93,6 @@ fn the_auto_predictor_never_ships_a_wrong_image() {
         assert_eq!(out, " 11  22  33 \n", "items={items} end=${end:04X}");
     }
 }
-
 #[test]
 fn images_below_the_window_are_untouched() {
     // Land the image around $9E00-$9F00, well inside the legal range but past the point where a
@@ -122,7 +119,6 @@ fn images_below_the_window_are_untouched() {
         assert!(r.clean_exit, "items={items} end=${end:04X}");
     }
 }
-
 #[test]
 fn the_extraram_layout_still_has_its_data_ceiling() {
     let opts = CompileOptions {

@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{
@@ -62,7 +64,6 @@ fn no_indirect_vector_starts_on_a_page_boundary() {
         }
     }
 }
-
 #[test]
 fn sweep_actually_crosses_the_hazard() {
     let mut padded_by_vector: Vec<String> = Vec::new();
@@ -85,7 +86,6 @@ fn sweep_actually_crosses_the_hazard() {
          if it stopped doing so the guard above is no longer being exercised"
     );
 }
-
 #[test]
 fn padded_images_produce_the_rom_answer() {
     let mut ran = 0;
@@ -125,7 +125,6 @@ fn dispatch_still_goes_through_the_vector() {
         "both vectors are accounted for: {names:?}"
     );
 }
-
 #[test]
 fn programs_clear_of_the_boundary_are_untouched() {
     let mut clean = 0;
@@ -235,7 +234,6 @@ fn an_image_running_into_the_io_area_is_refused() {
         assert!(msg.contains(want), "diagnostic names {want}: {msg}");
     }
 }
-
 #[test]
 fn an_image_stopping_below_the_io_area_still_compiles() {
     let prg = tokenize_program("10 PRINT \"HI\"\n20 END\n").expect("tokenizes");

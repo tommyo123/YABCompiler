@@ -42,7 +42,6 @@ fn lowering_of(asm: &str) -> Lowering {
         ),
     }
 }
-
 fn check_all_variants(src: &str, expect: Lowering, also_contains: &[&str]) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -62,7 +61,6 @@ fn check_all_variants(src: &str, expect: Lowering, also_contains: &[&str]) {
         }
     }
 }
-
 const FDIV: &str = "JSR $BB0F";
 
 // Must NOT short-circuit: the skipped operand is observable.
@@ -75,7 +73,6 @@ fn trapping_rhs_of_and_is_still_evaluated() {
         &[FDIV],
     );
 }
-
 #[test]
 fn trapping_rhs_of_or_is_still_evaluated() {
     check_all_variants(
@@ -84,7 +81,6 @@ fn trapping_rhs_of_or_is_still_evaluated() {
         &[FDIV],
     );
 }
-
 #[test]
 fn folded_false_lhs_still_emits_a_trapping_rhs() {
     check_all_variants(
@@ -93,7 +89,6 @@ fn folded_false_lhs_still_emits_a_trapping_rhs() {
         &[FDIV],
     );
 }
-
 #[test]
 fn folded_true_lhs_of_or_still_emits_a_trapping_rhs() {
     check_all_variants(
@@ -102,7 +97,6 @@ fn folded_true_lhs_of_or_still_emits_a_trapping_rhs() {
         &[FDIV],
     );
 }
-
 #[test]
 fn impure_rnd_rhs_is_still_evaluated() {
     check_all_variants(
@@ -124,7 +118,6 @@ fn def_fn_rhs_is_still_evaluated() {
         &[FDIV],
     );
 }
-
 #[test]
 fn io_space_peek_rhs_is_still_evaluated() {
     check_all_variants(
@@ -133,7 +126,6 @@ fn io_space_peek_rhs_is_still_evaluated() {
         &[],
     );
 }
-
 #[test]
 fn trapping_leaf_nested_in_the_rhs_disqualifies_it() {
     check_all_variants(
@@ -185,7 +177,6 @@ fn nested_bool_rhs_still_short_circuits() {
         &[],
     );
 }
-
 #[test]
 fn not_of_a_comparison_on_the_rhs_still_short_circuits() {
     check_all_variants(
@@ -194,7 +185,6 @@ fn not_of_a_comparison_on_the_rhs_still_short_circuits() {
         &[],
     );
 }
-
 #[test]
 fn ram_peek_rhs_still_short_circuits() {
     check_all_variants(
@@ -203,7 +193,6 @@ fn ram_peek_rhs_still_short_circuits() {
         &[],
     );
 }
-
 #[test]
 fn string_compare_rhs_still_short_circuits() {
     check_all_variants(
@@ -213,7 +202,6 @@ fn string_compare_rhs_still_short_circuits() {
         &[],
     );
 }
-
 #[test]
 fn substring_rhs_is_still_evaluated() {
     check_all_variants(
@@ -223,7 +211,6 @@ fn substring_rhs_is_still_evaluated() {
         &[],
     );
 }
-
 #[test]
 fn constant_arithmetic_rhs_still_short_circuits() {
     check_all_variants(

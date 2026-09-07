@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -26,7 +28,6 @@ fn run(src: &str, profile: Profile) -> (String, bool, Option<String>) {
         r.error_banner(),
     )
 }
-
 #[test]
 fn self_recursive_tail_gosub_still_runs_out_of_stack() {
     let src = "10 d=0\n20 gosub 100\n30 end\n100 d=d+1:print d;:gosub 100:return\n";
@@ -44,7 +45,6 @@ fn self_recursive_tail_gosub_still_runs_out_of_stack() {
         );
     }
 }
-
 #[test]
 fn tail_gosub_rewrite_still_flattens_a_non_recursive_call() {
     let src = "10 gosub 100\n20 end\n100 print \"a\";:gosub 200:return\n200 print \"b\";:return\n";
@@ -59,7 +59,6 @@ fn tail_gosub_rewrite_still_flattens_a_non_recursive_call() {
         assert_eq!(out.trim_end(), "AB", "{p:?}");
     }
 }
-
 #[test]
 fn mutually_recursive_tail_gosub_keeps_its_frame() {
     let src = "10 gosub 100\n20 end\n100 c=c+1:print c;:gosub 200:return\n200 gosub 100:return\n";
@@ -73,7 +72,6 @@ fn mutually_recursive_tail_gosub_keeps_its_frame() {
         );
     }
 }
-
 #[test]
 fn clr_restores_the_auto_dim_bound() {
     let src = "10 dim k(3):k(1)=5\n20 clr\n30 k(1)=k(1)+1:print k(1);\n40 print k(9)\n";
@@ -84,7 +82,6 @@ fn clr_restores_the_auto_dim_bound() {
         assert_eq!(out.trim_end(), " 1  0", "{p:?}");
     }
 }
-
 #[test]
 fn a_widened_array_still_bounds_checks_against_its_declared_dim() {
     let src = "10 dim k(3)\n20 print k(5)\n30 clr\n";
@@ -98,7 +95,6 @@ fn a_widened_array_still_bounds_checks_against_its_declared_dim() {
         );
     }
 }
-
 #[test]
 fn only_an_out_of_range_index_pays_for_widening() {
     let cases = [
@@ -119,7 +115,6 @@ fn only_an_out_of_range_index_pays_for_widening() {
         }
     }
 }
-
 #[test]
 fn a_costly_multi_dim_widening_is_declined() {
     let src = "10 dim a(3,3,3)\n20 clr\n30 print a(9,1,1)\n";
@@ -130,7 +125,6 @@ fn a_costly_multi_dim_widening_is_declined() {
         );
     }
 }
-
 #[test]
 fn next_restores_curlin_to_the_for_line() {
     let src = "10 for i=1 to 2:print peek(57)+peek(58)*256;\n20 next\n";
@@ -140,7 +134,6 @@ fn next_restores_curlin_to_the_for_line() {
         assert_eq!(out.trim_end(), " 10  10", "{p:?}");
     }
 }
-
 #[test]
 fn next_restores_curlin_inside_a_subroutine() {
     let src =
@@ -151,7 +144,6 @@ fn next_restores_curlin_inside_a_subroutine() {
         assert_eq!(out.trim_end(), " 100  100  100", "{p:?}");
     }
 }
-
 #[test]
 fn a_loop_that_never_reads_curlin_gets_no_restamp() {
     let quiet = "10 for i=1 to 10:a=a+i\n20 next\n30 print a\n";
@@ -181,7 +173,6 @@ fn top_of_for_body(asm: &str) -> Option<u16> {
     }
     u16::from_str_radix(&lo, 16).ok()
 }
-
 #[test]
 fn string_plus_number_is_a_runtime_type_mismatch() {
     let src = "10 a$=\"x\"\n20 print \"y\";\n30 print a$+1\n";
@@ -196,7 +187,6 @@ fn string_plus_number_is_a_runtime_type_mismatch() {
         );
     }
 }
-
 #[test]
 fn string_into_numeric_var_is_a_runtime_type_mismatch() {
     let src = "10 for i=1 to 3\n20 a$=\"x\"\n30 print \"a\";i;a$\n40 a=a$\n50 next\n";
@@ -211,7 +201,6 @@ fn string_into_numeric_var_is_a_runtime_type_mismatch() {
         );
     }
 }
-
 #[test]
 fn well_typed_string_expressions_are_untouched() {
     let ok = [
@@ -232,7 +221,6 @@ fn well_typed_string_expressions_are_untouched() {
         }
     }
 }
-
 #[test]
 fn an_unsupported_construct_is_still_a_compile_error() {
     let prg = tokenize_program("10 a$=\"x\"+\n").expect("tokenize");
@@ -244,7 +232,6 @@ fn an_unsupported_construct_is_still_a_compile_error() {
         "a truncated expression is not a type mismatch: {err}"
     );
 }
-
 #[test]
 fn for_with_an_integer_counter_is_a_kept_dialect_extension() {
     let src = "10 for i%=1 to 3\n20 print i%;:next\n30 print \"e\"\n";

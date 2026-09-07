@@ -2449,13 +2449,10 @@ fn fuse_poke_loops(stmts: &mut Vec<Stmt>, reads: &HashMap<VarName, u32>) {
             };
             stmts.drain(i + 1..i + 3);
             if let Some((var, exit)) = fused.loop_var_exit {
-                stmts.insert(
-                    i + 1,
-                    Stmt::Let {
-                        var,
-                        value: Expr::Number(exit),
-                    },
-                );
+                stmts.insert(i + 1, Stmt::Let {
+                    var,
+                    value: Expr::Number(exit),
+                });
             }
             // Don't advance i — a previous fusion could have left
             // another candidate adjacent (e.g., two consecutive
@@ -2491,8 +2488,10 @@ struct FusedPokeFill {
     /// exit-value store after the fill.
     loop_var_exit: Option<(VarName, f64)>,
 }
-
-fn match_poke_fill_triplet(stmts: &[Stmt], reads: &HashMap<VarName, u32>) -> Option<FusedPokeFill> {
+fn match_poke_fill_triplet(
+    stmts: &[Stmt],
+    reads: &HashMap<VarName, u32>,
+) -> Option<FusedPokeFill> {
     if stmts.len() != 3 {
         return None;
     }
@@ -4685,14 +4684,7 @@ fn compute_routine_effect(
         }
         let stmts = &module.lines[li].stmts;
         match scan_routine_stmts(
-            stmts,
-            false,
-            module,
-            line_index,
-            memo,
-            visiting,
-            &mut writes,
-            &mut stack,
+            stmts, false, module, line_index, memo, visiting, &mut writes, &mut stack,
         ) {
             RoutineCf::Escaped => return RoutineEffect::Unknown,
             RoutineCf::FallThrough => {
@@ -4751,17 +4743,11 @@ fn scan_routine_stmts(
                 }
                 return RoutineCf::Stop;
             }
-            Stmt::GoSub { target } => {
-                match routine_effect(*target, module, line_index, memo, visiting) {
-                    RoutineEffect::Writes(s) => writes.extend(s),
-                    RoutineEffect::Unknown => return RoutineCf::Escaped,
-                }
-            }
-            Stmt::OnBranch {
-                kind,
-                targets,
-                value,
-            } => {
+            Stmt::GoSub { target } => match routine_effect(*target, module, line_index, memo, visiting) {
+                RoutineEffect::Writes(s) => writes.extend(s),
+                RoutineEffect::Unknown => return RoutineCf::Escaped,
+            },
+            Stmt::OnBranch { kind, targets, value } => {
                 if !expr_is_int_safe(value, &probe) {
                     return RoutineCf::Escaped;
                 }
@@ -4867,9 +4853,9 @@ fn scan_routine_then(
             }
             None => RoutineCf::Escaped,
         },
-        ThenIr::Stmts(inner) => scan_routine_stmts(
-            inner, true, module, line_index, memo, visiting, writes, stack,
-        ),
+        ThenIr::Stmts(inner) => {
+            scan_routine_stmts(inner, true, module, line_index, memo, visiting, writes, stack)
+        }
     }
 }
 
@@ -9593,7 +9579,9 @@ fn int_range_escapees(
     }
     let mut out: Vec<VarName> = candidates
         .iter()
-        .filter(|v| unstable.contains(*v) || ranges.get(*v).is_some_and(|r| !r.fits_i16()))
+        .filter(|v| {
+            unstable.contains(*v) || ranges.get(*v).is_some_and(|r| !r.fits_i16())
+        })
         .cloned()
         .collect();
     out.sort_by_key(prom_sort_key);
@@ -9670,9 +9658,12 @@ fn prom_range_of(
                 ];
                 PromRange::new(*p.iter().min().unwrap(), *p.iter().max().unwrap())
             }
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                PromRange::new(-1, 0)
-            }
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge => PromRange::new(-1, 0),
             BinOp::And | BinOp::Or | BinOp::Xor => PromRange::i16(),
             _ => return None,
         },
@@ -10487,7 +10478,14 @@ impl ir::Pass for ResolveBareNext {
         for (line_idx, line) in module.lines.iter_mut().enumerate() {
             let line_no = line.number;
             for (top_idx, stmt) in line.stmts.iter_mut().enumerate() {
-                resolve_bare_next_stmt(stmt, &mut st, &orphans, line_no, line_idx, &[top_idx]);
+                resolve_bare_next_stmt(
+                    stmt,
+                    &mut st,
+                    &orphans,
+                    line_no,
+                    line_idx,
+                    &[top_idx],
+                );
             }
         }
         Ok(())
@@ -11002,7 +11000,6 @@ mod tests {
     use crate::ast::{BinOp, VarKind, VarName};
     use crate::ir::Pass;
     use crate::ir::{ArrayInductionIndex, Expr, Line, Module, Stmt, ThenIr};
-
     #[test]
     fn fold_refuses_results_outside_the_mflpt_range() {
         assert_eq!(fold_bin(BinOp::Mul, 1e38, 1e38), None);
@@ -11222,7 +11219,6 @@ mod tests {
         IntArrayPromote.run(&mut m).unwrap();
         assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Integer));
     }
-
     #[test]
     fn int_array_promote_skips_array_with_percent_twin() {
         let mut m = Module {
@@ -11240,7 +11236,6 @@ mod tests {
         IntArrayPromote.run(&mut m).unwrap();
         assert_eq!(array_let_kind_in(&m, "A"), Some(VarKind::Float));
     }
-
     #[test]
     fn int_array_promote_skips_array_with_fetch_percent_twin() {
         let mut m = Module {
@@ -11262,7 +11257,6 @@ mod tests {
         IntArrayPromote.run(&mut m).unwrap();
         assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Float));
     }
-
     #[test]
     fn int_array_promote_ignores_percent_scalar_twin() {
         let mut m = Module {
@@ -11562,7 +11556,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn identity_simplifier_still_drops_bitwise_ops_on_narrowed_operands() {
         for (op, lit) in [(BinOp::And, -1.0), (BinOp::Or, 0.0), (BinOp::Xor, 0.0)] {
@@ -12086,7 +12079,6 @@ mod tests {
         };
 
         GosubSingleUseInline.run(&mut module).unwrap();
-
         assert!(matches!(module.lines[0].stmts[0], Stmt::LineMark(100)));
         assert!(matches!(module.lines[0].stmts[1], Stmt::Let { .. }));
         assert!(matches!(module.lines[0].stmts[2], Stmt::LineMark(10)));
@@ -12133,7 +12125,6 @@ mod tests {
         };
 
         GosubShortBodyInline.run(&mut module).unwrap();
-
         for (idx, line_no) in [(0usize, 10), (1, 20)] {
             assert_eq!(module.lines[idx].number, line_no);
             assert!(
@@ -12573,10 +12564,7 @@ mod tests {
                         },
                     ],
                 },
-                Line {
-                    number: 20,
-                    stmts: vec![Stmt::End],
-                },
+                Line { number: 20, stmts: vec![Stmt::End] },
                 Line {
                     number: 100,
                     stmts: vec![Stmt::GoSub { target: 200 }, Stmt::Return],
@@ -13168,7 +13156,8 @@ impl ir::Pass for SplitMultiTypeVars {
                     let write_node = writes[write_local];
                     rename_writes.insert((var.clone(), write_node), new_var.clone());
                 }
-                let cluster_writes: HashSet<usize> = cluster.iter().map(|&i| writes[i]).collect();
+                let cluster_writes: HashSet<usize> =
+                    cluster.iter().map(|&i| writes[i]).collect();
                 for &r in reads {
                     let Some(reaching) = reach.get(&r) else {
                         continue;
@@ -13281,7 +13270,9 @@ fn scan_skip_vars(stmts: &[Stmt], skip: &mut HashSet<VarName>) {
                 ..
             } => scan_skip_vars(inner, skip),
             Stmt::IfElse {
-                then, else_then, ..
+                then,
+                else_then,
+                ..
             } => {
                 if let ThenIr::Stmts(inner) = then {
                     scan_skip_vars(inner, skip);
@@ -13306,11 +13297,7 @@ fn collect_stmt_writes_reads(
             collect_expr_reads(value, reads);
         }
         Stmt::For {
-            var,
-            start,
-            end,
-            step,
-            ..
+            var, start, end, step, ..
         } => {
             writes.insert(var.clone());
             collect_expr_reads(start, reads);
@@ -13371,9 +13358,7 @@ fn collect_stmt_writes_reads(
                 collect_print_piece_reads(piece, reads);
             }
         }
-        Stmt::Cmd {
-            items, file_num, ..
-        } => {
+        Stmt::Cmd { items, file_num, .. } => {
             collect_expr_reads(file_num, reads);
             for piece in items {
                 collect_print_piece_reads(piece, reads);
@@ -13419,15 +13404,8 @@ fn collect_expr_reads(e: &Expr, reads: &mut HashSet<VarName>) {
             reads.insert(v.clone());
         }
         Number(_) | String(_) => {}
-        Neg(inner)
-        | Not(inner)
-        | Func1(_, inner)
-        | Peek(inner)
-        | MemPeek(inner)
-        | Pos(inner)
-        | Fre(inner)
-        | Usr(inner)
-        | Joy(inner)
+        Neg(inner) | Not(inner) | Func1(_, inner) | Peek(inner) | MemPeek(inner)
+        | Pos(inner) | Fre(inner) | Usr(inner) | Joy(inner)
         | Pot(inner) => collect_expr_reads(inner, reads),
         Bin(_, l, r) => {
             collect_expr_reads(l, reads);
@@ -13520,7 +13498,10 @@ fn collect_expr_reads_fallback(e: &Expr, reads: &mut HashSet<VarName>) {
 /// A write GENs itself and KILLs every other write of the same var,
 /// so once a write executes, only that write is "live" downstream
 /// until the next assignment.
-fn reaching_defs(cfg: &crate::cfg::Cfg, writes: &HashSet<usize>) -> HashMap<usize, HashSet<usize>> {
+fn reaching_defs(
+    cfg: &crate::cfg::Cfg,
+    writes: &HashSet<usize>,
+) -> HashMap<usize, HashSet<usize>> {
     let n = cfg.nodes.len();
     let mut in_: Vec<HashSet<usize>> = vec![HashSet::new(); n];
     let mut out: Vec<HashSet<usize>> = vec![HashSet::new(); n];
@@ -13597,7 +13578,9 @@ fn stmt_at_mut<'a>(module: &'a mut ir::Module, path: &crate::cfg::StmtPath) -> &
                 ..
             } => s = &mut inner[idx],
             Stmt::IfElse {
-                then, else_then, ..
+                then,
+                else_then,
+                ..
             } => {
                 let then_len = match then {
                     ThenIr::Stmts(inner) => {
@@ -13749,9 +13732,7 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
         }
         If { cond, .. } => v.visit_expr_mut(cond),
         IfElse { cond, .. } => v.visit_expr_mut(cond),
-        For {
-            start, end, step, ..
-        } => {
+        For { start, end, step, .. } => {
             v.visit_expr_mut(start);
             v.visit_expr_mut(end);
             v.visit_expr_mut(step);
@@ -13793,9 +13774,7 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
         }
         GetFile { file_num, .. } => v.visit_expr_mut(file_num),
         InputFile { file_num, .. } => v.visit_expr_mut(file_num),
-        Cmd {
-            file_num, items, ..
-        } => {
+        Cmd { file_num, items, .. } => {
             v.visit_expr_mut(file_num);
             for piece in items {
                 match piece {

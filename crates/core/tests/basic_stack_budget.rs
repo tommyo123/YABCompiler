@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -44,7 +46,6 @@ fn nest(n: usize, body: &str) -> String {
     s.push_str(&format!("{line} PRINT \"OK\"\n"));
     s
 }
-
 #[test]
 fn nine_frames_evaluate_and_ten_do_not() {
     for profile in PROFILES {
@@ -75,7 +76,6 @@ fn nine_frames_evaluate_and_ten_do_not() {
         }
     }
 }
-
 #[test]
 fn ten_frames_unwound_by_bare_nexts_still_run() {
     for profile in PROFILES {
@@ -90,7 +90,6 @@ fn ten_frames_unwound_by_bare_nexts_still_run() {
         }
     }
 }
-
 #[test]
 fn the_eleventh_for_header_is_itself_out_of_memory() {
     for profile in PROFILES {
@@ -105,7 +104,6 @@ fn the_eleventh_for_header_is_itself_out_of_memory() {
         );
     }
 }
-
 #[test]
 fn a_normal_nest_pays_nothing() {
     const SRC: &str = "10 T=0\n\
@@ -132,7 +130,6 @@ fn a_normal_nest_pays_nothing() {
         }
     }
 }
-
 #[test]
 fn sequential_loops_never_reach_the_ceiling() {
     let mut src = String::from("10 T=0\n");
@@ -154,7 +151,6 @@ fn sequential_loops_never_reach_the_ceiling() {
         assert_eq!(out.trim_end(), "T 24", "({profile:?})");
     }
 }
-
 #[test]
 fn one_variable_reused_does_not_stack_frames() {
     let mut src = String::new();
@@ -178,7 +174,6 @@ fn one_variable_reused_does_not_stack_frames() {
         );
     }
 }
-
 #[test]
 fn the_trap_is_a_compile_time_jump_to_the_error_vector() {
     let asm = build(&nest(10, "PRINT \"IN\""), Profile::Default, false).asm;
@@ -248,7 +243,6 @@ fn a_leaking_frame_and_marker_pair_stops_on_bytes_not_on_entries() {
         }
     }
 }
-
 #[test]
 fn a_shallow_runtime_stack_is_untouched() {
     const SRC: &str = "10 FOR I=1 TO 3\n\
@@ -267,7 +261,6 @@ fn a_shallow_runtime_stack_is_untouched() {
         }
     }
 }
-
 #[test]
 fn the_static_for_fast_path_never_sees_the_byte_check() {
     const SRC: &str = "10 T=0\n\
@@ -293,15 +286,10 @@ fn the_static_for_fast_path_never_sees_the_byte_check() {
             );
             let (clean, out) = run(&built.prg_bytes);
             assert!(clean, "({profile:?}, extraram={extraram})");
-            assert_eq!(
-                out.trim_end(),
-                "T 400",
-                "({profile:?}, extraram={extraram})"
-            );
+            assert_eq!(out.trim_end(), "T 400", "({profile:?}, extraram={extraram})");
         }
     }
 }
-
 #[test]
 fn the_byte_check_is_one_shared_helper() {
     let asm = build(LEAKY, Profile::Default, false).asm;
@@ -346,7 +334,6 @@ fn clr_nest(n: usize) -> String {
     s.push_str(&format!("{line} PRINT \"OK\"\n"));
     s
 }
-
 #[test]
 fn ten_runtime_for_frames_fail_on_the_print_and_not_on_the_tenth_push() {
     let src = clr_nest(10);
@@ -375,7 +362,6 @@ fn ten_runtime_for_frames_fail_on_the_print_and_not_on_the_tenth_push() {
         }
     }
 }
-
 #[test]
 fn nine_runtime_for_frames_are_stopped_by_the_clr_and_not_by_the_budget() {
     let src = clr_nest(9);
@@ -398,7 +384,6 @@ fn nine_runtime_for_frames_are_stopped_by_the_clr_and_not_by_the_budget() {
         }
     }
 }
-
 fn emitted_floors(asm: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut lines = asm.lines();
@@ -414,7 +399,6 @@ fn emitted_floors(asm: &str) -> Vec<u8> {
     }
     out
 }
-
 fn g_family(selector: &str, prelude: &str) -> String {
     format!(
         "{prelude}1 GOTO 30\n\
@@ -426,7 +410,6 @@ fn g_family(selector: &str, prelude: &str) -> String {
          60 FOR K=1 TO 3:GOTO 42\n"
     )
 }
-
 #[test]
 fn the_emitted_floor_is_the_rom_measured_one_for_each_expression() {
     let cases: [(&str, &str, u8); 3] = [
@@ -474,22 +457,18 @@ fn each_on_expression_stops_where_the_rom_stops() {
         }
     }
 }
-
 #[test]
 fn a_cheap_selector_keeps_the_old_boundary() {
     for profile in PROFILES {
         let built = build(&g_family("(I AND 1)+1", ""), profile, false);
         let r = emu64::run_prg_to_end(&built.prg_bytes, common::MAX_INSNS).expect("run");
         assert_eq!(
-            common::petscii_to_string(&r.output)
-                .split_whitespace()
-                .count(),
+            common::petscii_to_string(&r.output).split_whitespace().count(),
             7,
             "({profile:?})"
         );
     }
 }
-
 #[test]
 fn no_site_is_guarded_later_than_the_validated_constant() {
     let leak = "10 C=0\n\
@@ -513,7 +492,6 @@ fn no_site_is_guarded_later_than_the_validated_constant() {
         }
     }
 }
-
 #[test]
 fn a_program_that_cannot_exhaust_page_one_pays_nothing() {
     const SRC: &str = "10 FOR I=1 TO 3\n\

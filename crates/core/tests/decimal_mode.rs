@@ -77,7 +77,6 @@ fn cld_precedes_the_prologue_of_a_zero_page_heavy_program() {
         "equates emit no bytes, so CLD is still first:\n{asm}"
     );
 }
-
 #[test]
 fn cld_survives_the_peephole_at_every_profile() {
     for profile in [Profile::Default, Profile::Size, Profile::Speed] {
@@ -89,7 +88,6 @@ fn cld_survives_the_peephole_at_every_profile() {
         );
     }
 }
-
 #[test]
 fn cld_is_emitted_exactly_once() {
     let src = "\
@@ -106,7 +104,6 @@ fn cld_is_emitted_exactly_once() {
         .count();
     assert_eq!(n, 1, "expected a single prologue CLD, found {n}:\n{asm}");
 }
-
 #[test]
 fn arithmetic_is_binary_end_to_end() {
     let src = "\

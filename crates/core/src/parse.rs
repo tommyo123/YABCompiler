@@ -6854,7 +6854,6 @@ mod tests {
             other => panic!("not a DATA statement: {other:?}"),
         }
     }
-
     #[test]
     fn data_keeps_trailing_spaces_in_unquoted_items() {
         use crate::ast::DataValue;
@@ -6883,7 +6882,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn data_numeric_items_keep_their_source_spelling() {
         use crate::ast::DataValue;
@@ -6922,11 +6920,7 @@ mod tests {
         // `GOSUB 500DEFGFX` — the tokeniser turns the leading `DEF` of
         // the label into a token byte; v2 reads the 500 and ignores the
         // rest, so it must not be parsed as a `DEF` statement.
-        let stmts = line_body(
-            10,
-            &[TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X'],
-        )
-        .unwrap();
+        let stmts = line_body(10, &[TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X']).unwrap();
         assert!(matches!(stmts.as_slice(), [Statement::GoSub(500)]));
     }
 
@@ -6937,8 +6931,8 @@ mod tests {
         let stmts = line_body(
             10,
             &[
-                TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X', b':', TOK_PRINT, b'"',
-                b'X', b'"',
+                TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X', b':', TOK_PRINT, b'"', b'X',
+                b'"',
             ],
         )
         .unwrap();
@@ -6951,13 +6945,9 @@ mod tests {
     fn gosub_drops_trailing_text_to_end_of_line() {
         // v2 ignores everything after the line number, even when it would
         // tokenise to a valid statement; only `GOSUB 10000` survives.
-        let stmts = line_body(
-            10,
-            &[
-                TOK_GOSUB, b'1', b'0', b'0', b'0', b'0', TOK_PRINT, b'"', b'X', b'"',
-            ],
-        )
-        .unwrap();
+        let stmts =
+            line_body(10, &[TOK_GOSUB, b'1', b'0', b'0', b'0', b'0', TOK_PRINT, b'"', b'X', b'"'])
+                .unwrap();
         assert!(matches!(stmts.as_slice(), [Statement::GoSub(10000)]));
     }
 
@@ -6966,8 +6956,7 @@ mod tests {
         let stmts = line_body(
             10,
             &[
-                TOK_IF, b'1', b' ', TOK_THEN, TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F',
-                b'X',
+                TOK_IF, b'1', b' ', TOK_THEN, TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X',
             ],
         )
         .unwrap();
@@ -7829,7 +7818,6 @@ mod tests {
             other => panic!("expected PRINT, got {other:?}"),
         }
     }
-
     #[test]
     fn unary_minus_after_caret_takes_the_whole_power_chain() {
         // 2 ^ - 1 ^ 3
@@ -7863,7 +7851,6 @@ mod tests {
         );
         assert!(matches!(exp.as_ref(), Expr::Number(n) if *n == 2.0));
     }
-
     #[test]
     fn unary_plus_after_caret_parses_without_widening_the_operand() {
         let e = print_expr(&[b'2', TOK_POW, TOK_PLUS, b'2']);
@@ -7883,7 +7870,6 @@ mod tests {
         );
         assert!(matches!(exp.as_ref(), Expr::Number(n) if *n == 3.0));
     }
-
     #[test]
     fn unary_minus_after_caret_stops_at_a_lower_precedence_operator() {
         // 2 ^ - 1 * 3

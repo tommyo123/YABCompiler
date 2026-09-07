@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -19,11 +21,9 @@ fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
 
 fn run_variant(src: &str, profile: Profile, extraram: bool) -> String {
     let (bytes, _) = build(src, profile, extraram);
-    common::run_clean(&bytes).unwrap_or_else(|| {
-        panic!("runs to a clean exit ({profile:?}, extraram={extraram}):\n{src}")
-    })
+    common::run_clean(&bytes)
+        .unwrap_or_else(|| panic!("runs to a clean exit ({profile:?}, extraram={extraram}):\n{src}"))
 }
-
 fn check_all_variants(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -76,7 +76,6 @@ fn for_under_then_owns_the_following_next() {
                40 PRINT I;K\n";
     check_all_variants(src, " 2  4 \n");
 }
-
 #[test]
 fn for_under_then_body_checksum_matches_basic() {
     let src = "5 N=0:S=0\n\
@@ -93,7 +92,6 @@ fn for_under_then_body_checksum_matches_basic() {
          E 2  4  4  76 \n",
     );
 }
-
 #[test]
 fn for_under_never_taken_then_leaves_the_outer_loop_alone() {
     let src = "10 FOR I=1 TO 4\n\
@@ -113,7 +111,6 @@ fn for_under_always_taken_then_captures_the_next_immediately() {
                40 PRINT I;K\n";
     check_all_variants(src, " 1  4 \n");
 }
-
 #[test]
 fn for_under_then_at_top_level_taken() {
     let src = "10 C=0:K=0\n\
@@ -123,7 +120,6 @@ fn for_under_then_at_top_level_taken() {
                50 PRINT C;I\n";
     check_all_variants(src, " 3  4 \n");
 }
-
 #[test]
 fn for_under_skipped_then_leaves_a_next_without_for() {
     let src = "10 C=0:K=1\n\
@@ -133,7 +129,6 @@ fn for_under_skipped_then_leaves_a_next_without_for() {
                50 PRINT C;I\n";
     check_stops_with(src, "C 1 \n");
 }
-
 #[test]
 fn conditional_frame_closes_and_abandons_the_outer_loop() {
     let src = "10 S=0\n\
@@ -144,7 +139,6 @@ fn conditional_frame_closes_and_abandons_the_outer_loop() {
                60 PRINT S;I;K\n";
     check_all_variants(src, " 2  1  3 \n");
 }
-
 #[test]
 fn one_next_binds_to_different_loops_on_different_iterations() {
     let src = "10 S=0\n\
@@ -168,7 +162,6 @@ fn two_conditional_frames_stack() {
                60 PRINT S;I;K;L\n";
     check_all_variants(src, " 3  2  1  3 \n");
 }
-
 #[test]
 fn for_under_else_arm_owns_the_following_next() {
     let src = "10 FOR I=1 TO 4\n\
@@ -178,7 +171,6 @@ fn for_under_else_arm_owns_the_following_next() {
                40 PRINT I;K;A\n";
     check_all_variants(src, " 2  4  1 \n");
 }
-
 #[test]
 fn conditional_frame_accumulator_matches_basic() {
     let src = "10 S=0\n\
@@ -190,7 +182,6 @@ fn conditional_frame_accumulator_matches_basic() {
                70 PRINT\"I\";I;\"K\";K\n";
     check_all_variants(src, "S 706 \nI 2 K 4 \n");
 }
-
 #[test]
 fn conditional_for_closed_by_a_goto_reached_orphan_next() {
     let src = "5 P=0\n\
@@ -210,7 +201,6 @@ fn conditional_for_closed_by_a_goto_reached_orphan_next() {
          P 6  4  3 \n",
     );
 }
-
 #[test]
 fn goto_reached_orphan_next_without_a_conditional_frame() {
     let src = "5 P=0\n\
@@ -228,7 +218,6 @@ fn goto_reached_orphan_next_without_a_conditional_frame() {
          P 4  4  0 \n",
     );
 }
-
 #[test]
 fn conditional_for_gets_a_dispatch_handler() {
     let asm = asm_of(
@@ -260,7 +249,6 @@ fn refor_same_var_then_extra_next_is_an_error() {
                60 PRINT\"E\";I\n";
     check_stops_with(src, "X 1 \nX 2 \n");
 }
-
 #[test]
 fn refor_same_var_bare() {
     let src = "10 FOR I=1 TO 3\n\
@@ -308,7 +296,6 @@ fn unmatched_next_emits_the_trap_not_a_resurrected_tail() {
          discarded the outer frame — it must become ?NEXT WITHOUT FOR:\n{asm}"
     );
 }
-
 #[test]
 fn shared_tail_next_idiom_still_pairs() {
     let src = "10 FOR I=1 TO 5\n\
@@ -344,7 +331,6 @@ fn ordinary_nest_stays_on_the_compile_time_stack() {
         "a statically paired nest cannot reach ?NEXT WITHOUT FOR:\n{asm}"
     );
 }
-
 #[test]
 fn if_inside_a_loop_body_does_not_force_the_runtime_stack() {
     let asm = asm_of(
@@ -379,7 +365,6 @@ fn for_and_next_both_inside_one_then_stay_static() {
     );
     check_all_variants(src, " 6  4  4 \n");
 }
-
 #[test]
 fn conditional_frame_still_uses_the_byte_counter_specialisation() {
     let asm = asm_of(

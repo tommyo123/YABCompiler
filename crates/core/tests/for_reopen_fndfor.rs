@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -18,7 +20,6 @@ fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
 fn asm_of(src: &str) -> String {
     build(src, Profile::Default, false).1
 }
-
 fn check_all_variants(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -33,7 +34,6 @@ fn check_all_variants(src: &str, expected: &str) {
         }
     }
 }
-
 fn check_stops_with(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -52,7 +52,6 @@ fn check_stops_with(src: &str, expected: &str) {
         }
     }
 }
-
 #[test]
 fn a_branch_over_the_next_that_would_have_popped_the_survivor() {
     check_all_variants(
@@ -81,7 +80,6 @@ fn the_same_shape_reached_through_on_goto() {
         "A 1 \nA 2 \nC 3 \n",
     );
 }
-
 #[test]
 fn the_named_next_now_reaches_the_dispatcher_the_bare_one_always_did() {
     let bare = "10 FOR I=1 TO 2\n\
@@ -119,7 +117,6 @@ fn reopening_the_inner_loop_leaves_the_outer_one_closeable() {
                60 PRINT I;J\n";
     check_all_variants(src, " 3  2 \n");
 }
-
 #[test]
 fn reopening_the_inner_loop_keeps_both_tails_inline() {
     let asm = asm_of(
@@ -179,7 +176,6 @@ fn a_discarded_frame_releases_its_runtime_slot() {
         "A 1  1  1 \nA 2  1  1 \n",
     );
 }
-
 #[test]
 fn a_discarded_frame_releases_its_runtime_slot_with_a_third_variable() {
     check_stops_with(
@@ -197,7 +193,6 @@ fn a_discarded_frame_releases_its_runtime_slot_with_a_third_variable() {
         "A 1  1  1 \nA 2  1  1 \n",
     );
 }
-
 #[test]
 fn a_discarded_frame_releases_its_runtime_slot_across_a_goto() {
     check_stops_with(
@@ -255,7 +250,6 @@ fn next_var_past_a_conditional_frame_terminates() {
         "A 1  1 \nA 2  1 \nB 3  1 \n",
     );
 }
-
 #[test]
 fn next_var_past_a_conditional_frame_dispatches() {
     let src = "10 FOR I=1 TO 2\n\
@@ -269,7 +263,6 @@ fn next_var_past_a_conditional_frame_dispatches() {
          represented at run time"
     );
 }
-
 #[test]
 fn next_var_past_an_unconditional_frame_keeps_the_static_fast_path() {
     let src = "10 FOR I=1 TO 2\n\
@@ -309,7 +302,6 @@ fn a_reopen_with_no_framed_loops_stays_free() {
         "no slot was allocated, so none is released:\n{asm}"
     );
 }
-
 #[test]
 fn a_searching_push_does_its_own_truncation() {
     let src = "10 GOTO 40\n\

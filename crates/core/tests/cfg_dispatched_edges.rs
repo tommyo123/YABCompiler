@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::cfg::Cfg;
@@ -16,7 +18,6 @@ const ACCUMULATOR: &str = "\
 40 s=s+1:goto 10
 50 print \"e\";i;s
 ";
-
 const FORTY_WITH_COUNTER: &str = "\
 5 goto 10
 6 next:if a=0 then end
@@ -31,7 +32,6 @@ const FORTY_WITH_COUNTER: &str = "\
 70 goto 40
 80 a=1:on (c and 1)+1 goto 6,8
 ";
-
 const CLEAN_NEST: &str = "\
 10 for i=1 to 3
 20 for j=1 to 3
@@ -94,10 +94,7 @@ fn reachable(cfg: &Cfg, start: usize) -> Vec<usize> {
 fn loop_carried_accumulator_is_not_frozen_across_a_dispatched_next() {
     for profile in PROFILES {
         let (clean, out) = run(ACCUMULATOR, profile);
-        assert!(
-            clean,
-            "{profile:?}: program should end cleanly, got {out:?}"
-        );
+        assert!(clean, "{profile:?}: program should end cleanly, got {out:?}");
         let got: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
             got, "E 3 2",
@@ -106,7 +103,6 @@ fn loop_carried_accumulator_is_not_frozen_across_a_dispatched_next() {
         );
     }
 }
-
 #[test]
 fn dispatched_loop_counter_reaches_the_branch_that_ends_the_program() {
     for profile in PROFILES {
@@ -157,7 +153,6 @@ fn dispatched_next_reaches_the_body_of_the_loop_it_runs() {
          dataflow can ever see the value the previous iteration wrote"
     );
 }
-
 #[test]
 fn both_dispatched_nexts_reach_both_loop_bodies() {
     let m = module_of(FORTY_WITH_COUNTER);
@@ -219,7 +214,6 @@ fn clean_nest_keeps_the_static_lowering() {
         );
     }
 }
-
 #[test]
 fn an_untouched_loop_in_a_dispatching_program_gains_no_edges() {
     const MIXED: &str = "\
@@ -245,7 +239,6 @@ fn an_untouched_loop_in_a_dispatching_program_gains_no_edges() {
         succ, want,
         "the clean K loop must keep exactly its back-edge and its exit"
     );
-
     let k_body = cfg.line_first[&110];
     for id in next_nodes(&cfg, &m) {
         if id == n {

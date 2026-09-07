@@ -1,3 +1,5 @@
+
+
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
 
 fn compile_asm(src: &str, profile: Profile) -> Result<String, String> {

@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -21,7 +23,6 @@ fn asm_of(src: &str) -> String {
         .expect("compiles")
         .asm
 }
-
 fn check_all_variants(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -36,7 +37,6 @@ fn check_all_variants(src: &str, expected: &str) {
         }
     }
 }
-
 fn check_stops_with(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -76,7 +76,6 @@ fn block(asm: &str, label: &str) -> String {
         .unwrap_or(rest.len());
     rest[..end].to_string()
 }
-
 #[test]
 fn gosub_entry_inside_an_unclosed_for_body_reads_the_variables_own_home() {
     let src = "10 for i=1 to 3\n\
@@ -87,7 +86,6 @@ fn gosub_entry_inside_an_unclosed_for_body_reads_the_variables_own_home() {
                200 print \"o\";i;:return\n";
     check_all_variants(src, "O 1 -E 8 -\n");
 }
-
 #[test]
 fn goto_back_into_a_finished_for_body_reads_the_variables_own_home() {
     let src = "10 a=0:for i=3 to 0 step -1\n\
@@ -97,7 +95,6 @@ fn goto_back_into_a_finished_for_body_reads_the_variables_own_home() {
                50 print i:next\n";
     check_all_variants(src, " 3 \n 2 \n 1 \n 0 \n 2 \n 1.5 \n 1 \n");
 }
-
 #[test]
 fn goto_back_into_a_finished_for_body_named_next_reads_the_variables_own_home() {
     let src = "10 a=0:for i=3 to 0 step -1\n\
@@ -107,7 +104,6 @@ fn goto_back_into_a_finished_for_body_named_next_reads_the_variables_own_home() 
                50 print i:next i\n";
     check_all_variants(src, " 3 \n 2 \n 1 \n 0 \n 2 \n 1.5 \n 1 \n");
 }
-
 #[test]
 fn goto_into_a_never_entered_for_body_reads_the_variables_own_home() {
     let src = "10 for i=2 to 2\n\
@@ -118,7 +114,6 @@ fn goto_into_a_never_entered_for_body_reads_the_variables_own_home() {
                60 print \"x\";:goto 40\n";
     check_stops_with(src, "X 2 ");
 }
-
 #[test]
 fn goto_into_a_finished_body_pokes_through_the_variables_own_home() {
     let src = "5 poke 899,0\n\
@@ -164,7 +159,6 @@ fn next_on_the_percent_twin_does_not_close_the_float_loop() {
         "",
     );
 }
-
 #[test]
 fn entered_body_routes_the_read_through_v_var() {
     let asm = asm_of(
@@ -181,7 +175,6 @@ fn entered_body_routes_the_read_through_v_var() {
          its read of I must not come from the counter slot:\n{asm}"
     );
 }
-
 #[test]
 fn still_reads_the_counter_slot_when_the_body_is_closed() {
     let asm = asm_of(
@@ -233,7 +226,6 @@ fn still_reads_the_counter_slot_when_the_branch_target_is_in_the_body() {
     );
     check_all_variants(src, " 1  2  4  2.5 \n");
 }
-
 #[test]
 fn still_allocates_an_induction_slot_for_an_unentered_loop() {
     let src = "10 for i=1 to 10\n\
@@ -247,7 +239,6 @@ fn still_allocates_an_induction_slot_for_an_unentered_loop() {
     );
     check_all_variants(src, " 75 \n");
 }
-
 #[test]
 fn still_allocates_array_pointer_inductions_for_an_unentered_loop() {
     let asm = asm_of(
@@ -269,7 +260,6 @@ fn still_allocates_array_pointer_inductions_for_an_unentered_loop() {
         );
     }
 }
-
 #[test]
 fn still_int_promotes_a_counter_whose_next_names_the_same_variable() {
     let src = "10 for i=1 to 2\n\

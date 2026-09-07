@@ -650,20 +650,13 @@ impl IntRange {
             self.max as f64 / other.min as f64,
             self.max as f64 / other.max as f64,
         ];
-        let lo = corners
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min)
-            .floor();
+        let lo = corners.iter().copied().fold(f64::INFINITY, f64::min).floor();
         let hi = corners
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max)
             .floor();
-        Some(Self::new(
-            clamp_fact_i64(lo as i64)?,
-            clamp_fact_i64(hi as i64)?,
-        ))
+        Some(Self::new(clamp_fact_i64(lo as i64)?, clamp_fact_i64(hi as i64)?))
     }
 }
 
@@ -2307,10 +2300,7 @@ fn collect_shadow_stmt(
             }
         }
         Stmt::ComputedGoto { target } => collect_shadow_expr(target, ShadowCtx::Int, info),
-        Stmt::Rcomp {
-            then: _,
-            else_then: _,
-        } => {
+        Stmt::Rcomp { then: _, else_then: _ } => {
             // Body stmts get their own CFG nodes — see Stmt::If above.
         }
         Stmt::OnKey { keys, .. } => collect_shadow_str(keys, info),
@@ -3569,10 +3559,7 @@ mod tests {
                 },
                 Line {
                     number: 20,
-                    stmts: vec![Stmt::Get {
-                        var: x.clone(),
-                        indices: Vec::new(),
-                    }],
+                    stmts: vec![Stmt::Get { var: x.clone(), indices: Vec::new() }],
                 },
                 Line {
                     number: 30,

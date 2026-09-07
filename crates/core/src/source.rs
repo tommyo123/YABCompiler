@@ -801,7 +801,6 @@ fn match_keyword(table: &[(&str, u8)], bytes: &[u8], i: usize) -> Option<(usize,
 pub fn tokenize_program(source: &str) -> Result<Vec<u8>, TokenizeError> {
     tokenize_program_at(source, LOAD_ADDR_C64)
 }
-
 pub fn tokenize_program_with(source: &str, dialect: Dialect) -> Result<Vec<u8>, TokenizeError> {
     tokenize_program_at_with(source, LOAD_ADDR_C64, dialect)
 }
@@ -908,7 +907,6 @@ fn tsb_words_used_as_variables(source: &str) -> std::collections::HashSet<&'stat
     }
     found
 }
-
 pub fn tokenize_program_at_with(
     source: &str,
     load_addr: u16,
@@ -1342,10 +1340,9 @@ mod tests {
         // reproduce the original byte.
         let rendered = crate::petscii::byte_to_string(0xA6);
         assert_eq!(rendered, "{$A6}");
-        assert_eq!(
-            body(&format!("PRINT \"{rendered}\"")),
-            vec![0x99, b' ', 0x22, 0xA6, 0x22]
-        );
+        assert_eq!(body(&format!("PRINT \"{rendered}\"")), vec![
+            0x99, b' ', 0x22, 0xA6, 0x22
+        ]);
     }
 
     #[test]

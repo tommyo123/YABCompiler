@@ -99,7 +99,6 @@ const POOR_MANS_GC: &str = "\
 160 print len(g$(1)); len(b$)
 170 data 65, 7000
 ";
-
 #[test]
 fn fre_falls_by_the_size_of_each_runtime_dim() {
     check_all_profiles(RUNTIME_DIM, "D1: 602 \nD2: 602 \nZ 7 \n");
@@ -118,7 +117,6 @@ fn fre_measures_against_the_array_ceiling_when_a_runtime_dim_exists() {
         "FRE must not read MEMSIZ once runtime DIM owns the ceiling:\n{fre}"
     );
 }
-
 #[test]
 fn fre_still_uses_memsiz_when_there_is_no_runtime_dim() {
     let asm = asm_of(LIVE_STRINGS);
@@ -133,7 +131,6 @@ fn fre_still_uses_memsiz_when_there_is_no_runtime_dim() {
          be materialised at all"
     );
 }
-
 fn fre_block(asm: &str) -> String {
     let start = asm
         .find("    JSR __GC_RUN\n    SEC\n")
@@ -142,17 +139,14 @@ fn fre_block(asm: &str) -> String {
     let end = tail.find("JSR $B391").expect("FRE ends in GIVAYF") + "JSR $B391".len();
     tail[..end].to_string()
 }
-
 #[test]
 fn fre_forces_a_collection() {
     check_all_profiles(GARBAGE_THEN_FRE, "GC LEAK: 0 \nBBBBBFFFFF\n");
 }
-
 #[test]
 fn a_collection_forced_by_fre_survives_the_statement() {
     check_all_profiles(POOR_MANS_GC, "DIMMED OK: 1234 \n 201  200 \n");
 }
-
 #[test]
 fn fre_tracks_live_string_heap_growth() {
     check_all_profiles(LIVE_STRINGS, "USED: 120 \nBBBUUU\n");
@@ -161,7 +155,6 @@ fn fre_tracks_live_string_heap_growth() {
 const UNGUARDED_RESTORE: &str = "__HEAP_END_NONLET:\n    \
      LDA __HEAP_SAVE\n    STA __HEAP_PTR\n    \
      LDA __HEAP_SAVE+1\n    STA __HEAP_PTR+1\n    RTS";
-
 #[test]
 fn heap_end_nonlet_keeps_the_unguarded_restore_when_nothing_calls_fre() {
     let src = "\
@@ -186,7 +179,6 @@ fn heap_end_nonlet_keeps_the_unguarded_restore_when_nothing_calls_fre() {
     );
     check_all_profiles(src, "BBDD 4 \n");
 }
-
 #[test]
 fn heap_end_nonlet_keeps_the_unguarded_restore_without_a_collector() {
     let src = "\
@@ -239,7 +231,6 @@ const FOLDABLE_INTO_HEAP_VAR: &str = "\
 70 print \"live:\"; f1 - fre(0)
 80 print len(b$); b$
 ";
-
 const FOLDABLE_INTO_HEAP_VAR_NO_FRE: &str = "\
 10 c$ = \"world\"
 30 for i=1 to 20
@@ -263,7 +254,6 @@ const FOLDABLE_INTO_ARRAY_NO_FRE: &str = "\
 30 z$(1) = \"x\" + \"y\"
 50 print z$(1)
 ";
-
 const INTERLEAVED_GARBAGE: &str = "\
 10 dim g$(2)
 20 x$ = \"0123456789\"
@@ -309,7 +299,6 @@ fn fre_collects_interleaved_array_garbage() {
 fn fre_does_not_see_folded_temporaries() {
     check_all_profiles(FOLDED_TEMPORARY, "TEMP: 0 \n 3 \n");
 }
-
 #[test]
 fn constant_string_concat_still_folds_when_nothing_calls_fre() {
     for src in [FOLDABLE_INTO_HEAP_VAR_NO_FRE, FOLDABLE_INTO_ARRAY_NO_FRE] {
@@ -326,7 +315,6 @@ fn constant_string_concat_still_folds_when_nothing_calls_fre() {
     check_all_profiles(FOLDABLE_INTO_HEAP_VAR_NO_FRE, " 10 HELLOWORLD\n");
     check_all_profiles(FOLDABLE_INTO_ARRAY_NO_FRE, "XY\n");
 }
-
 #[test]
 fn a_program_that_calls_fre_keeps_its_constant_concat() {
     for src in [FOLDABLE_INTO_HEAP_VAR, FOLDABLE_INTO_ARRAY] {
@@ -338,7 +326,6 @@ fn a_program_that_calls_fre_keeps_its_constant_concat() {
         );
     }
 }
-
 #[test]
 fn a_conditional_fre_still_arms_the_gate() {
     let src = "\
@@ -354,7 +341,6 @@ fn a_conditional_fre_still_arms_the_gate() {
     );
     check_all_profiles(src, " 10 \n");
 }
-
 #[test]
 fn an_unreachable_fre_does_not_arm_the_gate() {
     let src = "\
@@ -372,7 +358,6 @@ fn an_unreachable_fre_does_not_arm_the_gate() {
     );
     check_all_profiles(src, " 10 \n");
 }
-
 #[test]
 fn self_assignment_costs_nothing_after_the_binding_allocates() {
     check_all_profiles(
@@ -384,7 +369,6 @@ fn self_assignment_costs_nothing_after_the_binding_allocates() {
         "ABCD 0 \n",
     );
 }
-
 #[test]
 fn every_fre_site_collects_before_it_reports() {
     let src = "\
@@ -401,7 +385,6 @@ fn every_fre_site_collects_before_it_reports() {
         "two FRE calls must collect twice, not once:\n{asm}"
     );
 }
-
 #[test]
 fn the_corrected_heap_codegen_is_deterministic() {
     for src in [

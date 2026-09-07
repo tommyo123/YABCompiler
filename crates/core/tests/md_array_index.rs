@@ -19,7 +19,6 @@ fn asm_of_profile(src: &str, profile: Profile) -> String {
     };
     compile_with_options(&prg, opts).expect("compiles").asm
 }
-
 const FMULT: &str = "JSR $BA28";
 const MOVMF: &str = "JSR $BBD4";
 
@@ -53,7 +52,6 @@ fn check_stops_with(src: &str, banner: &str) {
         "execution continued past the error for:\n{src}"
     );
 }
-
 #[test]
 fn all_literal_multidim_subscript_folds_to_a_constant_address() {
     let asm = asm_of("10 DIM B(10,10)\n20 X=B(3,4)\n30 END\n");
@@ -67,7 +65,6 @@ fn all_literal_multidim_subscript_folds_to_a_constant_address() {
         "constant subscripts must not reach FMULT:\n{asm}"
     );
 }
-
 #[test]
 fn constant_fold_scales_by_the_element_size() {
     let asm = asm_of("10 DIM B(10,10)\n20 B(3,4)=1.5\n30 PRINT B(3,4)\n40 END\n");
@@ -77,7 +74,6 @@ fn constant_fold_scales_by_the_element_size() {
         "expected a 5-byte-scaled constant address, got:\n{asm}"
     );
 }
-
 #[test]
 fn float_scalar_multidim_subscript_keeps_the_horner_chain_native() {
     let asm = asm_of(concat!(
@@ -95,7 +91,6 @@ fn float_scalar_multidim_subscript_keeps_the_horner_chain_native() {
         "no MFLPT accumulator stash should survive:\n{asm}"
     );
 }
-
 #[test]
 fn float_scalar_subscript_handles_a_non_power_of_two_stride() {
     // dims[1] = 4 => stride 5 => ShiftAddSelf { k: 2 }.
@@ -107,7 +102,6 @@ fn float_scalar_subscript_handles_a_non_power_of_two_stride() {
     ));
     assert!(!asm.contains(FMULT), "expected a native stride:\n{asm}");
 }
-
 #[test]
 fn runtime_dim_multidim_subscript_uses_the_16_bit_multiply() {
     let with_access = asm_of(concat!(
@@ -140,7 +134,6 @@ fn runtime_dim_multidim_subscript_uses_the_16_bit_multiply() {
         "the access itself must add no FMULT:\n{with_access}"
     );
 }
-
 #[test]
 fn int_island_subscripts_still_take_the_fully_native_route() {
     let asm = asm_of(concat!(
@@ -158,7 +151,6 @@ fn int_island_subscripts_still_take_the_fully_native_route() {
     );
     assert!(!asm.contains(FMULT), "and must not reach FMULT:\n{asm}");
 }
-
 #[test]
 fn an_unlowerable_stride_still_uses_the_float_horner_chain() {
     // dims[1] = 22 => stride 23 = 16+4+2+1, four terms: past what `stride_lowering` covers.
@@ -173,7 +165,6 @@ fn an_unlowerable_stride_still_uses_the_float_horner_chain() {
         "unlowerable stride should still use FMULT:\n{asm}"
     );
 }
-
 #[test]
 fn the_fast_routes_fire_in_every_profile() {
     let src = concat!(
@@ -289,7 +280,6 @@ fn a_nested_float_array_reference_in_a_subscript_works_too() {
         " 42",
     );
 }
-
 #[test]
 fn fractional_subscripts_are_truncated() {
     check_prints(
@@ -466,7 +456,6 @@ fn the_constant_fold_respects_the_post_clr_bound() {
         "?BAD SUBSCRIPT  ERROR IN 40",
     );
 }
-
 #[test]
 fn a_runtime_array_used_before_dim_is_still_bad_subscript() {
     check_stops_with(
@@ -546,7 +535,6 @@ fn outlined_md_addresses_agree_across_profiles() {
         assert_eq!(first, out, "{p:?} disagrees with Default");
     }
 }
-
 #[test]
 fn the_int_island_md_route_survives_outlining_on_speed() {
     let src = concat!(

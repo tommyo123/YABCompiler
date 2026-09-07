@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -18,7 +20,6 @@ fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
 fn asm_of(src: &str) -> String {
     build(src, Profile::Default, false).1
 }
-
 fn check_all_variants(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -33,7 +34,6 @@ fn check_all_variants(src: &str, expected: &str) {
         }
     }
 }
-
 fn check_stops_with(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -72,7 +72,6 @@ fn check_stops_with_banner(src: &str, expected: &str, banner: &str) {
         }
     }
 }
-
 fn after_jsr(asm: &str, target: u16) -> String {
     let needle = format!("    JSR L{target}\n");
     let rest = asm
@@ -85,7 +84,6 @@ fn after_jsr(asm: &str, target: u16) -> String {
         .unwrap_or(rest.lines().count());
     rest.lines().take(end).collect::<Vec<_>>().join("\n")
 }
-
 fn curlin_stamp(line: u16) -> String {
     format!("LDA #${:02X}\n    STA $39", line & 0xFF)
 }
@@ -104,7 +102,6 @@ fn a_gosub_to_the_loops_own_next_is_still_a_barrier() {
         "the barrier has to be representable at all"
     );
 }
-
 #[test]
 fn the_barrier_reaches_the_whole_subroutine_not_just_its_first_line() {
     check_stops_with(
@@ -134,7 +131,6 @@ fn on_gosub_is_a_barrier_too() {
         " 1 ",
     );
 }
-
 #[test]
 fn a_subroutine_local_loop_keeps_the_static_fast_path() {
     let src = "10 FOR K=1 TO 3\n\
@@ -151,7 +147,6 @@ fn a_subroutine_local_loop_keeps_the_static_fast_path() {
         "neither loop crosses a barrier; both must stay tier 0:\n{asm}"
     );
 }
-
 #[test]
 fn a_gosub_out_of_a_loop_body_costs_the_loop_nothing() {
     let src = "10 FOR I=1 TO 3\n\
@@ -182,7 +177,6 @@ fn an_exhausted_loop_re_entered_below_its_next_dispatches() {
         " 1  1  2  1  3  1  4  1 ",
     );
 }
-
 #[test]
 fn the_re_entry_hole_reached_through_on_goto() {
     check_stops_with(
@@ -196,7 +190,6 @@ fn the_re_entry_hole_reached_through_on_goto() {
         " 1  1  2  1  3  1  4  1 ",
     );
 }
-
 #[test]
 fn leaving_a_body_does_not_by_itself_orphan_its_next() {
     let src = "10 GOTO 50\n\
@@ -242,7 +235,6 @@ fn an_abandoned_frame_is_dropped_before_the_loop_tail() {
         " 0  1  0  1  1  0  2  1  0  3  1  0 ",
     );
 }
-
 #[test]
 fn end_inside_an_on_gosub_subroutine_really_ends() {
     let src = "10 ON 1 GOSUB 100\n\
@@ -255,7 +247,6 @@ fn end_inside_an_on_gosub_subroutine_really_ends() {
         "an ON..GOSUB program has to snapshot the stack pointer"
     );
 }
-
 #[test]
 fn a_tail_gosub_keeps_its_marker_when_the_subroutine_has_a_next() {
     check_stops_with(
@@ -266,7 +257,6 @@ fn a_tail_gosub_keeps_its_marker_when_the_subroutine_has_a_next() {
         "",
     );
 }
-
 #[test]
 fn a_tail_gosub_without_a_next_still_folds_to_a_jump() {
     let src = "10 FOR I=1 TO 3\n\
@@ -296,7 +286,6 @@ fn a_next_after_a_returning_gosub_is_blamed_on_the_calling_line() {
         "?NEXT WITHOUT FOR  ERROR IN 10",
     );
 }
-
 #[test]
 fn the_calling_line_is_restored_before_the_rest_of_the_line_runs() {
     check_stops_with_banner(
@@ -330,7 +319,6 @@ fn curlin_after_a_gosub_reads_back_as_the_calling_line() {
         " 10 \n",
     );
 }
-
 #[test]
 fn curlin_high_byte_is_restored_across_a_gosub_to_a_high_line() {
     check_all_variants(
@@ -340,7 +328,6 @@ fn curlin_high_byte_is_restored_across_a_gosub_to_a_high_line() {
         " 10 \n",
     );
 }
-
 #[test]
 fn a_gosub_whose_line_cannot_raise_again_pays_nothing_for_the_restore() {
     let asm = asm_of(
@@ -353,7 +340,6 @@ fn a_gosub_whose_line_cannot_raise_again_pays_nothing_for_the_restore() {
         "only `END` follows the call, so no re-stamp is owed:\n{tail}"
     );
 }
-
 #[test]
 fn a_gosub_followed_by_more_of_its_line_does_emit_the_restore() {
     let asm = asm_of(
@@ -382,7 +368,6 @@ fn clr_in_a_subroutine_makes_its_own_return_fail() {
         "?RETURN WITHOUT GOSUB  ERROR IN 100",
     );
 }
-
 #[test]
 fn clr_in_a_subroutine_discards_the_callers_for_frames_too() {
     check_stops_with_banner(
@@ -397,7 +382,6 @@ fn clr_in_a_subroutine_discards_the_callers_for_frames_too() {
         "?RETURN WITHOUT GOSUB  ERROR IN 100",
     );
 }
-
 #[test]
 fn a_subroutine_without_clr_is_still_inlined() {
     let src = "10 FOR I=1 TO 3\n\
@@ -431,7 +415,6 @@ fn a_bare_next_reached_from_a_deeper_body_advances_the_inner_loop() {
         " 1  2  3 E 0  1  2 \n",
     );
 }
-
 #[test]
 fn bare_nexts_in_a_three_deep_on_goto_all_bind_the_innermost_loop() {
     check_all_variants(
@@ -446,7 +429,6 @@ fn bare_nexts_in_a_three_deep_on_goto_all_bind_the_innermost_loop() {
         "E 1  1  3 \n",
     );
 }
-
 #[test]
 fn a_bare_next_reached_from_its_own_body_keeps_the_static_fast_path() {
     let src = "10 FOR I=1 TO 2\n\
@@ -463,7 +445,6 @@ fn a_bare_next_reached_from_its_own_body_keeps_the_static_fast_path() {
         "the innermost loop's own back-jump must stay tier 0"
     );
 }
-
 #[test]
 fn a_named_next_reached_from_a_deeper_body_keeps_the_static_fast_path() {
     let src = "10 FOR I=1 TO 3\n\

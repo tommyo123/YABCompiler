@@ -25,7 +25,6 @@ fn compile_variant(src: &str, profile: Profile, extraram: bool) -> yabcompiler_c
     compile_with_options(&prg, opts)
         .unwrap_or_else(|e| panic!("compiles ({profile:?}, extraram={extraram}): {e}\n{src}"))
 }
-
 fn check_output(src: &str, expected: &str) {
     for (profile, extraram) in VARIANTS {
         let bytes = compile_variant(src, profile, extraram).prg_bytes;
@@ -37,7 +36,6 @@ fn check_output(src: &str, expected: &str) {
         );
     }
 }
-
 fn nums(fields: &[&str]) -> String {
     fields.iter().map(|f| format!("{f} \n")).collect()
 }
@@ -72,7 +70,6 @@ impl Trap {
         }
     }
 }
-
 const FDIV: Trap = Trap {
     rom: "JSR $BB0F",
     jt: "JSR __JT_FDIV",
@@ -89,7 +86,6 @@ const BOUNDS_GUARD: Trap = Trap {
     rom: "JSR __BNDS",
     jt: "",
 };
-
 fn check_emit_order(src: &str, first: Trap, second: Trap) {
     for (profile, extraram) in VARIANTS {
         let asm = compile_variant(src, profile, extraram).asm;
@@ -106,7 +102,6 @@ fn check_emit_order(src: &str, first: Trap, second: Trap) {
         );
     }
 }
-
 #[test]
 fn identity_shapes_still_narrow_a_fractional_operand() {
     check_output(
@@ -124,7 +119,6 @@ fn identity_shapes_floor_a_negative_operand() {
         &nums(&["-4", "-4", "-3.5"]),
     );
 }
-
 #[test]
 fn exor_with_zero_still_narrows() {
     check_output(
@@ -132,7 +126,6 @@ fn exor_with_zero_still_narrows() {
         &nums(&[" 3", " 3"]),
     );
 }
-
 #[test]
 fn computed_fractional_operand_still_narrows() {
     check_output(
@@ -140,7 +133,6 @@ fn computed_fractional_operand_still_narrows() {
         &nums(&[" 3", " 3.5"]),
     );
 }
-
 #[test]
 fn literal_operands_fold_with_the_narrowing_applied() {
     check_output(
@@ -174,7 +166,6 @@ fn comparison_operand_still_simplifies() {
     check_simplified("10 A=PEEK(53280)\n20 PRINT (A=99) AND -1\n30 END\n", true);
     check_simplified("10 A$=\"X\"\n20 PRINT (A$=\"Y\") OR 0\n30 END\n", true);
 }
-
 #[test]
 fn already_bitwise_operand_still_simplifies() {
     check_simplified("10 A=PEEK(53280)\n20 PRINT NOT(A) OR 0\n30 END\n", true);
@@ -218,7 +209,6 @@ fn float_array_element_operand_is_not_simplified() {
 fn arithmetic_operand_is_not_simplified() {
     check_simplified("10 A=PEEK(53280)\n20 PRINT (A/4) OR 0\n30 END\n", false);
 }
-
 #[test]
 fn out_of_range_literal_operand_is_not_simplified() {
     check_simplified("10 PRINT -1 AND 40000\n20 END\n", false);
@@ -251,7 +241,6 @@ fn if_and_with_operands_swapped_swaps_the_order() {
         FDIV,
     );
 }
-
 #[test]
 fn if_or_evaluates_the_left_operand_first() {
     check_emit_order(
@@ -260,7 +249,6 @@ fn if_or_evaluates_the_left_operand_first() {
         FN_LOG,
     );
 }
-
 #[test]
 fn value_context_and_evaluates_the_left_operand_first() {
     check_emit_order(
@@ -289,7 +277,6 @@ fn left_operand_bounds_check_runs_before_the_right_operand() {
         FN_LOG,
     );
 }
-
 #[test]
 fn a_provably_bad_subscript_deletes_the_right_operand_outright() {
     let src = "10 DIM Q(2)\n20 IF Q(9)=1 AND LOG(0)=1 THEN PRINT \"Y\"\n\
@@ -307,7 +294,6 @@ fn a_provably_bad_subscript_deletes_the_right_operand_outright() {
         );
     }
 }
-
 #[test]
 fn nested_and_keeps_both_stashes() {
     check_output(

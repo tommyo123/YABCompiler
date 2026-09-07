@@ -13,7 +13,6 @@ fn run(src: &str) -> String {
     assert!(r.clean_exit, "program must reach the exit RTS:\n{src}");
     common::petscii_to_string(&r.output)
 }
-
 fn run_prg(body_lines: &[(u16, &[u8])]) -> String {
     let prg = build_prg(body_lines);
     let out = common::compile_prg(&prg).unwrap_or_else(|e| panic!("compile failed: {e}"));
@@ -26,7 +25,6 @@ fn run_prg(body_lines: &[(u16, &[u8])]) -> String {
 fn lines(out: &str) -> Vec<String> {
     out.lines().map(|l| l.trim_end().to_string()).collect()
 }
-
 fn build_prg(body_lines: &[(u16, &[u8])]) -> Vec<u8> {
     let mut out = vec![0x01, 0x08];
     let mut addr: u16 = 0x0801;

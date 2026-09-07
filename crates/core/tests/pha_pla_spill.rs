@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -31,7 +33,6 @@ fn spill_triples(asm: &str) -> usize {
 fn ph209_sites(asm: &str) -> usize {
     asm.lines().filter(|l| l.contains("ph209:")).count()
 }
-
 const CMP_SRC: &str = "\
 10 A$=\"BANANA\"
 20 IF A$=\"BANANA\" THEN PRINT \"EQ\"
@@ -39,7 +40,6 @@ const CMP_SRC: &str = "\
 40 IF A$>\"APPLE\" THEN PRINT \"GT\"
 50 END
 ";
-
 const CAT_SRC: &str = "\
 10 READ A$,B$
 20 DATA AB,CD

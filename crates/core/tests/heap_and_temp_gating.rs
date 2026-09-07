@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -26,7 +28,6 @@ fn check_all_profiles(src: &str, expected: &str) {
         assert_eq!(got, expected, "{profile:?} output mismatch for:\n{src}");
     }
 }
-
 fn check_stops_with(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         let (bytes, _) = build(src, profile);
@@ -109,7 +110,6 @@ fn on_goto_over_val_mid_initialises_the_heap() {
     check_all_profiles(src, " 1  2 ");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_val_mid");
 }
-
 #[test]
 fn on_goto_over_val_mid_into_an_orphan_next() {
     let src = "5 V$=\"21212\":GOTO 20\n\
@@ -122,7 +122,6 @@ fn on_goto_over_val_mid_into_an_orphan_next() {
     check_all_profiles(src, " 1  2  3  4  5 V\n");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_val_mid_orphan_next");
 }
-
 #[test]
 fn on_goto_over_chr_defines_and_initialises_the_heap_pointer() {
     let src = "10 FOR I=1 TO 2\n\
@@ -132,7 +131,6 @@ fn on_goto_over_chr_defines_and_initialises_the_heap_pointer() {
     check_all_profiles(src, "Z\n");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_chr");
 }
-
 #[test]
 fn on_goto_over_asc_chr_dispatch_chain() {
     let src = "5 GOTO 20\n\
@@ -145,7 +143,6 @@ fn on_goto_over_asc_chr_dispatch_chain() {
     check_all_profiles(src, "1234C\n");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_asc_chr");
 }
-
 #[test]
 fn on_gosub_over_chr_initialises_the_heap() {
     let src = "10 FOR I=1 TO 2\n\
@@ -237,7 +234,6 @@ fn the_heap_and_temp_invariants_hold_across_shapes() {
         }
     }
 }
-
 #[test]
 fn the_prewalk_keeps_compilation_deterministic() {
     for src in [
@@ -260,7 +256,6 @@ fn a_heap_free_program_still_skips_the_heap_prologue() {
         "a heap-free program must not pay for the heap:\n{asm}"
     );
 }
-
 #[test]
 fn an_on_goto_without_a_heap_expression_still_skips_the_heap_prologue() {
     let asm = asm_of("10 I=1\n20 ON I GOTO 30,40\n30 PRINT \"a\":END\n40 PRINT \"b\"\n");
@@ -285,7 +280,6 @@ fn literal_only_string_work_still_skips_the_heap_prologue() {
         );
     }
 }
-
 #[test]
 fn the_temp_slot_block_is_still_omitted_when_nothing_needs_one() {
     for src in [
@@ -302,7 +296,6 @@ fn the_temp_slot_block_is_still_omitted_when_nothing_needs_one() {
         );
     }
 }
-
 #[test]
 fn the_prewalk_does_not_inflate_the_temp_count() {
     let src = "5 DATA 1,2,3\n\
@@ -324,7 +317,6 @@ fn the_prewalk_does_not_inflate_the_temp_count() {
         "one handler temp, reused — not one slot per emission pass:\n{asm}"
     );
 }
-
 #[test]
 fn an_ordinary_loop_still_keeps_the_static_next() {
     let asm = asm_of("10 FOR I=1 TO 10:PRINT I;:NEXT\n");

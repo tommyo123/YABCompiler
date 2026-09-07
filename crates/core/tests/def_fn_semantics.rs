@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -110,7 +112,6 @@ const F1_IN_LOOP: &str = "\
 fn fn_body_read_keeps_a_loop_carried_store_alive() {
     assert_rom_output(F1_IN_LOOP, "2  4  6");
 }
-
 #[test]
 fn dead_store_elimination_still_fires_around_a_def_fn() {
     let src = "\
@@ -155,7 +156,6 @@ fn an_uncalled_def_fn_keeps_nothing_alive() {
         );
     }
 }
-
 #[test]
 fn fn_body_reads_excludes_the_parameter_and_closes_transitively() {
     use yabcompiler_core::ast::FnName;
@@ -193,7 +193,6 @@ fn fn_body_reads_excludes_the_parameter_and_closes_transitively() {
         "an undefined name has no body and so no reads"
     );
 }
-
 #[test]
 fn a_variable_read_only_from_an_fn_body_interferes_across_the_call() {
     use yabcompiler_core::analysis::Registry;
@@ -299,7 +298,6 @@ fn a_conditionally_defined_fn_works_on_the_taken_path() {
     }
     assert_rom_output(F2_CONDITIONAL_TAKEN, "6");
 }
-
 #[test]
 fn a_conditionally_defined_fn_traps_when_the_branch_is_not_taken() {
     let src = "\
@@ -401,7 +399,6 @@ fn fn_dispatch_never_uses_an_indirect_jmp() {
         }
     }
 }
-
 #[test]
 fn recursion_through_the_dispatch_vector_is_guarded() {
     for profile in PROFILES {
@@ -420,7 +417,6 @@ fn recursion_through_the_dispatch_vector_is_guarded() {
         );
     }
 }
-
 #[test]
 fn a_single_definition_is_still_bound_statically() {
     let small = build("10 def fn f(x)=x*2\n20 print fn f(3)\n", Profile::Default);
@@ -493,7 +489,6 @@ const F3_IN_FOR: &str = "\
 fn an_fn_call_inside_a_for_recomputes_the_address_each_iteration() {
     assert_rom_output(F3_IN_FOR, "0  2  4  6");
 }
-
 #[test]
 fn the_array_address_cse_still_fires_next_to_an_fn_call() {
     let src = "\
@@ -511,7 +506,6 @@ fn the_array_address_cse_still_fires_next_to_an_fn_call() {
     );
     assert_rom_output(src, "1  1");
 }
-
 #[test]
 fn a_recursive_fn_raises_out_of_memory_instead_of_hanging() {
     let src = "\
@@ -532,7 +526,6 @@ fn a_recursive_fn_raises_out_of_memory_instead_of_hanging() {
         );
     }
 }
-
 #[test]
 fn mutually_recursive_fns_are_both_guarded() {
     let b = build(
@@ -550,7 +543,6 @@ fn mutually_recursive_fns_are_both_guarded() {
         b.asm
     );
 }
-
 #[test]
 fn a_non_recursive_fn_has_no_stack_guard() {
     let b = build(
@@ -567,7 +559,6 @@ fn a_non_recursive_fn_has_no_stack_guard() {
         b.asm
     );
 }
-
 #[test]
 fn an_unreachable_call_to_an_undefined_fn_still_runs() {
     assert_rom_output(
@@ -592,7 +583,6 @@ fn a_reachable_call_to_an_undefined_fn_traps_at_runtime() {
         );
     }
 }
-
 #[test]
 fn an_undefined_fn_evaluates_its_argument_first() {
     let b = build("10 print fn g(1/0)\n", Profile::Default);
@@ -611,7 +601,6 @@ fn an_undefined_fn_evaluates_its_argument_first() {
         b.asm
     );
 }
-
 #[test]
 fn a_variable_an_fn_body_reads_is_not_split() {
     assert_rom_output(
@@ -623,7 +612,6 @@ fn a_variable_an_fn_body_reads_is_not_split() {
         " 15  50",
     );
 }
-
 #[test]
 fn a_variable_read_through_a_nested_fn_is_not_split() {
     assert_rom_output(
@@ -636,7 +624,6 @@ fn a_variable_read_through_a_nested_fn_is_not_split() {
         " 15  50",
     );
 }
-
 #[test]
 fn a_textually_late_def_fn_still_protects_its_free_variables() {
     assert_rom_output(
@@ -665,7 +652,6 @@ fn the_formal_parameter_is_not_split() {
         " 10  7",
     );
 }
-
 #[test]
 fn a_variable_with_no_fn_reader_still_splits() {
     let b = build(
@@ -678,7 +664,6 @@ fn a_variable_with_no_fn_reader_still_splits() {
         b.asm
     );
 }
-
 #[test]
 fn a_def_fn_does_not_disable_splitting_for_unrelated_variables() {
     // Body has no free variables at all.
@@ -731,7 +716,6 @@ fn clr_undefines_a_statically_bound_fn() {
         assert_eq!(common::petscii_to_string(&r.output).trim(), "2");
     }
 }
-
 #[test]
 fn a_fn_redefined_after_clr_works_again() {
     assert_rom_output(
@@ -779,7 +763,6 @@ fn a_call_ahead_of_its_def_traps() {
         assert_eq!(common::petscii_to_string(&r.output).trim(), "A");
     }
 }
-
 #[test]
 fn an_ordinary_fn_still_binds_statically() {
     let b = build("10 def fnk(x)=x*2\n20 print fnk(3)\n", Profile::Default);
@@ -794,7 +777,6 @@ fn an_ordinary_fn_still_binds_statically() {
         b.asm
     );
 }
-
 #[test]
 fn a_def_inside_a_loop_still_binds_statically() {
     let src = "10 for i=1 to 2\n20 def fnk(x)=x*i\n30 print fnk(3);\n40 next\n";
@@ -806,7 +788,6 @@ fn a_def_inside_a_loop_still_binds_statically() {
         b.asm
     );
 }
-
 #[test]
 fn several_functions_without_clr_all_bind_statically() {
     let b = build(

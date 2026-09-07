@@ -830,7 +830,6 @@ fn assemble_pass(
             asm: Some(final_asm.clone()),
         }
     })?;
-
     let keep = bss_tail_keep_len(
         &machine_code,
         options.custom_start_address.unwrap_or(CODE_ORIGIN as u16),
@@ -909,7 +908,6 @@ fn assemble_with_aligned_vectors(
                     asm: None,
                 })?;
         }
-
         let (machine_code, items) =
             assembler
                 .assemble_full(&asm)
@@ -917,7 +915,6 @@ fn assemble_with_aligned_vectors(
                     message: format!("{e}"),
                     asm: Some(asm.clone()),
                 })?;
-
         if let Some(orphan) = bridge_orphans(&items, reserved)
             .into_iter()
             .filter_map(|o| o.resolve(|n| assembler.lookup(n)))
@@ -1151,7 +1148,6 @@ fn insert_vector_pad(asm: &str, label: &str) -> Option<String> {
     out.push_str(&asm[at..]);
     Some(out)
 }
-
 const ZP_X_MNEMONICS: &[&str] = &[
     "ADC", "AND", "ASL", "CMP", "DEC", "EOR", "INC", "LDA", "LDY", "LSR", "ORA", "ROL", "ROR",
     "SBC", "STA", "STY",
@@ -1340,7 +1336,6 @@ fn verify_indirect_zp_pointers(
     }
     Ok(())
 }
-
 fn encoded_len(insn: &AsmInsn<'_>, lookup: &impl Fn(&str) -> Option<u16>) -> Option<usize> {
     if insn.operand.is_empty() {
         return Some(1);
@@ -1568,7 +1563,6 @@ struct ResolvedOrphan {
     /// Linked address of the label displaced by a reserved-range bridge.
     addr: u16,
 }
-
 fn is_assembler_generated_label(name: &str) -> bool {
     name.starts_with("__skip_")
 }
@@ -2757,10 +2751,8 @@ mod tests {
     /// A program that builds a string on the heap at runtime, so codegen emits `__HEAP_BOTTOM`
     /// and the window matters.
     fn heap_using_prg() -> Vec<u8> {
-        crate::source::tokenize_program(
-            "10 A$=\"X\"\n20 FOR I=1 TO 5:A$=A$+\"Y\":NEXT\n30 PRINT A$\n",
-        )
-        .expect("tokenizes")
+        crate::source::tokenize_program("10 A$=\"X\"\n20 FOR I=1 TO 5:A$=A$+\"Y\":NEXT\n30 PRINT A$\n")
+            .expect("tokenizes")
     }
 
     #[test]
@@ -2871,10 +2863,7 @@ mod tests {
         let out = compile_with_options(&bytes, opts).expect("compiles at $C000");
         assert_eq!(string_heap_window(&out, 0xC000), Ok(None));
         assert!(
-            matches!(
-                out.diagnostics.extraram,
-                ExtraRamDecision::SkippedHighOrigin
-            ),
+            matches!(out.diagnostics.extraram, ExtraRamDecision::SkippedHighOrigin),
             "got {:?}",
             out.diagnostics.extraram
         );
@@ -3314,8 +3303,9 @@ mod tests {
 
     #[test]
     fn absx_static_int_array_uses_indexed_addressing() {
-        let c =
-            compile_src("10 DIM A%(10)\n20 J%=PEEK(830)\n30 A%(J%)=5\n40 PRINT A%(J%)\n50 END\n");
+        let c = compile_src(
+            "10 DIM A%(10)\n20 J%=PEEK(830)\n30 A%(J%)=5\n40 PRINT A%(J%)\n50 END\n",
+        );
         assert!(
             c.asm.contains("__ARR_A_I,X"),
             "read/write go through abs,X:\n{}",
@@ -3345,7 +3335,8 @@ mod tests {
 
     #[test]
     fn absx_declines_oversized_and_runtime_arrays() {
-        let big = compile_src("10 DIM A%(200)\n20 J%=PEEK(830)\n30 PRINT A%(J%)\n40 END\n");
+        let big =
+            compile_src("10 DIM A%(200)\n20 J%=PEEK(830)\n30 PRINT A%(J%)\n40 END\n");
         assert!(
             !big.asm.contains("__ARR_A_I,X"),
             "oversized array stays on the pointer path:\n{}",
@@ -3601,8 +3592,7 @@ JMPTBL:
         asm.push('\n');
 
         let mut a = Assembler6502::new();
-        a.add_reserved_range(0x0900, 0x09FF)
-            .expect("range accepted");
+        a.add_reserved_range(0x0900, 0x09FF).expect("range accepted");
         let (_, items) = a.assemble_full(&asm).expect("assembles");
         assert_eq!(a.lookup("ZPSLOT"), Some(0x00FB), "equate keeps its value");
         assert_eq!(

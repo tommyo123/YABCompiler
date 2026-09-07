@@ -24,7 +24,6 @@ fn compile_variant(src: &str, profile: Profile, extraram: bool) -> yabcompiler_c
     compile_with_options(&prg, opts)
         .unwrap_or_else(|e| panic!("compiles ({profile:?}, extraram={extraram}): {e}\n{src}"))
 }
-
 fn check_output(src: &str, expected: &str) {
     for (profile, extraram) in VARIANTS {
         let bytes = compile_variant(src, profile, extraram).prg_bytes;
@@ -36,7 +35,6 @@ fn check_output(src: &str, expected: &str) {
         );
     }
 }
-
 fn nums(fields: &[&str]) -> String {
     fields.iter().map(|f| format!("{f} \n")).collect()
 }
@@ -157,7 +155,6 @@ fn out_of_range_int_store_is_not_constant_folded() {
         );
     }
 }
-
 #[test]
 fn dead_out_of_range_int_store_survives_dead_store_elim() {
     check_asm("10 A%=40000\n20 END\n", "JSR __AYINT", true);
@@ -181,14 +178,12 @@ fn not_folds_with_ayint_floor_semantics() {
         &nums(&[" 1", "-2", "-1"]),
     );
 }
-
 #[test]
 fn in_range_narrowing_keeps_the_facword_fast_path() {
     let src = "10 PRINT PEEK(53280) AND 15\n20 END\n";
     check_rom_call(src, "$B7F7", true);
     check_asm(src, "JSR __AYINT", false);
 }
-
 #[test]
 fn dead_in_range_int_store_is_still_eliminated() {
     check_asm("10 A%=5\n20 END\n", "VI_A", false);
@@ -209,14 +204,12 @@ fn power_of_a_literal_is_not_folded() {
         ]),
     );
 }
-
 #[test]
 fn power_strength_reduction_is_gone() {
     let src = "10 A=7\n20 PRINT A^2\n30 PRINT A^3\n40 PRINT A^4\n50 END\n";
     check_output(src, &nums(&[" 49.0000001", " 343", " 2401"]));
     check_rom_call(src, "$BF7B", true);
 }
-
 #[test]
 fn exact_power_identities_still_fold() {
     let src = "10 PRINT 5^0;0^2;0^0;2^0\n20 END\n";
@@ -234,7 +227,6 @@ fn unary_sign_after_caret_binds_the_whole_power_chain() {
         &nums(&[" .5", " 1.95312499E-03", " .125", " 2", " .25"]),
     );
 }
-
 #[test]
 fn unary_plus_after_caret_is_accepted_but_opens_no_frame() {
     check_output(
@@ -263,7 +255,6 @@ fn commutative_operands_keep_the_rom_order() {
         &nums(&[" 1000", " 999", " 1000"]),
     );
 }
-
 #[test]
 fn constant_mem_operand_fast_path_still_fires_for_plain_loads() {
     let src = "10 DIM A(20)\n20 FOR I=0 TO 20:A(I)=I/3:NEXT I\n\
@@ -285,7 +276,6 @@ fn constant_mem_operand_fast_path_still_fires_for_plain_loads() {
         "constant-memory-operand fast path stopped firing: {stubs} stubs\n{asm}"
     );
 }
-
 #[test]
 fn computed_lhs_is_packed_to_a_temp_before_a_constant_operand() {
     let src = "10 PRINT INT(LOG(EXP(1))*1000)\n20 END\n";

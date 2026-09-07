@@ -9,7 +9,6 @@ fn run(src: &str) -> String {
     assert!(r.clean_exit, "program must reach END:\n{src}");
     common::petscii_to_string(&r.output)
 }
-
 const READ_CURLIN: &str = "A=PEEK(57)+PEEK(58)*256:PRINT A";
 
 #[test]
@@ -23,22 +22,14 @@ fn stamps_correctly_at_a_branch_target() {
     let out = run(&format!(
         "10 X=1\n20 GOTO 40\n30 PRINT \"SKIPPED\"\n40 {READ_CURLIN}\n50 END\n"
     ));
-    assert!(
-        out.contains("40"),
-        "branch target must stamp itself:\n{out}"
-    );
+    assert!(out.contains("40"), "branch target must stamp itself:\n{out}");
     assert!(!out.contains("SKIPPED"), "GOTO must skip line 30:\n{out}");
 }
 
 #[test]
 fn stamps_correctly_inside_a_for_body() {
-    let out = run(&format!(
-        "10 FOR I=1 TO 2\n20 {READ_CURLIN}\n30 NEXT\n40 END\n"
-    ));
-    assert!(
-        out.contains("20"),
-        "FOR-body line must stamp itself:\n{out}"
-    );
+    let out = run(&format!("10 FOR I=1 TO 2\n20 {READ_CURLIN}\n30 NEXT\n40 END\n"));
+    assert!(out.contains("20"), "FOR-body line must stamp itself:\n{out}");
 }
 
 #[test]

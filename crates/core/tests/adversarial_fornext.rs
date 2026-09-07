@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -46,7 +48,6 @@ fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
         .unwrap_or_else(|e| panic!("compiles ({profile:?}, extraram={extraram}): {e}"));
     (c.prg_bytes, c.asm)
 }
-
 fn runtime_frames(asm: &str) -> (usize, usize) {
     let pushes = asm
         .lines()
@@ -77,7 +78,6 @@ fn assert_every_for_has_a_frame(name: &str, src: &str, for_sites: usize) {
         }
     }
 }
-
 fn normalize(s: &str) -> String {
     s.lines()
         .map(str::trim_end)

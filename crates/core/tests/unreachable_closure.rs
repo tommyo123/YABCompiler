@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -91,7 +93,6 @@ fn a_continuation_reached_only_through_a_patched_vector_survives() {
         );
     }
 }
-
 #[test]
 fn the_orphan_next_fixture_still_produces_the_right_output() {
     let prg = common::compile_source(ORPHAN_NEXT).expect("compiles");
@@ -145,7 +146,6 @@ fn a_chain_of_helpers_below_a_dead_head_is_dropped() {
     }
     assert!(got.contains("LDA #$42"), "the live body stays:\n{got}");
 }
-
 #[test]
 fn taking_the_head_s_address_keeps_the_whole_chain() {
     let src = concat!(
@@ -230,7 +230,6 @@ fn code_after_a_jsr_is_reachable() {
     assert!(got.contains("LDA #$07"), "{got}");
     assert!(got.contains("LDA #$08"), "{got}");
 }
-
 #[test]
 fn the_corpus_still_compiles_and_never_grows() {
     let sources = [

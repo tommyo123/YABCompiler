@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -49,14 +51,10 @@ fn guard_limit(asm: &str) -> u8 {
         .unwrap_or_else(|| panic!("__GOSUB_CHK compares a limit:\n{helper}"));
     u8::from_str_radix(line.trim().trim_start_matches("CMP #$"), 16).expect("hex limit")
 }
-
 fn counted_prefix(out: &str) -> usize {
     let seen: Vec<usize> = out
         .split_whitespace()
-        .map(|t| {
-            t.parse()
-                .unwrap_or_else(|_| panic!("non-numeric {t:?} in {out:?}"))
-        })
+        .map(|t| t.parse().unwrap_or_else(|_| panic!("non-numeric {t:?} in {out:?}")))
         .collect();
     assert_eq!(
         seen,
@@ -74,7 +72,6 @@ const RECURSE: &str = "10 D=0\n\
                        110 PRINT D;\n\
                        120 GOSUB 100\n\
                        130 RETURN\n";
-
 const RECURSE_IN_FOR: &str = "10 D=0\n\
                               20 GOSUB 100\n\
                               30 END\n\
@@ -123,7 +120,6 @@ fn every_gosub_site_bumps_and_bounds_the_depth() {
         }
     }
 }
-
 #[test]
 fn the_guard_is_free_at_every_call_site() {
     // The subroutine has to have an effect, or the whole call chain is (correctly) optimised
@@ -171,7 +167,6 @@ fn a_recursive_gosub_inside_a_for_tightens_the_budget() {
         assert_eq!(guard_limit(&asm), TIGHT_LIMIT, "({profile:?}):\n{asm}");
     }
 }
-
 #[test]
 fn a_forward_gosub_inside_nested_fors_keeps_the_loose_budget() {
     const SRC: &str = "10 T=0\n\
@@ -198,7 +193,6 @@ fn a_forward_gosub_inside_nested_fors_keeps_the_loose_budget() {
         assert_eq!(out.trim_end(), "T 9", "({profile:?})");
     }
 }
-
 #[test]
 fn the_budget_never_leaves_its_safe_window() {
     for src in [
@@ -244,7 +238,6 @@ fn runaway_recursion_stops_instead_of_destroying_the_machine() {
         }
     }
 }
-
 #[test]
 fn recursion_holding_for_frames_stops_where_the_rom_does() {
     for profile in PROFILES {
@@ -265,7 +258,6 @@ fn recursion_holding_for_frames_stops_where_the_rom_does() {
         }
     }
 }
-
 #[test]
 fn deep_but_valid_recursion_runs_to_completion() {
     const SRC: &str = "10 D=0\n\
@@ -284,15 +276,10 @@ fn deep_but_valid_recursion_runs_to_completion() {
                 "20-deep recursion is valid on the ROM and must not be \
                  interrupted ({profile:?}, extraram={extraram}); output {out:?}"
             );
-            assert_eq!(
-                out.trim_end(),
-                "OK 20",
-                "({profile:?}, extraram={extraram})"
-            );
+            assert_eq!(out.trim_end(), "OK 20", "({profile:?}, extraram={extraram})");
         }
     }
 }
-
 #[test]
 fn deep_but_valid_recursion_with_for_frames_runs_to_completion() {
     const SRC: &str = "10 D=0\n\
@@ -319,7 +306,6 @@ fn deep_but_valid_recursion_with_for_frames_runs_to_completion() {
         }
     }
 }
-
 #[test]
 fn a_flat_gosub_loop_never_trips_the_guard() {
     const SRC: &str = "10 T=0\n\
@@ -356,7 +342,6 @@ fn on_gosub_is_guarded_as_well() {
         assert_eq!(out.trim_end(), "D 1", "({profile:?})");
     }
 }
-
 #[test]
 fn a_gosub_without_a_return_still_gets_a_counter() {
     const SRC: &str = "10 GOSUB 100\n20 END\n100 PRINT \"X\"\n";
@@ -379,16 +364,13 @@ fn a_gosub_without_a_return_still_gets_a_counter() {
         }
     }
 }
-
 #[test]
 fn return_without_gosub_still_reports() {
     const SRC: &str = "10 PRINT \"A\"\n20 RETURN\n30 PRINT \"B\"\n";
     for profile in PROFILES {
         let built = build(SRC, profile, false);
         assert!(
-            built
-                .asm
-                .contains("LDA __GOSUB_DEPTH\n    BEQ __RET_NO_GOSUB"),
+            built.asm.contains("LDA __GOSUB_DEPTH\n    BEQ __RET_NO_GOSUB"),
             "({profile:?}):\n{}",
             built.asm
         );
@@ -397,7 +379,6 @@ fn return_without_gosub_still_reports() {
         assert_eq!(out.trim_end(), "A", "({profile:?})");
     }
 }
-
 #[test]
 fn a_program_without_gosub_pays_nothing() {
     const SRC: &str = "10 FOR I=1 TO 3:PRINT I;:NEXT\n20 PRINT \"=\";I\n";

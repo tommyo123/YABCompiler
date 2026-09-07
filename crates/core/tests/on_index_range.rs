@@ -66,7 +66,6 @@ const TARGETS_FALL: &str = "20 print \"fall\":end\n30 print \"a\":end\n40 print 
 fn a_runtime_selector_of_258_is_illegal_quantity() {
     assert_illegal_quantity(&format!("10 q=258\n20 on q goto 30,40\n{TARGETS}"), 20);
 }
-
 #[test]
 fn a_runtime_selector_of_256_is_illegal_quantity() {
     assert_illegal_quantity(&format!("10 q=256\n20 on q goto 30,40\n{TARGETS}"), 20);
@@ -81,7 +80,6 @@ fn a_literal_selector_of_256_is_illegal_quantity() {
 fn a_negative_selector_is_illegal_quantity() {
     assert_illegal_quantity(&format!("10 on -1 goto 30,40\n{TARGETS}"), 10);
 }
-
 #[test]
 fn a_negative_fractional_selector_is_illegal_quantity() {
     assert_illegal_quantity(&format!("10 on -0.5 goto 30,40\n{TARGETS}"), 10);
@@ -99,7 +97,6 @@ fn on_gosub_range_checks_the_same_way() {
         10,
     );
 }
-
 #[test]
 fn a_failed_on_gosub_pushes_no_frame() {
     let c = build("10 on 256 gosub 30\n30 return\n", Profile::Default);
@@ -139,7 +136,6 @@ fn ordinary_selectors_still_branch() {
     assert_prints(&format!("10 on 2 goto 30,40\n{TARGETS_FALL}"), "B");
     assert_prints(&format!("10 q=2\n20 on q goto 30,40\n{TARGETS_FALL}"), "B");
 }
-
 #[test]
 fn a_u8_proven_selector_skips_the_range_check() {
     for src in [
@@ -159,7 +155,6 @@ fn a_u8_proven_selector_skips_the_range_check() {
         );
     }
 }
-
 #[test]
 fn an_unproven_selector_keeps_the_range_check() {
     let src = "10 input x\n20 on x goto 30,40\n30 print \"a\":end\n40 print \"b\":end\n";

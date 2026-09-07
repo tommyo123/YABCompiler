@@ -45,7 +45,6 @@ fn is_cond_branch(m: &str) -> bool {
         "BEQ" | "BNE" | "BCC" | "BCS" | "BMI" | "BPL" | "BVC" | "BVS"
     )
 }
-
 fn min_insn_bytes(mnem: &str, operand: Option<&str>) -> usize {
     match mnem {
         "BEQ" | "BNE" | "BCC" | "BCS" | "BMI" | "BPL" | "BVC" | "BVS" => 2,
@@ -56,7 +55,6 @@ fn min_insn_bytes(mnem: &str, operand: Option<&str>) -> usize {
         },
     }
 }
-
 fn min_distance(lines: &[Line], from: usize, target: &str) -> Option<usize> {
     let mut bytes = 0usize;
     for l in &lines[from..] {
@@ -76,7 +74,6 @@ fn min_distance(lines: &[Line], from: usize, target: &str) -> Option<usize> {
     }
     None
 }
-
 const DEFINITELY_IN_REACH: usize = 90;
 
 struct Scan {
@@ -161,7 +158,6 @@ fn scan_corpus() -> (Scan, usize) {
     }
     (acc, checked)
 }
-
 #[test]
 fn the_factoring_family_still_fires_across_the_corpus() {
     let (acc, checked) = scan_corpus();
@@ -173,7 +169,6 @@ fn the_factoring_family_still_fires_across_the_corpus() {
         acc.helpers
     );
 }
-
 #[test]
 fn no_tail_jsr_rts_residue_across_the_corpus() {
     let (acc, checked) = scan_corpus();
@@ -185,7 +180,6 @@ fn no_tail_jsr_rts_residue_across_the_corpus() {
         &acc.tail_jsr_rts[..acc.tail_jsr_rts.len().min(20)]
     );
 }
-
 #[test]
 fn no_reachable_branch_around_jmp_residue_across_the_corpus() {
     let (acc, checked) = scan_corpus();

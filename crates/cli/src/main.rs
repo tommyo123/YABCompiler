@@ -27,7 +27,9 @@ fn usage(program: &str) {
     eprintln!("    --asm <file>          Also write the generated 6502 assembly.");
     eprintln!("    --profile=<p>         default | speed | size  (default: default)");
     eprintln!("    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
-    eprintln!("    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS.");
+    eprintln!(
+        "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
+    );
     eprintln!(
         "    --rem-hints=<d>       Honour third-party compiler REM hints: basic64 | basic-boss."
     );

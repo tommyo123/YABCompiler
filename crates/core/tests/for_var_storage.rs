@@ -1,3 +1,5 @@
+
+
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -19,11 +21,9 @@ fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
 
 fn run_variant(src: &str, profile: Profile, extraram: bool) -> String {
     let (bytes, _) = build(src, profile, extraram);
-    common::run_clean(&bytes).unwrap_or_else(|| {
-        panic!("runs to a clean exit ({profile:?}, extraram={extraram}):\n{src}")
-    })
+    common::run_clean(&bytes)
+        .unwrap_or_else(|| panic!("runs to a clean exit ({profile:?}, extraram={extraram}):\n{src}"))
 }
-
 fn check_all_variants(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         for extraram in [false, true] {
@@ -70,7 +70,6 @@ fn write_from_outside_the_body_moves_the_counter() {
                110 GOTO 30\n";
     check_all_variants(src, " 3  6 F 7 \n");
 }
-
 #[test]
 fn write_from_outside_the_body_moves_a_16bit_counter() {
     let src = "10 FOR I=1 TO 100\n\
@@ -108,7 +107,6 @@ fn inner_loop_abandoned_by_outer_next_keeps_its_start_value() {
                50 END\n";
     check_all_variants(src, "J 5 \n");
 }
-
 #[test]
 fn abandoned_counter_cascades_into_a_later_loop_bound() {
     let src = "10 FOR C=5 TO 9\n\
@@ -131,7 +129,10 @@ fn negative_for_range_compares_as_signed() {
                40 PRINT I;\"POS\"\n\
                50 NEXT\n\
                60 END\n";
-    check_all_variants(src, "-2 NEG\n-1 NEG\n 0 ZERO\n 1 POS\n 2 POS\n");
+    check_all_variants(
+        src,
+        "-2 NEG\n-1 NEG\n 0 ZERO\n 1 POS\n 2 POS\n",
+    );
 }
 
 /// `NEXT A` abandons the open `C` frame, so no exit block is ever emitted for it.
@@ -157,14 +158,12 @@ fn for_header_store_keeps_the_preceding_store_deletable_and_correct() {
                50 END\n";
     check_all_variants(src, "C= 5 \n");
 }
-
 #[test]
 fn for_left_open_at_program_end_still_assigns() {
     let src = "10 FOR C=5 TO 9\n\
                20 PRINT \"C=\";C\n";
     check_all_variants(src, "C= 5 \n");
 }
-
 #[test]
 fn byte_range_loop_still_uses_the_one_byte_specialisation() {
     let asm = asm_of("10 FOR I=0 TO 200\n20 POKE 1024+I,65\n30 NEXT I\n40 END\n");
@@ -184,7 +183,6 @@ fn byte_range_loop_still_uses_the_one_byte_specialisation() {
          float-FOR:\n{asm}"
     );
 }
-
 #[test]
 fn word_range_loop_still_uses_the_int_specialisation() {
     let asm = asm_of("10 FOR I=1 TO 1000\n20 A=A+1\n30 NEXT I\n40 PRINT A\n50 END\n");
@@ -201,7 +199,6 @@ fn word_range_loop_still_uses_the_int_specialisation() {
         "the int-FOR increment must still be an inline INC chain:\n{asm}"
     );
 }
-
 #[test]
 fn index_register_promotion_still_fires() {
     let asm = asm_of("10 F=1\n20 FOR I=1 TO 100\n30 NEXT I\n40 PRINT F\n50 END\n");
@@ -210,7 +207,6 @@ fn index_register_promotion_still_fires() {
         "the peephole must still promote the loop counter to X:\n{asm}"
     );
 }
-
 #[test]
 fn float_kind_counter_keeps_its_private_int_slot() {
     // `I` is used as both a scalar and an array subscript name, which disqualifies it from
@@ -249,7 +245,6 @@ fn nested_loops_alias_distinct_variables() {
         " 1  1  1  2  1  3  2  1  2  2  2  3  3  1  3  2  3  3 F 4  4 \n",
     );
 }
-
 #[test]
 fn sequential_loops_on_one_variable_share_one_slot() {
     let src = "10 FOR I=1 TO 3\n\
