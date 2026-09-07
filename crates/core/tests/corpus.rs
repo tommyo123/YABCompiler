@@ -11,9 +11,8 @@ mod common;
 
 use std::path::PathBuf;
 
-/// Programs that exercise constructs the compiler intentionally does
-/// not support; each must fail to compile.
-const EXPECTED_REJECTS: &[&str] = &["reject_cont"];
+/// Programs that compile but never return to `READY`, so there is no end-of-run screen to compare.
+const NON_TERMINATING: &[&str] = &["reject_cont"];
 
 fn corpus_root() -> PathBuf {
     common::repo_path("test_corpus")
@@ -34,10 +33,6 @@ fn corpus_programs_compile() {
     let mut failures = Vec::new();
 
     for path in corpus_prgs() {
-        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if EXPECTED_REJECTS.contains(&name) {
-            continue;
-        }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -56,16 +51,16 @@ fn corpus_programs_compile() {
 }
 
 #[test]
-fn unsupported_corpus_programs_stay_rejected() {
-    for name in EXPECTED_REJECTS {
-        let path = corpus_root().join(format!("{name}.prg"));
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert!(
-            common::compile_prg(&bytes).is_err(),
-            "{} compiled unexpectedly",
-            path.display()
-        );
-    }
+fn reject_cont_compiles_and_hangs_like_the_rom() {
+    let path = corpus_root().join("reject_cont.prg");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let prg = common::compile_prg(&bytes).expect("a reached bare CONT is a hang, not a refusal");
+    let r = emu64::run_prg_to_end(&prg, common::MAX_INSNS).expect("runs");
+    let out = common::petscii_to_string(&r.output);
+    assert!(out.contains("BEFORE"), "{out:?}");
+    assert!(!out.contains("AFTER"), "{out:?}");
+    assert_eq!(r.error_banner(), None, "the ROM prints nothing here");
+    assert!(!r.clean_exit, "must never reach READY");
 }
 
 #[test]
@@ -75,7 +70,8 @@ fn corpus_behavior_matches_golden() {
     // corpus exists to cover); `check_behavior` falls back to
     // tokenizing the `.bas` if it is missing or fails to compile.
     let report = common::check_behavior(&root, |name, _src| {
-        if EXPECTED_REJECTS.contains(&name) {
+
+        if NON_TERMINATING.contains(&name) {
             return None;
         }
         let prg = root.join(format!("{name}.prg"));

@@ -60,6 +60,7 @@ fn a_hole_just_below_the_end_is_reported() {
 #[test]
 fn a_hole_above_the_end_is_not_reported() {
     assert!(reserved_tail_overshoots(0x0801, 0x2F27, &[(0x3000, 0x3FFF)]).is_empty());
+
     assert!(reserved_tail_overshoots(0x0801, 0x3FFF, &[(0x3000, 0x3FFF)]).is_empty());
 }
 
@@ -70,19 +71,23 @@ fn a_hole_below_the_image_is_not_reported() {
     // A custom origin moves the line with it.
     assert!(reserved_tail_overshoots(0xC000, 0xC050, &[(0x0400, 0x07E7)]).is_empty());
 }
+
 #[test]
 fn a_distant_end_is_not_reported() {
     assert!(!reserved_tail_overshoots(0x0801, 0x40FF, &[(0x3000, 0x3FFF)]).is_empty());
     assert!(reserved_tail_overshoots(0x0801, 0x4100, &[(0x3000, 0x3FFF)]).is_empty());
 }
+
 #[test]
 fn a_hole_smaller_than_the_overshoot_is_not_reported() {
     // 32-byte hole, 100 bytes above it: negative leverage.
     assert!(reserved_tail_overshoots(0x0801, 0x3063, &[(0x3000, 0x301F)]).is_empty());
+
     let got = reserved_tail_overshoots(0x0801, 0x302F, &[(0x3000, 0x301F)]);
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].recoverable(), 32 + 16);
 }
+
 #[test]
 fn holes_are_ranked_by_what_there_is_to_gain() {
     let got = reserved_tail_overshoots(0x0801, 0x30C4, &[(0x3090, 0x30BF), (0x3000, 0x307F)]);
@@ -93,9 +98,11 @@ fn holes_are_ranked_by_what_there_is_to_gain() {
         vec![((0x3000, 0x307F), 128 + 69), ((0x3090, 0x30BF), 48 + 5)],
         "the 128-byte hole is worth more than the 48-byte one: {got:#?}"
     );
+
     assert_eq!(got[0].overshoot, 0x30C4 - 0x307F);
     assert_eq!(got[1].overshoot, 0x30C4 - 0x30BF);
 }
+
 #[test]
 fn the_cap_is_applied_per_hole() {
     let got = reserved_tail_overshoots(0x0801, 0x4020, &[(0x3000, 0x37FF), (0x3F00, 0x3FFF)]);
@@ -107,10 +114,9 @@ fn the_cap_is_applied_per_hole() {
 }
 
 // End to end, against real compiler output.
-
 #[test]
 fn a_real_overshooting_image_reports_its_hole() {
-    let c = compile(&filler(145), vec![(0x3000, 0x3FFF)]);
+    let c = compile(&filler(148), vec![(0x3000, 0x3FFF)]);
     let o = c
         .diagnostics
         .reserved_overshoots
@@ -124,9 +130,10 @@ fn a_real_overshooting_image_reports_its_hole() {
     );
     assert_eq!(o.recoverable(), o.hole + o.overshoot);
 }
+
 #[test]
 fn an_image_that_clears_the_hole_says_nothing() {
-    let c = compile(&filler(143), vec![(0x3000, 0x3FFF)]);
+    let c = compile(&filler(147), vec![(0x3000, 0x3FFF)]);
     assert!(
         c.diagnostics.reserved_overshoots.is_empty(),
         "nothing to report at {:04X}: {:#?}",
@@ -139,10 +146,11 @@ fn an_image_that_clears_the_hole_says_nothing() {
         c.diagnostics.end_address
     );
 }
+
 #[test]
 fn the_cliff_is_real() {
-    let over = compile(&filler(144), vec![(0x3000, 0x3FFF)]);
-    let under = compile(&filler(143), vec![(0x3000, 0x3FFF)]);
+    let over = compile(&filler(148), vec![(0x3000, 0x3FFF)]);
+    let under = compile(&filler(147), vec![(0x3000, 0x3FFF)]);
     let o = over.diagnostics.reserved_overshoots[0];
     let jump = over.prg_bytes.len() - under.prg_bytes.len();
     assert!(
@@ -155,6 +163,7 @@ fn the_cliff_is_real() {
         jump > 4000,
         "the point of the diagnostic is that this is a cliff, not a slope: {jump}"
     );
+
     let code_delta = over.machine_code.len() - under.machine_code.len() - o.hole as usize;
     assert!(
         code_delta < 256,

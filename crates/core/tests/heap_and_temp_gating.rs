@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -28,6 +26,7 @@ fn check_all_profiles(src: &str, expected: &str) {
         assert_eq!(got, expected, "{profile:?} output mismatch for:\n{src}");
     }
 }
+
 fn check_stops_with(src: &str, expected: &str) {
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         let (bytes, _) = build(src, profile);
@@ -68,6 +67,7 @@ fn assert_temp_slots_are_defined(asm: &str, label: &str) {
     let mut defined = Vec::new();
     for line in asm.lines() {
         let t = line.trim();
+
         if let Some(rest) = t.strip_prefix('T')
             && let Some(n) = rest.strip_suffix(':')
             && n.chars().all(|c| c.is_ascii_digit())
@@ -76,6 +76,7 @@ fn assert_temp_slots_are_defined(asm: &str, label: &str) {
             defined.push(n.parse::<usize>().unwrap());
             continue;
         }
+
         for (i, _) in t.match_indices('T') {
             let before = t[..i].chars().last();
             if matches!(before, Some(c) if c.is_ascii_alphanumeric() || c == '_') {
@@ -101,7 +102,6 @@ fn assert_temp_slots_are_defined(asm: &str, label: &str) {
 }
 
 // The silent half: the heap pointer existed but nothing ever set it.
-
 #[test]
 fn on_goto_over_val_mid_initialises_the_heap() {
     let src = "10 V$=\"21\":I=1\n\
@@ -110,6 +110,7 @@ fn on_goto_over_val_mid_initialises_the_heap() {
     check_all_profiles(src, " 1  2 ");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_val_mid");
 }
+
 #[test]
 fn on_goto_over_val_mid_into_an_orphan_next() {
     let src = "5 V$=\"21212\":GOTO 20\n\
@@ -122,6 +123,7 @@ fn on_goto_over_val_mid_into_an_orphan_next() {
     check_all_profiles(src, " 1  2  3  4  5 V\n");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_val_mid_orphan_next");
 }
+
 #[test]
 fn on_goto_over_chr_defines_and_initialises_the_heap_pointer() {
     let src = "10 FOR I=1 TO 2\n\
@@ -131,6 +133,7 @@ fn on_goto_over_chr_defines_and_initialises_the_heap_pointer() {
     check_all_profiles(src, "Z\n");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_chr");
 }
+
 #[test]
 fn on_goto_over_asc_chr_dispatch_chain() {
     let src = "5 GOTO 20\n\
@@ -143,6 +146,7 @@ fn on_goto_over_asc_chr_dispatch_chain() {
     check_all_profiles(src, "1234C\n");
     assert_heap_pointer_is_sound(&asm_of(src), "on_goto_over_asc_chr");
 }
+
 #[test]
 fn on_gosub_over_chr_initialises_the_heap() {
     let src = "10 FOR I=1 TO 2\n\
@@ -155,7 +159,6 @@ fn on_gosub_over_chr_initialises_the_heap() {
 }
 
 // The temp-slot half.
-
 #[test]
 fn a_runtime_for_handler_gets_its_temp_slot() {
     let src = "5 DATA 1,2,3\n\
@@ -234,6 +237,7 @@ fn the_heap_and_temp_invariants_hold_across_shapes() {
         }
     }
 }
+
 #[test]
 fn the_prewalk_keeps_compilation_deterministic() {
     for src in [
@@ -256,6 +260,7 @@ fn a_heap_free_program_still_skips_the_heap_prologue() {
         "a heap-free program must not pay for the heap:\n{asm}"
     );
 }
+
 #[test]
 fn an_on_goto_without_a_heap_expression_still_skips_the_heap_prologue() {
     let asm = asm_of("10 I=1\n20 ON I GOTO 30,40\n30 PRINT \"a\":END\n40 PRINT \"b\"\n");
@@ -280,22 +285,25 @@ fn literal_only_string_work_still_skips_the_heap_prologue() {
         );
     }
 }
+
 #[test]
 fn the_temp_slot_block_is_still_omitted_when_nothing_needs_one() {
-    for src in [
-        "10 FOR I=1 TO 3:PRINT I:NEXT\n",
+    for (src, expected) in [
+        ("10 FOR I=1 TO 3:PRINT I:NEXT\n", " 1 \n 2 \n 3 \n"),
         // Orphan NEXT -> runtime handler, but an integer-narrowed loop whose handler is
         // `emit_next_int` and needs no temp.
-        "5 GOTO 20\n10 NEXT:GOTO 30\n20 FOR I=1 TO 3\n25 PRINT I;\n\
-         30 IF I>3 THEN END\n35 ON 1 GOTO 10\n",
+        ("5 GOTO 20\n10 NEXT:GOTO 30\n20 FOR I=1 TO 3\n25 PRINT I;\n\
+         30 IF I>3 THEN END\n35 ON 1 GOTO 10\n", " 1  2  3 "),
     ] {
         let asm = asm_of(src);
         assert!(
             !asm.contains("\nT0:"),
             "no temp is needed here, so no slot should be emitted:\n{src}\n{asm}"
         );
+        check_all_profiles(src, expected);
     }
 }
+
 #[test]
 fn the_prewalk_does_not_inflate_the_temp_count() {
     let src = "5 DATA 1,2,3\n\
@@ -317,6 +325,7 @@ fn the_prewalk_does_not_inflate_the_temp_count() {
         "one handler temp, reused — not one slot per emission pass:\n{asm}"
     );
 }
+
 #[test]
 fn an_ordinary_loop_still_keeps_the_static_next() {
     let asm = asm_of("10 FOR I=1 TO 10:PRINT I;:NEXT\n");

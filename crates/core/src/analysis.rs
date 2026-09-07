@@ -1062,10 +1062,18 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
                 out.writes.insert(EffectRegion::IoState);
             }
         }
-        Stmt::Sys { addr, regs, .. } => {
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             summarize_expr(addr, &mut out);
             for r in regs {
                 summarize_expr(r, &mut out);
+            }
+            for p in param_vars {
+                summarize_expr(&p.value, &mut out);
             }
             out.opaque_read = true;
             out.opaque_write = true;
@@ -1301,6 +1309,7 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
         | Stmt::End
         | Stmt::Stop
         | Stmt::RaiseError(_)
+        | Stmt::Hang
         | Stmt::Loop
         | Stmt::EndLoop
         | Stmt::Else

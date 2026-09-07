@@ -8,6 +8,7 @@ fn out(src: &str) -> String {
     let prg = common::compile_source(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"));
     common::run_clean(&prg).unwrap_or_else(|| panic!("no clean exit: {src:?}"))
 }
+
 #[test]
 fn tab_counts_from_the_current_column() {
     // ROM: X then seven spaces, Y at column 8.
@@ -17,11 +18,13 @@ fn tab_counts_from_the_current_column() {
         out("10 PRINT TAB(15);\"INDENTED\"\n"),
         "               INDENTED\n"
     );
+
     assert_eq!(
         out("10 PRINT \"COL0\";TAB(10);\"COL10\";TAB(20);\"COL20\"\n"),
         "COL0      COL10     COL20\n"
     );
 }
+
 #[test]
 fn tab_backwards_is_a_no_op() {
     assert_eq!(
@@ -39,6 +42,7 @@ fn tab_spans_a_wrapped_logical_line() {
         "0123456789012345678901234567890123456789     Z\n"
     );
 }
+
 #[test]
 fn spc_is_still_relative() {
     assert_eq!(
@@ -46,6 +50,7 @@ fn spc_is_still_relative() {
         "A     B   C\n"
     );
 }
+
 #[test]
 fn pos_reports_the_cursor_column() {
     assert_eq!(out("10 PRINT \"ABC\";POS(0)\n"), "ABC 3 \n");
@@ -64,13 +69,16 @@ fn print_comma_pads_to_the_next_zone() {
         "I         I*I       I*I*I\n"
     );
 }
+
 #[test]
-fn print_comma_wraps_when_the_line_is_full() {
+fn print_comma_pads_past_column_thirty_instead_of_breaking_the_line() {
+    let thirty_one = "0".repeat(31);
     assert_eq!(
-        out("10 PRINT \"0123456789012345678901234567890\",\"Z\"\n"),
-        "0123456789012345678901234567890\nZ\n"
+        out(&format!("10 PRINT \"{thirty_one}\",\"Z\"\n")),
+        format!("{thirty_one}{}Z\n", " ".repeat(9))
     );
 }
+
 #[test]
 fn print_comma_at_a_zone_boundary_advances_a_full_zone() {
     assert_eq!(
@@ -78,6 +86,7 @@ fn print_comma_at_a_zone_boundary_advances_a_full_zone() {
         "0123456789          X\n          Y\n"
     );
 }
+
 #[test]
 fn print_comma_keeps_padding_on_a_wrapped_logical_line() {
     let forty_one = "0".repeat(41);
@@ -86,6 +95,7 @@ fn print_comma_keeps_padding_on_a_wrapped_logical_line() {
         format!("{forty_one}{}Z\n", " ".repeat(9))
     );
 }
+
 #[test]
 fn print_comma_walks_successive_zones_from_column_zero() {
     assert_eq!(out("10 PRINT ,\"A\",\"B\"\n"), "          A         B\n");

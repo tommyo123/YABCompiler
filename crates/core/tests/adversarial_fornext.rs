@@ -1,4 +1,4 @@
-
+//! Externally-reported adversarial FOR/NEXT programs.
 
 mod common;
 
@@ -48,6 +48,7 @@ fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
         .unwrap_or_else(|e| panic!("compiles ({profile:?}, extraram={extraram}): {e}"));
     (c.prg_bytes, c.asm)
 }
+
 fn runtime_frames(asm: &str) -> (usize, usize) {
     let pushes = asm
         .lines()
@@ -78,6 +79,7 @@ fn assert_every_for_has_a_frame(name: &str, src: &str, for_sites: usize) {
         }
     }
 }
+
 fn normalize(s: &str) -> String {
     s.lines()
         .map(str::trim_end)
@@ -107,6 +109,7 @@ fn assert_all_variants(name: &str, src: &str, expected: &str) {
 
 #[test]
 fn forty_gives_every_for_a_runtime_frame() {
+
     assert_every_for_has_a_frame("forty", FORTY, 2);
 }
 
@@ -117,6 +120,7 @@ fn forty2_gives_every_for_a_runtime_frame() {
 
 #[test]
 fn forty3_gives_every_for_a_runtime_frame() {
+
     assert_every_for_has_a_frame("forty3", FORTY3, 3);
 }
 
@@ -124,6 +128,7 @@ fn forty3_gives_every_for_a_runtime_frame() {
 
 #[test]
 fn forty2_matches_the_rom() {
+
     assert_all_variants(
         "forty2",
         FORTY2,
@@ -133,6 +138,7 @@ fn forty2_matches_the_rom() {
 
 #[test]
 fn forty_matches_the_rom() {
+
     assert_all_variants(
         "forty",
         FORTY,
@@ -142,6 +148,7 @@ fn forty_matches_the_rom() {
 
 #[test]
 fn forty3_matches_the_rom() {
+
     assert_all_variants(
         "forty3",
         FORTY3,

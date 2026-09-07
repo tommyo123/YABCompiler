@@ -40,12 +40,13 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-/// Highest address (exclusive) at which any compiler-emitted data may
-/// land. Set 256 bytes below the actual BASIC-ROM start ($A000) as
-/// safety margin in case some helper grows or some piece of data
-/// turns out to be slightly larger than the budget at the moment of
-/// the assertion.
-pub const DATA_CEILING: u16 = 0x9F00;
+/// Highest address (exclusive) at which any compiler-emitted data may land: the first byte of the BASIC-ROM window.
+pub const DATA_CEILING: u16 = 0xA000;
+
+/// One past the last address that reads as BASIC ROM when the JT has banked it in ; the top of the `$A000-$BFFF` window.
+pub const ROM_WINDOW_TOP: u16 = 0xC000;
+
+pub const HEAP_CEILING: u16 = 0xD000;
 
 /// Label the compiler-injected wrapper places at the very end of the
 /// reordered data section. After assembly, `lookup(DATA_END_LABEL)`
@@ -67,6 +68,11 @@ const ROM_CALLS: &[RomCall] = &[
     RomCall {
         addr: 0xAB1E,
         label: "STROUT",
+    },
+
+    RomCall {
+        addr: 0xAB3B,
+        label: "PRINT_GAP",
     },
     RomCall {
         addr: 0xB391,
@@ -91,6 +97,15 @@ const ROM_CALLS: &[RomCall] = &[
     RomCall {
         addr: 0xBA28,
         label: "FMULT",
+    },
+    // MUL10 and ADD_SIGNED_BYTE are the two entries `__SET_TI` reaches to accumulate `TI$` the way the ROM's own writer at $A9E7-$AA0E does.
+    RomCall {
+        addr: 0xBAE2,
+        label: "MUL10",
+    },
+    RomCall {
+        addr: 0xBD7E,
+        label: "ADD_SIGNED_BYTE",
     },
     RomCall {
         addr: 0xBB0F,
@@ -156,6 +171,11 @@ const ROM_CALLS: &[RomCall] = &[
         addr: 0xB7B5,
         label: "VAL_PARSE",
     },
+    // FIN, called directly by `__INPUT_VAL` because VAL_PARSE throws away where the parse stopped and that position IS the `?REDO FROM START` test.
+    RomCall {
+        addr: 0xBCF3,
+        label: "FIN",
+    },
     RomCall {
         addr: 0xBC9B,
         label: "QINT",
@@ -218,6 +238,11 @@ fn rom_lookup(addr: u16) -> Option<&'static RomCall> {
     ROM_CALLS.iter().find(|c| c.addr == addr)
 }
 
+/// The store a user `POKE 1,<v>` lowers to.
+const PORT01_STORE: &str = "STA $0001";
+
+const PORT01_LORAM_MASK: u8 = 0xFE;
+
 /// Delimiters `codegen::bss_fill_block` wraps the entry-time zero-fill in, plus the two labels
 /// it measures.
 const BSS_FILL_OPEN: &str = "; --- BSS zero-fill ---";
@@ -254,6 +279,50 @@ pub(crate) fn strip_bss_tail_fill(asm: &str) -> String {
     out
 }
 
+pub(crate) fn has_val_variants(asm: &str) -> bool {
+    asm.contains(crate::codegen::VAL_COPY_OPEN)
+}
+
+pub(crate) fn select_val_variant(asm: &str, copy: bool) -> String {
+    use crate::codegen::{
+        VAL_BUF_CLOSE, VAL_BUF_OPEN, VAL_COPY_CLOSE, VAL_COPY_OPEN, VAL_INPLACE_CLOSE,
+        VAL_INPLACE_OPEN,
+    };
+    if !asm.contains(VAL_COPY_OPEN) {
+        return asm.to_string();
+    }
+
+    let blocks: [(&str, &str, bool); 3] = [
+        (VAL_COPY_OPEN, VAL_COPY_CLOSE, copy),
+        (VAL_INPLACE_OPEN, VAL_INPLACE_CLOSE, !copy),
+        (VAL_BUF_OPEN, VAL_BUF_CLOSE, copy),
+    ];
+    let mut out = String::with_capacity(asm.len());
+    // `dropping` is Some(close-sentinel) while inside a block whose body is being removed.
+    let mut dropping: Option<&str> = None;
+    for line in asm.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(close) = dropping {
+            if trimmed == close {
+                dropping = None;
+            }
+            continue;
+        }
+        if let Some(&(_, close, keep)) = blocks.iter().find(|(open, _, _)| trimmed == *open) {
+            if !keep {
+                dropping = Some(close);
+            }
+
+            continue;
+        }
+        if blocks.iter().any(|(_, close, _)| trimmed == *close) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Returns true when `addr` is a ROM call that the JT must wrap.
 ///
 /// Two cases:
@@ -274,10 +343,45 @@ fn needs_jt_wrapping(addr: u16) -> bool {
     rom_lookup(addr).is_some()
 }
 
-/// Top-level entry point used by `compile.rs`. Takes the post-peephole
-/// asm and returns the rewritten asm with the JT injected and data
-/// pulled to the low half of the binary.
+/// Top-level entry point used by `compile.rs`.
 pub fn inject(asm: &str) -> String {
+    inject_with_reserved(asm, &[], false)
+}
+
+/// The heap ceiling this layout gets, given the ranges the assembler has been told to keep clear.
+pub(crate) fn heap_ceiling(reserved: &[(u16, u16)], heap_bottom: u32) -> u16 {
+    reserved
+        .iter()
+        .filter(|&&(_, hi)| u32::from(hi) >= heap_bottom)
+        .map(|&(lo, _)| lo)
+        .filter(|&lo| lo >= DATA_CEILING)
+        .min()
+        .map_or(HEAP_CEILING, |lo| lo.min(HEAP_CEILING))
+}
+
+/// The final heap floor is known only after linking.
+pub(crate) fn refine_heap_ceiling(
+    asm: &str,
+    reserved: &[(u16, u16)],
+    heap_bottom: u32,
+) -> Option<String> {
+    let initial = heap_ceiling(reserved, u32::from(DATA_CEILING));
+    let settled = heap_ceiling(reserved, heap_bottom);
+    if initial == settled || !asm.contains("__EXRAM_MEMSIZ_RAISE:\n") {
+        return None;
+    }
+    let old = format!("__EXRAM_MEMSIZ_RAISE:\n{}", memsiz_raise(initial));
+    let new = format!("__EXRAM_MEMSIZ_RAISE:\n{}", memsiz_raise(settled));
+    assert!(asm.contains(&old), "generated MEMSIZ raise has its initial ceiling");
+    Some(asm.replacen(&old, &new, 1))
+}
+
+pub fn inject_with_reserved(
+    asm: &str,
+    reserved: &[(u16, u16)],
+    program_touches_memsiz: bool,
+) -> String {
+
     let asm = &strip_bss_tail_fill(asm);
     // Phase 1: scan for unique ROM addresses referenced by JSR/JMP.
     let mut used: BTreeSet<u16> = BTreeSet::new();
@@ -289,33 +393,113 @@ pub fn inject(asm: &str) -> String {
         }
     }
 
-    // Phase 2: split off the header (everything up to and including
-    // the `*=$080D` directive) so we can re-emit the JT INSIDE the
-    // originated section.
+    let heap_ceil = (asm.contains("__HEAP_BOTTOM:") && !program_touches_memsiz)
+        .then(|| heap_ceiling(reserved, u32::from(DATA_CEILING)));
+    // The `SYS` wrappers are a couple of dozen bytes that most programs have no site for.
+    let has_sys_wrap = asm.contains("; YAB_SYS_WRAP_IN");
+    let has_ierror = asm.contains("__TSB_IERROR_ENTRY:");
+    let has_sys_strings = asm.contains("__SYS_EVAL_ENTER:");
+    let inplace_pinned = asm
+        .lines()
+        .any(|l| l.trim() == crate::compile::INPLACE_PIN_END);
     let mut header_buffer = String::new();
     let mut body_buffer = String::new();
     let mut header_done = false;
+    let mut pinning = false;
+    let mut tramps = SysTrampolines::default();
+    let mut in_usr_vector = false;
+    let mut has_usr_wrap = false;
+
+    let mut wrapped: Option<Vec<String>> = None;
     for line in asm.lines() {
         if !header_done {
             header_buffer.push_str(line);
             header_buffer.push('\n');
             if line.trim_start().starts_with("*=") {
                 header_done = true;
+                pinning = inplace_pinned;
             }
             continue;
         }
-        // Rewrite ROM-targeting JSR/JMP to JT labels.
-        match rewrite_line(line) {
-            Some(rewritten) => {
-                body_buffer.push_str(&rewritten);
-                body_buffer.push('\n');
+        if pinning {
+            header_buffer.push_str(line);
+            header_buffer.push('\n');
+            if line.trim() == crate::compile::INPLACE_PIN_END {
+                pinning = false;
             }
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.ends_with(':') {
+            in_usr_vector = trimmed == "__USR_VECTORED:";
+        }
+        // Only the compiler's USR dispatch tail is an external call.
+        if in_usr_vector && trimmed == "JMP ($0311)" {
+            body_buffer.push_str("    JMP __EXRAM_USRJT\n");
+            has_usr_wrap = true;
+            continue;
+        }
+        if trimmed == "; YAB_SYS_WRAP_IN" {
+            if heap_ceil.is_some() {
+                let _ = writeln!(body_buffer, "    JSR {SYS_IN}");
+            }
+            wrapped = Some(Vec::new());
+            continue;
+        }
+        if trimmed == "; YAB_SYS_WRAP_OUT" {
+
+            let inner = wrapped.take().unwrap_or_default();
+            let _ = writeln!(body_buffer, "    JSR {}", tramps.intern(inner));
+            if heap_ceil.is_some() {
+                let _ = writeln!(body_buffer, "    JSR {SYS_OUT}");
+            }
+            continue;
+        }
+
+        if trimmed == PORT01_STORE {
+            match &mut wrapped {
+                Some(buf) => buf.push(format!("    AND #${PORT01_LORAM_MASK:02X}")),
+                None => {
+                    let _ = writeln!(body_buffer, "    AND #${PORT01_LORAM_MASK:02X}");
+                }
+            }
+        }
+        // Rewrite ROM-targeting JSR/JMP to JT labels.
+        let rewritten = rewrite_line(line, heap_ceil).unwrap_or_else(|| line.to_string());
+
+        let rewritten = if has_ierror {
+            rewritten
+                .replace("#<__TSB_IERROR_ENTRY", "#<__EXRAM_IERROR_ENTRY")
+                .replace("#>__TSB_IERROR_ENTRY", "#>__EXRAM_IERROR_ENTRY")
+        } else {
+            rewritten
+        };
+        let rewritten = if has_sys_strings {
+            let s = rewritten
+                .replace("#<__SYS_EVAL_ENTER", "#<__EXRAM_SYS_EVAL_ENTER")
+                .replace("#>__SYS_EVAL_ENTER", "#>__EXRAM_SYS_EVAL_ENTER")
+                .replace("#<__SYS_EVAL_IERROR", "#<__EXRAM_SYS_EVAL_IERROR")
+                .replace("#>__SYS_EVAL_IERROR", "#>__EXRAM_SYS_EVAL_IERROR");
+            match s.trim() {
+                "__SYS_EVAL_CHAIN:" => format!("{s}\n    JMP __EXRAM_SYS_EVAL_CHAIN"),
+                "__SYS_EVAL_RETURN:" => format!("{s}\n    JMP __EXRAM_SYS_EVAL_RETURN"),
+                "; YAB_SYS_EVAL_ERROR_CLEAN" if heap_ceil.is_some() =>
+                    format!("{s}\n    JSR {MEMSIZ_APPLY}"),
+                _ => s,
+            }
+        } else {
+            rewritten
+        };
+        match &mut wrapped {
+            Some(buf) => buf.push(rewritten),
             None => {
-                body_buffer.push_str(line);
+                body_buffer.push_str(&rewritten);
                 body_buffer.push('\n');
             }
         }
     }
+
+    tramps.redirect_patch_stores(&mut body_buffer);
 
     // Phase 3: classify each block in the body as DATA or CODE so we
     // can hoist data above code. `__HEAP_BOTTOM` is special-cased to
@@ -329,6 +513,7 @@ pub fn inject(asm: &str) -> String {
         if block.label.as_deref() == Some("__HEAP_BOTTOM:") {
             heap_marker = Some(block);
         } else if block.is_data() || is_data_anchor_label(block.label.as_deref()) {
+
             data_blocks.push(block);
         } else {
             code_blocks.push(block);
@@ -337,7 +522,15 @@ pub fn inject(asm: &str) -> String {
 
     // Phase 4: stitch it all together.
     let mut out = header_buffer;
-    out.push_str(&emit_preamble(&used));
+    out.push_str(&emit_preamble(
+        &used,
+        heap_ceil,
+        has_sys_wrap,
+        has_usr_wrap,
+        has_ierror,
+        has_sys_strings,
+        &tramps,
+    ));
     out.push_str("; --- extraram: hoisted data sections ---\n");
     for b in &data_blocks {
         out.push_str(&b.text);
@@ -352,15 +545,7 @@ pub fn inject(asm: &str) -> String {
         out.push_str(&b.text);
     }
 
-    // Phase 5 (debug-only): scan the user-code section for any direct
-    // ROM call that *should* have been routed through the JT. This is
-    // a safety net for new ROM addresses being added to runtime.rs
-    // without a matching ROM_CALLS entry — without this, the bug would
-    // only surface as a hard-to-debug crash on the first call once the
-    // program grew big enough to trigger extraram. Guarded by
-    // debug_assertions so it costs nothing in release builds.
-    #[cfg(debug_assertions)]
-    debug_assert_no_unwrapped_rom_calls(&out);
+    assert_no_unwrapped_rom_calls(&out);
     #[cfg(debug_assertions)]
     debug_assert_data_anchors_hoisted(&out);
 
@@ -403,9 +588,8 @@ fn debug_assert_data_anchors_hoisted(asm: &str) {
     }
 }
 
-/// Byte offset of the line that consists solely of `label` (modulo leading whitespace), or
-/// `None`.
-#[cfg(debug_assertions)]
+/// Byte offset of the line that consists solely of `label` (modulo leading whitespace), or `None`.
+#[cfg(any(debug_assertions, test))]
 fn find_label_line(asm: &str, label: &str) -> Option<usize> {
     let mut offset = 0usize;
     for line in asm.lines() {
@@ -417,32 +601,8 @@ fn find_label_line(asm: &str, label: &str) -> Option<usize> {
     None
 }
 
-/// Scan the post-inject asm for any direct `JSR/JMP $XXXX` that
-/// targets an address inside the BASIC ROM bank-out window
-/// ($A000-$BFFF) or one of the explicitly-listed `$E000+` math /
-/// warm-start entries — but only in the USER CODE section, not the
-/// JT preamble (whose entire purpose is to host the wrapped calls).
-///
-/// Panics with a clear diagnostic if any slip through. Catches
-/// regressions where a new ROM helper is added to `runtime.rs` and
-/// emitted by `codegen.rs` without a matching `ROM_CALLS` entry.
-#[cfg(debug_assertions)]
-fn debug_assert_no_unwrapped_rom_calls(asm: &str) {
-    // The user code lives after `__EXRAM_CODE_START:`. The preamble
-    // (where the JT entries live) is everything before that label.
-    let Some(code_start) = asm.find("__EXRAM_CODE_START:") else {
-        return;
-    };
-    let user_code = &asm[code_start..];
-    let mut leaks: Vec<(usize, u16, &str)> = Vec::new();
-    for (lineno, line) in user_code.lines().enumerate() {
-        let Some(addr) = parse_rom_call(line) else {
-            continue;
-        };
-        if needs_jt_wrapping(addr) {
-            leaks.push((lineno, addr, line));
-        }
-    }
+fn assert_no_unwrapped_rom_calls(asm: &str) {
+    let leaks = unwrapped_rom_calls(asm);
     if !leaks.is_empty() {
         let mut msg = String::from(
             "extraram: unwrapped ROM call(s) in user code section — \
@@ -454,6 +614,25 @@ fn debug_assert_no_unwrapped_rom_calls(asm: &str) {
         }
         panic!("{msg}");
     }
+}
+
+fn unwrapped_rom_calls(asm: &str) -> Vec<(usize, u16, &str)> {
+    // The user code lives after `__EXRAM_CODE_START:`. The preamble
+    // (where the JT entries live) is everything before that label.
+    let Some(code_start) = asm.find("__EXRAM_CODE_START:") else {
+        return Vec::new();
+    };
+    let user_code = &asm[code_start..];
+    let mut leaks = Vec::new();
+    for (lineno, line) in user_code.lines().enumerate() {
+        let Some(addr) = parse_rom_call(line) else {
+            continue;
+        };
+        if needs_jt_wrapping(addr) {
+            leaks.push((lineno, addr, line));
+        }
+    }
+    leaks
 }
 
 /// If the line is `    JSR $XXXX` or `    JMP $XXXX`, return the
@@ -476,27 +655,92 @@ fn parse_rom_call(line: &str) -> Option<u16> {
     u16::from_str_radix(&hex, 16).ok()
 }
 
-/// Rewrite a single line to use the JT label when it targets an address
-/// that needs banking. Pure KERNAL calls (CHROUT, GETIN, etc.) pass
-/// through — they don't depend on the BASIC ROM bank state.
-fn rewrite_line(line: &str) -> Option<String> {
-    // SYS-call bank markers emitted by `emit_sys`. Under extraram the
-    // program holds `$01 = $36` (BASIC ROM out), so a SYS routine that
-    // calls back into BASIC ROM (FRMEVL, CHROUT, …) would land on
-    // banked-out RAM. INC/DEC $01 around the JSR bank ROM in for the
-    // duration of the user routine and back out on return. Replacing
-    // the marker line (rather than inserting a new one) leaves the
-    // self-modify offsets `<label>+1/+2` intact — the marker sits
-    // outside the label/JSR pair, never between them.
-    let trimmed = line.trim_start();
-    if trimmed == "; YAB_SYS_WRAP_IN" {
-        let leading = &line[..line.len() - trimmed.len()];
-        return Some(format!("{leading}INC $01"));
+/// The `SYS` trampolines, one per distinct call, collected while the body is scanned and emitted into the preamble.
+#[derive(Default)]
+struct SysTrampolines {
+    /// `(inner lines, label)`, in first-seen order.
+    entries: Vec<(Vec<String>, String)>,
+
+    patched_sites: Vec<String>,
+}
+
+const SYS_IND_TRAMP: &str = "__EXRAM_SYSJT_IND";
+const SYS_IND_PATCH: &str = "__EXRAM_SYS_PATCHED";
+
+impl SysTrampolines {
+    /// Label for this call, creating the trampoline on first sight.
+    fn intern(&mut self, inner: Vec<String>) -> String {
+        if let Some(label) = patched_jsr_label(&inner) {
+            self.patched_sites.push(label);
+            return SYS_IND_TRAMP.to_string();
+        }
+        if let Some((_, label)) = self.entries.iter().find(|(k, _)| *k == inner) {
+            return label.clone();
+        }
+        let label = format!("__EXRAM_SYSJT_{}", self.entries.len());
+        self.entries.push((inner, label.clone()));
+        label
     }
-    if trimmed == "; YAB_SYS_WRAP_OUT" {
-        let leading = &line[..line.len() - trimmed.len()];
-        return Some(format!("{leading}DEC $01"));
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.patched_sites.is_empty()
     }
+
+    fn redirect_patch_stores(&self, body: &mut String) {
+        for label in &self.patched_sites {
+            *body = body
+                .replace(&format!("{label}+1"), &format!("{SYS_IND_PATCH}+1"))
+                .replace(&format!("{label}+2"), &format!("{SYS_IND_PATCH}+2"));
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut s = String::new();
+        if !self.patched_sites.is_empty() {
+            let _ = writeln!(s, "{SYS_IND_TRAMP}:");
+            s.push_str("    INC $01\n");
+            let _ = writeln!(s, "{SYS_IND_PATCH}:");
+            s.push_str("    JSR $FFFF\n");
+            s.push_str("    DEC $01\n");
+            s.push_str("    RTS\n");
+        }
+        for (inner, label) in &self.entries {
+            let _ = writeln!(s, "{label}:");
+            s.push_str("    INC $01\n");
+            for l in inner {
+                if l.trim().is_empty() {
+                    continue;
+                }
+                s.push_str(l);
+                s.push('\n');
+            }
+            s.push_str("    DEC $01\n");
+            s.push_str("    RTS\n");
+        }
+        s
+    }
+}
+
+fn patched_jsr_label(inner: &[String]) -> Option<String> {
+    if !inner.iter().any(|l| l.trim() == "JSR $FFFF") {
+        return None;
+    }
+    inner
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| l.ends_with(':'))
+        .map(|l| l.trim_end_matches(':').to_string())
+}
+
+/// Rewrite a single line to use the JT label when it targets an address that needs banking.
+fn rewrite_line(line: &str, _ceiling: Option<u16>) -> Option<String> {
+    debug_assert!(
+        !matches!(
+            line.trim(),
+            "; YAB_SYS_WRAP_IN" | "; YAB_SYS_WRAP_OUT"
+        ),
+        "the SYS bank markers are the body loop's business, not this function's"
+    );
     let addr = parse_rom_call(line)?;
     if !needs_jt_wrapping(addr) {
         return None;
@@ -512,20 +756,58 @@ fn rewrite_line(line: &str) -> Option<String> {
     Some(format!("{leading}{mnemonic} __JT_{}", call.label))
 }
 
-/// Build the JT, the entry-point wrapper that banks ROM out, and the
-/// `JSR __EXRAM_CODE_START / INC $01 / RTS` exit sequence. `JSR` is
-/// chosen over fall-through so the program's natural top-level RTS
-/// returns OUT of __EXRAM_CODE_START — saving the trouble of finding
-/// and rewriting the exit-RTS in the user code.
-fn emit_preamble(used: &BTreeSet<u16>) -> String {
+/// Build the JT, the entry-point wrapper that banks ROM out, and the `JSR __EXRAM_CODE_START / INC $01 / RTS` exit sequence.
+fn emit_preamble(
+    used: &BTreeSet<u16>,
+    ceiling: Option<u16>,
+    has_sys: bool,
+    has_usr: bool,
+    has_ierror: bool,
+    has_sys_strings: bool,
+    tramps: &SysTrampolines,
+) -> String {
     let mut s = String::new();
     s.push_str("; --- extraram: bank BASIC ROM out, route ROM calls through low JT ---\n");
     s.push_str("    JMP __EXRAM_ENTRY\n");
+    if has_sys_strings {
+        s.push_str("__EXRAM_SYS_EVAL_ENTER:\n    PHP\n    PHA\n    TXA\n    PHA\n    TYA\n    PHA\n    LDA $01\n    STA __SYS_EVAL_PORT\n    AND #$FE\n    STA $01\n    JMP __SYS_EVAL_DISPATCH\n");
+        s.push_str("__EXRAM_SYS_EVAL_CHAIN:\n    LDA __SYS_EVAL_PORT\n    STA $01\n    PLA\n    TAY\n    PLA\n    TAX\n    PLA\n    PLP\n    JMP (__SYS_EVAL_PREVIOUS)\n");
+        s.push_str("__EXRAM_SYS_EVAL_RETURN:\n    LDA __SYS_EVAL_PORT\n    STA $01\n    PLA\n    TAY\n    PLA\n    TAX\n    PLA\n    PLP\n    RTS\n");
+        s.push_str("__EXRAM_SYS_EVAL_IERROR:\n    LDA $01\n    PHA\n    AND #$FE\n    STA $01\n    JSR __SYS_EVAL_ABORT\n    PLA\n    STA $01\n    JMP (__SYS_EVAL_OLD_ERROR)\n");
+    }
+    if has_ierror {
+        s.push_str("__EXRAM_IERROR_ENTRY:\n    LDA $01\n    AND #$FE\n    STA $01\n");
+        // A nonreturning error may have abandoned SYS/USR's MEMSIZ swap.
+        if ceiling.is_some() {
+            let _ = writeln!(s, "    JSR {MEMSIZ_APPLY}");
+        }
+        s.push_str("    JMP __TSB_ERROR\n");
+    }
+
+    if !tramps.is_empty() {
+        s.push_str(&tramps.render());
+    }
+    if has_usr {
+        s.push_str("__EXRAM_USRJT:\n");
+
+        if ceiling.is_some() {
+            let _ = writeln!(s, "    JSR {SYS_IN}");
+        }
+        s.push_str("    INC $01\n    JSR __EXRAM_USR_VECTOR\n    DEC $01\n");
+        if ceiling.is_some() {
+            let _ = writeln!(s, "    JSR {SYS_OUT}");
+        }
+        s.push_str("    RTS\n__EXRAM_USR_VECTOR:\n    JMP ($0311)\n");
+    }
     for &addr in used {
         let Some(call) = rom_lookup(addr) else {
             continue;
         };
         let _ = writeln!(s, "__JT_{}:", call.label);
+
+        if ceiling.is_some() && matches!(call.addr, 0xA437 | 0xE37B) {
+            let _ = writeln!(s, "    JSR {MEMSIZ_RESTORE}");
+        }
         let _ = writeln!(s, "    INC $01");
         let _ = writeln!(s, "    JSR ${:04X}", call.addr);
         let _ = writeln!(s, "    DEC $01");
@@ -534,14 +816,92 @@ fn emit_preamble(used: &BTreeSet<u16>) -> String {
     s.push_str("__EXRAM_ENTRY:\n");
     s.push_str("    LDA #$36\n");
     s.push_str("    STA $01\n");
+    if ceiling.is_some() {
+        s.push_str("    LDA $37\n");
+        let _ = writeln!(s, "    STA {MEMSIZ_SAVE}");
+        s.push_str("    LDA $38\n");
+        let _ = writeln!(s, "    STA {MEMSIZ_SAVE}+1");
+        let _ = writeln!(s, "    JSR {MEMSIZ_APPLY}");
+    }
     s.push_str("    JSR __EXRAM_CODE_START\n");
+    if ceiling.is_some() {
+        let _ = writeln!(s, "    JSR {MEMSIZ_RESTORE}");
+    }
     // INC bumps LORAM 0 → 1, leaving $01 = $37 — what BASIC expects
     // when it resumes from the SYS call. One byte cheaper than
     // `LDA #$37 / STA $01`, and no A clobber.
     s.push_str("    INC $01\n");
     s.push_str("    RTS\n");
+    if let Some(ceiling) = ceiling {
+        let _ = writeln!(s, "{MEMSIZ_RESTORE}:");
+        let _ = writeln!(s, "    LDA {MEMSIZ_SAVE}");
+        s.push_str("    STA $37\n");
+        let _ = writeln!(s, "    LDA {MEMSIZ_SAVE}+1");
+        s.push_str("    STA $38\n");
+        s.push_str("    RTS\n");
+
+        let _ = writeln!(s, "{MEMSIZ_APPLY}:");
+        s.push_str("    SEC\n");
+        let _ = writeln!(s, "    LDA {MEMSIZ_SAVE}");
+        s.push_str("    SBC #<__HEAP_BOTTOM\n");
+        let _ = writeln!(s, "    LDA {MEMSIZ_SAVE}+1");
+
+        s.push_str("    SBC #>__HEAP_BOTTOM\n");
+        s.push_str("    BCC __EXRAM_MEMSIZ_RAISE\n");
+        let _ = writeln!(
+            s,
+            "    CMP #${:02X}",
+            (crate::compile::MIN_STRING_HEAP >> 8) as u8
+        );
+        s.push_str("    BCC __EXRAM_MEMSIZ_RAISE\n");
+        let _ = writeln!(s, "    JMP {MEMSIZ_RESTORE}");
+        s.push_str("__EXRAM_MEMSIZ_RAISE:\n");
+        s.push_str(&memsiz_raise(ceiling));
+        s.push_str("    RTS\n");
+        if has_sys || has_usr {
+            s.push_str(&emit_sys_wrappers());
+        }
+
+        let _ = writeln!(s, "{MEMSIZ_SAVE}:");
+        s.push_str("    .byte $00,$00\n");
+    }
     s.push_str("; --- end extraram preamble ---\n\n");
     s
+}
+
+/// Where the machine's own MEMSIZ is parked for the duration of the run.
+const MEMSIZ_SAVE: &str = "__EXRAM_MEMSIZ_SAVE";
+
+pub(crate) const MEMSIZ_APPLY: &str = "__EXRAM_MEMSIZ_APPLY";
+/// `SYS` entry: MEMSIZ back to the machine's.
+const SYS_IN: &str = "__EXRAM_SYS_IN";
+
+const SYS_OUT: &str = "__EXRAM_SYS_OUT";
+
+/// The two `SYS` wrappers, emitted only when MEMSIZ is relocated.
+fn emit_sys_wrappers() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "{SYS_IN}:");
+    s.push_str("    PHP\n    PHA\n");
+    let _ = writeln!(s, "    JSR {MEMSIZ_RESTORE}");
+    s.push_str("    PLA\n    PLP\n    RTS\n");
+    let _ = writeln!(s, "{SYS_OUT}:");
+    s.push_str("    PHP\n    PHA\n");
+
+    let _ = writeln!(s, "    JSR {MEMSIZ_APPLY}");
+    s.push_str("    PLA\n    PLP\n    RTS\n");
+    s
+}
+/// Puts [`MEMSIZ_SAVE`] back into `$37/$38`.
+const MEMSIZ_RESTORE: &str = "__EXRAM_MEMSIZ_RESTORE";
+
+/// `$37/$38 = ceiling`, clobbering `.A`.
+fn memsiz_raise(ceiling: u16) -> String {
+    format!(
+        "    LDA #${:02X}\n    STA $37\n    LDA #${:02X}\n    STA $38\n",
+        ceiling & 0xFF,
+        ceiling >> 8,
+    )
 }
 
 /// One contiguous slab of asm — usually a label and the lines that
@@ -579,18 +939,28 @@ impl Block {
     }
 }
 
-/// Bodyless labels that bracket a data pool and must be hoisted WITH the pool they bracket.
 fn is_data_anchor_label(label: Option<&str>) -> bool {
     matches!(
         label,
         Some("__DATA:") | Some("__DATA_END:") | Some("__VARS_START:") | Some("__VARS_END:")
+            | Some("__CP_BEGIN:") | Some("__CP_END:")
     )
+        || label
+            .and_then(|label| label.strip_suffix(':'))
+            .is_some_and(|name| {
+                ["__DATA_LINE_", "__DBAD_S", "__DBAD_E"].iter().any(|prefix| {
+                    name.strip_prefix(prefix).is_some_and(|index| {
+                        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+            })
 }
 
-/// Every anchor label from `is_data_anchor_label`, in the bare form used for substring searches
-/// (no trailing colon-newline concerns).
 #[cfg(debug_assertions)]
-const DATA_ANCHOR_LABELS: &[&str] = &["__DATA:", "__DATA_END:", "__VARS_START:", "__VARS_END:"];
+const DATA_ANCHOR_LABELS: &[&str] = &[
+    "__DATA:", "__DATA_END:", "__VARS_START:", "__VARS_END:",
+    "__CP_BEGIN:", "__CP_END:",
+];
 
 fn split_into_blocks(body: &str) -> Vec<Block> {
     // Two-stage parse:
@@ -737,20 +1107,47 @@ fn classify_line(trimmed: &str) -> BodyKind {
     }
 }
 
-/// Verify that the assembled binary's data section ended below the
-/// configured ceiling. Called from compile.rs after the assembler
-/// has resolved all labels.
-pub fn verify_data_fits<F>(lookup: F) -> Result<(), String>
+/// Shared markers for composing the two recognised layout refusals.
+pub(crate) const DATA_CEILING_MARKER: &str = "hoisted data sections grew to";
+pub(crate) const IO_WALL_MARKER: &str = "the image runs to";
+
+pub fn verify_data_fits<F>(
+    lookup: F,
+    user_asked_for_extraram: bool,
+    image_end: u32,
+    heap_ceiling: u16,
+) -> Result<(), String>
 where
     F: Fn(&str) -> Option<u16>,
 {
     let data_end = lookup(DATA_END_LABEL)
         .ok_or_else(|| format!("--extraram: assembler did not resolve `{DATA_END_LABEL}` label"))?;
     if data_end > DATA_CEILING {
+        let over = u32::from(data_end) - u32::from(DATA_CEILING);
+        let escape = if user_asked_for_extraram {
+            " or run without --extraram"
+        } else {
+            ""
+        };
+        let past_io = image_end.saturating_sub(u32::from(heap_ceiling));
+        if past_io > 0 {
+            let binding = over.max(past_io);
+
+            return Err(format!(
+                "{IO_WALL_MARKER} ${image_end:04X}, {past_io} bytes above ${heap_ceiling:04X} \
+                 — the top of the space this layout has, which is where the I/O registers \
+                 start (${HEAP_CEILING:04X}) or the lowest address reserved below them. Its \
+                 hoisted data sections also end at ${data_end:04X}, {over} bytes beyond the \
+                 ${DATA_CEILING:04X} ceiling. The {binding} is the binding figure: both \
+                 limits must be satisfied. These are emitted-byte overshoots, not amounts \
+                 of BASIC source to delete. Reduce data (smaller arrays, fewer string literals, less \
+                 DATA){escape}."
+            ));
+        }
         return Err(format!(
-            "--extraram: data sections grew to ${data_end:04X}, beyond the \
+            "{DATA_CEILING_MARKER} ${data_end:04X}, {over} bytes beyond the \
              ${DATA_CEILING:04X} ceiling. Reduce data (smaller arrays, fewer \
-             string literals, less DATA) or run without --extraram."
+             string literals, less DATA){escape}."
         ));
     }
     Ok(())
@@ -774,6 +1171,62 @@ mod tests {
         assert!(out.contains("__JT_FADD:"));
         assert!(out.contains("INC $01"));
         assert!(out.contains("DEC $01"));
+    }
+
+    #[test]
+    fn usr_trampoline_returns_to_shadow_ram_and_preserves_fac() {
+        for touches_memsiz in [false, true] {
+            let input = "*=$080D\n    JSR __USR_VECTORED\n\
+                STA $0404\n    STX $0405\n    STY $0406\n\
+                PHP\n    PLA\n    STA $0407\n\
+                LDA $01\n    STA $0402\n    LDA $38\n    STA $0403\n    RTS\n\
+                __USR_VECTORED:\n    JMP ($0311)\n__HEAP_BOTTOM:\n";
+            let out = inject_with_reserved(input, &[], touches_memsiz);
+            let mut assembler = asm6502::Assembler6502::new();
+            assembler.assemble_bytes(&out).unwrap();
+            let padding = 0xA100 - assembler.lookup("__EXRAM_CODE_START").unwrap();
+            let out = out.replace(
+                "__EXRAM_CODE_START:\n",
+                &format!("    .byte {}\n__EXRAM_CODE_START:\n", vec!["$EA"; usize::from(padding)].join(",")),
+            );
+            let mut assembler = asm6502::Assembler6502::new();
+            let bytes = assembler.assemble_bytes(&out).unwrap();
+            assert!(assembler.lookup("__EXRAM_USR_VECTOR").unwrap() < 0xA000);
+            assert!(assembler.lookup("__USR_VECTORED").unwrap() >= 0xA100);
+            let mut system = emu64::System::new();
+            system.mem.ram[0x080D..0x080D + bytes.len()].copy_from_slice(&bytes);
+            // JSR $080D; JMP $FFFE: an explicit return sentinel.
+            system.mem.ram[0x0200..0x0206].copy_from_slice(&[0x20, 0x0D, 0x08, 0x4C, 0xFE, 0xFF]);
+            system.mem.ram[0x0311..0x0313].copy_from_slice(&[0x40, 0x03]);
+            let callee = assemble("*=$0340\n LDA $01\n STA $0400\n LDA $38\n STA $0401\n INC $61\n LDA #$9A\n LDX #$56\n LDY #$78\n SEC\n RTS\n");
+            system.mem.ram[0x0340..0x0340 + callee.len()].copy_from_slice(&callee);
+            system.mem.ram[1] = 0x37;
+            system.mem.ram[0x37..0x39].copy_from_slice(&[0, 0xA0]);
+            system.mem.ram[0x61..0x67].copy_from_slice(&[0x81, 0x80, 3, 4, 5, 0]);
+            system.start_at(0x0200);
+            system.cpu.regs.sp = 0xF0;
+            for _ in 0..500 {
+                if system.cpu.regs.pc == 0xFFFE {
+                    break;
+                }
+                assert!(system.step(), "USR did not return at ${:04X}: {out}", system.cpu.regs.pc);
+            }
+            assert_eq!(system.cpu.regs.pc, 0xFFFE);
+            assert_eq!(system.cpu.regs.sp, 0xF0, "balanced indirect call");
+            assert_eq!(&system.mem.ram[0x400..0x407], &[0x37, 0xA0, 0x36, if touches_memsiz { 0xA0 } else { 0xD0 }, 0x9A, 0x56, 0x78]);
+            assert_eq!(system.mem.ram[0x407] & 1, 1, "carry survives the swap");
+            assert_eq!(&system.mem.ram[0x61..0x67], &[0x82, 0x80, 3, 4, 5, 0]);
+            assert_eq!(system.mem.ram[1], 0x37, "normal program exit");
+            assert_eq!(&system.mem.ram[0x37..0x39], &[0, 0xA0]);
+        }
+    }
+
+    #[test]
+    fn only_the_compilers_usr_vector_tail_gets_wrapped() {
+        let unrelated = "*=$080D\nOTHER:\n    JMP ($0311)\n";
+        let out = inject(unrelated);
+        assert!(!out.contains("__EXRAM_USR"));
+        assert!(out.contains("OTHER:\n    JMP ($0311)"));
     }
 
     #[test]
@@ -824,6 +1277,87 @@ mod tests {
                  found {count}\n{out}"
             );
         }
+    }
+
+    /// The two ROM entries `__SET_TI` reaches.
+    #[test]
+    fn ti_string_rom_helpers_get_wrapped() {
+        for (addr, label) in [(0xBAE2u16, "MUL10"), (0xBD7E, "ADD_SIGNED_BYTE")] {
+            let input = format!("*=$080D\n    JSR ${addr:04X}\n    RTS\n");
+            let out = inject(&input);
+            let want_jsr = format!("JSR __JT_{label}");
+            let want_def = format!("__JT_{label}:");
+            assert!(
+                out.contains(&want_jsr),
+                "${addr:04X} ({label}) JSR rewritten to JT label\n{out}"
+            );
+            assert!(
+                out.contains(&want_def),
+                "${addr:04X} ({label}) JT entry defined\n{out}"
+            );
+            // Exactly one direct `JSR $XXXX` may survive: the one inside the wrapper.
+            let direct = format!("    JSR ${addr:04X}");
+            let count = out.matches(&direct).count();
+            assert_eq!(
+                count, 1,
+                "expected exactly one inner `{direct}` (the JT wrapper); found {count}\n{out}"
+            );
+
+            let body = out.split(&want_def).nth(1).unwrap();
+            let head: Vec<&str> = body.lines().skip(1).take(4).map(str::trim).collect();
+            assert_eq!(
+                head,
+                vec![
+                    "INC $01",
+                    &format!("JSR ${addr:04X}")[..],
+                    "DEC $01",
+                    "RTS"
+                ],
+                "{label} trampoline body\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn unwrapped_rom_call_detector_reports_the_addresses() {
+        let asm = "__EXRAM_CODE_START:\n\
+                   ; --- user code ---\n\
+                       JSR __JT_FMULT\n\
+                       JSR $BD7E\n\
+                       LDA #$00\n\
+                       JMP $BAE2\n\
+                       JSR $FFD2\n\
+                       JMP ($0314)\n\
+                       RTS\n";
+        let found: Vec<u16> = unwrapped_rom_calls(asm).iter().map(|l| l.1).collect();
+        assert_eq!(
+            found,
+            vec![0xBD7E, 0xBAE2],
+            "the two BASIC-window calls, in order; \
+             $FFD2 is KERNAL (HIRAM, always mapped) and the indirect is not a ROM call"
+        );
+
+        let preamble = "__JT_ADD_SIGNED_BYTE:\n    INC $01\n    JSR $BD7E\n    DEC $01\n    RTS\n";
+        let whole = format!("{preamble}__EXRAM_CODE_START:\n    JSR __JT_ADD_SIGNED_BYTE\n    RTS\n");
+        assert!(
+            unwrapped_rom_calls(&whole).is_empty(),
+            "the wrapper's own inner JSR is not a leak"
+        );
+
+        // No marker label at all -> not an extraram image -> nothing to check.
+        assert!(unwrapped_rom_calls("    JSR $BD7E\n    RTS\n").is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "unwrapped ROM call")]
+    fn assert_no_unwrapped_rom_calls_panics_and_names_the_fix() {
+        assert_no_unwrapped_rom_calls("__EXRAM_CODE_START:\n    JSR $BD7E\n    RTS\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "unwrapped ROM call")]
+    fn inject_itself_refuses_to_emit_an_unwrapped_rom_call() {
+        let _ = inject("*=$080D\n    JSR $A123\n    RTS\n");
     }
 
     /// BASIC_WARM_START ($E37B) is special: a non-returning JMP
@@ -978,9 +1512,7 @@ S0:
         let s0_pos = out.find("S0:").expect("S0 label present");
         // The user code starts at __EXRAM_CODE_START (the boundary
         // emitted by inject after the hoisted data).
-        let code_start = out
-            .find("__EXRAM_CODE_START:")
-            .expect("CODE_START boundary");
+        let code_start = out.find("__EXRAM_CODE_START:").expect("CODE_START boundary");
         let lda_pos = out.find("    LDA #<S0").expect("LDA #<S0 present in body");
         // S0 must appear BEFORE the boundary, and user code (the
         // LDA instruction) must appear AFTER the boundary.
@@ -988,6 +1520,7 @@ S0:
         assert!(lda_pos > code_start, "LDA below CODE_START:\n{out}");
         assert!(out.contains("__EXRAM_DATA_END:"));
     }
+
     #[test]
     fn vars_anchors_hoist_with_their_slots() {
         let input = "\
@@ -1011,6 +1544,7 @@ __HEAP_BOTTOM:
         let end = out.find("__VARS_END:").expect("__VARS_END present");
         assert!(start < code_start, "__VARS_START hoisted:\n{out}");
         assert!(end < code_start, "__VARS_END hoisted:\n{out}");
+
         let a = out.find("V_A:").expect("V_A present");
         let c = out.find("VI_C:").expect("VI_C present");
         assert!(
@@ -1018,6 +1552,7 @@ __HEAP_BOTTOM:
             "anchors must still bracket every slot:\n{out}"
         );
     }
+
     #[test]
     fn data_pool_anchors_hoist_with_their_pool() {
         let input = "\
@@ -1033,12 +1568,51 @@ __DATA_END:
 __HEAP_BOTTOM:
 ";
         let out = inject(input);
-        let code_start = out.find("__EXRAM_CODE_START:").expect("CODE_START boundary");
+        let code_start = out
+            .find("__EXRAM_CODE_START:")
+            .expect("CODE_START boundary");
         for anchor in ["__DATA:", "__DATA_LINE_10:", "__DATA_END:"] {
             let pos = out
                 .find(anchor)
                 .unwrap_or_else(|| panic!("{anchor} present:\n{out}"));
             assert!(pos < code_start, "{anchor} hoisted:\n{out}");
+        }
+    }
+
+    #[test]
+    fn adjacent_read_error_and_line_anchors_stay_inside_the_data_pool() {
+        let input = "\
+*=$080D
+    RTS
+__DATA:
+__DATA_LINE_100:
+__DBAD_S0:
+    .byte $03,$4F,$4E,$45
+__DATA_LINE_200:
+__DBAD_S1:
+__DBAD_E0:
+    .byte $03,$54,$57,$4F
+__DATA_LINE_300:
+__DBAD_E1:
+    .byte $01,$37
+__DATA_END:
+__DATA_BAD:
+    .word __DBAD_S0,__DBAD_E0,100
+    .word __DBAD_S1,__DBAD_E1,200
+    .word $0000
+__HEAP_BOTTOM:
+";
+        let out = inject(input);
+        let labels = ["__DATA:", "__DATA_LINE_100:", "__DBAD_S0:",
+            "__DATA_LINE_200:", "__DBAD_S1:", "__DBAD_E0:",
+            "__DATA_LINE_300:", "__DBAD_E1:", "__DATA_END:",
+            "__DATA_BAD:", "__EXRAM_CODE_START:"];
+        let positions: Vec<_> = labels.iter().map(|label| find_label_line(&out, label).unwrap()).collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{out}");
+        for label in [None, Some("__DBAD_S:"), Some("__DBAD_Edone:"),
+            Some("__DBAD_S1_suffix:"), Some("__DATA_LINE_READ:"),
+            Some("__DATA_LINE_12"), Some("__DATA_INIT:")] {
+            assert!(!is_data_anchor_label(label), "not a numbered data anchor: {label:?}");
         }
     }
 
@@ -1103,38 +1677,258 @@ S0:
         );
     }
 
+    const IMAGE_WELL_CLEAR_OF_IO: u32 = 0xC000;
+
+    #[test]
+    fn heap_ceiling_ignores_only_reservations_entirely_below_the_floor() {
+        let ranges = [(0xC000, 0xC0FF), (0xC800, 0xC8FF)];
+        assert_eq!(heap_ceiling(&ranges, 0xBFFF), 0xC000);
+        assert_eq!(heap_ceiling(&ranges, 0xC000), 0xC000);
+        assert_eq!(heap_ceiling(&ranges, 0xC0FF), 0xC000);
+        assert_eq!(heap_ceiling(&ranges, 0xC100), 0xC800);
+        assert_eq!(heap_ceiling(&ranges, 0xC900), HEAP_CEILING);
+        assert_eq!(heap_ceiling(&[(0xE000, 0xEFFF)], 0xC900), HEAP_CEILING);
+    }
+
+    fn fits_ending_at(data_end: u16) -> Result<(), String> {
+
+        verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(data_end),
+            false,
+            IMAGE_WELL_CLEAR_OF_IO,
+            HEAP_CEILING,
+        )
+    }
+
     #[test]
     fn data_ceiling_check_passes_for_small_program() {
-        // A trivial program's data section ends well below $9F00.
-        // Verify the helper accepts it.
-        verify_data_fits(|name| {
-            if name == DATA_END_LABEL {
-                Some(0x0820)
-            } else {
-                None
-            }
-        })
-        .expect("0820 is below ceiling");
+
+        fits_ending_at(0x0820).expect("0820 is below ceiling");
+    }
+
+    #[test]
+    fn data_ending_flush_against_the_rom_window_is_accepted() {
+        fits_ending_at(0xA000).expect("last data byte at $9FFF is always-RAM");
+    }
+
+    #[test]
+    fn data_in_the_last_page_below_the_rom_window_is_accepted() {
+        for data_end in [0x9F00, 0x9F01, 0x9FA5, 0x9FFF] {
+            fits_ending_at(data_end).unwrap_or_else(|e| panic!("${data_end:04X} is RAM: {e}"));
+        }
     }
 
     #[test]
     fn data_ceiling_check_fails_for_overflow() {
-        // Data ending at $9F01 = above ceiling. Helper must reject.
-        let err = verify_data_fits(|name| {
-            if name == DATA_END_LABEL {
-                Some(0x9F01)
-            } else {
-                None
-            }
-        })
-        .expect_err("ceiling violation should be caught");
-        assert!(err.contains("9F01"), "{err}");
-        assert!(err.contains("9F00"));
+        // One byte into the ROM window.
+        let err = fits_ending_at(0xA001).expect_err("ceiling violation should be caught");
+        assert!(err.contains("A001"), "{err}");
+        assert!(err.contains("A000"), "{err}");
+        // The overshoot, spelled out.
+        assert!(err.contains("1 bytes beyond"), "{err}");
+    }
+
+    #[test]
+    fn the_run_without_extraram_escape_is_offered_only_to_whoever_passed_it() {
+        // The auto-predictor escalates to this layout on its own.
+        let auto = fits_ending_at(0xA001).expect_err("refuses");
+        assert!(
+            !auto.contains("without --extraram"),
+            "escalated builds must not offer a flag the user never set: {auto}"
+        );
+        let asked = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xA001),
+            true,
+            IMAGE_WELL_CLEAR_OF_IO,
+            HEAP_CEILING,
+        )
+        .expect_err("refuses");
+        assert!(
+            asked.contains("or run without --extraram"),
+            "a user who DID pass it keeps the escape hatch: {asked}"
+        );
+
+        let asked_io = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xA001),
+            true,
+            0xE000,
+            HEAP_CEILING,
+        )
+        .expect_err("refuses");
+        assert!(
+            asked_io.contains("or run without --extraram"),
+            "the I/O-wall arm keeps the escape hatch as well: {asked_io}"
+        );
+    }
+
+    #[test]
+    fn the_binding_ceiling_is_the_io_wall_when_the_image_is_past_it_too() {
+
+        let err = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xA026),
+            false,
+            0xE000,
+            HEAP_CEILING,
+        )
+        .expect_err("both ceilings are violated");
+        assert!(
+            err.contains("4096 bytes above $D000"),
+            "the I/O overshoot, to the byte: {err}"
+        );
+        assert!(
+            err.contains("38 bytes beyond the $A000 ceiling"),
+            "the data overshoot is carried, not discarded: {err}"
+        );
+        assert!(
+            err.contains("The 4096 is the binding figure"),
+            "and the larger one is named as the binding one: {err}"
+        );
+        assert!(
+            err.starts_with(IO_WALL_MARKER),
+            "must be recognisable to binding_layout_failure: {err}"
+        );
+        assert!(
+            !err.starts_with(DATA_CEILING_MARKER),
+            "and must not masquerade as the plain data-ceiling refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn an_image_that_fits_under_the_io_wall_still_gets_the_plain_data_refusal() {
+
+        let err = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xACCC),
+            false,
+            u32::from(HEAP_CEILING),
+            HEAP_CEILING,
+        )
+        .expect_err("the data ceiling is still violated");
+        assert!(
+            err.starts_with(DATA_CEILING_MARKER),
+            "unchanged wording when only one ceiling binds: {err}"
+        );
+        assert!(
+            err.contains("3276 bytes beyond"),
+            "with its own figure: {err}"
+        );
+        assert!(
+            !err.contains("the top of the space this layout has"),
+            "no I/O clause for an image that fits: {err}"
+        );
+    }
+
+    #[test]
+    fn data_can_remain_the_larger_overshoot_when_both_ceilings_are_exceeded() {
+
+        let err = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xB000),
+            false,
+            0xD001,
+            HEAP_CEILING,
+        )
+        .expect_err("both ceilings are violated");
+        assert!(err.contains("1 bytes above $D000"), "{err}");
+        assert!(err.contains("4096 bytes beyond the $A000 ceiling"), "{err}");
+        assert!(err.contains("The 4096 is the binding figure"), "{err}");
+    }
+
+    #[test]
+    fn a_reserved_range_lowers_the_wall_the_image_is_measured_against() {
+        // The ceiling is a parameter, not $D000 spelled twice.
+        let reserved_ceiling = heap_ceiling(&[(0xC000, 0xC7FF)], 0xB000);
+        assert_eq!(reserved_ceiling, 0xC000, "premise: the reservation binds");
+        let err = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xA001),
+            false,
+            0xC800,
+            reserved_ceiling,
+        )
+        .expect_err("refuses");
+        assert!(
+            err.contains("2048 bytes above $C000"),
+            "measured against the reserved ceiling: {err}"
+        );
+
+        assert!(
+            err.contains("($D000)"),
+            "the real I/O address stays named even when the wall is lower: {err}"
+        );
+        // The default ceiling leaves the entire image within bounds.
+        let plain = verify_data_fits(
+            |name| (name == DATA_END_LABEL).then_some(0xA001),
+            false,
+            0xC800,
+            HEAP_CEILING,
+        )
+        .expect_err("refuses");
+        assert!(
+            plain.starts_with(DATA_CEILING_MARKER),
+            "and only the data ceiling without the reservation: {plain}"
+        );
     }
 
     #[test]
     fn data_ceiling_check_fails_when_label_missing() {
-        let err = verify_data_fits(|_| None).expect_err("missing label is an error");
+        let err = verify_data_fits(|_| None, false, IMAGE_WELL_CLEAR_OF_IO, HEAP_CEILING)
+            .expect_err("missing label is an error");
         assert!(err.contains("did not resolve"));
+    }
+
+    #[test]
+    fn a_materialised_image_is_pinned_below_the_jump_table() {
+        let input = concat!(
+            "*=$080D\n",
+            "    JMP __BT_INPLACE_AFTER\n",
+            "__BT_INPLACE_BODY:\n",
+            "    .byte $01,$02,$03\n",
+            "__BT_INPLACE_AFTER:\n",
+            "    LDX #$0E\n",
+            "__BT_INPLACE_RESTORE:\n",
+            "    LDA __BT_INPLACE_HEAD,X\n",
+            "    STA $0801,X\n",
+            "    DEX\n",
+            "    BPL __BT_INPLACE_RESTORE\n",
+            "    JMP __BT_INPLACE_START\n",
+            "__BT_INPLACE_HEAD:\n",
+            "    .byte $AA,$BB\n",
+            "__BT_INPLACE_START:\n",
+            "S0:\n",
+            "    .byte $48,$49\n",
+            "__PROG:\n",
+            "    JSR $B867\n",
+            "    RTS\n",
+        );
+        let out = inject(input);
+        let at = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("{needle}\n{out}"));
+
+        let origin = at("*=$080D");
+        let blob = at("__BT_INPLACE_BODY:");
+        let head = at("__BT_INPLACE_HEAD:");
+        let pin_end = at("__BT_INPLACE_START:");
+        let preamble = at("extraram: bank BASIC ROM out");
+        let jt = at("__JT_FADD:");
+        let hoisted = at("S0:");
+        let code = at("__EXRAM_CODE_START:");
+        assert!(origin < blob, "the blob stays inside the originated section");
+        assert!(blob < head);
+        assert!(head < pin_end);
+        assert!(
+            pin_end < preamble,
+            "the pinned prologue must precede the extraram preamble"
+        );
+        assert!(preamble < jt);
+        assert!(jt < hoisted, "the JT still precedes the hoisted data");
+        assert!(hoisted < code, "data is still hoisted above the code");
+
+        assert!(out.contains("JSR __JT_FADD"));
+    }
+
+    /// Apply the heap limit only when preserving the original image.
+    #[test]
+    fn an_ordinary_program_keeps_the_jump_table_first() {
+        let out = inject("*=$080D\nS0:\n    .byte $48\n__PROG:\n    JSR $B867\n    RTS\n");
+        let jt = out.find("__JT_FADD:").expect("a JT entry");
+        let data = out.find("S0:").expect("the data block");
+        assert!(jt < data, "JT must still come first:\n{out}");
     }
 }

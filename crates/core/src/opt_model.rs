@@ -74,8 +74,8 @@ impl CostModel {
         access_count >= ARRAY_PTR_INDUCTION_MIN_USES
     }
 
-    pub fn loop_induction_worth_it(self, k: f64) -> bool {
-        if !k.is_finite() {
+    pub fn loop_induction_worth_it(self, k: f64, step: f64) -> bool {
+        if !k.is_finite() || !step.is_finite() {
             return false;
         }
         if k == 0.0 || k == 1.0 || k == -1.0 {
@@ -87,7 +87,22 @@ impl CostModel {
                 return false;
             }
         }
-        true
+        // Correctness gate.
+        let advance = k * step;
+        if advance == 0.0 {
+
+            return true;
+        }
+
+        match mflpt_mantissa_trailing_zeros(advance) {
+            Some(tz) if tz >= INDUCTION_MIN_TRAILING_ZEROS => {}
+            _ => return false,
+        }
+
+        match mflpt_mantissa_trailing_zeros(step) {
+            Some(tz) => tz >= INDUCTION_MIN_TRAILING_ZEROS,
+            None => false,
+        }
     }
 
     pub fn ph301_min_sites(self) -> usize {
@@ -98,6 +113,35 @@ impl CostModel {
         PH301_LATE_JSR_BUDGET
     }
 }
+
+pub fn mflpt_mantissa_trailing_zeros(v: f64) -> Option<u32> {
+    if v == 0.0 || !v.is_finite() {
+        return None;
+    }
+    let bits = v.abs().to_bits();
+    let raw_exp = ((bits >> 52) & 0x7FF) as i32;
+    if raw_exp == 0 {
+
+        return None;
+    }
+
+    let sig = (1u64 << 52) | (bits & ((1u64 << 52) - 1));
+    // The C64 keeps 32 mantissa bits, so drop the low 21, rounding half up exactly as the ROM's own narrowing does.
+    let mut m = (sig + (1 << 20)) >> 21;
+    let mut e = raw_exp - 894;
+    if m == 1u64 << 32 {
+        m >>= 1;
+        e += 1;
+    }
+
+    if !(1..=255).contains(&e) {
+        return None;
+    }
+    Some((m as u32).trailing_zeros())
+}
+
+/// How much headroom the induction increment must keep.
+pub const INDUCTION_MIN_TRAILING_ZEROS: u32 = 16;
 
 pub const FLOAT_LOAD_STUB_MIN_USES: u32 = 3;
 pub const FLOAT_STORE_STUB_MIN_USES: u32 = 3;

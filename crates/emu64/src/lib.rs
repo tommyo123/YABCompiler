@@ -96,6 +96,46 @@ pub struct RunResult {
     pub output: Vec<u8>,
 }
 
+pub const SCREEN_UNWRITTEN: u8 = 0x00;
+
+/// Screen comparison result, including whether either program wrote screen RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenVerdict {
+    /// Cells where either side departed from [`SCREEN_UNWRITTEN`] ; how much of the screen carries any signal at all.
+    pub live: usize,
+    /// Cells where the two sides hold different bytes.
+    pub diff: usize,
+}
+
+impl ScreenVerdict {
+    pub fn of(a: &[u8; 1000], b: &[u8; 1000]) -> Self {
+        let mut live = 0;
+        let mut diff = 0;
+        for i in 0..1000 {
+            if a[i] != SCREEN_UNWRITTEN || b[i] != SCREEN_UNWRITTEN {
+                live += 1;
+            }
+            if a[i] != b[i] {
+                diff += 1;
+            }
+        }
+        ScreenVerdict { live, diff }
+    }
+
+    pub fn same(&self) -> bool {
+        self.diff == 0
+    }
+
+    /// The reportable classification.
+    pub fn evidence(&self) -> &'static str {
+        match (self.live, self.diff) {
+            (0, _) => "none",
+            (_, 0) => "agree",
+            _ => "differ",
+        }
+    }
+}
+
 /// Outcome of running a PRG to completion via [`run_prg_to_end`].
 #[derive(Debug)]
 pub struct RunToEnd {
@@ -109,6 +149,7 @@ pub struct RunToEnd {
     /// (clean exit); false if it halted (BRK/JAM) or hit the budget.
     pub clean_exit: bool,
     pub instructions: u64,
+
     pub error_code: Option<u8>,
     /// BASIC error line, or None for a direct-mode error or no error.
     pub error_line: Option<u16>,
@@ -136,6 +177,7 @@ impl RunToEnd {
         if line.starts_with('?') {
             return Some(trim_end(&line));
         }
+
         Some(format!("?ERROR {}", self.error_code.unwrap()))
     }
 }
@@ -313,10 +355,12 @@ mod tests {
 
     #[test]
     fn forty_characters_link_a_second_row_into_one_logical_line() {
+
         let sys = chrout_seq(&[b'X'; 40]);
         assert_eq!(cursor(&sys), (40, 79, 1));
         let sys = chrout_seq(&[b'X'; 46]);
         assert_eq!(cursor(&sys), (46, 79, 1));
+
         let sys = chrout_seq(&[b'X'; 85]);
         assert_eq!(cursor(&sys), (5, 39, 2));
     }
@@ -337,6 +381,7 @@ mod tests {
         assert_eq!(chrout_seq(b"AB\x12\x05").mem.ram[0xD3], 2);
         assert_eq!(chrout_seq(b"AB\x92\x1c\x9e\x0e").mem.ram[0xD3], 2);
     }
+
     #[test]
     fn cursor_tracking_does_not_disturb_the_transcript() {
         let text = b"HI\r\x1D\x1DTHERE\x12!";
@@ -376,10 +421,12 @@ mod tests {
         assert_eq!(r.error_line, Some(40));
         assert!(!r.clean_exit);
         assert!(r.ready_reached, "the ROM should have got back to READY");
+
         assert_eq!(
             r.error_banner().as_deref(),
             Some("?NEXT WITHOUT FOR  ERROR IN 40")
         );
+
         let other = run_prg_to_end(&raise_error_prg(16, 40), 200_000).unwrap();
         assert_eq!(
             other.error_banner().as_deref(),
@@ -406,6 +453,7 @@ mod tests {
         );
         assert!(!r.error_output.is_empty());
     }
+
     #[test]
     fn clean_program_reports_no_error() {
         let mut prg = vec![0x00, 0xC0];
@@ -430,6 +478,9 @@ mod tests {
         assert_eq!(v(0x031A), 0xF34A, "OPEN");
         assert_eq!(v(0x0322), 0xF333, "CLRCHN");
         assert_eq!(v(0x0326), 0xF1CA, "CHROUT");
+
+        assert_eq!(sys.mem.ram[0x0310], 0x4C, "USRPOK JMP opcode");
+        assert_eq!(v(0x0311), 0xB248, "USR default target");
         assert_eq!(sys.mem.ram[0x9A], 3, "DFLTO = screen");
         assert_eq!(sys.mem.ram[0xD5], 39, "LNMX");
     }

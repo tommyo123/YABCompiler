@@ -1,4 +1,4 @@
-
+//! Build-time assertions on the addressing modes the assembler picked for the settled layout.
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
 
@@ -27,24 +27,45 @@ fn wrap_src() -> &'static str {
 }
 
 #[test]
-fn zero_page_indexed_wrap_is_refused_at_every_profile() {
+fn zero_page_indexed_wrap_is_pinned_absolute_at_every_profile() {
+
     for profile in [Profile::Default, Profile::Size, Profile::Speed] {
-        let err = compile_asm(wrap_src(), profile)
-            .err()
-            .unwrap_or_else(|| panic!("{profile:?}: a base of $00C8 under `,X` must be refused"));
+        let asm = compile_asm(wrap_src(), profile)
+            .unwrap_or_else(|e| panic!("{profile:?}: must compile now: {e}"));
         assert!(
-            err.contains("$00C8"),
-            "{profile:?}: the message must name the base it refused:\n{err}"
+            asm.contains(">$00C8,X"),
+            "{profile:?}: the base must be pinned absolute, not left to the \
+             assembler's value-based choice:\n{asm}"
         );
         assert!(
-            err.contains("zeropage,X"),
-            "{profile:?}: the message must name the mode the assembler would pick:\n{err}"
+            !asm.contains(" $00C8,X"),
+            "{profile:?}: no bare `$00C8,X` may survive — that one narrows to \
+             `zeropage,X` and wraps:\n{asm}"
         );
     }
 }
 
 #[test]
+fn the_narrowing_guard_still_fires_on_a_bare_small_base() {
+    // The guard is the post-condition for every emit site that has not been taught `abs_index_base`, so it has to keep refusing a bare small base.
+    let err = yabcompiler_core::verify_addressing_modes_for_test(
+        "*=$080D\n    LDX #$FF\n    LDY $00C8,X\n    RTS\n",
+        |_| None,
+    )
+    .expect_err("a bare $00C8,X must be refused");
+    assert!(
+        err.contains("$00C8"),
+        "the message must name the base it refused:\n{err}"
+    );
+    assert!(
+        err.contains("zeropage,X"),
+        "the message must name the mode the assembler would pick:\n{err}"
+    );
+}
+
+#[test]
 fn the_refused_program_differs_only_in_the_base() {
+
     let ok = wrap_src()
         .replace("POKE 320,111", "POKE 1344,111")
         .replace("PEEK(200+X%)", "PEEK(1224+X%)");
@@ -57,6 +78,7 @@ fn the_refused_program_differs_only_in_the_base() {
 
 #[test]
 fn abs_x_peek_and_poke_fast_paths_still_fire() {
+
     let asm = asm_of(
         "10 POKE 49152,120\n\
          20 A=49152\n\
@@ -76,6 +98,7 @@ fn abs_x_peek_and_poke_fast_paths_still_fire() {
 
 #[test]
 fn base_zero_indexed_reads_are_still_allowed() {
+
     let asm = asm_of(
         "10 DIM A(20)\n\
          20 FOR I=0 TO 20\n\
@@ -91,6 +114,7 @@ fn base_zero_indexed_reads_are_still_allowed() {
 
 #[test]
 fn indirect_y_fast_path_still_fires() {
+
     let asm = asm_of(
         "10 FOR I%=12800 TO 12871\n\
          20 POKE I%,7\n\
@@ -100,6 +124,7 @@ fn indirect_y_fast_path_still_fires() {
         asm.contains("STA (VI_I),Y"),
         "the ZP-pointer POKE tier must still fire:\n{asm}"
     );
+
     let equate = asm
         .lines()
         .find(|l| l.starts_with("VI_I = "))
@@ -111,6 +136,7 @@ fn indirect_y_fast_path_still_fires() {
 
 #[test]
 fn self_modifying_peek_operands_are_still_three_bytes() {
+
     let asm = asm_of(
         "10 A=1024\n\
          20 FOR I=0 TO 3\n\

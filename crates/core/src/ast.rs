@@ -15,6 +15,33 @@ pub struct Program {
     pub lines: Vec<Line>,
     /// Statements the parser could not translate and compiled away.
     pub skipped: Vec<SkippedStatement>,
+    /// Statements that raise a BASIC error at runtime.
+    pub traps: Vec<SyntaxTrap>,
+    /// Invalid DEF FN bodies whose errors occur at their call sites.
+    pub deferred_fn_bodies: Vec<DeferredFnBody>,
+}
+
+/// A statement lowered to a runtime BASIC error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxTrap {
+    pub line: u16,
+    /// The BASIC error index the trap raises (`11` = `?SYNTAX ERROR`, `22` = `?TYPE MISMATCH`).
+    pub code: u8,
+    /// Parse diagnostic included in the runtime-trap warning.
+    pub detail: String,
+}
+
+/// A DEF FN body whose parse error is deferred until a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredFnBody {
+    /// Line containing the DEF FN declaration.
+    pub line: u16,
+    /// The function whose body did not parse.
+    pub name: FnName,
+    /// The BASIC error index a call raises (`11` = `?SYNTAX ERROR`, `22` = `?TYPE MISMATCH`).
+    pub code: u8,
+    /// Parse diagnostic included in the warning.
+    pub detail: String,
 }
 
 /// One statement dropped during parsing, for the caller to report.
@@ -189,6 +216,8 @@ pub enum Statement {
     Stop,
     /// Raise the BASIC error in X and return to READY.
     RaiseError(u8),
+    /// Halt execution when a bare CONT is reached.
+    Hang,
     /// `RUN [line]` — restart from the first line (when None) or
     /// from `Some(line)`. Resets variables, arrays, the string heap,
     /// and the DATA pointer to their startup state in both cases.
@@ -677,6 +706,8 @@ pub enum Statement {
         /// them just as it would under the interpreter. Empty when the
         /// SYS has no trailing tokens.
         params: Vec<u8>,
+
+        param_refs: Vec<SysParamRef>,
     },
     /// `WAIT addr, mask [, eor]` — busy-poll memory at `addr` until
     /// `(byte XOR eor) AND mask` is non-zero. `eor` defaults to 0.
@@ -945,6 +976,17 @@ pub enum StrExpr {
     ArrayRef(VarName, Vec<Expr>),
 }
 
+/// A parsed variable reference within SYS parameter text.
+#[derive(Debug, Clone)]
+pub struct SysParamRef {
+    /// Byte offset within [`Statement::Sys::params`] where the reference starts.
+    pub start: usize,
+    /// Reference length in bytes, including array subscripts.
+    pub len: usize,
+    /// Numeric value or string descriptor supplied during SYS evaluation.
+    pub value: Expr,
+}
+
 #[derive(Debug, Clone)]
 pub struct DimSpec {
     pub name: VarName,
@@ -965,14 +1007,22 @@ pub enum ReadTarget {
     Array { name: VarName, indices: Vec<Expr> },
 }
 
-/// One value in a `DATA` statement. Numeric and string literals
-/// coexist in the same pool; READ dispatches on the target variable's
-/// kind (numeric → __VAL_HELPER on the entry's bytes; string → V_var
-/// pointed straight at the entry, since pool strings are immutable).
+/// One value in a `DATA` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataValue {
     Float(f64),
     String(Vec<u8>),
+    Quoted(Vec<u8>),
+}
+
+impl DataValue {
+    /// Text returned by string READ, without surrounding quotes.
+    pub fn text(&self) -> Option<&[u8]> {
+        match self {
+            DataValue::String(b) | DataValue::Quoted(b) => Some(b),
+            DataValue::Float(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -999,9 +1049,7 @@ pub enum OnKeyAction {
     /// is pressed; do not save a return address (the original
     /// program flow is abandoned).
     Goto(u16),
-    /// `ON KEY "..." GOSUB <line>` — like GOTO but pushes a return
-    /// address so a matching `RETURN` resumes the interrupted code.
-    /// Currently parsed for compatibility; codegen treats it as GOTO.
+
     GoSub(u16),
 }
 
@@ -1139,9 +1187,7 @@ pub enum Expr {
     /// `FRE(x)` — bytes of free RAM between the heap top and MEMSIZ.
     /// Same arg-discard semantics as POS.
     Fre(Box<Expr>),
-    /// `USR(x)` — call user machine code via the standard USR vector
-    /// at $0311/$0312. The argument is evaluated to FAC; the user
-    /// routine returns with its result also in FAC.
+    /// `USR(x)` ; call user machine code via the standard USR vector at $0311/$0312.
     Usr(Box<Expr>),
     /// `JOY(n)` — normalised joystick direction plus fire bit.
     Joy(Box<Expr>),

@@ -1,6 +1,25 @@
-
+//! `__STR_PRINT`'s inline-argument convention (PH114).
 
 use yabcompiler_core::{CompileOptions, Compiled, Profile, compile_with_options, tokenize_program};
+
+fn register_form(inline: &Compiled) -> Vec<u8> {
+    let asm = yabcompiler_core::peephole::undo_str_print_inline_args(&inline.asm);
+    assert!(!asm.contains("__STR_PRINT_I"), "every site must be back");
+    asm6502::Assembler6502::new()
+        .assemble_bytes(&asm)
+        .expect("the register form assembles")
+}
+
+fn as_prg(inline: &Compiled, image: &[u8]) -> Vec<u8> {
+    let head = inline.prg_bytes.len() - inline.machine_code.len();
+    assert_eq!(
+        head, 14,
+        "expected a 2-byte load address plus the 12-byte SYS stub"
+    );
+    let mut prg = inline.prg_bytes[..head].to_vec();
+    prg.extend_from_slice(image);
+    prg
+}
 
 fn compile(src: &str) -> Compiled {
     compile_at(src, CompileOptions::default())
@@ -41,6 +60,7 @@ fn many_prints(n: usize) -> (String, String) {
     }
     (src, want)
 }
+
 fn convertible(n: usize) -> usize {
     n - 1
 }
@@ -66,21 +86,18 @@ fn a_print_heavy_program_uses_the_inline_convention() {
 
 #[test]
 fn the_inline_form_is_smaller_than_the_register_form() {
+
     let (src, _) = many_prints(40);
     let inline = compile(&src);
-    let mut off = CompileOptions::default();
-    // Far above anything this program can reach, so the only effect is the refusal itself.
-    off.reserved_ranges = vec![(0xCF00, 0xCFFF)];
-    let register = compile_at(&src, off);
-    assert_eq!(inline_sites(&register.asm), 0);
+    let register = register_form(&inline);
     assert!(
-        inline.prg_bytes.len() < register.prg_bytes.len(),
+        inline.machine_code.len() < register.len(),
         "inline {} bytes vs register {} bytes",
-        inline.prg_bytes.len(),
-        register.prg_bytes.len()
+        inline.machine_code.len(),
+        register.len()
     );
     assert_eq!(
-        register.prg_bytes.len() - inline.prg_bytes.len(),
+        register.len() - inline.machine_code.len(),
         convertible(40) * 2 - 34,
         "2 bytes a site against a 34-byte trampoline"
     );
@@ -92,18 +109,18 @@ fn the_two_conventions_print_the_same_bytes() {
     // trampoline's return-address arithmetic.
     let (src, want) = many_prints(30);
     let inline = compile(&src);
-    let mut off = CompileOptions::default();
-    off.reserved_ranges = vec![(0xCF00, 0xCFFF)];
-    let register = compile_at(&src, off);
-    assert!(inline_sites(&inline.asm) > 0 && inline_sites(&register.asm) == 0);
+    assert!(inline_sites(&inline.asm) > 0);
+    let register = as_prg(&inline, &register_form(&inline));
     let a = emu64::run_prg_to_end(&inline.prg_bytes, 80_000_000).expect("runs");
-    let b = emu64::run_prg_to_end(&register.prg_bytes, 80_000_000).expect("runs");
+    let b = emu64::run_prg_to_end(&register, 80_000_000).expect("runs");
+    assert!(a.clean_exit && b.clean_exit, "both must reach their RTS");
     assert_eq!(a.output, b.output, "CHROUT streams must be identical");
     assert_eq!(petscii(&a.output), want);
 }
 
 #[test]
 fn the_call_returns_past_its_own_argument() {
+
     let mut src = String::from("10 X=0\n");
     let mut want = String::new();
     for i in 0..25 {
@@ -120,6 +137,7 @@ fn the_call_returns_past_its_own_argument() {
 
 #[test]
 fn every_argument_is_the_line_after_its_call() {
+
     let (src, _) = many_prints(30);
     let c = compile(&src);
     let lines: Vec<&str> = c.asm.lines().collect();
@@ -144,12 +162,14 @@ fn hello_must_not_grow() {
     let c = compile("10 PRINT \"HELLO\"\n");
     assert_eq!(inline_sites(&c.asm), 0);
     assert!(!c.asm.contains("__STR_PRINT_I"));
+
     assert_eq!(c.prg_bytes.len(), 56);
     assert_eq!(run(&c), "HELLO\n");
 }
 
 #[test]
 fn sixteen_sites_decline_and_seventeen_accept() {
+
     let (below, _) = many_prints(17); // 16 convertible
     let (at, _) = many_prints(18); // 17 convertible
     assert_eq!(inline_sites(&compile(&below).asm), 0);
@@ -163,13 +183,13 @@ fn a_program_that_declines_is_byte_identical_to_one_compiled_with_it_off() {
     let mut off = CompileOptions::default();
     off.reserved_ranges = vec![(0xCF00, 0xCFFF)];
     let with_reservation = compile_at(&src, off);
-    // The reservation itself is inert here, so declining for lack of sites and declining for a
-    // reservation must produce the same image.
+
     assert_eq!(on.prg_bytes, with_reservation.prg_bytes);
 }
 
 #[test]
-fn any_reservation_turns_the_convention_off() {
+fn a_reservation_that_misses_every_site_keeps_the_convention_on() {
+
     let (src, want) = many_prints(30);
     for range in [(0x1000u16, 0x10FF), (0x3000, 0x37FF), (0xC000, 0xC000)] {
         let mut options = CompileOptions::default();
@@ -177,19 +197,20 @@ fn any_reservation_turns_the_convention_off() {
         let c = compile_at(&src, options);
         assert_eq!(
             inline_sites(&c.asm),
-            0,
-            "reservation ${:04X}-${:04X} must refuse the inline convention",
+            convertible(30),
+            "reservation ${:04X}-${:04X} does not touch a site, so every \
+             site must stay inline",
             range.0,
             range.1
         );
+        assert!(!c.diagnostics.inline_str_args_undone);
         assert_eq!(run(&c), want);
     }
 }
 
 #[test]
-fn a_poke_derived_auto_reservation_also_turns_it_off() {
-    // `discover_reserved_ranges` reads POKE/PEEK literals out of the IR, so a program can
-    // acquire a reservation without the user asking for one.
+fn a_poke_derived_auto_reservation_no_longer_turns_it_off() {
+    // `discover_reserved_ranges` reads POKE/PEEK literals out of the IR, so a program can acquire a reservation without the user asking for one.
     let (mut src, mut want) = many_prints(30);
     src.push_str("900 POKE 12288,7\n910 PRINT PEEK(12288)\n");
     want.push_str(" 7 \n");
@@ -198,7 +219,8 @@ fn a_poke_derived_auto_reservation_also_turns_it_off() {
         !c.diagnostics.effective_reserved.is_empty(),
         "fixture must acquire an auto reservation"
     );
-    assert_eq!(inline_sites(&c.asm), 0);
+    assert!(inline_sites(&c.asm) >= 17, "the convention must still fire");
+    assert!(!c.diagnostics.inline_str_args_undone);
     assert_eq!(run(&c), want);
 }
 
@@ -217,6 +239,7 @@ fn falls_into_str_print(asm: &str) -> Option<String> {
 
 #[test]
 fn falling_through_into_str_print_is_a_real_shape() {
+
     let c = compile("10 PRINT \"X\"\n");
     assert_eq!(
         falls_into_str_print(&c.asm).as_deref(),
@@ -259,6 +282,7 @@ fn nothing_is_ever_spliced_above_str_print() {
             "the trampoline is immediately above __STR_PRINT and would be \
              fallen into.\n  source: {src}"
         );
+
         if let Some(t) = lines.iter().position(|l| l.trim() == "__STR_PRINT_I:") {
             let before = lines[..t]
                 .iter()
@@ -268,6 +292,7 @@ fn nothing_is_ever_spliced_above_str_print() {
                 .unwrap_or("*=");
             let mnem = before.split_whitespace().next().unwrap_or("");
             assert!(
+
                 matches!(mnem, "RTS" | "JMP" | "RTI" | "*=") || mnem.starts_with('.'),
                 "`{before}` falls through into the trampoline.\n  source: {src}"
             );
@@ -277,6 +302,7 @@ fn nothing_is_ever_spliced_above_str_print() {
 
 #[test]
 fn a_fall_through_print_and_inline_sites_coexist() {
+
     let mut src = String::from("10 A$=\"TAIL\"\n");
     let mut want = String::new();
     for i in 0..25 {
@@ -292,6 +318,7 @@ fn a_fall_through_print_and_inline_sites_coexist() {
 
 #[test]
 fn the_chr_corpus_program_still_matches_its_golden() {
+
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_corpus/chr.prg");
     let bytes = std::fs::read(&path).expect("test_corpus/chr.prg");
     let c = compile_with_options(&bytes, CompileOptions::default()).expect("compiles");
@@ -303,6 +330,7 @@ fn the_chr_corpus_program_still_matches_its_golden() {
 
 #[test]
 fn the_trampoline_is_never_inside_the_heap_or_the_bss() {
+
     let mut src = String::from("10 DIM Q(200)\n20 A$=\"SEED\"\n");
     let mut want = String::new();
     for i in 0..30 {
@@ -346,6 +374,7 @@ fn a_heap_program_with_both_optimizations_still_runs() {
 
 #[test]
 fn the_trampoline_follows_a_relocated_zero_page_pair() {
+
     let mut src = String::from("10 POKE 253,1\n");
     let mut want = String::new();
     for i in 0..25 {

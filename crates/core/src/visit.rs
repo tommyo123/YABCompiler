@@ -601,10 +601,19 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
             }
             v.visit_expr(ticks);
         }
-        Sys { addr, regs, .. } => {
+        Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             v.visit_expr(addr);
             for r in regs {
                 v.visit_expr(r);
+            }
+            // The variables the callee will parse out of the staged parameter text.
+            for p in param_vars {
+                v.visit_expr(&p.value);
             }
         }
         Wait { addr, mask, eor } => {
@@ -726,6 +735,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
         | End
         | Stop
         | RaiseError(_)
+        | Hang
         | Run(_)
         | Clr
         | Data(_)
@@ -734,6 +744,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
         | SwapStr { .. }
         | Restore
         | Reset { .. } => {}
+
         Get { indices, .. } => {
             for e in indices {
                 v.visit_expr(e);
@@ -1447,10 +1458,18 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
             }
             v.visit_expr_mut(ticks);
         }
-        Sys { addr, regs, .. } => {
+        Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             v.visit_expr_mut(addr);
             for r in regs {
                 v.visit_expr_mut(r);
+            }
+            for p in param_vars {
+                v.visit_expr_mut(&mut p.value);
             }
         }
         Wait { addr, mask, eor } => {
@@ -1571,6 +1590,7 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
         | End
         | Stop
         | RaiseError(_)
+        | Hang
         | Run(_)
         | Clr
         | Data(_)

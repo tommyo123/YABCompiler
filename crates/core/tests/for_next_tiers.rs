@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -75,6 +73,7 @@ fn clean_nest_gets_no_frames_at_all() {
 ";
     assert_tiers("clean_nest", src, (0, 0));
 }
+
 #[test]
 fn uncrossed_loop_keeps_the_fast_path_beside_a_dispatcher() {
     // The `k` loop is untouched; the `i` loop is entered and left by GOTO and shares a bare
@@ -118,6 +117,7 @@ fn crossing_without_a_dispatcher_is_free() {
 ";
     assert_tiers("crossing_no_dispatcher", src, (0, 0));
 }
+
 const TIER1: &str = "\
 10 goto 50
 20 next j:goto 200
@@ -152,6 +152,7 @@ fn tier1_keeps_the_direct_back_edge() {
         1,
         "only the dispatched loop returns through the exit vector:\n{asm}"
     );
+
     assert!(
         asm.lines()
             .filter(|l| l.trim() == "DEC __FOR_STACK_PTR")
@@ -183,11 +184,13 @@ fn tier1_runs_correctly() {
         );
     }
 }
+
 #[test]
 fn a_reachable_bare_dispatcher_promotes_tier1_to_tier2() {
     let src = TIER1.replace("20 next j:", "20 next:");
     assert_tiers("bare_dispatcher", &src, (2, 2));
 }
+
 #[test]
 fn the_dispatcher_variable_decides_which_loop_is_dispatched() {
     let src = TIER1.replace("20 next j:", "20 next w:");
@@ -209,14 +212,15 @@ fn the_tier1_table_slot_is_a_trap_not_a_hole() {
         .skip_while(|l| !l.starts_with("__FOR_HANDLER_TABLE:"))
         .skip(1)
         .take_while(|l| l.trim_start().starts_with(".word"))
+        .flat_map(|l| l.trim().strip_prefix(".word").unwrap().split(','))
         .map(str::trim)
         .collect();
     assert_eq!(
         table,
         vec![
-            ".word $0000",                // GOSUB marker.
-            ".word __FOR_NEXT_HANDLER_1", // Dispatched loop j.
-            ".word __NEXT_NO_FOR",        // Framed loop w.
+            "$0000",                 // GOSUB marker.
+            "__FOR_NEXT_HANDLER_1",   // Dispatched loop j.
+            "__NEXT_NO_FOR",          // Framed loop w.
         ],
         "handler table:\n{asm}"
     );
@@ -261,7 +265,6 @@ fn on_gosub_pushes_the_fndfor_barrier() {
 }
 
 // The one-line loop.
-
 const ONE_LINE_DELAY: &str = "\
 10 for k=1 to 3
 20 print \"k\";k;:gosub 100
@@ -305,6 +308,7 @@ fn one_line_loop_gosubbed_from_a_body_runs() {
         assert_eq!(got.trim_end(), "K 1 K 2 K 3 DONE", "({profile:?})");
     }
 }
+
 #[test]
 fn a_header_after_the_next_on_its_line_is_a_real_orphan() {
     let src = ONE_LINE_DELAY.replace("100 for z=1 to 5:next", "100 next:for z=1 to 5");

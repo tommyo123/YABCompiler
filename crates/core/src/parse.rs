@@ -22,19 +22,35 @@
 //! land when the codegen needs them.
 
 use crate::ast::{
-    BinOp, DimSpec, Expr, FnName, Func1, Line, MemTransferOp, OnBranchKind, PrintItem, PrintStmt,
+    BinOp, DeferredFnBody, DimSpec, Expr, FnName, Func1, Line, MemTransferOp, OnBranchKind,
+    PrintItem, PrintStmt,
     ProcName, Program, ResumeTarget, ScreenRectOp, ScreenScrollOp, SkippedStatement, Statement,
-    StrExpr, ThenBranch, VarKind, VarName,
+    StrExpr, SyntaxTrap, SysParamRef, ThenBranch, VarKind, VarName,
 };
 use crate::prg;
+use crate::runtime::ERR_SYNTAX as BASIC_ERR_SYNTAX;
 use crate::runtime::ERR_TYPE_MISMATCH as BASIC_ERR_TYPE_MISMATCH;
 use crate::tokens::Dialect;
+
+/// How to spell the byte in an [`ParseError::UnsupportedToken`].
+#[derive(Debug)]
+pub enum TokenSpelling {
+    /// A BASIC v2 keyword token, already looked up.
+    BasicV2(&'static str),
+    /// A `$64`-prefixed extended-BASIC sub-token that [`crate::tokens::tsb_keyword`] does not name.
+    ExtendedUnnamed,
+    /// The `$64` prefix with the line ending immediately after it, so there is no sub-token byte at all.
+    ExtendedPrefixAtEndOfLine,
+
+    Unnamed,
+}
 
 #[derive(Debug)]
 pub enum ParseError {
     UnsupportedToken {
         line: u16,
         byte: u8,
+        spelling: TokenSpelling,
     },
     UnsupportedFeature {
         line: u16,
@@ -73,17 +89,44 @@ pub enum ParseError {
         line: u16,
         byte: u8,
     },
+
     TypeMismatch {
         line: u16,
+    },
+
+    NotAStatementStart {
+        line: u16,
+        byte: u8,
     },
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::UnsupportedToken { line, byte } => {
-                write!(f, "line {line}: token ${byte:02X} is not yet supported")
-            }
+            // The byte stays in every arm.
+            ParseError::UnsupportedToken {
+                line,
+                byte,
+                spelling,
+            } => match spelling {
+                TokenSpelling::BasicV2(kw) => write!(
+                    f,
+                    "line {line}: {kw} (token ${byte:02X}) is not yet supported"
+                ),
+                TokenSpelling::ExtendedUnnamed => write!(
+                    f,
+                    "line {line}: extended-BASIC token $64 ${byte:02X} is not a keyword \
+                     this compiler knows"
+                ),
+                TokenSpelling::ExtendedPrefixAtEndOfLine => write!(
+                    f,
+                    "line {line}: the line ends after the extended-BASIC prefix \
+                     ${byte:02X}, with no keyword after it"
+                ),
+                TokenSpelling::Unnamed => {
+                    write!(f, "line {line}: token ${byte:02X} is not yet supported")
+                }
+            },
             ParseError::UnsupportedFeature { line, what } => {
                 write!(f, "line {line}: {what} is not yet supported")
             }
@@ -120,11 +163,35 @@ impl std::fmt::Display for ParseError {
                 f,
                 "line {line}: string where a number belongs (?TYPE MISMATCH at run time)"
             ),
+            ParseError::NotAStatementStart { line, byte } => write!(
+                f,
+                "line {line}: ${byte:02X} cannot begin a statement (?SYNTAX ERROR at run time)"
+            ),
         }
     }
 }
 
 impl std::error::Error for ParseError {}
+
+impl ParseError {
+
+    fn runtime_error_code(&self) -> Option<u8> {
+        match self {
+            ParseError::TypeMismatch { .. } => Some(BASIC_ERR_TYPE_MISMATCH),
+            ParseError::ExpectedLineNumber { .. }
+            | ParseError::ExpectedVar { .. }
+            | ParseError::ExpectedKeyword { .. }
+            | ParseError::ExpectedExpr { .. }
+            | ParseError::LineNumberOverflow { .. }
+            | ParseError::BadStatementBoundary { .. }
+            | ParseError::NotAStatementStart { .. } => Some(BASIC_ERR_SYNTAX),
+            ParseError::UnsupportedToken { .. }
+            | ParseError::UnsupportedFeature { .. }
+            | ParseError::Unsupported { .. }
+            | ParseError::RejectedKeyword { .. } => None,
+        }
+    }
+}
 
 // BASIC v2 token bytes we care about.
 const TOK_END: u8 = 0x80;
@@ -416,6 +483,8 @@ pub struct ParseOptions {
     pub int_hint_vars: std::collections::HashSet<String>,
     /// Dialect used to interpret bare extended keyword spellings.
     pub dialect: Dialect,
+    /// Read `SYS addr, a, x, y, sr` as register arguments that pre-load A/X/Y/SR before the JSR.
+    pub sys_register_args: bool,
 }
 
 /// Whether the program contains extended keyword tokens in code.
@@ -472,18 +541,48 @@ pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Pr
     };
     let mut lines = Vec::with_capacity(prg.lines.len());
     let mut skipped = Vec::new();
+    let mut traps = Vec::new();
+    let mut deferred_fn_bodies = Vec::new();
     for raw in &prg.lines {
         lines.push(Line {
             number: raw.number,
-            statements: line_body_inner(raw.number, &raw.body, &opts, tsb_ascii, &mut skipped)?,
+            statements: line_body_inner(
+                raw.number,
+                &raw.body,
+                &opts,
+                tsb_ascii,
+                &mut skipped,
+                &mut traps,
+                &mut deferred_fn_bodies,
+            )?,
         });
     }
-    Ok(Program { lines, skipped })
+    Ok(Program {
+        lines,
+        skipped,
+        traps,
+        deferred_fn_bodies,
+    })
 }
 
 #[cfg(test)]
 fn line_body(line_no: u16, body: &[u8]) -> Result<Vec<Statement>, ParseError> {
     line_body_with_options(line_no, body, &ParseOptions::default(), &mut Vec::new())
+}
+
+#[cfg(test)]
+fn line_body_traps(line_no: u16, body: &[u8]) -> Result<Vec<SyntaxTrap>, ParseError> {
+    let mut traps = Vec::new();
+    line_body_inner(
+        line_no,
+        body,
+        &ParseOptions::default(),
+        body_uses_tsb_tokens(body),
+        &mut Vec::new(),
+        &mut traps,
+        &mut Vec::new(),
+    )?;
+    Ok(traps)
 }
 
 /// Parse one line with the extended dialect forced on, for the tests that exercise the
@@ -509,7 +608,15 @@ fn line_body_with_options(
         Dialect::BasicV2 => false,
         Dialect::Tsb => true,
     };
-    line_body_inner(line_no, body, opts, tsb_ascii, skipped)
+    line_body_inner(
+        line_no,
+        body,
+        opts,
+        tsb_ascii,
+        skipped,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
 }
 
 fn line_body_inner(
@@ -518,11 +625,14 @@ fn line_body_inner(
     opts: &ParseOptions,
     tsb_ascii: bool,
     skipped: &mut Vec<SkippedStatement>,
+    traps: &mut Vec<SyntaxTrap>,
+    deferred_fn_bodies: &mut Vec<DeferredFnBody>,
 ) -> Result<Vec<Statement>, ParseError> {
     let mut p = Cursor::new(body, line_no);
     p.lenient_syntax = opts.lenient_syntax;
     p.int_hint_vars = &opts.int_hint_vars;
     p.tsb_ascii = tsb_ascii;
+    p.sys_register_args = opts.sys_register_args;
     let mut out = Vec::new();
     loop {
         p.skip_spaces();
@@ -546,8 +656,10 @@ fn line_body_inner(
         let stmt = match statement(&mut p) {
             Ok(s) => s,
             Err(err) => {
-                if let ParseError::TypeMismatch { .. } = err {
-                    out.push(Statement::RaiseError(BASIC_ERR_TYPE_MISMATCH));
+
+                if let Some(code) = err.runtime_error_code() {
+                    p.note_trap(code, &err);
+                    out.push(Statement::RaiseError(code));
                     break;
                 }
                 let offending = match err {
@@ -595,6 +707,12 @@ fn line_body_inner(
                 | Statement::Goto(_)
         );
         out.push(stmt);
+
+        if let Some((code, detail)) = p.pending_trap.take() {
+            p.note_trap_detail(code, detail);
+            out.push(Statement::RaiseError(code));
+            break;
+        }
         p.skip_spaces();
         // Stray control bytes ($00-$1F) at end of line are common in
         // hand-edited tokenised sources and the v2 interpreter just
@@ -646,6 +764,8 @@ fn line_body_inner(
             }
         }
     }
+    traps.append(&mut p.traps);
+    deferred_fn_bodies.append(&mut p.deferred_fn_bodies);
     Ok(out)
 }
 
@@ -661,6 +781,125 @@ fn statement_owns_rest_of_line(p: &Cursor<'_>) -> bool {
             .is_some_and(|t| t == TSB_RCOMP),
         _ => false,
     }
+}
+
+fn sys_param_refs(p: &Cursor<'_>, params: &[u8]) -> Vec<SysParamRef> {
+    let mut out: Vec<SysParamRef> = Vec::new();
+    let mut covered_to = 0usize;
+    for v in crate::sys_params::scan(params) {
+        if v.start < covered_to {
+            continue;
+        }
+        if v.is_fn || (v.kind == VarKind::String && matches!(v.base.as_str(), "TI" | "ST")) {
+            continue;
+        }
+        if !v.subscripted {
+            covered_to = v.start + v.len;
+            out.push(SysParamRef {
+                start: v.start,
+                len: v.len,
+                value: Expr::Var(VarName {
+                    base: v.base,
+                    kind: v.kind,
+                }),
+            });
+            continue;
+        }
+        let mut q = Cursor::new(params, p.line);
+        q.lenient_syntax = p.lenient_syntax;
+        q.int_hint_vars = p.int_hint_vars;
+        q.tsb_ascii = p.tsb_ascii;
+        q.sys_register_args = p.sys_register_args;
+        q.pos = v.start;
+        let value = if v.kind == VarKind::String {
+            let Ok(StrExpr::ArrayRef(name, indices)) = string_atom(&mut q) else { continue };
+            Expr::ArrayRef(name, indices)
+        } else {
+            let Ok(value) = atom(&mut q) else { continue };
+            value
+        };
+        // Only an array read of the very name and type `scan` reported.
+        let Expr::ArrayRef(name, _) = &value else {
+            continue;
+        };
+        if name.base != v.base || name.kind != v.kind || q.pos <= v.start {
+            continue;
+        }
+        if name.kind == VarKind::String {
+            let Expr::ArrayRef(_, indices) = &value else { unreachable!() };
+            if !indices.iter().all(sys_string_index_is_pure) {
+                continue;
+            }
+        }
+        covered_to = q.pos;
+        out.push(SysParamRef {
+            start: v.start,
+            len: q.pos - v.start,
+            value,
+        });
+    }
+    // A length is an exact byte-sized number.
+    out.extend(sys_param_string_lengths(p, params));
+    out.sort_by_key(|r| (r.start, std::cmp::Reverse(r.len)));
+    let mut end = 0;
+    out.retain(|r| {
+        if r.start < end {
+            false
+        } else {
+            end = r.start + r.len;
+            true
+        }
+    });
+    out
+}
+
+fn sys_string_index_is_pure(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) => true,
+        Expr::Var(v) => v.kind != VarKind::String && !matches!(v.base.as_str(), "TI" | "ST"),
+        Expr::Neg(e) | Expr::Not(e) => sys_string_index_is_pure(e),
+        Expr::Bin(_, a, b) => sys_string_index_is_pure(a) && sys_string_index_is_pure(b),
+        _ => false,
+    }
+}
+
+fn sys_param_string_lengths(p: &Cursor<'_>, params: &[u8]) -> Vec<SysParamRef> {
+    let strings: Vec<_> = crate::sys_params::scan(params)
+        .into_iter()
+        .filter(|v| v.kind == VarKind::String)
+        .collect();
+    if strings.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut quoted = false;
+    for (start, &byte) in params.iter().enumerate() {
+        if byte == b'"' {
+            quoted = !quoted;
+        }
+        if quoted || byte != TOK_LEN {
+            continue;
+        }
+        let mut q = Cursor::new(params, p.line);
+        q.lenient_syntax = p.lenient_syntax;
+        q.int_hint_vars = p.int_hint_vars;
+        q.tsb_ascii = p.tsb_ascii;
+        q.sys_register_args = p.sys_register_args;
+        q.pos = start;
+        let Ok(value @ Expr::Len(_)) = atom(&mut q) else {
+            continue;
+        };
+        // Leave constant-only calls on the existing verbatim path.
+        if !strings.iter().any(|v| v.start > start && v.start < q.pos) {
+            continue;
+        }
+        out.push(SysParamRef {
+            start,
+            len: q.pos - start,
+            value,
+        });
+    }
+    out
 }
 
 fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
@@ -740,12 +979,10 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         TOK_GOTO => {
             p.advance(1);
             p.skip_spaces();
-            if p.eof() || p.peek() == Some(b':') {
-                // A handful of legacy tokenized listings contain a
-                // bare trailing GOTO where the original target was
-                // lost. Let the line compile by treating that corrupt
-                // tail as an empty statement.
-                return Ok(Statement::Rem(Vec::new()));
+            if !matches!(p.peek(), Some(b) if b.is_ascii_digit()) {
+
+                skip_line_target_label(p);
+                return Ok(Statement::Goto(0));
             }
             let target = line_number(p)?;
             skip_line_target_label(p);
@@ -754,69 +991,34 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         TOK_GOSUB => {
             p.advance(1);
             p.skip_spaces();
+            if !matches!(p.peek(), Some(b) if b.is_ascii_digit()) {
+
+                skip_line_target_label(p);
+                return Ok(Statement::GoSub(0));
+            }
             let target = line_number(p)?;
             skip_line_target_label(p);
             Ok(Statement::GoSub(target))
         }
         TOK_GO => {
-            // `GO TO` (CB A4) or `GO SUB` (CB then ASCII "SUB"). In
-            // lenient mode, also accept `GOT<digits>` / `GOS<digits>`
-            // typos — v2's tokeniser stored those as `GO` + raw text
-            // rather than a longer GOTO/GOSUB match.
+
             p.advance(1);
             p.skip_spaces();
             match p.peek() {
                 Some(TOK_TO) => {
                     p.advance(1);
                     p.skip_spaces();
-                    if p.eof() || p.peek() == Some(b':') {
-                        return Ok(Statement::Rem(Vec::new()));
+                    if !matches!(p.peek(), Some(b) if b.is_ascii_digit()) {
+                        // `GO TO` with a target that is missing or does not begin with a digit.
+                        skip_line_target_label(p);
+                        return Ok(Statement::Goto(0));
                     }
                     Ok(Statement::Goto(line_number(p)?))
                 }
-                Some(b'S') if p.peek_at(1) == Some(b'U') && p.peek_at(2) == Some(b'B') => {
-                    p.advance(3);
-                    p.skip_spaces();
-                    Ok(Statement::GoSub(line_number(p)?))
-                }
-                Some(b's') if p.peek_at(1) == Some(b'u') && p.peek_at(2) == Some(b'b') => {
-                    p.advance(3);
-                    p.skip_spaces();
-                    Ok(Statement::GoSub(line_number(p)?))
-                }
-                // Typo recovery: BASIC v2's tokeniser stores `GOTxxx`
-                // / `GOSxxx` (missing the second 'O' or the closing
-                // 'B') as `GO` + raw text rather than the proper
-                // GOTO/GOSUB tokens. Accept
-                // the shape unconditionally rather than requiring the
-                // lenient-syntax flag: the alternative is rejecting
-                // working programs over a single missing keystroke.
-                Some(c)
-                    if (c == b'S' || c == b's')
-                        && p.peek_at(1).is_some_and(|b| b.is_ascii_digit()) =>
-                {
-                    p.advance(1);
-                    Ok(Statement::GoSub(line_number(p)?))
-                }
-                Some(c)
-                    if (c == b'T' || c == b't')
-                        && p.peek_at(1).is_some_and(|b| b.is_ascii_digit()) =>
-                {
-                    p.advance(1);
-                    Ok(Statement::Goto(line_number(p)?))
-                }
-                // `GOT` / `GOS` truncated at end of statement with no
-                // line number following. Treat the tail as a no-op REM.
-                Some(c)
-                    if (c == b'T' || c == b't' || c == b'S' || c == b's')
-                        && matches!(p.peek_at(1), None | Some(b':') | Some(b';')) =>
-                {
-                    Ok(Statement::Rem(Vec::new()))
-                }
-                None | Some(b':') | Some(b';') => Ok(Statement::Rem(Vec::new())),
+
                 _ => Err(ParseError::ExpectedKeyword {
                     line: p.line,
-                    what: "TO or SUB after GO",
+                    what: "TO after GO",
                 }),
             }
         }
@@ -873,37 +1075,45 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         TOK_SYS => {
             p.advance(1);
             let addr = expression(p)?;
-            // Some BASIC dialects accept up to four
-            // trailing comma-separated args after the address that
-            // pre-load A / X / Y / SR before the JSR. Pure v2 syntax-
-            // errors here, but extension-authored listings may use it.
+            // `SYS addr, a [, x [, y [, sr]]]` ; the extension register-argument form, where the trailing values pre-load A / X / Y / SR before the JSR.
             let mut regs = Vec::new();
-            p.skip_spaces();
-            while p.peek() == Some(TOK_COMMA) && regs.len() < 4 {
-                p.advance(1);
+            if p.sys_register_args {
                 p.skip_spaces();
-                regs.push(expression(p)?);
+                while p.peek() == Some(TOK_COMMA) && regs.len() < 4 {
+                    p.advance(1);
+                    p.skip_spaces();
+                    regs.push(expression(p)?);
+                    p.skip_spaces();
+                }
+            } else {
+
                 p.skip_spaces();
             }
-            // BASIC v2 SYS-with-parameters form (`SYS49152"text",8`):
-            // any remaining tokens up to colon/end-of-statement become
-            // the raw param byte string. Captured verbatim so codegen
-            // can stage them at TXTPTR and let the ML target call ROM
-            // parsers (CHRGOT, FRMEVL, ...) to consume them.
+
             let mut params = Vec::new();
+            let mut quoted = false;
             while let Some(b) = p.peek() {
-                if b == b':' || b == b';' {
+                if b == b'"' {
+                    quoted = !quoted;
+                } else if b == b':' && !quoted {
                     break;
                 }
                 params.push(b);
                 p.advance(1);
             }
-            // Trim trailing whitespace so an interpreter-style listing
-            // with a stray space before the colon doesn't carry it.
-            while matches!(params.last(), Some(b' ')) {
-                params.pop();
+            // Trim trailing spaces.
+            if !quoted {
+                while matches!(params.last(), Some(b' ')) {
+                    params.pop();
+                }
             }
-            Ok(Statement::Sys { addr, regs, params })
+            let param_refs = sys_param_refs(p, &params);
+            Ok(Statement::Sys {
+                addr,
+                regs,
+                params,
+                param_refs,
+            })
         }
         TOK_OPEN => {
             p.advance(1);
@@ -1015,6 +1225,7 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 return Ok(Statement::GetFile { file_num, vars });
             }
             let var = var_name(p)?;
+
             p.skip_spaces();
             let indices = if p.peek() == Some(b'(') {
                 p.advance(1);
@@ -1022,6 +1233,7 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             } else {
                 Vec::new()
             };
+
             if var.kind == VarKind::String {
                 if indices.is_empty() {
                     Ok(Statement::LetStr {
@@ -1057,7 +1269,8 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             match def_fn_stmt(p) {
                 Ok(stmt) => Ok(stmt),
                 Err(err) => {
-                    if p.lenient_syntax {
+                    // The lenient hatch is for `DEF` that is not a `DEF FN` at all ; `2220 DEFINITIONEN` has no `FN` token after the `DEF`.
+                    if p.lenient_syntax && !matches!(err, ParseError::TypeMismatch { .. }) {
                         p.pos = saved;
                         while let Some(b) = p.peek() {
                             if b == b':' {
@@ -1095,11 +1308,10 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             }
         }
         TOK_LIST => {
-            // No source listing exists at runtime in compiled mode.
-            // Swallow the rest as a REM-style comment so it parses.
+            // LIST inside a RUNning program ENDs it.
             p.advance(1);
-            let rest = p.take_until_statement_end().to_vec();
-            Ok(Statement::Rem(rest))
+            let _discarded_range = p.take_until_statement_end();
+            Ok(Statement::End)
         }
         TOK_NEW => {
             // Same reasoning as `LIST`: `NEW` would clear the live
@@ -1108,13 +1320,36 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             p.advance(1);
             Ok(Statement::Rem(Vec::new()))
         }
-        TOK_CONT => Err(ParseError::RejectedKeyword {
+        TOK_CONT => {
+            // `CONT` is the one direct-mode keyword whose run-time behaviour splits in two, and only one half is reproducible.
+            let mut i = p.pos + 1;
+            while matches!(p.bytes.get(i), Some(b' ')) {
+                i += 1;
+            }
+            match p.bytes.get(i) {
+                // A bare `CONT`.
+                None | Some(0x00) | Some(b':') => {
+                    p.pos = i;
+                    Ok(Statement::Hang)
+                }
+                Some(&byte) => Err(ParseError::BadStatementBoundary {
+                    line: p.line,
+                    byte,
+                }),
+            }
+        }
+
+        TOK_TSB_PREFIX if !p.tsb_ascii => Err(ParseError::NotAStatementStart {
             line: p.line,
-            keyword: "CONT",
-            reason: "compiled programs cannot be resumed from STOP; use GOTO/IF for control flow",
+            byte: TOK_TSB_PREFIX,
         }),
         TOK_TSB_PREFIX => tsb_statement(p),
         b if b.is_ascii_alphabetic() => {
+            // `DPOKE addr, value`.
+            if b == b'D' && p.peek_at(1) == Some(TOK_POKE) {
+                p.advance(2);
+                return dpoke_operands(p);
+            }
             if consume_ascii_stmt_word(p, b"FCHR") {
                 return tsb_screen_rect_statement(p, ScreenRectOp::Fchr);
             }
@@ -1505,23 +1740,20 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 let_assign(p)
             }
         }
-        // Statement-start bytes we don't recognise as keywords.
-        // Save-disk noise can leave stray ASCII where BASIC v2 would
-        // have stored raw text. Treat the byte and the rest of
-        // the statement) as a no-op REM rather than failing the
-        // whole compile.
-        other if !is_known_keyword_byte(other) => {
-            while let Some(b) = p.peek() {
-                if b == b':' || b == b';' {
-                    break;
-                }
-                p.advance(1);
-            }
-            Ok(Statement::Rem(Vec::new()))
-        }
+        // Statement-start bytes that cannot begin a BASIC v2 statement.
+        other if !is_known_keyword_byte(other) => Err(ParseError::NotAStatementStart {
+            line: p.line,
+            byte: other,
+        }),
+
         other => Err(ParseError::UnsupportedToken {
             line: p.line,
             byte: other,
+            spelling: if other >= crate::tokens::TOKEN_MIN {
+                TokenSpelling::BasicV2(crate::tokens::keyword(other))
+            } else {
+                TokenSpelling::Unnamed
+            },
         }),
     }
 }
@@ -1532,12 +1764,8 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
 /// byte is corrupt source (skip) or a token we forgot to wire up
 /// (surface the error).
 fn is_known_keyword_byte(b: u8) -> bool {
-    // Operator-and-clause tokens ($A4..$B3) are never valid as the
-    // *first* byte of a statement — they're TO, FN, SPC(, THEN, NOT,
-    // STEP, +, -, *, /, ^, AND, OR, >, =, <. BASIC v2 stores them in
-    // tokenised form even when they appear in decorative lines that
-    // the program never reaches. Treat them as REM-style decoration.
-    if (0xA4..=0xB3).contains(&b) {
+
+    if (0xA3..=0xB3).contains(&b) {
         return false;
     }
     // Function tokens ($B4..$CA: SGN, INT, ABS, USR, FRE, POS, SQR,
@@ -1571,6 +1799,7 @@ fn tsb_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         return Err(ParseError::UnsupportedToken {
             line: p.line,
             byte: TOK_TSB_PREFIX,
+            spelling: TokenSpelling::ExtendedPrefixAtEndOfLine,
         });
     };
     p.advance(1);
@@ -1774,11 +2003,16 @@ fn vol_statement(value: Expr) -> Statement {
     }
 }
 
+// `tsb_keyword` has already been asked and said no, so these two bytes have no spelling in any dialect the compiler knows.
 fn unsupported_tsb(line: u16, token: u8) -> Result<Statement, ParseError> {
     if let Some(name) = crate::tokens::tsb_keyword(token) {
         Err(ParseError::Unsupported { line, name })
     } else {
-        Err(ParseError::UnsupportedToken { line, byte: token })
+        Err(ParseError::UnsupportedToken {
+            line,
+            byte: token,
+            spelling: TokenSpelling::ExtendedUnnamed,
+        })
     }
 }
 
@@ -1786,7 +2020,11 @@ fn unsupported_tsb_expr(line: u16, token: u8) -> Result<Expr, ParseError> {
     if let Some(name) = crate::tokens::tsb_keyword(token) {
         Err(ParseError::Unsupported { line, name })
     } else {
-        Err(ParseError::UnsupportedToken { line, byte: token })
+        Err(ParseError::UnsupportedToken {
+            line,
+            byte: token,
+            spelling: TokenSpelling::ExtendedUnnamed,
+        })
     }
 }
 
@@ -3274,10 +3512,9 @@ fn consume_ascii_two_word(p: &mut Cursor<'_>, first: &[u8], second: &[u8]) -> bo
 }
 
 fn consume_ascii_color_command(p: &mut Cursor<'_>) -> bool {
-    // Some tokenisers split `COLOR` as ASCII `COL`
-    // followed by BASIC v2's `OR` token. Treat that shape as the same
-    // statement as the real `COLOUR` token.
-    if p.peek().is_some_and(|b| b.eq_ignore_ascii_case(&b'C'))
+    // Some tokenisers split `COLOR` as ASCII `COL` followed by BASIC v2's `OR` token.
+    if p.tsb_ascii
+        && p.peek().is_some_and(|b| b.eq_ignore_ascii_case(&b'C'))
         && p.peek_at(1).is_some_and(|b| b.eq_ignore_ascii_case(&b'O'))
         && p.peek_at(2).is_some_and(|b| b.eq_ignore_ascii_case(&b'L'))
         && p.peek_at(3) == Some(TOK_OR)
@@ -3610,8 +3847,12 @@ fn tsb_d_bang_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         });
     }
     p.advance(1);
+    dpoke_operands(p)
+}
+
+fn dpoke_operands(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     let addr = expression(p)?;
-    expect_comma(p, "',' in D!POKE")?;
+    expect_comma(p, "',' in DPOKE")?;
     let value = expression(p)?;
     Ok(Statement::Dpoke { addr, value })
 }
@@ -3890,6 +4131,7 @@ fn tsb_call_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 addr: expression(p)?,
                 regs: Vec::new(),
                 params: Vec::new(),
+                param_refs: Vec::new(),
             })
         }
         // CALL is a tail call: it replaces the current PROC frame
@@ -3938,6 +4180,10 @@ fn proc_name(p: &mut Cursor<'_>) -> Result<ProcName, ParseError> {
         if b == b':' || b == b';' {
             break;
         }
+
+        if peek_tsb(p, TSB_ELSE) {
+            break;
+        }
         p.advance(1);
     }
     let mut bytes = p.bytes[start..p.pos].to_vec();
@@ -3950,6 +4196,7 @@ fn proc_name(p: &mut Cursor<'_>) -> Result<ProcName, ParseError> {
     Ok(ProcName(bytes))
 }
 
+/// Is the statement at the cursor a bare `EXEC`-less procedure call?
 fn bare_identifier_statement(p: &Cursor<'_>) -> bool {
     let mut i = p.pos;
     if i >= p.bytes.len() || !p.bytes[i].is_ascii_alphabetic() {
@@ -3964,7 +4211,17 @@ fn bare_identifier_statement(p: &Cursor<'_>) -> bool {
     while i < p.bytes.len() && p.bytes[i] == b' ' {
         i += 1;
     }
-    !matches!(p.bytes.get(i).copied(), Some(TOK_EQ | b'('))
+    match p.bytes.get(i).copied() {
+        None | Some(b':' | b';') => true,
+
+        Some(TOK_TSB_PREFIX) => p
+            .bytes
+            .get(i + 1)
+            .copied()
+            .map(normalize_tsb_token)
+            .is_some_and(|t| t == TSB_ELSE),
+        _ => false,
+    }
 }
 
 fn consume_ascii_word(p: &mut Cursor<'_>, word: &[u8]) -> bool {
@@ -4378,6 +4635,7 @@ fn string_expression(p: &mut Cursor<'_>) -> Result<StrExpr, ParseError> {
             let after_plus = p.pos;
             let rhs = match string_atom(p) {
                 Ok(r) => r,
+
                 Err(e) => {
                     p.pos = after_plus;
                     if expression(p).is_ok() {
@@ -4518,10 +4776,8 @@ fn string_atom(p: &mut Cursor<'_>) -> Result<StrExpr, ParseError> {
         Some(b) if b.is_ascii_alphabetic() => {
             let v = var_name(p)?;
             if v.kind != VarKind::String {
-                return Err(ParseError::UnsupportedFeature {
-                    line: p.line,
-                    what: "numeric variable in string context",
-                });
+                // A numeric variable in a string expression raises TYPE MISMATCH.
+                return Err(ParseError::TypeMismatch { line: p.line });
             }
             p.skip_spaces();
             if p.peek() == Some(b'(') {
@@ -4554,6 +4810,7 @@ fn tsb_str_atom(p: &mut Cursor<'_>) -> Result<StrExpr, ParseError> {
                 Err(ParseError::UnsupportedToken {
                     line: p.line,
                     byte: other,
+                    spelling: TokenSpelling::ExtendedUnnamed,
                 })
             }
         }
@@ -4777,6 +5034,7 @@ fn index_list(p: &mut Cursor<'_>) -> Result<Vec<Expr>, ParseError> {
 }
 
 fn if_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
+
     let cond = parse_truthy_expression(p)?;
     p.skip_spaces();
     if p.peek() == Some(TOK_THEN) {
@@ -4835,48 +5093,110 @@ fn then_else_tail(p: &mut Cursor<'_>) -> Result<(ThenBranch, Option<ThenBranch>)
     Ok((then_branch, else_branch))
 }
 
+fn then_goto_target(p: &mut Cursor<'_>, skip_tail: bool) -> Result<ThenBranch, ParseError> {
+    // `IF cond THEN GOTO` with the target missing.
+    if !matches!(p.peek(), Some(b) if b.is_ascii_digit()) {
+        let tail_data = if skip_tail {
+            skip_after_then_line_number(p)
+        } else {
+            Vec::new()
+        };
+        if tail_data.is_empty() {
+            return Ok(ThenBranch::Goto(0));
+        }
+        let mut stmts = vec![Statement::Goto(0)];
+        stmts.extend(tail_data);
+        return Ok(ThenBranch::Stmts(stmts));
+    }
+    match line_number(p) {
+        Ok(n) => {
+            let tail_data = if skip_tail {
+                skip_after_then_line_number(p)
+            } else {
+                Vec::new()
+            };
+
+            if tail_data.is_empty() {
+                Ok(ThenBranch::Goto(n))
+            } else {
+                let mut stmts = vec![Statement::Goto(n)];
+                stmts.extend(tail_data);
+                Ok(ThenBranch::Stmts(stmts))
+            }
+        }
+        Err(err) => match err.runtime_error_code() {
+            Some(code) => {
+                p.note_trap(code, &err);
+                let tail_data = if skip_tail {
+                    skip_after_then_line_number(p)
+                } else {
+                    Vec::new()
+                };
+                let mut stmts = vec![Statement::RaiseError(code)];
+                stmts.extend(tail_data);
+                Ok(ThenBranch::Stmts(stmts))
+            }
+            None => Err(err),
+        },
+    }
+}
+
 fn then_tail_until_else(p: &mut Cursor<'_>) -> Result<ThenBranch, ParseError> {
     if matches!(p.peek(), Some(b) if b.is_ascii_digit()) {
-        let n = line_number(p)?;
-        skip_after_then_line_number(p);
-        return Ok(ThenBranch::Goto(n));
+        return then_goto_target(p, true);
     }
     if p.peek() == Some(TOK_GOTO) {
         p.advance(1);
         p.skip_spaces();
-        let n = line_number(p)?;
-        skip_after_then_line_number(p);
-        return Ok(ThenBranch::Goto(n));
+        return then_goto_target(p, true);
     }
     let stmts = inline_stmts(p, true)?;
     Ok(ThenBranch::Stmts(stmts))
 }
 
-/// `IF cond THEN <line>` consumes the rest of the line — BASIC v2
-/// skips it on a false condition and never reaches it on a true one.
-/// Drop everything until ELSE or end-of-line so trailing `:STMTS`
-/// (the v2 dead-code idiom) and stray comment-like bytes (e.g. a
-/// trailing `*`) don't confuse the outer line parser.
-fn skip_after_then_line_number(p: &mut Cursor<'_>) {
+/// `IF cond THEN <line>` consumes the rest of the line ; BASIC v2 skips it on a false condition and never reaches it on a true one.
+fn skip_after_then_line_number(p: &mut Cursor<'_>) -> Vec<Statement> {
+    let mut recovered = Vec::new();
     p.skip_spaces();
     while let Some(b) = p.peek() {
         if b == TOK_TSB_PREFIX && p.peek_at(1).map(normalize_tsb_token) == Some(TSB_ELSE) {
-            return;
+            break;
+        }
+        // Quoted text and a REM tail are stored as raw bytes, so a `$83` in either is the character, not the DATA token.
+        if b == b'"' {
+            p.advance(1);
+            while let Some(c) = p.peek() {
+                p.advance(1);
+                if c == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if b == TOK_REM {
+            break;
+        }
+        if b == TOK_DATA {
+            // `data_stmt` stops at the next `:` or end of line, so the scan resumes on the following statement.
+            p.advance(1);
+            if let Ok(stmt) = data_stmt(p) {
+                recovered.push(stmt);
+            }
+            continue;
         }
         p.advance(1);
     }
+    recovered
 }
 
 fn then_tail_to_end(p: &mut Cursor<'_>) -> Result<ThenBranch, ParseError> {
     if matches!(p.peek(), Some(b) if b.is_ascii_digit()) {
-        let n = line_number(p)?;
-        return Ok(ThenBranch::Goto(n));
+        return then_goto_target(p, false);
     }
     if p.peek() == Some(TOK_GOTO) {
         p.advance(1);
         p.skip_spaces();
-        let n = line_number(p)?;
-        return Ok(ThenBranch::Goto(n));
+        return then_goto_target(p, false);
     }
     let stmts = inline_stmts(p, false)?;
     Ok(ThenBranch::Stmts(stmts))
@@ -4893,7 +5213,39 @@ fn inline_stmts(p: &mut Cursor<'_>, stop_at_else: bool) -> Result<Vec<Statement>
         if p.eof() || (stop_at_else && peek_tsb(p, TSB_ELSE)) {
             break;
         }
-        stmts.push(statement(p)?);
+        let saved = p.pos;
+        match statement(p) {
+            Ok(s) => stmts.push(s),
+
+            Err(err) => match err.runtime_error_code() {
+                Some(code) => {
+                    p.note_trap(code, &err);
+                    stmts.push(Statement::RaiseError(code));
+                    // The rest of the branch is dead ; the ROM never reaches it.
+                    p.pos = saved;
+                    while let Some(b) = p.peek() {
+                        if stop_at_else && b == TOK_TSB_PREFIX && peek_tsb(p, TSB_ELSE) {
+                            break;
+                        }
+                        p.advance(1);
+                    }
+                    break;
+                }
+                None => return Err(err),
+            },
+        }
+
+        if let Some((code, detail)) = p.pending_trap.take() {
+            p.note_trap_detail(code, detail);
+            stmts.push(Statement::RaiseError(code));
+            while let Some(b) = p.peek() {
+                if stop_at_else && b == TOK_TSB_PREFIX && peek_tsb(p, TSB_ELSE) {
+                    break;
+                }
+                p.advance(1);
+            }
+            break;
+        }
         p.skip_spaces();
         match p.peek() {
             None => break,
@@ -4947,11 +5299,9 @@ fn consume_ascii_then(p: &mut Cursor<'_>) -> bool {
 
 fn for_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     let var = var_name(p)?;
+
     if var.kind == VarKind::String {
-        return Err(ParseError::UnsupportedFeature {
-            line: p.line,
-            what: "FOR with string counter",
-        });
+        return Err(ParseError::TypeMismatch { line: p.line });
     }
     p.skip_spaces();
     if p.peek() != Some(TOK_EQ) {
@@ -4998,7 +5348,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             // at the statement boundary).
             Some(b'"') => {
                 p.advance(1);
-                values.push(DataValue::String(p.take_string_body()));
+                values.push(DataValue::Quoted(p.take_string_body()));
             }
             // Optional unary minus on a numeric literal.
             Some(TOK_MINUS) => {
@@ -5017,6 +5367,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                     let bytes = take_unquoted_data_item(p);
                     values.push(DataValue::String(bytes));
                 } else {
+
                     let mut raw = vec![b'-'];
                     raw.extend_from_slice(&p.bytes[start + 1..p.pos]);
                     values.push(data_item_from_number(&raw, -n));
@@ -5058,6 +5409,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         p.skip_spaces();
         if p.peek() == Some(TOK_COMMA) {
             p.advance(1);
+
             p.skip_spaces();
             if matches!(p.peek(), None | Some(b':')) {
                 values.push(DataValue::String(Vec::new()));
@@ -5067,6 +5419,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             break;
         }
     }
+
     if values.is_empty() {
         values.push(DataValue::String(Vec::new()));
     }
@@ -5187,10 +5540,25 @@ fn on_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             });
         }
     };
-    let mut targets = Vec::new();
+
+    let mut targets: Vec<u16> = Vec::new();
     loop {
         p.skip_spaces();
-        targets.push(line_number(p)?);
+        let target = if p.peek().is_some_and(|b| b.is_ascii_digit()) {
+            match line_number(p) {
+                Ok(n) => n,
+                Err(e @ ParseError::LineNumberOverflow { .. })
+                    if !targets.is_empty() && matches!(kind, OnBranchKind::Goto) =>
+                {
+                    p.pending_trap = Some((BASIC_ERR_SYNTAX, e.to_string()));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            0
+        };
+        targets.push(target);
         p.skip_spaces();
         if p.peek() == Some(TOK_COMMA) {
             p.advance(1);
@@ -5252,14 +5620,10 @@ fn line_number(p: &mut Cursor<'_>) -> Result<u16, ParseError> {
         return Err(ParseError::ExpectedLineNumber { line: p.line });
     }
     let s = std::str::from_utf8(&digits).expect("ASCII digits");
+
     let n: u32 = s.parse().unwrap_or(u32::MAX);
-    // BASIC v2's interactive editor caps at 63999, but the tokenised
-    // format stores line numbers as u16 — and programs in the wild
-    // (Cylon Zap line 490: `GOTO 65535`) use a high non-existent
-    // line as a deliberate `?UNDEF'D STATEMENT ERROR` abort. Accept
-    // anything that fits in u16; codegen routes unresolved targets
-    // through the undefined-line error handler.
-    if n > 65535 {
+
+    if n > 63999 {
         return Err(ParseError::LineNumberOverflow {
             line: p.line,
             value: n,
@@ -5398,6 +5762,10 @@ fn def_fn_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     }
     p.advance(1);
     let param = var_name(p)?;
+
+    if param.kind == VarKind::String {
+        return Err(ParseError::TypeMismatch { line: p.line });
+    }
     if param.kind != VarKind::Float {
         return Err(ParseError::UnsupportedFeature {
             line: p.line,
@@ -5420,8 +5788,25 @@ fn def_fn_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         });
     }
     p.advance(1);
-    let body = expression(p)?;
-    Ok(Statement::DefFn { name, param, body })
+    let body_start = p.pos;
+    match expression(p) {
+        Ok(body) => Ok(Statement::DefFn { name, param, body }),
+        // The header is good and the body is not.
+        Err(err) if err.runtime_error_code().is_some() => {
+            let code = err.runtime_error_code().expect("just checked");
+            let detail = err.to_string();
+            p.pos = body_start;
+            p.skip_def_fn_body();
+            p.deferred_fn_bodies.push(DeferredFnBody {
+                line: p.line,
+                name,
+                code,
+                detail,
+            });
+            Ok(Statement::Rem(Vec::new()))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // ----- expression parser (recursive descent, precedence climbing) -----
@@ -5451,9 +5836,9 @@ fn parse_truthy_expression(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         let s = string_expression(p)?;
         p.skip_spaces();
         let first = if is_compare_op_byte(p.peek()) {
-            let op = parse_compare_op(p)?;
+            let mask = parse_compare_mask(p)?;
             let rhs = string_expression(p)?;
-            Expr::StrCompare(op, s, rhs)
+            str_compare_from_mask(mask, s, rhs)
         } else {
             Expr::Len(Box::new(s))
         };
@@ -5552,67 +5937,23 @@ fn cmp_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             if p.lenient_syntax {
                 return Ok(Expr::Val(Box::new(lhs)));
             }
+
             return Err(ParseError::TypeMismatch { line: p.line });
         }
-        let op = parse_compare_op(p)?;
+        let mask = parse_compare_mask(p)?;
         let rhs = string_expression(p)?;
-        return Ok(Expr::StrCompare(op, lhs, rhs));
+        return Ok(str_compare_from_mask(mask, lhs, rhs));
     }
     let mut lhs = add_expr(p)?;
-    // BASIC permits 2-token sequences for compound compares. The ROM
-    // accepts both orderings symmetrically: `<=` and `=<`, `>=` and
-    // `=>`, `<>` and `><`. The tokenizer stores each as a separate
-    // token, so we look at up to two. Chained compares parse
-    // left-associatively as `(B=A1)=X`.
+
     loop {
         p.skip_spaces();
-        let op = match p.peek() {
-            Some(TOK_EQ) => {
-                p.advance(1);
-                match p.peek() {
-                    Some(TOK_GT) => {
-                        p.advance(1);
-                        BinOp::Ge
-                    }
-                    Some(TOK_LT) => {
-                        p.advance(1);
-                        BinOp::Le
-                    }
-                    _ => BinOp::Eq,
-                }
-            }
-            Some(TOK_LT) => {
-                p.advance(1);
-                match p.peek() {
-                    Some(TOK_EQ) => {
-                        p.advance(1);
-                        BinOp::Le
-                    }
-                    Some(TOK_GT) => {
-                        p.advance(1);
-                        BinOp::Ne
-                    }
-                    _ => BinOp::Lt,
-                }
-            }
-            Some(TOK_GT) => {
-                p.advance(1);
-                match p.peek() {
-                    Some(TOK_EQ) => {
-                        p.advance(1);
-                        BinOp::Ge
-                    }
-                    Some(TOK_LT) => {
-                        p.advance(1);
-                        BinOp::Ne
-                    }
-                    _ => BinOp::Gt,
-                }
-            }
-            _ => break,
-        };
+        if !is_compare_op_byte(p.peek()) {
+            break;
+        }
+        let mask = parse_compare_mask(p)?;
         let rhs = add_expr(p)?;
-        lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        lhs = num_compare_from_mask(mask, lhs, rhs);
     }
     Ok(lhs)
 }
@@ -5665,6 +6006,7 @@ fn unary_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         p.advance(1);
         return unary_expr(p);
     }
+
     if p.peek() == Some(TOK_NOT) {
         p.advance(1);
         let inner = not_expr(p)?;
@@ -5707,7 +6049,20 @@ fn pow_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn atom(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     p.skip_spaces();
+
+    if matches!(
+        p.peek(),
+        Some(TOK_CHR | TOK_STR | TOK_LEFT | TOK_RIGHT | TOK_MID)
+    ) || peek_is_string_var(p)
+    {
+
+        if p.lenient_syntax {
+            return Ok(Expr::Val(Box::new(string_expression(p)?)));
+        }
+        return Err(ParseError::TypeMismatch { line: p.line });
+    }
     match p.peek() {
+
         Some(0xFF) => {
             p.advance(1);
             Ok(Expr::Number(3_373_259_425.0 / 1_073_741_824.0))
@@ -5725,9 +6080,14 @@ fn atom(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             p.advance(1);
             Ok(e)
         }
+
         Some(b'"') => {
             p.advance(1);
-            Ok(Expr::String(p.take_string_body()))
+            let body = p.take_string_body();
+            if p.lenient_syntax {
+                return Ok(Expr::Val(Box::new(StrExpr::Literal(body))));
+            }
+            Err(ParseError::TypeMismatch { line: p.line })
         }
         Some(b'$') => parse_prefixed_int_literal(p, b'$', 16),
         Some(b'%') => parse_prefixed_int_literal(p, b'%', 2),
@@ -6255,6 +6615,7 @@ fn d_bang_peek_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 /// Find the end of a balanced parenthesized group, skipping string literals.
 fn paren_group_end(bytes: &[u8], i: usize) -> Option<usize> {
+
     if bytes.get(i) != Some(&b'(') {
         return None;
     }
@@ -6286,11 +6647,11 @@ fn paren_group_end(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Whether a parenthesized expression has string type.
-fn paren_group_is_string(bytes: &[u8], i: usize) -> bool {
+fn paren_group_is_string(bytes: &[u8], i: usize, tsb_ascii: bool) -> bool {
     let Some(end) = paren_group_end(bytes, i) else {
         return false;
     };
-    if !peek_is_string_atom_at(bytes, i + 1) {
+    if !peek_is_string_atom_at(bytes, i + 1, tsb_ascii) {
         return false;
     }
     let mut depth = 0usize;
@@ -6407,17 +6768,17 @@ fn peek_is_string_compare(p: &Cursor<'_>) -> bool {
 /// before a string atom — the program then concats normally.
 fn peek_string_atom_after_plus(p: &Cursor<'_>) -> bool {
     debug_assert_eq!(p.peek(), Some(TOK_PLUS));
-    peek_is_string_atom_at(p.bytes, p.pos + 1)
+    peek_is_string_atom_at(p.bytes, p.pos + 1, p.tsb_ascii)
 }
 
 /// True if the next atom is a string-typed thing (literal, string
 /// variable, CHR$). Used by `cmp_expr` to dispatch to string-compare
 /// before committing to the numeric expression grammar.
 fn peek_is_string_atom(p: &Cursor<'_>) -> bool {
-    peek_is_string_atom_at(p.bytes, p.pos)
+    peek_is_string_atom_at(p.bytes, p.pos, p.tsb_ascii)
 }
 
-fn peek_is_string_atom_at(bytes: &[u8], start: usize) -> bool {
+fn peek_is_string_atom_at(bytes: &[u8], start: usize, tsb_ascii: bool) -> bool {
     let mut i = start;
     while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
@@ -6429,7 +6790,8 @@ fn peek_is_string_atom_at(bytes: &[u8], start: usize) -> bool {
     // string-typed function tokens.
     match bytes[i] {
         b'"' | TOK_CHR | TOK_STR | TOK_LEFT | TOK_RIGHT | TOK_MID => return true,
-        b'(' => return paren_group_is_string(bytes, i),
+
+        b'(' => return paren_group_is_string(bytes, i, tsb_ascii),
         TOK_TSB_PREFIX => {
             return bytes
                 .get(i + 1)
@@ -6442,7 +6804,8 @@ fn peek_is_string_atom_at(bytes: &[u8], start: usize) -> bool {
         b'%' if bytes.get(i + 1) == Some(&b'%') => return true,
         _ => {}
     }
-    if i + 3 <= bytes.len()
+    if tsb_ascii
+        && i + 3 <= bytes.len()
         && bytes[i..].len() >= 3
         && bytes[i..i + 3]
             .iter()
@@ -6454,7 +6817,8 @@ fn peek_is_string_atom_at(bytes: &[u8], start: usize) -> bool {
     {
         return true;
     }
-    if i + 6 <= bytes.len()
+    if tsb_ascii
+        && i + 6 <= bytes.len()
         && bytes[i..i + 6]
             .iter()
             .zip(b"INSERT".iter())
@@ -6480,58 +6844,63 @@ fn is_compare_op_byte(b: Option<u8>) -> bool {
     matches!(b, Some(TOK_EQ | TOK_LT | TOK_GT))
 }
 
-/// Parse one of `=`, `<>`, `<`, `<=`, `>`, `>=` as a `BinOp`. ROM
-/// also accepts `=<`, `=>`, `><` as synonyms — handled here.
-fn parse_compare_op(p: &mut Cursor<'_>) -> Result<BinOp, ParseError> {
+/// The relational OR-mask FRMEVL builds over a run of `>` `=` `<` tokens: `>` contributes 1, `=` contributes 2, `<` contributes 4.
+fn parse_compare_mask(p: &mut Cursor<'_>) -> Result<u8, ParseError> {
     p.skip_spaces();
-    match p.peek() {
-        Some(TOK_EQ) => {
-            p.advance(1);
-            match p.peek() {
-                Some(TOK_GT) => {
-                    p.advance(1);
-                    Ok(BinOp::Ge)
-                }
-                Some(TOK_LT) => {
-                    p.advance(1);
-                    Ok(BinOp::Le)
-                }
-                _ => Ok(BinOp::Eq),
-            }
+    let mut mask = 0u8;
+    loop {
+
+        let bit = match p.peek() {
+            Some(TOK_GT) => 1,
+            Some(TOK_EQ) => 2,
+            Some(TOK_LT) => 4,
+            _ => break,
+        };
+        if mask & bit != 0 {
+            // A repeated relational bit.
+            return Err(ParseError::ExpectedExpr { line: p.line });
         }
-        Some(TOK_LT) => {
-            p.advance(1);
-            match p.peek() {
-                Some(TOK_EQ) => {
-                    p.advance(1);
-                    Ok(BinOp::Le)
-                }
-                Some(TOK_GT) => {
-                    p.advance(1);
-                    Ok(BinOp::Ne)
-                }
-                _ => Ok(BinOp::Lt),
-            }
-        }
-        Some(TOK_GT) => {
-            p.advance(1);
-            match p.peek() {
-                Some(TOK_EQ) => {
-                    p.advance(1);
-                    Ok(BinOp::Ge)
-                }
-                Some(TOK_LT) => {
-                    p.advance(1);
-                    Ok(BinOp::Ne)
-                }
-                _ => Ok(BinOp::Gt),
-            }
-        }
-        _ => Err(ParseError::ExpectedKeyword {
+        mask |= bit;
+        p.advance(1);
+    }
+    if mask == 0 {
+        return Err(ParseError::ExpectedKeyword {
             line: p.line,
             what: "comparison operator",
-        }),
+        });
     }
+    Ok(mask)
+}
+
+/// The `BinOp` a relational mask of 1..=6 denotes.
+fn binop_for_compare_mask(mask: u8) -> BinOp {
+    match mask {
+        1 => BinOp::Gt,
+        2 => BinOp::Eq,
+        3 => BinOp::Ge,
+        4 => BinOp::Lt,
+        5 => BinOp::Ne,
+        6 => BinOp::Le,
+        _ => unreachable!("mask {mask} is not a single BinOp"),
+    }
+}
+
+fn always_true_compare(cmp: Expr) -> Expr {
+    Expr::Bin(BinOp::Or, Box::new(cmp), Box::new(Expr::Number(-1.0)))
+}
+
+fn num_compare_from_mask(mask: u8, lhs: Expr, rhs: Expr) -> Expr {
+    if mask == 7 {
+        return always_true_compare(Expr::Bin(BinOp::Ge, Box::new(lhs), Box::new(rhs)));
+    }
+    Expr::Bin(binop_for_compare_mask(mask), Box::new(lhs), Box::new(rhs))
+}
+
+fn str_compare_from_mask(mask: u8, lhs: StrExpr, rhs: StrExpr) -> Expr {
+    if mask == 7 {
+        return always_true_compare(Expr::StrCompare(BinOp::Ge, lhs, rhs));
+    }
+    Expr::StrCompare(binop_for_compare_mask(mask), lhs, rhs)
 }
 
 /// Look ahead from `p`'s current position to see whether the next
@@ -6652,6 +7021,14 @@ struct Cursor<'a> {
     int_hint_vars: &'a std::collections::HashSet<String>,
     /// Whether bare extended keyword spellings are accepted as keywords.
     tsb_ascii: bool,
+    /// See [`ParseOptions::sys_register_args`].
+    sys_register_args: bool,
+    /// Statements this line lowered to a runtime BASIC error, for the caller to warn about.
+    traps: Vec<SyntaxTrap>,
+    /// `DEF FN`s on this line whose body did not parse.
+    deferred_fn_bodies: Vec<DeferredFnBody>,
+
+    pending_trap: Option<(u8, String)>,
 }
 
 impl<'a> Cursor<'a> {
@@ -6665,7 +7042,21 @@ impl<'a> Cursor<'a> {
             lenient_syntax: false,
             int_hint_vars: EMPTY.get_or_init(std::collections::HashSet::new),
             tsb_ascii: true,
+            sys_register_args: false,
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
+            pending_trap: None,
         }
+    }
+
+    fn note_trap(&mut self, code: u8, err: &ParseError) {
+        let detail = err.to_string();
+        self.note_trap_detail(code, detail);
+    }
+
+    fn note_trap_detail(&mut self, code: u8, detail: String) {
+        let line = self.line;
+        self.traps.push(SyntaxTrap { line, code, detail });
     }
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
@@ -6688,6 +7079,18 @@ impl<'a> Cursor<'a> {
         let s = &self.bytes[self.pos..];
         self.pos = self.bytes.len();
         s
+    }
+
+    fn skip_def_fn_body(&mut self) {
+        let mut quoted = false;
+        while let Some(b) = self.peek() {
+            match b {
+                b'"' => quoted = !quoted,
+                b':' if !quoted => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
     }
     fn take_until_statement_end(&mut self) -> &'a [u8] {
         let start = self.pos;
@@ -6746,6 +7149,7 @@ impl<'a> Cursor<'a> {
                 break;
             }
         }
+
         let mantissa_len = buf.len();
         let (pre_e, e_byte) = self.peek_past_spaces(self.pos);
         if matches!(e_byte, Some(b'E') | Some(b'e')) {
@@ -6801,6 +7205,70 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    /// An unimplemented statement keyword must be named, not numbered.
+    #[test]
+    fn an_unsupported_statement_token_is_named_not_numbered() {
+        let mut seen = 0;
+        for byte in crate::tokens::TOKEN_MIN..=0xFFu8 {
+            let Err(err) = line_body(10, &[byte]) else {
+                continue;
+            };
+            let ParseError::UnsupportedToken {
+                byte: got,
+                ref spelling,
+                ..
+            } = err
+            else {
+                continue;
+            };
+            seen += 1;
+            assert_eq!(got, byte, "the byte must survive for a bug report");
+            assert!(
+                matches!(spelling, TokenSpelling::BasicV2(_)),
+                "a statement-position token is BASIC v2 and has a name; \
+                 ${byte:02X} came back as {spelling:?}"
+            );
+            let msg = format!("{err}");
+            let kw = crate::tokens::keyword(byte);
+            assert!(
+                msg.contains(kw),
+                "${byte:02X} is {kw} and the message must say so; got: {msg}"
+            );
+        }
+        println!("statement tokens reporting UnsupportedToken: {seen}");
+
+        // The half that cannot go vacuous.
+        let e = ParseError::UnsupportedToken {
+            line: 20,
+            byte: 0x9D,
+            spelling: TokenSpelling::BasicV2(crate::tokens::keyword(0x9D)),
+        };
+        assert_eq!(format!("{e}"), "line 20: CMD (token $9D) is not yet supported");
+    }
+
+    #[test]
+    fn an_extended_sub_token_is_never_named_as_a_v2_keyword() {
+        let e = ParseError::UnsupportedToken {
+            line: 30,
+            byte: 0xB2,
+            spelling: TokenSpelling::ExtendedUnnamed,
+        };
+        let msg = format!("{e}");
+        assert_eq!(
+            crate::tokens::keyword(0xB2),
+            "=",
+            "premise: $B2 is `=` in the v2 table"
+        );
+        assert!(
+            !msg.contains('='),
+            "the v2 spelling of $B2 must not appear for an extended sub-token; got: {msg}"
+        );
+        assert!(
+            msg.contains("extended-BASIC") && msg.contains("$B2"),
+            "say which namespace it is in, and keep the byte; got: {msg}"
+        );
+    }
+
     #[test]
     fn if_accepts_bare_goto_without_then() {
         let stmts = line_body(10, &[TOK_IF, b'1', b' ', TOK_GOTO, b'2', b'0']).unwrap();
@@ -6854,6 +7322,7 @@ mod tests {
             other => panic!("not a DATA statement: {other:?}"),
         }
     }
+
     #[test]
     fn data_keeps_trailing_spaces_in_unquoted_items() {
         use crate::ast::DataValue;
@@ -6882,6 +7351,7 @@ mod tests {
             ]
         );
     }
+
     #[test]
     fn data_numeric_items_keep_their_source_spelling() {
         use crate::ast::DataValue;
@@ -6909,10 +7379,17 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bare_goto_is_accepted_as_empty_statement() {
+    fn trailing_bare_goto_is_goto_line_zero() {
         let stmts = line_body(3250, &[TOK_PRINT, b'"', b'X', b'"', b':', TOK_GOTO]).unwrap();
         assert_eq!(stmts.len(), 2);
-        assert!(matches!(stmts[1], Statement::Rem(_)));
+        assert!(matches!(stmts[1], Statement::Goto(0)), "{:?}", stmts[1]);
+    }
+
+    #[test]
+    fn trailing_bare_gosub_is_gosub_line_zero() {
+        let stmts = line_body(3250, &[TOK_PRINT, b'"', b'X', b'"', b':', TOK_GOSUB]).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(stmts[1], Statement::GoSub(0)), "{:?}", stmts[1]);
     }
 
     #[test]
@@ -7818,6 +8295,7 @@ mod tests {
             other => panic!("expected PRINT, got {other:?}"),
         }
     }
+
     #[test]
     fn unary_minus_after_caret_takes_the_whole_power_chain() {
         // 2 ^ - 1 ^ 3
@@ -7851,6 +8329,7 @@ mod tests {
         );
         assert!(matches!(exp.as_ref(), Expr::Number(n) if *n == 2.0));
     }
+
     #[test]
     fn unary_plus_after_caret_parses_without_widening_the_operand() {
         let e = print_expr(&[b'2', TOK_POW, TOK_PLUS, b'2']);
@@ -7870,6 +8349,7 @@ mod tests {
         );
         assert!(matches!(exp.as_ref(), Expr::Number(n) if *n == 3.0));
     }
+
     #[test]
     fn unary_minus_after_caret_stops_at_a_lower_precedence_operator() {
         // 2 ^ - 1 * 3
@@ -7882,5 +8362,127 @@ mod tests {
             "left of the multiply must be the whole 2^-1, got {l:?}"
         );
         assert!(matches!(r.as_ref(), Expr::Number(n) if *n == 3.0));
+    }
+}
+
+#[cfg(test)]
+mod syntax_trap_tests {
+    use super::*;
+
+    /// `WIBBLE 1` ; `<ident> <junk>` fails `bare_identifier_statement` and falls into `let_assign`, which wants an `=`.
+    #[test]
+    fn an_unparseable_statement_becomes_a_syntax_trap() {
+        let stmts = line_body(30, b"WIBBLE 1").unwrap();
+        assert!(
+            matches!(stmts[..], [Statement::RaiseError(BASIC_ERR_SYNTAX)]),
+            "{stmts:?}"
+        );
+    }
+
+    /// The trap keeps its position.
+    #[test]
+    fn the_trap_keeps_the_statements_before_it() {
+        let body = [TOK_PRINT, b'"', b'A', b'"', b':', b'Z', b'Z', b' ', b'1'];
+        let stmts = line_body(10, &body).unwrap();
+        assert_eq!(stmts.len(), 2, "{stmts:?}");
+        assert!(matches!(stmts[0], Statement::Print(_)), "{stmts:?}");
+        assert!(
+            matches!(stmts[1], Statement::RaiseError(BASIC_ERR_SYNTAX)),
+            "{stmts:?}"
+        );
+    }
+
+    #[test]
+    fn the_trap_drops_the_rest_of_the_line() {
+        let mut body = vec![b'Z', b'Z', b' ', b'1', b':'];
+        body.extend_from_slice(&[TOK_PRINT, b'"', b'C', b'"']);
+        let stmts = line_body(10, &body).unwrap();
+        assert!(
+            matches!(stmts[..], [Statement::RaiseError(BASIC_ERR_SYNTAX)]),
+            "{stmts:?}"
+        );
+    }
+
+    #[test]
+    fn the_trap_is_reported_with_its_line_and_reason() {
+        let traps = line_body_traps(30, b"WIBBLE 1").unwrap();
+        assert_eq!(traps.len(), 1, "{traps:?}");
+        assert_eq!(traps[0].line, 30);
+        assert_eq!(traps[0].code, BASIC_ERR_SYNTAX);
+        assert!(
+            traps[0].detail.contains("line 30"),
+            "the reason must survive: {:?}",
+            traps[0].detail
+        );
+    }
+
+    /// A well-formed line records nothing, which is what makes the warning meaningful.
+    #[test]
+    fn a_well_formed_line_records_no_trap() {
+        assert!(
+            line_body_traps(10, &[TOK_PRINT, b'"', b'A', b'"'])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unimplemented_feature_is_still_an_error() {
+        for err in [
+            ParseError::UnsupportedFeature {
+                line: 10,
+                what: "a feature this compiler has not implemented",
+            },
+            ParseError::Unsupported {
+                line: 10,
+                name: "SECURE",
+            },
+            ParseError::UnsupportedToken {
+                line: 10,
+                byte: 0xFF,
+                spelling: TokenSpelling::BasicV2(crate::tokens::keyword(0xFF)),
+            },
+            // Not a syntax error either: the ROM does not raise on CONT.
+            ParseError::RejectedKeyword {
+                line: 10,
+                keyword: "RUN",
+                reason: "direct mode only",
+            },
+        ] {
+            assert!(
+                err.runtime_error_code().is_none(),
+                "must stay a compile refusal: {err}"
+            );
+        }
+
+        assert_eq!(
+            ParseError::TypeMismatch { line: 10 }.runtime_error_code(),
+            Some(BASIC_ERR_TYPE_MISMATCH),
+        );
+        for err in [
+            ParseError::ExpectedLineNumber { line: 10 },
+            ParseError::ExpectedVar { line: 10 },
+            ParseError::ExpectedExpr { line: 10 },
+            ParseError::LineNumberOverflow {
+                line: 10,
+                value: 70000,
+            },
+            ParseError::NotAStatementStart { line: 10, byte: b']' },
+        ] {
+            assert_eq!(
+                err.runtime_error_code(),
+                Some(BASIC_ERR_SYNTAX),
+                "must defer to ?SYNTAX: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_for_counter_defers_to_type_mismatch() {
+        let traps = line_body_traps(10, &[TOK_FOR, b'A', b'$', TOK_EQ, b'1', TOK_TO, b'3'])
+            .expect("must parse into a trap, not refuse the build");
+        assert_eq!(traps.len(), 1, "{traps:?}");
+        assert_eq!(traps[0].code, BASIC_ERR_TYPE_MISMATCH);
+        assert_eq!(traps[0].line, 10);
     }
 }

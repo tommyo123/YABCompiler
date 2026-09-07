@@ -269,7 +269,7 @@ fn rewrite_vars_in_then(branch: &mut ast::ThenBranch, map: &HashMap<VarName, Var
 fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarName>) {
     use ast::Statement;
     match stmt {
-        Statement::RaiseError(_) => {}
+        Statement::RaiseError(_) | Statement::Hang => {}
         Statement::Print(p) => {
             for item in &mut p.items {
                 rewrite_vars_in_print_item(item, map);
@@ -1024,6 +1024,38 @@ fn rewrite_vars_in_print_item(item: &mut ast::PrintItem, map: &HashMap<VarName, 
 ///     order normally guards against fall-through; we leave that
 ///     alone.
 pub fn inline_procs_ast(prog: &mut ast::Program) {
+    fn branch_has_on_key(branch: &ast::ThenBranch) -> bool {
+        matches!(branch, ast::ThenBranch::Stmts(stmts) if stmts.iter().any(stmt_has_on_key))
+    }
+    fn stmt_has_on_key(stmt: &ast::Statement) -> bool {
+        match stmt {
+            ast::Statement::OnKey { .. }
+            | ast::Statement::OnError { .. }
+            | ast::Statement::Resume { .. } => true,
+            ast::Statement::If { then_branch, .. } => branch_has_on_key(then_branch),
+            ast::Statement::IfElse {
+                then_branch,
+                else_branch,
+                ..
+            } => branch_has_on_key(then_branch) || branch_has_on_key(else_branch),
+            ast::Statement::Rcomp {
+                then_branch,
+                else_branch,
+            } => {
+                branch_has_on_key(then_branch)
+                    || else_branch.as_ref().is_some_and(branch_has_on_key)
+            }
+            _ => false,
+        }
+    }
+
+    if prog
+        .lines
+        .iter()
+        .any(|line| line.statements.iter().any(stmt_has_on_key))
+    {
+        return;
+    }
     let bodies = collect_proc_bodies(prog);
     if bodies.is_empty() {
         return;
@@ -1720,6 +1752,7 @@ struct ConstantFolder {
 
 impl crate::visit::MutVisitor for ConstantFolder {
     fn visit_stmt_mut(&mut self, line_no: u16, stmt: &mut Stmt) {
+
         match stmt {
             Stmt::LetStr { value, .. }
                 if str_binding_fold_is_fre_visible(value, self.fre_observable) =>
@@ -1755,6 +1788,7 @@ impl crate::visit::MutVisitor for ConstantFolder {
             *e = simplified;
             return;
         }
+
     }
 
     fn visit_str_expr_mut(&mut self, s: &mut StrExpr) {
@@ -1877,6 +1911,7 @@ fn try_fold(e: &Expr) -> Option<f64> {
             let text = std::str::from_utf8(&bytes).ok()?;
             let trimmed = text.trim();
             let n = trimmed.parse::<f64>().ok().filter(|n| n.is_finite())?;
+
             if crate::codegen::mflpt_overflows(n) {
                 return None;
             }
@@ -1928,6 +1963,7 @@ fn fold_bin_exact(op: BinOp, l: f64, r: f64) -> Option<f64> {
         BinOp::Le => Some(bool_to_basic(l <= r)),
         BinOp::Gt => Some(bool_to_basic(l > r)),
         BinOp::Ge => Some(bool_to_basic(l >= r)),
+
         BinOp::And => ayint(l).zip(ayint(r)).map(|(a, b)| (a & b) as i16 as f64),
         BinOp::Or => ayint(l).zip(ayint(r)).map(|(a, b)| (a | b) as i16 as f64),
         BinOp::Xor => ayint(l).zip(ayint(r)).map(|(a, b)| (a ^ b) as i16 as f64),
@@ -2049,6 +2085,7 @@ fn fold_func1(f: Func1, v: f64) -> Option<f64> {
                 0.0
             }
         }
+
         Func1::Sqr
         | Func1::Sin
         | Func1::Cos
@@ -2301,9 +2338,7 @@ impl ir::Pass for IntForBodyAnalysis {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        // Step 1: pair up every FOR with its matching NEXT by walking
-        // statements in source order with a depth counter. Unmatched
-        // FORs are left alone — codegen errors out on those anyway.
+
         let mut pairs: Vec<((usize, usize), (usize, usize))> = Vec::new();
         let mut stack: Vec<(usize, usize)> = Vec::new();
         for (li, line) in module.lines.iter().enumerate() {
@@ -2330,7 +2365,24 @@ impl ir::Pass for IntForBodyAnalysis {
         // GOSUB in the body stay int-safe when the called routine never
         // writes the counter.
         let routines = build_routine_writes(module);
-        let mut unsafe_positions: HashSet<(usize, usize)> = HashSet::new();
+        // A Float counter cannot share its private integer slot with the variable's five-byte home.
+        let counter_writes = reachable_for_counter_writes(module);
+        let unmatched_positions: HashSet<(usize, usize)> = stack.into_iter().collect();
+        let mut unsafe_positions = HashSet::new();
+        for &(fli, fsi) in &unmatched_positions {
+            let Stmt::For { var, .. } = &module.lines[fli].stmts[fsi] else {
+                unreachable!("position came from FOR scan")
+            };
+            let safe = module.lines.iter().enumerate().all(|(li, line)| {
+                line.stmts.iter().enumerate().all(|(si, stmt)| {
+                    (li, si) == (fli, fsi)
+                        || unmatched_counter_stmt_is_safe(stmt, var, &routines)
+                })
+            });
+            if !safe {
+                unsafe_positions.insert((fli, fsi));
+            }
+        }
         let mut unread_positions: HashSet<(usize, usize)> = HashSet::new();
         for ((fli, fsi), (nli, nsi)) in &pairs {
             let (loop_var, for_lowering, induction_const) = match &module.lines[*fli].stmts[*fsi] {
@@ -2392,13 +2444,108 @@ impl ir::Pass for IntForBodyAnalysis {
                     if unsafe_positions.contains(&(li, si)) {
                         *body_int_safe = false;
                     }
-                    if unread_positions.contains(&(li, si)) {
+                    if unmatched_positions.contains(&(li, si)) {
+                        *body_reads_loop_var = true;
+                    } else if unread_positions.contains(&(li, si)) {
                         *body_reads_loop_var = false;
                     }
                 }
             }
         }
+
+        struct MutableFloatCounters<'a>(&'a HashSet<VarName>);
+        impl crate::visit::MutVisitor for MutableFloatCounters<'_> {
+            fn visit_stmt_mut(&mut self, line: u16, stmt: &mut Stmt) {
+                if let Stmt::For {
+                    var,
+                    body_int_safe,
+                    body_reads_loop_var,
+                    ..
+                } = stmt
+                {
+                    if var.kind == VarKind::Float && self.0.contains(var) {
+                        *body_int_safe = false;
+                        *body_reads_loop_var = true;
+                    }
+                }
+                crate::visit::walk_stmt_mut(self, line, stmt);
+            }
+        }
+        crate::visit::MutVisitor::visit_module_mut(
+            &mut MutableFloatCounters(&counter_writes),
+            module,
+        );
         Ok(())
+    }
+}
+
+/// A body with no textual end can visit any line.
+fn unmatched_counter_stmt_is_safe(stmt: &Stmt, var: &VarName, routines: &RoutineWrites) -> bool {
+    // The general body predicate only rejects FN at expression leaves.
+    use crate::visit::Visitor;
+    struct OpaqueCalls(bool);
+    impl crate::visit::Visitor for OpaqueCalls {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if matches!(expr, Expr::FnCall(_, _) | Expr::Usr(_)) {
+                self.0 = true;
+            }
+            crate::visit::walk_expr(self, expr);
+        }
+    }
+    let mut calls = OpaqueCalls(false);
+    calls.visit_stmt(0, stmt);
+    if calls.0 {
+        return false;
+    }
+    let admitted = matches!(
+        stmt,
+        Stmt::Let { .. }
+            | Stmt::LetStr { .. }
+            | Stmt::ArrayLet { .. }
+            | Stmt::ArrayLetStr { .. }
+            | Stmt::Read(_)
+            | Stmt::Input { .. }
+            | Stmt::KeyGet { .. }
+            | Stmt::Get { .. }
+            | Stmt::For { .. }
+            | Stmt::Next { .. }
+            | Stmt::Print { .. }
+            | Stmt::If { .. }
+            | Stmt::IfElse { .. }
+            | Stmt::Rcomp { .. }
+            | Stmt::OnBranch {
+                kind: OnBranchKind::Goto,
+                ..
+            }
+            | Stmt::Goto { .. }
+            | Stmt::ComputedGoto { .. }
+            | Stmt::GoSub { .. }
+            | Stmt::Return
+            | Stmt::End
+            | Stmt::Stop
+            | Stmt::Run(_)
+            | Stmt::Data(_)
+            | Stmt::Restore
+            | Stmt::DefFn { .. }
+            | Stmt::Rem(_)
+            | Stmt::LineMark(_)
+    );
+    if !admitted || !stmt_is_int_safe_with(stmt, var, Some(routines)) {
+        return false;
+    }
+    let branch_safe = |branch: &ThenIr| match branch {
+        ThenIr::Goto(_) => true,
+        ThenIr::Stmts(inner) => inner
+            .iter()
+            .all(|s| unmatched_counter_stmt_is_safe(s, var, routines)),
+    };
+    match stmt {
+        Stmt::If { then, .. } => branch_safe(then),
+        Stmt::IfElse { then, else_then, .. } => branch_safe(then) && branch_safe(else_then),
+        Stmt::Rcomp { then, else_then } => {
+            branch_safe(then) && else_then.as_ref().is_none_or(branch_safe)
+        }
+        _ => true,
     }
 }
 
@@ -2411,6 +2558,7 @@ impl ir::Pass for PokeLoopFusion {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+
         let reads = count_var_reads(module);
         for line in &mut module.lines {
             fuse_poke_loops(&mut line.stmts, &reads);
@@ -2488,6 +2636,31 @@ struct FusedPokeFill {
     /// exit-value store after the fill.
     loop_var_exit: Option<(VarName, f64)>,
 }
+
+fn expr_contains_memory_read(e: &Expr) -> bool {
+    match e {
+        Expr::Peek(_) | Expr::MemPeek(_) => true,
+        Expr::Neg(i) | Expr::Not(i) => expr_contains_memory_read(i),
+        Expr::Bin(_, l, r) => expr_contains_memory_read(l) || expr_contains_memory_read(r),
+        Expr::Func1(_, a)
+        | Expr::FnCall(_, a)
+        | Expr::Pos(a)
+        | Expr::Fre(a)
+        | Expr::Usr(a)
+        | Expr::Joy(a)
+        | Expr::Pot(a) => expr_contains_memory_read(a),
+        Expr::At(a, b) | Expr::Test(a, b) => {
+            expr_contains_memory_read(a) || expr_contains_memory_read(b)
+        }
+        Expr::ArrayRef(_, idx) => idx.iter().any(expr_contains_memory_read),
+        Expr::Check { first, second } => {
+            expr_contains_memory_read(first)
+                || second.as_deref().is_some_and(expr_contains_memory_read)
+        }
+        _ => false,
+    }
+}
+
 fn match_poke_fill_triplet(
     stmts: &[Stmt],
     reads: &HashMap<VarName, u32>,
@@ -2519,6 +2692,10 @@ fn match_poke_fill_triplet(
     if expr_reads_var(value, loop_var) {
         return None;
     }
+
+    if !expr_is_pure(value) || expr_contains_memory_read(value) {
+        return None;
+    }
     // Start/end can't read the loop variable either (the BASIC v2
     // FOR header captures both at loop entry, so a self-reference
     // would be a corner case we don't need to optimise).
@@ -2535,6 +2712,7 @@ fn match_poke_fill_triplet(
         [Some(v)] if v == loop_var => {}
         _ => return None,
     }
+
     let read_elsewhere = reads.get(loop_var).copied().unwrap_or(0) > 1;
     let loop_var_exit = if read_elsewhere {
         let exit = poke_fill_loop_var_exit(start, end)?;
@@ -3216,20 +3394,14 @@ impl ir::Pass for LoopInductionDetect {
         let pairs = collect_for_next_pairs(module);
         let mut assignments: Vec<((usize, usize), f64)> = Vec::new();
         for ((fli, fsi), (nli, nsi)) in &pairs {
-            let (loop_var, step_is_literal) = match &module.lines[*fli].stmts[*fsi] {
-                Stmt::For { var, step, .. } => (var.clone(), expr_as_f64_literal(step).is_some()),
+            let (loop_var, step_literal) = match &module.lines[*fli].stmts[*fsi] {
+                Stmt::For { var, step, .. } => (var.clone(), expr_as_f64_literal(step)),
                 _ => unreachable!("position came from FOR scan"),
             };
-            // We skip the `body_int_safe` gate here: the analysis
-            // pass that owns it runs after this one, and codegen
-            // routes induction through the float-FOR fallback when
-            // body_int_safe ends up false (emit_next_float honours
-            // `induction` on its frame). The inner-body shape needs
-            // a literal STEP so the per-iter `step * K` advance
-            // folds at compile time.
-            if !step_is_literal {
+
+            let Some(step_value) = step_literal else {
                 continue;
-            }
+            };
             // Sanity: skip FORs whose body is structurally unsound
             // for induction (writes to the loop var, GOSUB, FN
             // calls, nested FOR with same var). These mirror
@@ -3252,7 +3424,7 @@ impl ir::Pass for LoopInductionDetect {
             }
             // Keep only `K` values worth strength-reducing (skip the
             // shapes codegen already handles cheaply).
-            counts.retain(|(k, _)| induction_worth_it(*k));
+            counts.retain(|(k, _)| induction_worth_it(*k, step_value));
             if counts.is_empty() {
                 continue;
             }
@@ -3345,6 +3517,7 @@ impl ir::Pass for ArrayPtrInductionDetect {
             if safe.is_empty() {
                 continue;
             }
+
             safe.sort_by(|a, b| {
                 a.name
                     .label()
@@ -3593,15 +3766,9 @@ impl<'a> crate::visit::Visitor for InductionVisitor<'a> {
     }
 }
 
-/// True iff strength-reducing `var * K` would actually save
-/// instructions. Skips constants where codegen already has a
-/// cheaper inline path: 0, ±1, and integer powers of two (which
-/// lower to ASL/ROL chains in the int island). Anything else
-/// (non-integer floats and non-pot2 integers) goes through FMULT
-/// per iteration, which the induction slot replaces with a single
-/// FADD.
-fn induction_worth_it(k: f64) -> bool {
-    crate::opt_model::CostModel::default().loop_induction_worth_it(k)
+/// True iff strength-reducing `var * K` is both profitable and sound.
+fn induction_worth_it(k: f64, step: f64) -> bool {
+    crate::opt_model::CostModel::default().loop_induction_worth_it(k, step)
 }
 
 fn stmt_reads_var(stmt: &Stmt, var: &VarName) -> bool {
@@ -3655,8 +3822,16 @@ fn stmt_reads_var(stmt: &Stmt, var: &VarName) -> bool {
                 || expr_reads_var(dst_end, var)
                 || expr_reads_var(value, var)
         }
-        Stmt::Sys { addr, regs, .. } => {
-            expr_reads_var(addr, var) || regs.iter().any(|e| expr_reads_var(e, var))
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
+            expr_reads_var(addr, var)
+                || regs.iter().any(|e| expr_reads_var(e, var))
+                // A variable in the parameter text is read by the callee through the ROM's parsers.
+                || param_vars.iter().any(|p| expr_reads_var(&p.value, var))
         }
         Stmt::Wait { addr, mask, eor } => {
             expr_reads_var(addr, var)
@@ -3906,11 +4081,20 @@ fn stmt_loop_var_needs_fac(
                 || expr_loop_var_needs_fac(dst_end, target, true, induction)
                 || expr_loop_var_needs_fac(value, target, true, induction)
         }
-        Stmt::Sys { addr, regs, .. } => {
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             expr_loop_var_needs_fac(addr, target, true, induction)
                 || regs
                     .iter()
                     .any(|e| expr_loop_var_needs_fac(e, target, true, induction))
+                // Rendered with FOUT, which reads FAC.
+                || param_vars
+                    .iter()
+                    .any(|p| expr_loop_var_needs_fac(&p.value, target, true, induction))
         }
         Stmt::Wait { addr, mask, eor } => {
             expr_loop_var_needs_fac(addr, target, true, induction)
@@ -4135,6 +4319,7 @@ fn u8_for_literal_params(start: i16, end: i16, step: i16) -> bool {
     {
         return false;
     }
+
     if step > 0 {
         if start > end {
             return false;
@@ -4446,16 +4631,52 @@ fn collect_body<'a>(
     out
 }
 
-/// Walk the module once, find every FOR/NEXT pair, and collect the
-/// loop counter var of any FOR whose body contains constructs that
-/// would force the codegen's float-FOR fallback (GOSUB, USR, direct
-/// writes to the counter, etc.). The walker mirrors
-/// `IntForBodyAnalysis::run`'s pairing logic.
-///
-/// Returns the union of unsafe loop counters. IntPromote uses this
-/// to keep those vars as Float — float-FOR's MOVMF/MOVFM stores 5
-/// bytes to V_<var>, which only fits when the slot itself is 5 bytes.
 fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
+    let literal_ranges = literal_scalar_i16_ranges(module);
+    // Header safety applies to every FOR, including an inline conditional header and a header whose runtime NEXT precedes it in the source.
+    struct Headers<'a> {
+        ranges: &'a HashMap<VarName, crate::dataflow::IntRange>,
+        unsafe_counters: HashSet<VarName>,
+    }
+    impl crate::visit::Visitor for Headers<'_> {
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            if let Stmt::For {
+                var, start, end, step, ..
+            } = stmt
+            {
+                let end_range = expr_as_i16_literal(end)
+                    .map(|e| crate::dataflow::IntRange::singleton(e as i32))
+                    .or_else(|| match end {
+                        Expr::Var(v) => self.ranges.get(v).copied(),
+                        _ => None,
+                    });
+                let exit_fits = match (
+                    expr_as_i16_literal(start),
+                    end_range,
+                    expr_as_i16_literal(step),
+                ) {
+                    (Some(s), Some(e), Some(st)) if st != 0 => {
+                        crate::codegen::int_for_exit_fits_i16(
+                            (s as i32).min(e.min),
+                            (s as i32).max(e.max),
+                            st as i32,
+                        )
+                    }
+                    _ => false,
+                };
+                if !exit_fits || crate::codegen::for_bounds_read_loop_var(var, end, step) {
+                    self.unsafe_counters.insert(var.clone());
+                }
+            }
+            crate::visit::walk_stmt(self, line, stmt);
+        }
+    }
+    let mut headers = Headers {
+        ranges: &literal_ranges,
+        unsafe_counters: unproved_mutated_for_counters(module, &literal_ranges),
+    };
+    crate::visit::Visitor::visit_module(&mut headers, module);
+    let mut unsafe_counters = headers.unsafe_counters;
     let mut pairs: Vec<((usize, usize), (usize, usize))> = Vec::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
     for (li, line) in module.lines.iter().enumerate() {
@@ -4475,95 +4696,263 @@ fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
     }
 
     let routines = build_routine_writes(module);
-    let mut unsafe_counters: HashSet<VarName> = HashSet::new();
     for ((fli, fsi), (nli, nsi)) in pairs {
-        let (loop_var, start_lit, end_lit, step_lit, bounds_read_var, exit_fits) =
-            match &module.lines[fli].stmts[fsi] {
-                Stmt::For {
-                    var,
-                    start,
-                    end,
-                    step,
-                    ..
-                } => {
-                    let exit_fits = match (
-                        expr_as_i16_literal(start),
-                        expr_as_i16_literal(end),
-                        expr_as_f64_literal(step).and_then(f64_to_i16_lit),
-                    ) {
-                        (Some(s), Some(e), Some(st)) => crate::codegen::int_for_exit_fits_i16(
-                            (s.min(e)) as i32,
-                            (s.max(e)) as i32,
-                            st as i32,
-                        ),
-                        _ => false,
-                    };
-                    (
-                        var.clone(),
-                        expr_is_i16_literal(start),
-                        expr_is_i16_literal(end),
-                        expr_is_i16_nonzero_literal(step),
-                        crate::codegen::for_bounds_read_loop_var(var, end, step),
-                        exit_fits,
-                    )
-                }
-                _ => continue,
-            };
-        // The codegen's int-FOR fast path requires literal i16
-        // start AND step (and either a literal end or one that
-        // proves to fit i16 via range analysis). When any of those
-        // fail we fall through to float-FOR, which calls MOVMF on
-        // V_<var> as a 5-byte FAC slot — incompatible with the
-        // 1- or 2-byte storage that int-promoted vars get. Mark
-        // such counters as "unsafe to promote" so V_<var> stays
-        // a 5-byte float slot and the float-FOR can write to it
-        // without overshooting into the next BSS variable.
-        if !start_lit || !end_lit || !step_lit || bounds_read_var || !exit_fits {
-            unsafe_counters.insert(loop_var.clone());
+        let Stmt::For { var: loop_var, .. } = &module.lines[fli].stmts[fsi] else {
             continue;
-        }
+        };
         let body = collect_body(module, fli, fsi, nli, nsi);
         if !body
             .iter()
-            .all(|s| stmt_is_int_safe_with(s, &loop_var, Some(&routines)))
+            .all(|s| stmt_is_int_safe_with(s, loop_var, Some(&routines)))
         {
-            unsafe_counters.insert(loop_var);
+            unsafe_counters.insert(loop_var.clone());
         }
     }
     unsafe_counters
 }
 
-fn expr_is_i16_literal(e: &Expr) -> bool {
-    match e {
-        Expr::Number(n) => n.is_finite() && n.fract() == 0.0 && (-32768.0..=32767.0).contains(n),
-        Expr::Neg(inner) => match inner.as_ref() {
-            Expr::Number(n) => {
-                let neg = -n;
-                neg.is_finite() && neg.fract() == 0.0 && (-32768.0..=32767.0).contains(&neg)
+/// Explicit scalar writes to any FOR variable, wherever control flow places them.
+fn explicit_for_counter_writes(module: &ir::Module) -> HashSet<VarName> {
+    use crate::visit::Visitor;
+    struct Writes(HashSet<VarName>);
+    impl Visitor for Writes {
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            if let Stmt::Let { var, .. } = stmt {
+                self.0.insert(var.clone());
+            } else if !matches!(stmt, Stmt::For { .. }) {
+                self.0.extend(stmt_counter_defs(stmt));
             }
-            _ => false,
-        },
-        _ => false,
+            crate::visit::walk_stmt(self, line, stmt);
+        }
     }
+    let counters = collect_for_counter_vars(module);
+    let mut writes = Writes(HashSet::new());
+    writes.visit_module(module);
+    writes.0.retain(|v| counters.contains(v));
+    writes.0
 }
 
-fn expr_is_i16_nonzero_literal(e: &Expr) -> bool {
-    match e {
-        Expr::Number(n) => {
-            n.is_finite() && n.fract() == 0.0 && *n != 0.0 && (-32768.0..=32767.0).contains(n)
-        }
-        Expr::Neg(inner) => match inner.as_ref() {
-            Expr::Number(n) => {
-                let neg = -n;
-                neg.is_finite()
-                    && neg.fract() == 0.0
-                    && neg != 0.0
-                    && (-32768.0..=32767.0).contains(&neg)
-            }
-            _ => false,
-        },
-        _ => false,
+/// Writes before initialization or after a proved Static loop completes cannot mutate its live private counter.
+fn reachable_for_counter_writes(module: &ir::Module) -> HashSet<VarName> {
+    let mut writes = explicit_for_counter_writes(module);
+    if writes.is_empty()
+        || module.has_on_key()
+        || module.has_error_continuation()
+        || module.lines.iter().any(|line| {
+            line.stmts.iter().any(|stmt| effect_summary_for_stmt(stmt).opaque_write)
+        })
+    {
+        return writes;
     }
+    let lifetimes = crate::for_next_runtime::analyze(module);
+    let cfg = crate::cfg::Cfg::build_with(module, &lifetimes);
+    writes.retain(|var| {
+        let headers = (0..cfg.nodes.len())
+            .filter(|id| matches!(cfg.stmt_at(*id, module), Stmt::For { var: v, .. } if v == var))
+            .collect::<Vec<_>>();
+        for header in headers {
+            let node = &cfg.nodes[header];
+            let header_id = crate::for_next_runtime::StmtId {
+                line_no: node.line_no,
+                line_idx: node.stmt.line_idx,
+                path: node.stmt.path.clone(),
+            };
+            let mut completed_at = HashSet::new();
+            if lifetimes.for_tier(node.line_no, node.stmt.line_idx, &node.stmt.path)
+                == crate::for_next_runtime::ForTier::Static
+            {
+                for (id, next) in cfg.nodes.iter().enumerate() {
+                    let next_id = crate::for_next_runtime::StmtId {
+                        line_no: next.line_no,
+                        line_idx: next.stmt.line_idx,
+                        path: next.stmt.path.clone(),
+                    };
+                    if lifetimes.static_pairs.get(&next_id).is_some_and(|partners| {
+                        partners.iter().any(|partner| partner.as_ref() == Some(&header_id))
+                    }) {
+                        completed_at.insert(id);
+                    }
+                }
+            }
+            let mut pending = vec![header];
+            let mut seen = HashSet::new();
+            while let Some(id) = pending.pop() {
+
+                if completed_at.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                let stmt = cfg.stmt_at(id, module);
+                if matches!(stmt, Stmt::Let { var: v, .. } if v == var)
+                    || (!matches!(stmt, Stmt::For { .. }) && stmt_counter_defs(stmt).contains(var))
+                {
+                    return true;
+                }
+                pending.extend(cfg.nodes[id].successors.iter().copied());
+            }
+        }
+        false
+    });
+    writes
+}
+
+fn unproved_mutated_for_counters(
+    module: &ir::Module,
+    literal_ranges: &HashMap<VarName, crate::dataflow::IntRange>,
+) -> HashSet<VarName> {
+    let mut candidates = explicit_for_counter_writes(module);
+    candidates.retain(|v| v.kind == VarKind::Float);
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let cfg = crate::cfg::Cfg::build(module);
+    candidates.retain(|var| !mutated_for_counter_domain_fits(module, &cfg, var, literal_ranges));
+    candidates
+}
+
+fn mutated_for_counter_domain_fits(
+    module: &ir::Module,
+    cfg: &crate::cfg::Cfg,
+    var: &VarName,
+    literal_ranges: &HashMap<VarName, crate::dataflow::IntRange>,
+) -> bool {
+    let bound = |expr: &Expr| {
+        expr_as_i16_literal(expr)
+            .map(|n| PromRange::new(n as i64, n as i64))
+            .or_else(|| match expr {
+                Expr::Var(v) => literal_ranges
+                    .get(v)
+                    .map(|r| PromRange::new(r.min as i64, r.max as i64)),
+                _ => None,
+            })
+    };
+    let mut domain = PromRange::new(0, 0);
+    let mut headers = Vec::new();
+    let mut steps = HashMap::new();
+    for id in 0..cfg.nodes.len() {
+        match cfg.stmt_at(id, module) {
+            Stmt::For {
+                var: v, start, end, step, ..
+            } if v == var => {
+                let (Some(s), Some(e), Some(st)) =
+                    (bound(start), bound(end), expr_as_i16_literal(step))
+                else {
+                    return false;
+                };
+                if st == 0 || crate::codegen::for_bounds_read_loop_var(var, end, step) {
+                    return false;
+                }
+                domain = domain.join(s).join(e);
+                headers.push((id, st as i64));
+            }
+            Stmt::Let { var: v, value } if v == var => match classify_counter_write(var, value) {
+                Some(CounterWrite::Init(r)) => domain = domain.join(r),
+                Some(CounterWrite::Step { k, .. }) => {
+                    steps.insert(id, k);
+                }
+                None => return false,
+            },
+            stmt if !matches!(stmt, Stmt::For { .. }) && stmt_counter_defs(stmt).contains(var) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    let mut covered_steps = HashSet::new();
+    for (header, step) in headers {
+        let mut total = 0_i64;
+        if !steps.is_empty() {
+            // Admit a straight control-flow path to NEXT, including GOTOs outside the lexical body.
+            let mut region = HashSet::new();
+            let mut node = header;
+            loop {
+                let [next] = cfg.nodes[node].successors.as_slice() else {
+                    return false;
+                };
+                node = *next;
+                if node == header || !region.insert(node) {
+                    return false;
+                }
+                let stmt = cfg.stmt_at(node, module);
+                if let Stmt::Next { vars } = stmt {
+                    if vars.len() != 1 || vars[0].as_ref().is_some_and(|v| v != var) {
+                        return false;
+                    }
+                    break;
+                }
+                if matches!(stmt, Stmt::For { .. } | Stmt::GoSub { .. } | Stmt::Return)
+                    || effect_summary_for_stmt(stmt).opaque_write
+                {
+                    return false;
+                }
+                if let Some(k) = steps.get(&node) {
+                    if k.signum() != step.signum() {
+                        return false;
+                    }
+                    total += k;
+                    covered_steps.insert(node);
+                }
+            }
+            if region.iter().any(|id| {
+                cfg.nodes[*id].predecessors.iter()
+                    .any(|pred| *pred != header && !region.contains(pred))
+            }) {
+                return false;
+            }
+        }
+        let extra = total + step;
+        let crossing = if extra > 0 {
+            PromRange::new(domain.min, domain.max + extra)
+        } else {
+            PromRange::new(domain.min + extra, domain.max)
+        };
+        if !crossing.fits_i16() {
+            return false;
+        }
+    }
+    steps.keys().all(|id| covered_steps.contains(id))
+}
+
+/// A whole-program range for scalars written only with i16 literals.
+pub(crate) fn literal_scalar_i16_ranges(
+    module: &ir::Module,
+) -> HashMap<VarName, crate::dataflow::IntRange> {
+    if module.has_on_key()
+        || module.has_error_continuation()
+        || module.lines.iter().any(|line| {
+            line.stmts
+                .iter()
+                // CLR only restores the zero already present in every hull.
+                .any(|stmt| !matches!(stmt, Stmt::Clr) && effect_summary_for_stmt(stmt).opaque_write)
+        })
+    {
+        return HashMap::new();
+    }
+    let mut writes = WriteCollector {
+        defs: HashMap::new(),
+        bad: HashSet::new(),
+        scalar_used: HashSet::new(),
+        array_used: HashSet::new(),
+    };
+    crate::visit::walk_module(&mut writes, module);
+    writes.bad.extend(collect_for_counter_vars(module));
+    writes
+        .defs
+        .into_iter()
+        .filter(|(v, _)| {
+            v.kind != VarKind::String
+                && !matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL")
+                && !writes.bad.contains(v)
+                && !writes.array_used.contains(v)
+        })
+        .filter_map(|(var, values)| {
+            let mut range = crate::dataflow::IntRange::singleton(0);
+            for value in values {
+                let n = expr_as_i16_literal(&value)?;
+                range = range.join(crate::dataflow::IntRange::singleton(n as i32));
+            }
+            Some((var, range))
+        })
+        .collect()
 }
 
 /// Per-GOSUB-target summary: the variables a routine may write, or
@@ -4728,7 +5117,7 @@ fn scan_routine_stmts(
     };
     for stmt in stmts {
         match stmt {
-            Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) => {
+            Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) | Stmt::Hang => {
                 if conditional {
                     continue;
                 }
@@ -5422,9 +5811,18 @@ fn stmt_is_int_safe_with(
         Stmt::Cset { mode } => expr_is_int_safe(mode, loop_var),
         Stmt::Nrm | Stmt::MemModeOn => true,
         Stmt::Pause { ticks, .. } => expr_is_int_safe(ticks, loop_var),
-        Stmt::Sys { addr, regs, .. } => {
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             expr_is_int_safe(addr, loop_var)
                 && regs.iter().all(|e| expr_is_int_safe(e, loop_var))
+
+                && param_vars
+                    .iter()
+                    .all(|p| expr_is_int_safe(&p.value, loop_var))
         }
         Stmt::Wait { addr, mask, eor } => {
             expr_is_int_safe(addr, loop_var)
@@ -5529,6 +5927,7 @@ fn stmt_is_int_safe_with(
         | Stmt::End
         | Stmt::Stop
         | Stmt::RaiseError(_)
+        | Stmt::Hang
         // RUN abandons the loop entirely (jumps to L<first>) so it
         // doesn't matter whether the int-counter and float V_var are
         // in sync at the time of the jump.
@@ -5601,13 +6000,15 @@ impl ir::Pass for GotoChainFold {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        // Build the direct-redirect map: for every line whose only
-        // top-level statement is `GOTO M`, record N → M.
+        let defined: HashSet<u16> = module.lines.iter().map(|l| l.number).collect();
+
         let mut redirect: HashMap<u16, u16> = HashMap::new();
         for line in &module.lines {
             if line.stmts.len() == 1 {
                 if let Stmt::Goto { target: m } = &line.stmts[0] {
-                    redirect.insert(line.number, *m);
+                    if defined.contains(m) {
+                        redirect.insert(line.number, *m);
+                    }
                 }
             }
         }
@@ -5702,6 +6103,7 @@ impl ir::Pass for TailGosubRewrite {
             module,
             direct.keys().chain(on_targets.iter()).copied(),
         );
+
         let mut sites: Vec<(u16, u16)> = Vec::new();
         for line in &module.lines {
             collect_gosub_call_sites(line.number, &line.stmts, &mut sites);
@@ -6104,64 +6506,106 @@ fn collect_goto_targets_in_then(then: &ThenIr, targets: &mut HashSet<u16>) {
     }
 }
 
-fn gosub_inline_body(stmts: &[Stmt]) -> Option<Vec<Stmt>> {
-    let (last, body) = stmts.split_last()?;
-    if !matches!(last, Stmt::Return) {
-        return None;
-    }
-    if !body.iter().all(stmt_safe_for_gosub_inline) {
-        return None;
-    }
-    Some(body.to_vec())
+/// Why a line cannot serve as an inlinable `GOSUB` body.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GosubRefusal {
+    /// The line has no statements at all, so there is no trailing `RETURN`.
+    EmptyLine,
+    /// The line does not end in `RETURN`: the subroutine body runs on into the following line.
+    NoTrailingReturn,
+
+    Branch,
+    /// A nested `GOSUB`.
+    NestedGosub,
+    /// A second `RETURN` before the final one ; an early exit.
+    EarlyReturn,
+    /// `FOR` or `NEXT` in the body.
+    ForFrame,
+    /// `END`, `STOP`, or `RUN` ; the body can terminate or restart, so the `RETURN` is not the only exit.
+    Terminator,
+    /// `CLR`, which resets BASIC's stack pointer and turns the body's own `RETURN` into `?RETURN WITHOUT GOSUB` on the subroutine's line.
+    Clr,
+    /// `ON KEY`, `RESUME`, `ON ERROR`, or an explicit error raise: these read or write interpreter error state that is keyed to position.
+    ErrorState,
+    /// `DIM`, `DATA`, or `DEF FN` ; declarations whose meaning depends on where they sit, not on when they run.
+    Declaration,
 }
 
-fn stmt_safe_for_gosub_inline(stmt: &Stmt) -> bool {
+impl GosubRefusal {
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            GosubRefusal::EmptyLine => "empty-line",
+            GosubRefusal::NoTrailingReturn => "no-trailing-return",
+            GosubRefusal::Branch => "branch",
+            GosubRefusal::NestedGosub => "nested-gosub",
+            GosubRefusal::EarlyReturn => "early-return",
+            GosubRefusal::ForFrame => "for-frame",
+            GosubRefusal::Terminator => "terminator",
+            GosubRefusal::Clr => "clr",
+            GosubRefusal::ErrorState => "error-state",
+            GosubRefusal::Declaration => "declaration",
+        }
+    }
+}
+
+/// The first reason `stmts` cannot be inlined as a `GOSUB` body, or `None` when it can.
+pub fn gosub_inline_refusal(stmts: &[Stmt]) -> Option<GosubRefusal> {
+    let Some((last, body)) = stmts.split_last() else {
+        return Some(GosubRefusal::EmptyLine);
+    };
+    if !matches!(last, Stmt::Return) {
+        return Some(GosubRefusal::NoTrailingReturn);
+    }
+    body.iter().find_map(stmt_gosub_inline_refusal)
+}
+
+fn gosub_inline_body(stmts: &[Stmt]) -> Option<Vec<Stmt>> {
+    if gosub_inline_refusal(stmts).is_some() {
+        return None;
+    }
+    // `gosub_inline_refusal` returned `None`, so `split_last` succeeded there and the last statement is the `RETURN` this strips.
+    Some(stmts[..stmts.len() - 1].to_vec())
+}
+
+fn stmt_gosub_inline_refusal(stmt: &Stmt) -> Option<GosubRefusal> {
     match stmt {
-        Stmt::Goto { .. }
-        | Stmt::GoSub { .. }
-        | Stmt::Return
-        | Stmt::For { .. }
-        | Stmt::Next { .. }
-        | Stmt::End
-        | Stmt::Stop
-        | Stmt::Run(_)
+        Stmt::Goto { .. } | Stmt::ComputedGoto { .. } | Stmt::OnBranch { .. } => {
+            Some(GosubRefusal::Branch)
+        }
+        Stmt::GoSub { .. } => Some(GosubRefusal::NestedGosub),
+        Stmt::Return => Some(GosubRefusal::EarlyReturn),
+        Stmt::For { .. } | Stmt::Next { .. } => Some(GosubRefusal::ForFrame),
+        Stmt::End | Stmt::Stop | Stmt::Run(_) => Some(GosubRefusal::Terminator),
         // `CLR` resets BASIC's interpreter stack pointer, which throws away the caller's GOSUB
         // frame along with every FOR frame.
-        | Stmt::Clr
-        | Stmt::ComputedGoto { .. }
-        | Stmt::OnKey { .. }
+        Stmt::Clr => Some(GosubRefusal::Clr),
+        Stmt::OnKey { .. }
         | Stmt::Resume { .. }
         | Stmt::OnError { .. }
-        | Stmt::ErrorRaise { .. }
-        | Stmt::OnBranch { .. }
-        | Stmt::Dim(_)
-        | Stmt::Data(_)
-        | Stmt::DefFn { .. } => false,
+        | Stmt::ErrorRaise { .. } => Some(GosubRefusal::ErrorState),
+        Stmt::Dim(_) | Stmt::Data(_) | Stmt::DefFn { .. } => Some(GosubRefusal::Declaration),
         Stmt::If {
             then: ThenIr::Goto(_),
             ..
-        } => false,
+        } => Some(GosubRefusal::Branch),
         Stmt::If {
             then: ThenIr::Stmts(inner),
             ..
-        } => inner.iter().all(stmt_safe_for_gosub_inline),
+        } => inner.iter().find_map(stmt_gosub_inline_refusal),
         Stmt::IfElse {
             then, else_then, ..
-        } => then_ir_safe_for_gosub_inline(then) && then_ir_safe_for_gosub_inline(else_then),
-        Stmt::Rcomp { then, else_then } => {
-            then_ir_safe_for_gosub_inline(then)
-                && else_then
-                    .as_ref()
-                    .map_or(true, then_ir_safe_for_gosub_inline)
-        }
-        _ => true,
+        } => then_ir_gosub_inline_refusal(then).or_else(|| then_ir_gosub_inline_refusal(else_then)),
+        Stmt::Rcomp { then, else_then } => then_ir_gosub_inline_refusal(then)
+            .or_else(|| else_then.as_ref().and_then(then_ir_gosub_inline_refusal)),
+        _ => None,
     }
 }
 
-fn then_ir_safe_for_gosub_inline(then: &ThenIr) -> bool {
+fn then_ir_gosub_inline_refusal(then: &ThenIr) -> Option<GosubRefusal> {
     match then {
-        ThenIr::Goto(_) => false,
-        ThenIr::Stmts(inner) => inner.iter().all(stmt_safe_for_gosub_inline),
+        ThenIr::Goto(_) => Some(GosubRefusal::Branch),
+        ThenIr::Stmts(inner) => inner.iter().find_map(stmt_gosub_inline_refusal),
     }
 }
 
@@ -6279,7 +6723,12 @@ fn trim_after_transfer(stmts: &mut Vec<Stmt>) {
     // either. CLR clears state but continues. RUN restarts the
     // program — anything after it is dead.
     if let Some(idx) = stmts.iter().position(is_transfer) {
-        stmts.truncate(idx + 1);
+        // `DATA` is a declaration, not a statement.
+        let kept: Vec<Stmt> = stmts
+            .drain(idx + 1..)
+            .filter(|s| matches!(s, Stmt::Data(_)))
+            .collect();
+        stmts.extend(kept);
     }
 }
 
@@ -6378,15 +6827,17 @@ pub fn run_str_const_var_prop(module: &mut ir::Module) -> bool {
     if consts.is_empty() {
         return false;
     }
+    // Text order does not establish execution order: an earlier GOSUB can read a later subroutine's variable before its sole LET runs.
+    retain_initialized_constants(module, &mut consts);
+    if consts.is_empty() {
+        return false;
+    }
     let mut substituter = StrConstVarSubstituter {
         consts: &consts,
         fre_observable,
     };
     crate::visit::walk_module_mut(&mut substituter, module);
-    for line in &mut module.lines {
-        line.stmts
-            .retain(|s| !is_promoted_str_const_let(s, &consts));
-    }
+    retain_top_level_except_floor_traps(module, |s| is_promoted_str_const_let(s, &consts));
     true
 }
 
@@ -6511,6 +6962,7 @@ impl crate::visit::Visitor for StrConstVarScanner {
                     self.mark_nonlet_write(v);
                 }
             }
+
             Stmt::Clr | Stmt::Run(_) => {
                 self.saw_var_reset = true;
             }
@@ -6526,6 +6978,17 @@ struct StrConstVarSubstituter<'a> {
 }
 
 impl<'a> crate::visit::MutVisitor for StrConstVarSubstituter<'a> {
+    fn visit_expr_mut(&mut self, e: &mut Expr) {
+
+        if let Expr::Var(v) = e {
+            if let Some(bytes) = self.consts.get(v) {
+                *e = Expr::String(bytes.clone());
+                return;
+            }
+        }
+        crate::visit::walk_expr_mut(self, e);
+    }
+
     fn visit_stmt_mut(&mut self, line_no: u16, stmt: &mut Stmt) {
         match stmt {
             Stmt::LetStr { value, .. }
@@ -6635,18 +7098,77 @@ pub fn run_const_var_prop(module: &mut ir::Module) -> bool {
     if consts.is_empty() {
         return false;
     }
+    // BASIC variables are initially zero.
+    retain_initialized_constants(module, &mut consts);
+    if consts.is_empty() {
+        return false;
+    }
     let mut substituter = ConstVarSubstituter { consts: &consts };
     crate::visit::walk_module_mut(&mut substituter, module);
-    // Step 4: drop the original LETs that promoted these constants —
-    // every reader has been folded to a literal already, and the RHS
-    // is itself a pure literal so removing the assignment has no
-    // observable effect. We retain empty lines so GOTO/GOSUB targets
-    // keep resolving (codegen still emits the `L<n>:` label and CURLIN
-    // stamp).
-    for line in &mut module.lines {
-        line.stmts.retain(|s| !is_promoted_const_let(s, &consts));
-    }
+
+    retain_top_level_except_floor_traps(module, |s| is_promoted_const_let(s, &consts));
     true
+}
+
+/// A candidate has one unconditional literal definition and no other writes.
+fn retain_initialized_constants<T>(module: &ir::Module, consts: &mut HashMap<VarName, T>) {
+    if module.has_on_key() || module.has_error_continuation() {
+        consts.clear();
+        return;
+    }
+    let cfg = crate::cfg::Cfg::build(module);
+    if cfg.nodes.is_empty() { return; }
+    let fns = crate::dataflow::FnBodyReads::build(module);
+    struct Reads<'a> {
+        names: HashSet<VarName>,
+        fns: &'a crate::dataflow::FnBodyReads,
+    }
+    impl crate::visit::Visitor for Reads<'_> {
+        fn visit_var_read(&mut self, v: &VarName) { self.names.insert(v.clone()); }
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::FnCall(name, _) = expr {
+                self.names.extend(self.fns.free_vars(name).iter().cloned());
+            }
+            crate::visit::walk_expr(self, expr);
+        }
+    }
+    let reads: Vec<_> = (0..cfg.nodes.len()).map(|id| {
+        let mut r = Reads { names: HashSet::new(), fns: &fns };
+        crate::visit::Visitor::visit_stmt(&mut r, cfg.nodes[id].line_no, cfg.stmt_at(id, module));
+        r.names
+    }).collect();
+    consts.retain(|var, _| {
+        let mut pending = vec![cfg.entry];
+        let mut visited = vec![false; cfg.nodes.len()];
+        while let Some(id) = pending.pop() {
+            if std::mem::replace(&mut visited[id], true) { continue; }
+            if reads[id].contains(var) { return false; }
+            if matches!(cfg.stmt_at(id, module),
+                Stmt::Let { var: target, .. } | Stmt::LetStr { var: target, .. } if target == var)
+            { continue; }
+            pending.extend(cfg.nodes[id].successors.iter().copied());
+        }
+        true
+    });
+}
+
+fn retain_top_level_except_floor_traps(module: &mut ir::Module, drop_it: impl Fn(&Stmt) -> bool) {
+    let traps = stack_floor_trap_positions(module);
+
+    if traps.is_empty() {
+        for line in &mut module.lines {
+            line.stmts.retain(|s| !drop_it(s));
+        }
+        return;
+    }
+    for (line_idx, line) in module.lines.iter_mut().enumerate() {
+        let mut idx = 0usize;
+        line.stmts.retain(|s| {
+            let here = idx;
+            idx += 1;
+            !drop_it(s) || traps.contains(&(line_idx, vec![here]))
+        });
+    }
 }
 
 /// Returns the set of line numbers that may be reached while
@@ -6886,6 +7408,7 @@ impl crate::visit::Visitor for ConstVarScanner {
                         },
                         _ => None,
                     };
+
                     entry.let_value = raw_value.and_then(|v| narrow_for_int_store(var, v));
                 }
             }
@@ -6951,6 +7474,7 @@ impl crate::visit::Visitor for ConstVarScanner {
                     self.mark_nonlet_write(v);
                 }
             }
+
             Stmt::Clr | Stmt::Run(_) => {
                 self.saw_var_reset = true;
             }
@@ -7155,7 +7679,7 @@ fn local_const_prop_stmts(
 
 fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_observable: bool) {
     match stmt {
-        Stmt::RaiseError(_) => {}
+        Stmt::RaiseError(_) | Stmt::Hang => {}
         Stmt::Let { value, .. } => local_const_expr(value, env),
         // Binding RHS: fold the sub-trees but leave an allocating outermost node alone when
         // `FRE` can see the heap.
@@ -7635,10 +8159,19 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_ob
         }
         Stmt::Cset { mode } => local_const_expr(mode, env),
         Stmt::Pause { ticks, .. } => local_const_expr(ticks, env),
-        Stmt::Sys { addr, regs, .. } => {
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             local_const_expr(addr, env);
             for r in regs {
                 local_const_expr(r, env);
+            }
+
+            for p in param_vars {
+                local_const_expr(&mut p.value, env);
             }
         }
         Stmt::Wait { addr, mask, eor } => {
@@ -7788,7 +8321,7 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_ob
 
 fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
     match stmt {
-        Stmt::RaiseError(_) => {}
+        Stmt::RaiseError(_) | Stmt::Hang => {}
         Stmt::Let { var, value } => {
             if var.kind != VarKind::String && expr_is_pure(value) {
                 if let Some(n) = local_expr_literal(value) {
@@ -8157,7 +8690,7 @@ fn local_effects(stmts: &[Stmt]) -> LocalEffects {
 
 fn local_note_effects(stmt: &Stmt, effects: &mut LocalEffects) {
     match stmt {
-        Stmt::RaiseError(_) => {}
+        Stmt::RaiseError(_) | Stmt::Hang => {}
         Stmt::Let { var, .. }
         | Stmt::LetStr { var, .. }
         | Stmt::Get { var, .. }
@@ -8558,6 +9091,7 @@ impl crate::visit::Visitor for ArrayPromoteFacts {
                     }
                 }
             }
+
             Stmt::Fetch {
                 target,
                 target_indices,
@@ -8584,15 +9118,17 @@ fn data_all_integer_i16(module: &ir::Module) -> bool {
         for stmt in &line.stmts {
             if let Stmt::Data(values) = stmt {
                 for value in values {
-                    if let ast::DataValue::Float(f) = value {
-                        any = true;
-                        if !f.is_finite()
-                            || f.fract() != 0.0
-                            || *f < i16::MIN as f64
-                            || *f > i16::MAX as f64
-                        {
-                            return false;
-                        }
+
+                    let Some(f) = crate::codegen::data_item_numeric_value(value) else {
+                        continue;
+                    };
+                    any = true;
+                    if !f.is_finite()
+                        || f.fract() != 0.0
+                        || f < i16::MIN as f64
+                        || f > i16::MAX as f64
+                    {
+                        return false;
                     }
                 }
             }
@@ -8782,20 +9318,7 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
         scalar_used,
         array_used,
     } = info;
-    // Disqualify any FOR-counter whose body contains constructs that
-    // would force the float-FOR fallback at codegen time. The float
-    // fallback uses MOVMF/MOVFM on V_<var> as a 5-byte FAC slot;
-    // when V_<var> is integer-promoted (1 or 2 bytes), MOVMF
-    // overshoots the slot and corrupts adjacent BSS — most visibly
-    // the loop's own end-value slot, so the counter ends up walking
-    // through random values.
-    //
-    // `IntForBodyAnalysis` does this same scan but runs LATE in the
-    // pipeline (after LoopInductionDetect / ArrayPtrInductionDetect)
-    // because it needs their annotations to compute the v_var-sync
-    // gate accurately. For our purposes (gating int-promotion) the
-    // simpler stmt-by-stmt scan is enough — false positives just
-    // leave a few more vars as Float, never miscompile.
+
     bad.extend(scan_for_counters_with_unsafe_body(module));
     // V2 IR shares VarName between scalar `A` and array `A()`, but at
     // codegen they're separate slots — promoting one to Integer flips
@@ -8827,19 +9350,47 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     }
 
     let for_counters = collect_for_counter_vars(module);
+    // Bounds for hand-rolled counters, from their loop-exit tests.
+    let mut guarded = guarded_counter_bounds(module);
+    let mut bounded_families = HashSet::new();
+    for (var, range) in bounded_accumulator_ranges(module) {
+        // Both are independent whole-program bounds.
+        if var.kind == VarKind::Float && range.fits_i16() {
+            bounded_families.insert(split_family_base(&var).to_owned());
+            guarded.entry(var).or_insert(range);
+        }
+    }
+
+    let trace = std::env::var("INTPROMOTE_DEBUG").is_ok();
+    if trace {
+        let mut seed: Vec<&str> = candidates.iter().map(|v| v.base.as_str()).collect();
+        seed.sort_unstable();
+        let mut badv: Vec<&str> = bad.iter().map(|v| v.base.as_str()).collect();
+        badv.sort_unstable();
+        badv.dedup();
+        eprintln!("[intpromote] seed candidates: {seed:?}");
+        eprintln!("[intpromote] disqualified before seeding: {badv:?}");
+    }
     loop {
         let mut to_drop: Vec<VarName> = Vec::new();
         for v in &candidates {
             let Some(values) = defs.get(v) else { continue };
             for value in values {
                 if !int_stayable(value, &candidates) {
+                    if trace {
+                        eprintln!(
+                            "[intpromote] DROP {} (not int-stayable: one definition is {:?})",
+                            v.base, value
+                        );
+                    }
                     to_drop.push(v.clone());
                     break;
                 }
             }
         }
         if to_drop.is_empty() {
-            to_drop = int_range_escapees(&defs, &candidates, &for_counters);
+
+            to_drop = int_range_escapees(&defs, &candidates, &for_counters, &guarded);
             if to_drop.is_empty() {
                 break;
             }
@@ -8886,10 +9437,27 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
             eprintln!("[intpromote] {} kind={:?} counts={c:?}", v.base, v.kind);
         }
     }
+
+    let mut family_prices: HashMap<&str, (u64, u64)> = HashMap::new();
+    for v in &candidates {
+        let c = counts.get(v).copied().unwrap_or_default();
+        let family = split_family_base(v);
+        let key = if bounded_families.contains(family) { family } else { &v.base };
+        let price = family_prices.entry(key).or_default();
+        price.0 += u64::from(c.for_var) * 8
+            + u64::from(c.for_bound) * 4
+            + u64::from(c.addr) * 4
+            + u64::from(c.index) * 3
+            + u64::from(c.arith) * 2
+            + u64::from(c.cond)
+            + u64::from(c.let_rhs);
+        price.1 += u64::from(c.print) * 4
+            + u64::from(c.transcend) * 6
+            + u64::from(c.print_arg);
+    }
     let drop_after_cost: Vec<VarName> = candidates
         .iter()
         .filter(|v| {
-            let c = counts.get(*v).copied().unwrap_or_default();
             // Per-role weights tuned against regression workloads +
             // bubble sort. `arith` and `cond` are net positive
             // when the var sits in a tight loop (each iteration
@@ -8904,14 +9472,9 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
             // Programs that score net-negative are typically
             // text-adventure dispatcher vars (one PRINT or VAL
             // dominating), which are correctly left float.
-            let benefit = c.for_var * 8
-                + c.for_bound * 4
-                + c.addr * 4
-                + c.index * 3
-                + c.arith * 2
-                + c.cond * 1
-                + c.let_rhs * 1;
-            let cost = c.print * 4 + c.transcend * 6 + c.print_arg * 1;
+            let family = split_family_base(v);
+            let key = if bounded_families.contains(family) { family } else { &v.base };
+            let (benefit, cost) = family_prices[key];
             benefit < cost
         })
         .cloned()
@@ -9256,10 +9819,19 @@ impl<'a> UseClassifier<'a> {
             }
             Stmt::ComputedGoto { target } => self.walk_expr(target, UseRole::Addr),
             Stmt::OnBranch { value, .. } => self.walk_expr(value, UseRole::Cond),
-            Stmt::Sys { addr, regs, .. } => {
+            Stmt::Sys {
+                addr,
+                regs,
+                param_vars,
+                ..
+            } => {
                 self.walk_expr(addr, UseRole::Addr);
                 for r in regs {
                     self.walk_expr(r, UseRole::Addr);
+                }
+                // FOUT wants the value in FAC, so this is an arithmetic use, not an address one.
+                for p in param_vars {
+                    self.walk_expr(&p.value, UseRole::Arith);
                 }
             }
             Stmt::Wait { addr, mask, eor } => {
@@ -9378,6 +9950,7 @@ impl crate::visit::Visitor for WriteCollector {
                 entry.push(end.clone());
                 entry.push(step.clone());
             }
+
             Stmt::Next { vars } => {
                 for v in vars.iter().flatten() {
                     self.note_scalar(v);
@@ -9438,6 +10011,7 @@ impl crate::visit::Visitor for WriteCollector {
                     self.note_array(&spec.name);
                 }
             }
+
             Stmt::Fetch {
                 target,
                 target_indices,
@@ -9510,6 +10084,176 @@ impl PromRange {
 /// Maximum interval-propagation rounds before treating a changing range as unbounded.
 const PROM_RANGE_ROUNDS: usize = 24;
 
+fn split_family_base(var: &VarName) -> &str {
+    var.base.rsplit_once("__")
+        .filter(|(base, suffix)| !base.is_empty() && !suffix.is_empty()
+            && suffix.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(var.base.as_str(), |(base, _)| base)
+}
+
+fn bounded_accumulator_ranges(module: &ir::Module) -> HashMap<VarName, PromRange> {
+    fn prove(module: &ir::Module) -> Option<HashMap<VarName, PromRange>> {
+        struct Safe(bool);
+        impl crate::visit::Visitor for Safe {
+            fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+                // Explicit allow-list: new control-flow or machine-code features do not silently gain an execution-count proof.
+                self.0 &= matches!(stmt,
+                    Stmt::Let { .. } | Stmt::LetStr { .. }
+                    | Stmt::ArrayLet { .. } | Stmt::ArrayLetStr { .. }
+                    | Stmt::Print { .. } | Stmt::Poke { .. } | Stmt::Dpoke { .. }
+                    | Stmt::For { .. } | Stmt::Next { .. }
+                    | Stmt::If { .. } | Stmt::IfElse { .. } | Stmt::Goto { .. }
+                    | Stmt::Read(_) | Stmt::Data(_) | Stmt::Restore | Stmt::Dim(_)
+                    | Stmt::Rem(_) | Stmt::End | Stmt::Stop | Stmt::LineMark(_));
+                if self.0 {
+                    crate::visit::walk_stmt(self, line, stmt);
+                }
+            }
+            fn visit_expr(&mut self, expr: &Expr) {
+                self.0 &= !matches!(expr, Expr::FnCall(..) | Expr::Usr(_));
+                if self.0 {
+                    crate::visit::walk_expr(self, expr);
+                }
+            }
+        }
+        let mut safe = Safe(true);
+        crate::visit::walk_module(&mut safe, module);
+        if !safe.0 { return None; }
+        let orphans = crate::for_next_runtime::analyze(module);
+        if orphans.needs_runtime_stack() { return None; }
+        let cfg = crate::cfg::Cfg::build_with(module, &orphans);
+        if cfg.nodes.len() > REGION_NODE_LIMIT { return None; }
+
+        fn literal(expr: &Expr) -> Option<i64> {
+            let value = match expr {
+                Expr::Number(n) => *n,
+                Expr::Neg(inner) => -literal(inner)? as f64,
+                _ => return None,
+            };
+            (value.is_finite() && value.fract() == 0.0
+                && (-32768.0..=32767.0).contains(&value)).then_some(value as i64)
+        }
+        let mut stack: Vec<(VarName, usize, i64)> = Vec::new();
+        let mut multiplier = 1i64;
+        let mut counts = vec![1i64; cfg.nodes.len()];
+        let mut back_edges = HashSet::new();
+        for (id, node) in cfg.nodes.iter().enumerate() {
+            let stmt = cfg.stmt_at(id, module);
+            counts[id] = multiplier;
+            match stmt {
+                Stmt::For { var, start, end, step, .. } => {
+                    if node.stmt.path.len() != 1
+                        || stack.iter().any(|(active, _, _)| active == var)
+                        || node.successors.as_slice() != [id + 1]
+                    { return None; }
+                    let (start, end, step) = (literal(start)?, literal(end)?, literal(step)?);
+                    if step == 0 { return None; }
+                    // BASIC's FOR is do-while: even reversed bounds run once.
+                    let distance = if step > 0 { end - start } else { start - end };
+                    let trips = if distance < 0 { 1 } else { distance / step.abs() + 1 };
+                    let exit = start.checked_add(trips.checked_mul(step)?)?;
+                    if !(i16::MIN as i64..=i16::MAX as i64).contains(&exit) { return None; }
+                    stack.push((var.clone(), id, multiplier));
+                    multiplier = multiplier.checked_mul(trips)?;
+                }
+                Stmt::Next { vars } => {
+                    if node.stmt.path.len() != 1 || vars.len() != 1 { return None; }
+                    let (var, header, previous) = stack.pop()?;
+                    if vars[0].as_ref().is_some_and(|v| v != &var)
+                        || !node.successors.contains(&(header + 1))
+                    { return None; }
+                    back_edges.insert((id, header + 1));
+                    multiplier = previous;
+                }
+                _ => {
+                    // A body assignment can extend a nominally bounded FOR forever.
+                    if stack.iter().any(|(v, _, _)| stmt_writes_var(stmt, v)) {
+                        return None;
+                    }
+                }
+            }
+        }
+        if !stack.is_empty() { return None; }
+        for (id, node) in cfg.nodes.iter().enumerate() {
+            if node.successors.iter().any(|&to| to <= id && !back_edges.contains(&(id, to))) {
+                return None;
+            }
+        }
+
+        #[derive(Default)]
+        struct Excursion {
+            names: HashSet<VarName>,
+            init_min: i64,
+            init_max: i64,
+            negative: i64,
+            positive: i64,
+            stepped: bool,
+            bad: bool,
+        }
+        let family_key = |v: &VarName| VarName {
+            base: split_family_base(v).to_owned(), kind: v.kind,
+        };
+        let mut families: HashMap<VarName, Excursion> = HashMap::new();
+        for (id, _) in cfg.nodes.iter().enumerate() {
+            let stmt = cfg.stmt_at(id, module);
+            let Stmt::Let { var, value } = stmt else {
+                for v in stmt_counter_defs(stmt) {
+                    families.entry(family_key(&v)).or_default().bad = true;
+                }
+                continue;
+            };
+            if var.kind == VarKind::String { continue; }
+            let family = split_family_base(var);
+            let entry = families.entry(family_key(var)).or_default();
+            entry.names.insert(var.clone());
+            if let Some(init) = literal(value) {
+                entry.init_min = entry.init_min.min(init);
+                entry.init_max = entry.init_max.max(init);
+                continue;
+            }
+            let same_family = |expr: &Expr| matches!(expr,
+                Expr::Var(v) if v.kind == var.kind && split_family_base(v) == family);
+            let step = match value {
+                Expr::Bin(BinOp::Add, l, r) if same_family(l) => literal(r),
+                Expr::Bin(BinOp::Add, l, r) if same_family(r) => literal(l),
+                Expr::Bin(BinOp::Sub, l, r) if same_family(l) => literal(r).map(|n| -n),
+                _ => None,
+            };
+            if let Some(step) = step {
+                let delta = step.checked_mul(counts[id])?;
+                entry.negative = entry.negative.checked_add(delta.min(0))?;
+                entry.positive = entry.positive.checked_add(delta.max(0))?;
+                entry.stepped = true;
+            } else {
+                entry.bad = true;
+            }
+        }
+        let mut out = HashMap::new();
+        for (_, family) in families {
+            if family.bad || !family.stepped { continue; }
+            let range = PromRange::new(
+                family.init_min.checked_add(family.negative)?,
+                family.init_max.checked_add(family.positive)?,
+            );
+            for name in family.names { out.insert(name, range); }
+        }
+        Some(out)
+    }
+    prove(module).unwrap_or_default()
+}
+
+/// Recheck the final IR, after promotion and the loop transforms.
+pub(crate) fn bounded_integer_accumulators(module: &ir::Module) -> HashSet<VarName> {
+    bounded_accumulator_ranges(module).into_iter()
+        .filter(|(v, range)| v.kind == VarKind::Integer && range.fits_i16())
+        .map(|(v, _)| v)
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "bounded_accumulator_tests.rs"]
+mod bounded_accumulator_tests;
+
 /// Every variable that some `FOR` header controls.
 fn collect_for_counter_vars(module: &ir::Module) -> HashSet<VarName> {
     use crate::visit::Visitor;
@@ -9536,6 +10280,7 @@ fn int_range_escapees(
     defs: &HashMap<VarName, Vec<Expr>>,
     candidates: &HashSet<VarName>,
     for_counters: &HashSet<VarName>,
+    guarded: &HashMap<VarName, PromRange>,
 ) -> Vec<VarName> {
     let mut ranges: HashMap<VarName, PromRange> = HashMap::new();
     let mut unstable: HashSet<VarName> = HashSet::new();
@@ -9563,7 +10308,10 @@ fn int_range_escapees(
                 Some(&old) => {
                     ranges.insert(v.clone(), old.join(next));
                     changed = true;
-                    if round == PROM_RANGE_ROUNDS && !for_counters.contains(v) {
+                    if round == PROM_RANGE_ROUNDS
+                        && !for_counters.contains(v)
+                        && !guarded.contains_key(v)
+                    {
                         unstable.insert(v.clone());
                     }
                 }
@@ -9580,12 +10328,442 @@ fn int_range_escapees(
     let mut out: Vec<VarName> = candidates
         .iter()
         .filter(|v| {
+
+            if let Some(b) = guarded.get(*v) {
+                return !b.fits_i16();
+            }
             unstable.contains(*v) || ranges.get(*v).is_some_and(|r| !r.fits_i16())
         })
         .cloned()
         .collect();
     out.sort_by_key(prom_sort_key);
+    // Gate-trace.
+    if std::env::var("INTPROMOTE_DEBUG").is_ok() {
+        for v in &out {
+            let why = if unstable.contains(v) {
+                format!(
+                    "unstable after {PROM_RANGE_ROUNDS} rounds (range still widening: \
+                     {:?}) -- unguarded self-recurrence",
+                    ranges.get(v)
+                )
+            } else {
+                format!("range {:?} leaves i16", ranges.get(v))
+            };
+            eprintln!("[intpromote] DROP {} (range-gate: {why})", v.base);
+        }
+    }
     out
+}
+
+const GUARD_WALK_LIMIT: usize = 8;
+/// Cap on the loop-region BFS, so a pathological CFG cannot make this analysis quadratic.
+const REGION_NODE_LIMIT: usize = 4096;
+/// Rounds of the bound fixpoint.
+const BOUND_ROUNDS: usize = 8;
+
+/// What a single write to a candidate does to it.
+enum CounterWrite {
+
+    Step { node: usize, k: i64 },
+    /// A write that does not read V, with a computable interval.
+    Init(PromRange),
+}
+
+fn guarded_counter_bounds(module: &ir::Module) -> HashMap<VarName, PromRange> {
+    let cfg = crate::cfg::Cfg::build(module);
+
+    let mut writes: HashMap<VarName, Vec<CounterWrite>> = HashMap::new();
+    let mut bad: HashSet<VarName> = HashSet::new();
+    let mut init_nodes: HashMap<VarName, HashSet<usize>> = HashMap::new();
+    for id in 0..cfg.nodes.len() {
+        let stmt = cfg.stmt_at(id, module);
+        if let Stmt::Let { var, value } = stmt {
+            if var.kind != VarKind::Float {
+                continue;
+            }
+            match classify_counter_write(var, value) {
+                Some(CounterWrite::Step { k, .. }) => {
+                    writes
+                        .entry(var.clone())
+                        .or_default()
+                        .push(CounterWrite::Step { node: id, k });
+                }
+                Some(CounterWrite::Init(r)) => {
+                    writes.entry(var.clone()).or_default().push(CounterWrite::Init(r));
+                    init_nodes.entry(var.clone()).or_default().insert(id);
+                }
+                None => {
+                    bad.insert(var.clone());
+                }
+            }
+            continue;
+        }
+        for v in stmt_counter_defs(stmt) {
+            bad.insert(v);
+        }
+    }
+
+    let mut proven: HashMap<VarName, PromRange> = HashMap::new();
+    for _ in 0..BOUND_ROUNDS {
+        let mut changed = false;
+        let mut names: Vec<&VarName> = writes.keys().filter(|v| !bad.contains(*v)).collect();
+        names.sort_by_key(|v| prom_sort_key(v));
+        for v in names {
+            if proven.contains_key(v) {
+                continue;
+            }
+            if let Some(r) = prove_counter_bound(module, &cfg, v, &writes[v], &init_nodes, &proven)
+            {
+                proven.insert(v.clone(), r);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    proven
+}
+
+/// Variables a non-LET statement writes, for the disqualification scan.
+fn stmt_counter_defs(stmt: &Stmt) -> Vec<VarName> {
+    let mut out = Vec::new();
+    match stmt {
+        Stmt::For { var, .. } => out.push(var.clone()),
+        Stmt::Get { indices, .. } if !indices.is_empty() => {}
+        Stmt::Get { var, .. } | Stmt::KeyGet { var } => out.push(var.clone()),
+        Stmt::GetFile { vars, .. } => out.extend(vars.iter().cloned()),
+        Stmt::Fetch { target, .. } => out.push(target.clone()),
+        Stmt::Read(targets) | Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+            for t in targets {
+                if let crate::ir::ReadTarget::Scalar(v) = t {
+                    out.push(v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn classify_counter_write(var: &VarName, value: &Expr) -> Option<CounterWrite> {
+    let as_step = |l: &Expr, r: &Expr, sign: i64| -> Option<i64> {
+        let is_self = matches!(l, Expr::Var(v) if v == var);
+        if !is_self {
+            return None;
+        }
+        let Expr::Number(n) = r else { return None };
+        if !n.is_finite() || n.fract() != 0.0 || *n == 0.0 || n.abs() > 1024.0 {
+            return None;
+        }
+        Some(sign * (*n as i64))
+    };
+    match value {
+        Expr::Bin(BinOp::Add, l, r) => {
+            if let Some(k) = as_step(l, r, 1).or_else(|| as_step(r, l, 1)) {
+                return Some(CounterWrite::Step { node: 0, k });
+            }
+        }
+        Expr::Bin(BinOp::Sub, l, r) => {
+            if let Some(k) = as_step(l, r, -1) {
+                return Some(CounterWrite::Step { node: 0, k });
+            }
+        }
+        _ => {}
+    }
+    if expr_reads_var_named(value, var) {
+
+        return None;
+    }
+    let r = prom_range_of(value, &HashSet::new(), &HashMap::new())?;
+    Some(CounterWrite::Init(r))
+}
+
+fn expr_reads_var_named(e: &Expr, var: &VarName) -> bool {
+    struct Look<'a> {
+        var: &'a VarName,
+        found: bool,
+    }
+    impl crate::visit::Visitor for Look<'_> {
+        fn visit_var_read(&mut self, v: &VarName) {
+            if v == self.var {
+                self.found = true;
+            }
+        }
+    }
+    let mut l = Look { var, found: false };
+    crate::visit::Visitor::visit_expr(&mut l, e);
+    l.found
+}
+
+/// Prove a bound for one candidate, or return `None`.
+fn prove_counter_bound(
+    module: &ir::Module,
+    cfg: &crate::cfg::Cfg,
+    var: &VarName,
+    writes: &[CounterWrite],
+    init_nodes: &HashMap<VarName, HashSet<usize>>,
+    proven: &HashMap<VarName, PromRange>,
+) -> Option<PromRange> {
+    let mut init: Option<PromRange> = None;
+    let mut steps: Vec<(usize, i64)> = Vec::new();
+    for w in writes {
+        match w {
+            CounterWrite::Step { node, k } => steps.push((*node, *k)),
+            CounterWrite::Init(r) => {
+                init = Some(match init {
+                    Some(a) => a.join(*r),
+                    None => *r,
+                })
+            }
+        }
+    }
+    if steps.is_empty() {
+        return None;
+    }
+    // A BASIC scalar reads as 0 before its first assignment, so an un-initialised counter still has a known starting value.
+    let init = init.unwrap_or_else(|| PromRange::new(0, 0));
+
+    let dir = steps[0].1.signum();
+    if steps.iter().any(|(_, k)| k.signum() != dir) {
+        return None;
+    }
+    let kmax = steps.iter().map(|(_, k)| k.abs()).max().unwrap_or(1);
+    let empty = HashSet::new();
+    let mut acc: Option<PromRange> = None;
+    for &(node, k) in &steps {
+        let (cont_op, b_expr) = guard_for_step(module, cfg, var, node, init_nodes)?;
+        let b = prom_range_of(b_expr, &empty, proven)?;
+        let bound = if matches!(cont_op, BinOp::Ne) {
+            // Equality exit.
+            if k.abs() != 1 {
+                return None;
+            }
+            if dir > 0 {
+                if init.max > b.min {
+                    return None;
+                }
+                PromRange::new(init.min, b.max)
+            } else {
+                if init.min < b.max {
+                    return None;
+                }
+                PromRange::new(b.min, init.max)
+            }
+        } else {
+            // Inequality exit.
+            match (dir > 0, cont_op) {
+                (true, BinOp::Lt | BinOp::Le) => {
+                    PromRange::new(init.min, b.max.saturating_add(kmax))
+                }
+                (false, BinOp::Gt | BinOp::Ge) => {
+                    PromRange::new(b.min.saturating_sub(kmax), init.max)
+                }
+                _ => return None,
+            }
+        };
+        acc = Some(match acc {
+            Some(a) => a.join(bound),
+            None => bound,
+        });
+    }
+    Some(acc?.join(init))
+}
+
+fn guard_for_step<'m>(
+    module: &'m ir::Module,
+    cfg: &crate::cfg::Cfg,
+    var: &VarName,
+    step_node: usize,
+    init_nodes: &HashMap<VarName, HashSet<usize>>,
+) -> Option<(BinOp, &'m Expr)> {
+    // Walk single-successor edges to the guard, checking on the way that nothing rewrites the counter before the test sees it.
+    let mut cur = step_node;
+    let mut hops = 0;
+    let guard_id = loop {
+        let succ = &cfg.nodes[cur].successors;
+        if succ.len() != 1 {
+            return None;
+        }
+        cur = succ[0];
+        hops += 1;
+        if hops > GUARD_WALK_LIMIT {
+            return None;
+        }
+        if matches!(cfg.stmt_at(cur, module), Stmt::If { .. }) && cfg.nodes[cur].successors.len() == 2
+        {
+            break cur;
+        }
+        // Any statement between the step and the guard that writes the counter breaks the induction.
+        if stmt_writes_var(cfg.stmt_at(cur, module), var) {
+            return None;
+        }
+    };
+    let Stmt::If { cond, then, .. } = cfg.stmt_at(guard_id, module) else {
+        return None;
+    };
+    // Only the `IF <cmp> THEN <line>` form.
+    let crate::ir::ThenIr::Goto(target) = then else {
+        return None;
+    };
+    let Expr::Bin(op, l, r) = cond else {
+        return None;
+    };
+    // Normalise to `V <op2> B`.
+    let (op2, b_expr): (BinOp, &Expr) = if matches!(l.as_ref(), Expr::Var(v) if v == var) {
+        (*op, r.as_ref())
+    } else if matches!(r.as_ref(), Expr::Var(v) if v == var) {
+        (mirror_relop(*op)?, l.as_ref())
+    } else {
+        return None;
+    };
+    if !matches!(
+        op2,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    ) {
+        return None;
+    }
+    // Identify the true edge by its target line.
+    let succs = &cfg.nodes[guard_id].successors;
+    let on_target: Vec<usize> = succs
+        .iter()
+        .copied()
+        .filter(|&s| cfg.nodes[s].line_no == *target)
+        .collect();
+    if on_target.len() != 1 {
+        return None;
+    }
+    let true_edge = on_target[0];
+    let false_edge = *succs.iter().find(|&&s| s != true_edge)?;
+
+    // Which edge continues the recurrence?
+    let empty = HashSet::new();
+    let inits = init_nodes.get(var).unwrap_or(&empty);
+    let t_reaches = region_reaches(cfg, true_edge, guard_id, inits, step_node);
+    let f_reaches = region_reaches(cfg, false_edge, guard_id, inits, step_node);
+    let (cont_edge, cont_is_true) = match (t_reaches, f_reaches) {
+        (Some(true), Some(false)) => (true_edge, true),
+        (Some(false), Some(true)) => (false_edge, false),
+        // Both continue: the guard does not exit the recurrence.
+        _ => return None,
+    };
+    // The bound has to hold still while the loop runs.
+    let b_vars = expr_var_set(b_expr);
+    if !b_vars.is_empty()
+        && region_writes_any(cfg, module, cont_edge, guard_id, inits, &b_vars)
+    {
+        return None;
+    }
+    let cont_op = if cont_is_true { op2 } else { negate_relop(op2) };
+    Some((cont_op, b_expr))
+}
+
+/// `a op b` rewritten as `b op' a`.
+fn mirror_relop(op: BinOp) -> Option<BinOp> {
+    Some(match op {
+        BinOp::Eq => BinOp::Eq,
+        BinOp::Ne => BinOp::Ne,
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        _ => return None,
+    })
+}
+
+fn negate_relop(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Eq => BinOp::Ne,
+        BinOp::Ne => BinOp::Eq,
+        BinOp::Lt => BinOp::Ge,
+        BinOp::Le => BinOp::Gt,
+        BinOp::Gt => BinOp::Le,
+        BinOp::Ge => BinOp::Lt,
+        other => other,
+    }
+}
+
+/// Can `start` reach `target` without passing through `stop` or any node in `skip`?
+fn region_reaches(
+    cfg: &crate::cfg::Cfg,
+    start: usize,
+    stop: usize,
+    skip: &HashSet<usize>,
+    target: usize,
+) -> Option<bool> {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut work = vec![start];
+    while let Some(n) = work.pop() {
+        if n == stop || skip.contains(&n) {
+            continue;
+        }
+        if !seen.insert(n) {
+            continue;
+        }
+        if seen.len() > REGION_NODE_LIMIT {
+            return None;
+        }
+        if n == target {
+            return Some(true);
+        }
+        work.extend(cfg.nodes[n].successors.iter().copied());
+    }
+    Some(false)
+}
+
+fn region_writes_any(
+    cfg: &crate::cfg::Cfg,
+    module: &ir::Module,
+    start: usize,
+    stop: usize,
+    skip: &HashSet<usize>,
+    vars: &HashSet<VarName>,
+) -> bool {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut work = vec![start];
+    while let Some(n) = work.pop() {
+        if n == stop || skip.contains(&n) {
+            continue;
+        }
+        if !seen.insert(n) {
+            continue;
+        }
+        if seen.len() > REGION_NODE_LIMIT {
+            // Could not finish the scan ; assume the worst.
+            return true;
+        }
+        let stmt = cfg.stmt_at(n, module);
+        if vars.iter().any(|v| stmt_writes_var(stmt, v)) {
+            return true;
+        }
+        work.extend(cfg.nodes[n].successors.iter().copied());
+    }
+    false
+}
+
+fn stmt_writes_var(stmt: &Stmt, var: &VarName) -> bool {
+    if let Stmt::Let { var: v, .. } = stmt
+        && v == var
+    {
+        return true;
+    }
+    stmt_counter_defs(stmt).iter().any(|v| v == var)
+}
+
+fn expr_var_set(e: &Expr) -> HashSet<VarName> {
+    struct Collect {
+        out: HashSet<VarName>,
+    }
+    impl crate::visit::Visitor for Collect {
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.out.insert(v.clone());
+        }
+    }
+    let mut c = Collect {
+        out: HashSet::new(),
+    };
+    crate::visit::Visitor::visit_expr(&mut c, e);
+    c.out
 }
 
 /// Stable variable order for interval propagation.
@@ -9673,6 +10851,7 @@ fn prom_range_of(
                 let hi = r.min.saturating_abs().max(r.max.saturating_abs());
                 PromRange::new(0, hi)
             }
+
             Func1::Int => prom_range_of(arg, candidates, ranges)?,
             Func1::Sgn => PromRange::new(-1, 1),
             _ => return None,
@@ -10252,10 +11431,18 @@ impl<'a> VarKindPromoter<'a> {
             }
             Stmt::Cset { mode } => self.rewrite_expr(mode),
             Stmt::Pause { ticks, .. } => self.rewrite_expr(ticks),
-            Stmt::Sys { addr, regs, .. } => {
+            Stmt::Sys {
+                addr,
+                regs,
+                param_vars,
+                ..
+            } => {
                 self.rewrite_expr(addr);
                 for r in regs {
                     self.rewrite_expr(r);
+                }
+                for p in param_vars {
+                    self.rewrite_expr(&mut p.value);
                 }
             }
             Stmt::Wait { addr, mask, eor } => {
@@ -10530,6 +11717,7 @@ fn resolve_bare_next_stmt(
 ) {
     match stmt {
         Stmt::For { var, .. } => {
+
             st.discard_same_var(var);
             st.for_stack.push(var.clone());
         }
@@ -10644,6 +11832,11 @@ impl ir::Pass for DeadStoreElim {
         // `str_is_pure` gate so the FRE return value doesn't change.
         let fre_observable = module_uses_fre(module);
 
+        let fretop_observable = module_reads_fretop(module);
+
+        // Positions where the statement being there at all is the observable effect ; see `stack_floor_trap_positions`.
+        let floor_traps = stack_floor_trap_positions(module);
+
         // For each top-level LET, find its CfgNode and check if the
         // var is live at the OUT side of that node. If not — and
         // the RHS is pure — mark the line+stmt for removal.
@@ -10653,6 +11846,7 @@ impl ir::Pass for DeadStoreElim {
             let drop = match stmt {
                 Stmt::Let { var, value } => {
                     let live_out = &live.per_node[id].1;
+
                     !live_out.contains(var)
                         && expr_is_pure(value)
                         && expr_cannot_trap(value)
@@ -10660,11 +11854,18 @@ impl ir::Pass for DeadStoreElim {
                 }
                 Stmt::LetStr { var, value } => {
                     let live_out = &live.per_node[id].1;
-                    !live_out.contains(var) && str_is_pure_for_dead_store(value, fre_observable)
+
+                    !live_out.contains(var)
+                        && str_store_cannot_trap(var)
+                        && str_is_pure_for_dead_store(value, fre_observable)
+                        && !(fretop_observable && is_str_self_assign(var, value))
                 }
                 _ => false,
             };
-            if drop {
+            if drop
+                && (floor_traps.is_empty()
+                    || !floor_traps.contains(&(node.stmt.line_idx, node.stmt.path.clone())))
+            {
                 to_remove.insert((node.stmt.line_idx, node.stmt.path.clone()));
             }
         }
@@ -10678,6 +11879,89 @@ impl ir::Pass for DeadStoreElim {
             drop_paths_in(&mut line.stmts, &[], line_idx, &to_remove);
         }
         Ok(())
+    }
+}
+
+/// Statement positions where evaluating anything at all is fatal, so deleting the statement deletes a `?OUT OF MEMORY`.
+fn stack_floor_trap_positions(module: &ir::Module) -> HashSet<(usize, Vec<usize>)> {
+    let mut out: HashSet<(usize, Vec<usize>)> = HashSet::new();
+    let mut depth = 0usize;
+    let mut path: Vec<usize> = Vec::new();
+    for (line_idx, line) in module.lines.iter().enumerate() {
+        walk_stack_floor(&line.stmts, &mut path, 0, line_idx, &mut depth, &mut out);
+        debug_assert!(path.is_empty());
+    }
+    out
+}
+
+/// One nesting level of [`stack_floor_trap_positions`].
+fn walk_stack_floor(
+    stmts: &[Stmt],
+    path: &mut Vec<usize>,
+    path_offset: usize,
+    line_idx: usize,
+    depth: &mut usize,
+    out: &mut HashSet<(usize, Vec<usize>)>,
+) {
+    for (i, stmt) in stmts.iter().enumerate() {
+        path.push(path_offset + i);
+
+        if *depth > crate::codegen::FOR_NEST_EXPR_MAX
+            && crate::codegen::stmt_evaluates_expression(stmt)
+        {
+            out.insert((line_idx, path.clone()));
+        }
+        match stmt {
+            Stmt::For { .. } => *depth += 1,
+            Stmt::Next { vars } => {
+                *depth = depth.saturating_sub(vars.len().max(1));
+            }
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => {
+                let before = *depth;
+                walk_stack_floor(inner, path, 0, line_idx, depth, out);
+                *depth = (*depth).max(before);
+            }
+            Stmt::IfElse {
+                then, else_then, ..
+            } => {
+                let before = *depth;
+                let then_len = then_branch_len(then);
+                walk_stack_floor_then(then, path, 0, line_idx, depth, out);
+                *depth = (*depth).max(before);
+                let after_then = *depth;
+                walk_stack_floor_then(else_then, path, then_len, line_idx, depth, out);
+                *depth = (*depth).max(after_then);
+            }
+            Stmt::Rcomp { then, else_then } => {
+                let before = *depth;
+                let then_len = then_branch_len(then);
+                walk_stack_floor_then(then, path, 0, line_idx, depth, out);
+                *depth = (*depth).max(before);
+                let after_then = *depth;
+                if let Some(else_then) = else_then {
+                    walk_stack_floor_then(else_then, path, then_len, line_idx, depth, out);
+                    *depth = (*depth).max(after_then);
+                }
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+}
+
+fn walk_stack_floor_then(
+    then: &ThenIr,
+    path: &mut Vec<usize>,
+    path_offset: usize,
+    line_idx: usize,
+    depth: &mut usize,
+    out: &mut HashSet<(usize, Vec<usize>)>,
+) {
+    if let ThenIr::Stmts(inner) = then {
+        walk_stack_floor(inner, path, path_offset, line_idx, depth, out);
     }
 }
 
@@ -10779,9 +12063,11 @@ pub(crate) fn expr_cannot_trap(e: &Expr) -> bool {
             },
             _ => false,
         },
+
         Expr::Func1(f, arg) => {
             matches!(f, Func1::Abs | Func1::Int | Func1::Sgn) && expr_cannot_trap(arg)
         }
+
         Expr::Peek(_) | Expr::MemPeek(_) => true,
         // String compare walks two descriptors byte by byte and drops -1/0 in FAC ($B02E).
         Expr::StrCompare(_, l, r) => str_is_pure(l) && str_is_pure(r),
@@ -10801,12 +12087,17 @@ fn int_store_cannot_trap(var: &VarName, value: &Expr) -> bool {
     expr_is_ayint_narrowed(value)
 }
 
+fn str_store_cannot_trap(var: &VarName) -> bool {
+    !(var.kind == VarKind::String && var.base == "TI")
+}
+
 pub(crate) fn expr_is_pure(e: &Expr) -> bool {
     match e {
         Expr::Number(n) => n.is_finite(),
         Expr::Var(_) => true,
         Expr::String(_) => true,
         Expr::Neg(inner) | Expr::Not(inner) => expr_is_pure(inner),
+
         Expr::Bin(op, l, r) => {
             matches!(
                 op,
@@ -10994,12 +12285,70 @@ fn module_uses_fre(module: &ir::Module) -> bool {
     f.found
 }
 
+pub(crate) fn is_str_self_assign(var: &VarName, value: &StrExpr) -> bool {
+    matches!(value, StrExpr::Var(_)) && var.kind == VarKind::String
+}
+
+/// True iff the module reads BASIC's FRETOP pair through a `PEEK` with a literal address ; `PEEK(51)` or `PEEK(52)`.
+pub(crate) fn module_reads_fretop(module: &ir::Module) -> bool {
+    struct FretopFinder {
+        found: bool,
+    }
+    impl crate::visit::Visitor for FretopFinder {
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Peek(arg) = e
+                && let Expr::Number(n) = &**arg
+                && (*n == f64::from(crate::runtime::FRETOP_LO)
+                    || *n == f64::from(crate::runtime::FRETOP_HI))
+            {
+                self.found = true;
+                return;
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut f = FretopFinder { found: false };
+    crate::visit::walk_module(&mut f, module);
+    f.found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{BinOp, VarKind, VarName};
     use crate::ir::Pass;
     use crate::ir::{ArrayInductionIndex, Expr, Line, Module, Stmt, ThenIr};
+
+    fn guarded_bounds_from_source(source: &str) -> HashMap<VarName, PromRange> {
+        let bytes = crate::tokenize_program(source).unwrap();
+        let prg = crate::prg::Program::parse(&bytes).unwrap();
+        let ast = crate::parse::program(&prg).unwrap();
+        guarded_counter_bounds(&crate::ir::lower(&ast).unwrap())
+    }
+
+    #[test]
+    fn guarded_counter_bounds_prove_both_bubble_inductions() {
+        let bounds = guarded_bounds_from_source(
+            "10 M=240\n20 M=M-1:IF M=0 THEN 80\n30 X=-1\n40 X=X+1:IF X=M THEN 20\n50 POKE 1024+X,1\n60 GOTO 40\n80 END\n",
+        );
+        let m = bounds.get(&fvar("M")).expect("down-counter bound");
+        let x = bounds.get(&fvar("X")).expect("inner up-counter bound");
+        assert_eq!((m.min, m.max), (0, 240));
+        assert_eq!((x.min, x.max), (-1, 240));
+    }
+
+    #[test]
+    fn guarded_counter_bounds_reject_equality_step_over_and_wrong_side() {
+        for (init, step) in [("M=240:X=1", 2), ("M=10:X=20", 1)] {
+            let source = format!("10 {init}\n20 X=X+{step}:IF X=M THEN 40\n25 IF X>300 THEN 40\n30 GOTO 20\n40 PRINT X\n");
+            let bounds = guarded_bounds_from_source(&source);
+            assert!(!bounds.contains_key(&fvar("X")), "{source}: {bounds:?}");
+        }
+    }
+
     #[test]
     fn fold_refuses_results_outside_the_mflpt_range() {
         assert_eq!(fold_bin(BinOp::Mul, 1e38, 1e38), None);
@@ -11219,6 +12568,7 @@ mod tests {
         IntArrayPromote.run(&mut m).unwrap();
         assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Integer));
     }
+
     #[test]
     fn int_array_promote_skips_array_with_percent_twin() {
         let mut m = Module {
@@ -11234,8 +12584,10 @@ mod tests {
             ],
         };
         IntArrayPromote.run(&mut m).unwrap();
+
         assert_eq!(array_let_kind_in(&m, "A"), Some(VarKind::Float));
     }
+
     #[test]
     fn int_array_promote_skips_array_with_fetch_percent_twin() {
         let mut m = Module {
@@ -11257,6 +12609,7 @@ mod tests {
         IntArrayPromote.run(&mut m).unwrap();
         assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Float));
     }
+
     #[test]
     fn int_array_promote_ignores_percent_scalar_twin() {
         let mut m = Module {
@@ -11536,6 +12889,7 @@ mod tests {
                 try_simplify_identity(&float_operand).is_none(),
                 "{op:?} with a float var must keep its AYINT narrowing"
             );
+
             let float_operand_rhs = Expr::Bin(
                 op,
                 Box::new(Expr::Number(lit)),
@@ -11545,6 +12899,7 @@ mod tests {
                 try_simplify_identity(&float_operand_rhs).is_none(),
                 "{op:?} with a float var on the right must keep its narrowing"
             );
+
             let out_of_range = Expr::Bin(
                 op,
                 Box::new(Expr::Number(40000.0)),
@@ -11556,6 +12911,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn identity_simplifier_still_drops_bitwise_ops_on_narrowed_operands() {
         for (op, lit) in [(BinOp::And, -1.0), (BinOp::Or, 0.0), (BinOp::Xor, 0.0)] {
@@ -11607,6 +12963,8 @@ mod tests {
         };
         let mut prog = AstProgram {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![
                 AstLine {
                     number: 10,
@@ -11692,6 +13050,8 @@ mod tests {
         let mut prog = AstProgram {
             lines,
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
         };
         crate::passes::inline_procs_ast(&mut prog);
         // None of the call sites should have been inlined.
@@ -11721,6 +13081,8 @@ mod tests {
         };
         let mut prog = AstProgram {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![
                 // Outside body — must NOT be mangled.
                 AstLine {
@@ -11787,6 +13149,8 @@ mod tests {
         };
         let mut prog = AstProgram {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![
                 AstLine {
                     number: 10,
@@ -11833,6 +13197,8 @@ mod tests {
         use crate::ast::{Line as AstLine, ProcName, Program as AstProgram, Statement as AstStmt};
         let mut prog = AstProgram {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![
                 AstLine {
                     number: 10,
@@ -12052,6 +13418,70 @@ mod tests {
         }
     }
 
+    /// A trampoline whose own target does not exist is not folded through: the `?UNDEF'D STATEMENT` belongs to the trampoline line.
+    #[test]
+    fn goto_chain_fold_stops_at_a_chain_that_ends_nowhere() {
+        let mut module = Module {
+            lines: vec![
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::OnBranch {
+                        value: Expr::Number(1.0),
+                        kind: crate::ast::OnBranchKind::Goto,
+                        targets: vec![6, 35],
+                    }],
+                },
+                Line {
+                    number: 35,
+                    stmts: vec![Stmt::Goto { target: 999 }],
+                },
+            ],
+        };
+        GotoChainFold.run(&mut module).unwrap();
+        match &module.lines[0].stmts[0] {
+            Stmt::OnBranch { targets, .. } => assert_eq!(
+                targets,
+                &[6, 35],
+                "a GOTO to a line that does not exist is a trap on line 35, \
+                 not a jump the caller may absorb"
+            ),
+            other => panic!("expected ON GOTO, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goto_chain_fold_still_folds_a_chain_that_lands_somewhere() {
+        let mut module = Module {
+            lines: vec![
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::OnBranch {
+                        value: Expr::Number(1.0),
+                        kind: crate::ast::OnBranchKind::Goto,
+                        targets: vec![35],
+                    }],
+                },
+                Line {
+                    number: 35,
+                    stmts: vec![Stmt::Goto { target: 40 }],
+                },
+                Line {
+                    number: 40,
+                    stmts: vec![Stmt::Goto { target: 50 }],
+                },
+                Line {
+                    number: 50,
+                    stmts: vec![Stmt::End],
+                },
+            ],
+        };
+        GotoChainFold.run(&mut module).unwrap();
+        match &module.lines[0].stmts[0] {
+            Stmt::OnBranch { targets, .. } => assert_eq!(targets, &[50]),
+            other => panic!("expected ON GOTO, got {other:?}"),
+        }
+    }
+
     #[test]
     fn gosub_single_use_inlines_isolated_return_tail() {
         let a = fvar("A");
@@ -12079,6 +13509,7 @@ mod tests {
         };
 
         GosubSingleUseInline.run(&mut module).unwrap();
+
         assert!(matches!(module.lines[0].stmts[0], Stmt::LineMark(100)));
         assert!(matches!(module.lines[0].stmts[1], Stmt::Let { .. }));
         assert!(matches!(module.lines[0].stmts[2], Stmt::LineMark(10)));
@@ -12125,6 +13556,7 @@ mod tests {
         };
 
         GosubShortBodyInline.run(&mut module).unwrap();
+
         for (idx, line_no) in [(0usize, 10), (1, 20)] {
             assert_eq!(module.lines[idx].number, line_no);
             assert!(
@@ -12543,6 +13975,52 @@ mod tests {
             .expect("module has a FOR")
     }
 
+    #[test]
+    fn unmatched_for_opaque_expressions_cannot_prove_counter_preservation() {
+        // The earlier predicate skipped DIM and ON GOSUB selectors, and PRINT AT/USE fields.
+        for call in [
+            Expr::FnCall(crate::ast::FnName("F".into()), Box::new(Expr::Number(1.0))),
+            Expr::Usr(Box::new(Expr::Number(1.0))),
+        ] {
+            let a = fvar("A");
+            let str_call = StrExpr::Str(Box::new(call.clone()));
+            let print = |p| Stmt::Print { items: vec![p], newline: true };
+            let cases = vec![
+                Stmt::Let { var: a.clone(), value: call.clone() },
+                Stmt::LetStr { var: a.clone(), value: str_call.clone() },
+                Stmt::ArrayLet { name: a.clone(), indices: vec![call.clone()], value: Expr::Number(0.0) },
+                Stmt::ArrayLet { name: a.clone(), indices: vec![Expr::Number(0.0)], value: call.clone() },
+                Stmt::ArrayLetStr { name: a.clone(), indices: vec![call.clone()], value: StrExpr::Literal(vec![]) },
+                Stmt::ArrayLetStr { name: a.clone(), indices: vec![Expr::Number(0.0)], value: str_call.clone() },
+                Stmt::Read(vec![ir::ReadTarget::Array { name: a.clone(), indices: vec![call.clone()] }]),
+                Stmt::Get { var: a.clone(), indices: vec![call.clone()] },
+                print(PrintPiece::Expr(call.clone())),
+                print(PrintPiece::CharOut(call.clone())),
+                print(PrintPiece::TabTo(call.clone())),
+                print(PrintPiece::Spc(call.clone())),
+                print(PrintPiece::StrExpr(str_call)),
+                print(PrintPiece::PositionAt(call.clone(), Expr::Number(0.0))),
+                print(PrintPiece::PositionAt(Expr::Number(0.0), call.clone())),
+                print(PrintPiece::UseField { width: 3, value: call.clone() }),
+                Stmt::If { cond: call.clone(), then: ThenIr::Goto(10) },
+                Stmt::IfElse { cond: call.clone(), then: ThenIr::Goto(10), else_then: ThenIr::Goto(20) },
+                Stmt::ComputedGoto { target: call.clone() },
+                Stmt::OnBranch { kind: OnBranchKind::Goto, value: call.clone(), targets: vec![10] },
+                Stmt::OnBranch { kind: OnBranchKind::GoSub, value: call.clone(), targets: vec![100] },
+                Stmt::Dim(vec![ir::DimSpec { name: a, dims: vec![call] }]),
+            ];
+            for stmt in cases {
+                let mut module = Module { lines: vec![
+                    Line { number: 10, stmts: vec![Stmt::Next { vars: vec![None] }] },
+                    Line { number: 20, stmts: vec![for_stmt(fvar("I"), 1.0, 3.0, 1.0), stmt.clone()] },
+                    Line { number: 100, stmts: vec![Stmt::Return] },
+                ] };
+                IntForBodyAnalysis.run(&mut module).unwrap();
+                assert!(!for_body_int_safe(&module), "opaque expression in {stmt:?}");
+            }
+        }
+    }
+
     /// `FOR I … : GOSUB 100 … : NEXT` where line 100 itself does
     /// `GOSUB 200`, and neither routine writes I. The interprocedural
     /// routine-write analysis should keep the body int-safe.
@@ -12680,6 +14158,90 @@ mod tests {
         crate::visit::MutVisitor::visit_expr_mut(&mut folder, &mut end);
         assert_eq!(expr_as_f64_literal(&start), Some(1024.0));
         assert_eq!(expr_as_f64_literal(&end), Some(1033.0));
+    }
+
+    fn fuses_with_value(lo: f64, hi: f64, value: Expr) -> bool {
+        let i = ivar("I");
+        let mut module = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![
+                    for_stmt(i.clone(), lo, hi, 1.0),
+                    Stmt::Poke {
+                        addr: Expr::Var(i.clone()),
+                        value,
+                    },
+                    Stmt::Next {
+                        vars: vec![Some(i.clone())],
+                    },
+                ],
+            }],
+        };
+        PokeLoopFusion.run(&mut module).unwrap();
+        let stmts = &module.lines[0].stmts;
+        match stmts.len() {
+            1 => matches!(stmts[0], Stmt::PokeFill { .. }),
+            3 => false,
+            n => panic!("unexpected statement count {n}"),
+        }
+    }
+
+    #[test]
+    fn poke_loop_fusion_skips_io_peek_value() {
+        assert!(
+            !fuses_with_value(
+                1024.0,
+                2023.0,
+                Expr::Peek(Box::new(Expr::Number(53266.0)))
+            ),
+            "a $D012 read must not be hoisted out of the fill"
+        );
+    }
+
+    #[test]
+    fn poke_loop_fusion_skips_value_peeking_into_the_fill_range() {
+        let value = Expr::Bin(
+            BinOp::Add,
+            Box::new(Expr::Peek(Box::new(Expr::Number(49500.0)))),
+            Box::new(Expr::Number(1.0)),
+        );
+        assert!(
+            !fuses_with_value(49152.0, 50151.0, value),
+            "a PEEK of an address inside the fill range must not be hoisted"
+        );
+    }
+
+    #[test]
+    fn poke_loop_fusion_skips_peek_outside_the_fill_range_too() {
+        assert!(
+            !fuses_with_value(
+                1024.0,
+                2023.0,
+                Expr::Peek(Box::new(Expr::Number(4096.0)))
+            ),
+            "the gate refuses every memory read in the value"
+        );
+    }
+
+    #[test]
+    fn poke_loop_fusion_still_fuses_a_literal_value() {
+        assert!(
+            fuses_with_value(1024.0, 2023.0, Expr::Number(81.0)),
+            "the ordinary constant fill must still fuse"
+        );
+    }
+
+    #[test]
+    fn poke_loop_fusion_still_fuses_a_variable_expression() {
+        let value = Expr::Bin(
+            BinOp::Mul,
+            Box::new(Expr::Var(fvar("V"))),
+            Box::new(Expr::Number(3.0)),
+        );
+        assert!(
+            fuses_with_value(49152.0, 50151.0, value),
+            "a pure scalar expression must still fuse"
+        );
     }
 
     #[test]
@@ -12942,6 +14504,175 @@ mod tests {
         );
     }
 
+    /// Generate nested FOR loops with one statement per BASIC line.
+    fn for_nest_module(n: usize, body: Vec<Stmt>) -> Module {
+        let mut lines = Vec::new();
+        let mut number = 10u16;
+        let names: Vec<VarName> = (0..n).map(|i| fvar(&format!("{}", (b'A' + i as u8) as char))).collect();
+        for v in &names {
+            lines.push(Line {
+                number,
+                stmts: vec![Stmt::For {
+                    var: v.clone(),
+                    start: Expr::Number(1.0),
+                    end: Expr::Number(1.0),
+                    step: Expr::Number(1.0),
+                    body_int_safe: false,
+                    body_reads_loop_var: true,
+                    induction_const: None,
+                    array_inductions: Vec::new(),
+                }],
+            });
+            number += 10;
+        }
+        lines.push(Line {
+            number,
+            stmts: body,
+        });
+        number += 10;
+        for v in names.iter().rev() {
+            lines.push(Line {
+                number,
+                stmts: vec![Stmt::Next {
+                    vars: vec![Some(v.clone())],
+                }],
+            });
+            number += 10;
+        }
+        Module { lines }
+    }
+
+    #[test]
+    fn the_page_one_ceiling_protects_only_positions_past_it() {
+        let body = vec![Stmt::Let {
+            var: fvar("Z"),
+            value: Expr::Number(1.0),
+        }];
+        let deep = for_nest_module(10, body.clone());
+        assert_eq!(
+            stack_floor_trap_positions(&deep),
+            [(10usize, vec![0usize])].into_iter().collect(),
+            "line index 10 is the `Z=1` line, sitting on ten live frames"
+        );
+        assert!(
+            stack_floor_trap_positions(&for_nest_module(9, body)).is_empty(),
+            "nine frames leave room for an expression — nothing to protect"
+        );
+    }
+
+    #[test]
+    fn const_var_prop_keeps_a_promoted_let_past_the_ceiling() {
+        let mut module = for_nest_module(
+            10,
+            vec![Stmt::Let {
+                var: fvar("Z"),
+                value: Expr::Number(1.0),
+            }],
+        );
+        run_const_var_prop(&mut module);
+        assert_eq!(
+            module.lines[10].stmts.len(),
+            1,
+            "the trap has to have a statement to sit in front of:\n{:#?}",
+            module.lines[10].stmts
+        );
+    }
+
+    #[test]
+    fn const_var_prop_still_drops_a_promoted_let_under_the_ceiling() {
+        let mut module = for_nest_module(
+            9,
+            vec![Stmt::Let {
+                var: fvar("Z"),
+                value: Expr::Number(1.0),
+            }],
+        );
+        run_const_var_prop(&mut module);
+        assert!(
+            module.lines[9].stmts.is_empty(),
+            "still droppable nine frames deep:\n{:#?}",
+            module.lines[9].stmts
+        );
+    }
+
+    #[test]
+    fn dead_store_elim_keeps_a_dead_store_past_the_ceiling() {
+        let z = fvar("Z");
+        let mut module = for_nest_module(
+            10,
+            vec![
+                Stmt::Let {
+                    var: z.clone(),
+                    value: Expr::Number(1.0),
+                },
+                Stmt::Let {
+                    var: z,
+                    value: Expr::Number(2.0),
+                },
+            ],
+        );
+        DeadStoreElim.run(&mut module).unwrap();
+        assert_eq!(
+            module.lines[10].stmts.len(),
+            2,
+            "both sit past the ceiling; the first is where the ROM stops:\n{:#?}",
+            module.lines[10].stmts
+        );
+    }
+
+    #[test]
+    fn dead_store_elim_keeps_the_ti_clock_write() {
+        let ti = svar("TI");
+        let a = svar("A");
+        let mut module = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![
+                    Stmt::LetStr {
+                        var: ti.clone(),
+                        value: crate::ir::StrExpr::Literal(b"000000".to_vec()),
+                    },
+                    Stmt::LetStr {
+                        var: a,
+                        value: crate::ir::StrExpr::Literal(b"000000".to_vec()),
+                    },
+                ],
+            }],
+        };
+        DeadStoreElim.run(&mut module).unwrap();
+        let kept: Vec<&VarName> = module.lines[0]
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::LetStr { var, .. } => Some(var),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![&ti],
+            "TI$ is the clock write and must stay; the ordinary A$ store \
+             next to it is genuinely dead and must go:\n{:#?}",
+            module.lines[0].stmts
+        );
+    }
+
+    #[test]
+    fn str_store_trap_guard_is_scoped_to_the_string_ti() {
+        assert!(
+            !str_store_cannot_trap(&svar("TI")),
+            "TI$ stores can trap and must block the drop"
+        );
+        assert!(
+            str_store_cannot_trap(&svar("TA")),
+            "an ordinary string var must stay droppable"
+        );
+        assert!(
+            str_store_cannot_trap(&fvar("TI")),
+            "the guard is about the string TI$, not the base"
+        );
+    }
+
     fn svar(base: &str) -> VarName {
         VarName {
             base: base.to_string(),
@@ -13069,23 +14800,21 @@ impl ir::Pass for SplitMultiTypeVars {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        let cfg = crate::cfg::Cfg::build(module);
-        let (writes_by_var, reads_by_var) = collect_var_io(module, &cfg);
-        // FOR/NEXT counters can't be split: the FOR-init write, the
-        // NEXT-step write, AND any body LET to the loop var all share
-        // one storage slot at runtime, and codegen pairs NEXT to FOR
-        // by name. A program that writes the loop var inside its own
-        // body (`120 FOR I=1 TO 5: 130 I=I+1: 140 NEXT I`) needs the
-        // body's write to land in the same slot the FOR reads from
-        // next iteration — splitting it would let the loop run with
-        // a stale counter. Conservatively skip any var that ever
-        // appears as a FOR counter or a NEXT-named counter.
+        let cfg = crate::cfg::Cfg::build(module);        let (writes_by_var, reads_by_var) = collect_var_io(module, &cfg);        // FOR/NEXT counters can't be split: the FOR-init write, the
+// NEXT-step write, AND any body LET to the loop var all share
+// one storage slot at runtime, and codegen pairs NEXT to FOR
+// by name. A program that writes the loop var inside its own
+// body (`120 FOR I=1 TO 5: 130 I=I+1: 140 NEXT I`) needs the
+// body's write to land in the same slot the FOR reads from
+// next iteration — splitting it would let the loop run with
+// a stale counter. Conservatively skip any var that ever
+// appears as a FOR counter or a NEXT-named counter.
         let mut skip: HashSet<VarName> = HashSet::new();
         for line in &module.lines {
             scan_skip_vars(&line.stmts, &mut skip);
         }
-        let mut rename_writes: HashMap<(VarName, usize), VarName> = HashMap::new();
-        let mut rename_reads: HashMap<(VarName, usize), VarName> = HashMap::new();
+
+        let mut candidates: Vec<(&VarName, &Vec<usize>, &Vec<usize>)> = Vec::new();
         for (var, writes) in &writes_by_var {
             if var.kind != VarKind::Float {
                 continue;
@@ -13106,25 +14835,23 @@ impl ir::Pass for SplitMultiTypeVars {
             let Some(reads) = reads_by_var.get(var) else {
                 continue;
             };
-            let writes_set: HashSet<usize> = writes.iter().copied().collect();
-            let reach = reaching_defs(&cfg, &writes_set);
+            candidates.push((var, writes, reads));
+        }
+        candidates.sort_by(|a, b| a.0.base.cmp(&b.0.base));
+        // ONE reaching-defs solve for every candidate at once.
+        let reach = reaching_defs(&cfg, &candidates);        let mut rename_writes: HashMap<(VarName, usize), VarName> = HashMap::new();
+        let mut rename_reads: HashMap<(VarName, usize), VarName> = HashMap::new();
+        for (var_slot, &(var, writes, reads)) in candidates.iter().enumerate() {
             // Each write starts as its own partition. Union by shared
             // reader: if a read sees writes {a, b}, union(a, b).
-            let mut idx_of_write: HashMap<usize, usize> = HashMap::new();
-            for (i, &w) in writes.iter().enumerate() {
-                idx_of_write.insert(w, i);
-            }
             let mut uf = UnionFind::new(writes.len());
             for &r in reads {
-                let Some(reaching) = reach.get(&r) else {
-                    continue;
-                };
-                let in_writes: Vec<usize> = reaching
-                    .iter()
-                    .filter_map(|w| idx_of_write.get(w).copied())
-                    .collect();
-                for i in 1..in_writes.len() {
-                    uf.union(in_writes[0], in_writes[i]);
+                let mut first: Option<usize> = None;
+                for w in reach.iter_in(r, var_slot) {
+                    match first {
+                        None => first = Some(w),
+                        Some(f) => uf.union(f, w),
+                    }
                 }
             }
             let partitions = uf.partitions();
@@ -13156,19 +14883,14 @@ impl ir::Pass for SplitMultiTypeVars {
                     let write_node = writes[write_local];
                     rename_writes.insert((var.clone(), write_node), new_var.clone());
                 }
-                let cluster_writes: HashSet<usize> =
-                    cluster.iter().map(|&i| writes[i]).collect();
+                let cluster_mask = reach.mask_of(var_slot, cluster);
                 for &r in reads {
-                    let Some(reaching) = reach.get(&r) else {
-                        continue;
-                    };
-                    if !reaching.is_disjoint(&cluster_writes) {
+                    if reach.intersects(r, &cluster_mask) {
                         rename_reads.insert((var.clone(), r), new_var.clone());
                     }
                 }
             }
-        }
-        if rename_writes.is_empty() && rename_reads.is_empty() {
+        }        if rename_writes.is_empty() && rename_reads.is_empty() {
             return Ok(());
         }
         apply_var_split_renames(module, &cfg, &rename_writes, &rename_reads);
@@ -13261,6 +14983,14 @@ fn scan_skip_vars(stmts: &[Stmt], skip: &mut HashSet<VarName>) {
                     skip.insert(v.clone());
                 }
             }
+
+            Stmt::Input { targets, .. } => {
+                for t in targets {
+                    if let crate::ir::ReadTarget::Scalar(v) = t {
+                        skip.insert(v.clone());
+                    }
+                }
+            }
             Stmt::DefFn { param, body, .. } => {
                 skip.insert(param.clone());
                 collect_expr_reads(body, skip);
@@ -13346,10 +15076,18 @@ fn collect_stmt_writes_reads(
             collect_expr_reads(addr, reads);
             collect_expr_reads(value, reads);
         }
-        Stmt::Sys { addr, regs, .. } => {
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             collect_expr_reads(addr, reads);
             for e in regs {
                 collect_expr_reads(e, reads);
+            }
+            for p in param_vars {
+                collect_expr_reads(&p.value, reads);
             }
         }
         Stmt::OnBranch { value, .. } => collect_expr_reads(value, reads),
@@ -13490,63 +15228,148 @@ fn collect_expr_reads_fallback(e: &Expr, reads: &mut HashSet<VarName>) {
     crate::visit::walk_expr(&mut r, e);
 }
 
-/// Forward reaching-defs for ONE variable. `writes` is the set of
-/// CFG node ids that write the var. Returns, per node, the set of
-/// writes that can reach it on entry (i.e. before executing the
-/// node's own write, if any).
-///
-/// A write GENs itself and KILLs every other write of the same var,
-/// so once a write executes, only that write is "live" downstream
-/// until the next assignment.
+/// Forward reaching definitions for every candidate variable at once, as one bitset per CFG node.
+struct ReachingDefs {
+    /// `u64` words per node.
+    words: usize,
+    /// `in`-sets, `words` entries per node, indexed by node id.
+    in_: Vec<u64>,
+    /// First bit owned by candidate `v`.
+    bit_base: Vec<usize>,
+}
+
+impl ReachingDefs {
+
+    fn iter_in(&self, node: usize, var_slot: usize) -> impl Iterator<Item = usize> + '_ {
+        let lo = self.bit_base[var_slot];
+        let hi = self.bit_base[var_slot + 1];
+        let base = node * self.words;
+        // Only the words this variable's run touches can contribute.
+        let (w0, w1) = (lo / 64, hi.div_ceil(64));
+        self.in_[base + w0..base + w1]
+            .iter()
+            .enumerate()
+            .flat_map(move |(i, &bits)| {
+                let w = w0 + i;
+                std::iter::successors((bits != 0).then_some(bits), |b| {
+                    let rest = b & (b - 1);
+                    (rest != 0).then_some(rest)
+                })
+                .map(move |b| w * 64 + b.trailing_zeros() as usize)
+            })
+            .filter(move |&bit| bit >= lo && bit < hi)
+            .map(move |bit| bit - lo)
+    }
+
+    fn mask_of(&self, var_slot: usize, locals: &[usize]) -> Vec<u64> {
+        let lo = self.bit_base[var_slot];
+        let mut mask = vec![0u64; self.words];
+        for &i in locals {
+            let bit = lo + i;
+            mask[bit / 64] |= 1u64 << (bit % 64);
+        }
+        mask
+    }
+
+    /// True when any write in `mask` reaches `node` on entry.
+    fn intersects(&self, node: usize, mask: &[u64]) -> bool {
+        let base = node * self.words;
+        self.in_[base..base + self.words]
+            .iter()
+            .zip(mask)
+            .any(|(a, b)| a & b != 0)
+    }
+}
+
+/// `candidates` is `(var, writes, reads)` per variable; only `writes` is read here.
 fn reaching_defs(
     cfg: &crate::cfg::Cfg,
-    writes: &HashSet<usize>,
-) -> HashMap<usize, HashSet<usize>> {
+    candidates: &[(&VarName, &Vec<usize>, &Vec<usize>)],
+) -> ReachingDefs {
     let n = cfg.nodes.len();
-    let mut in_: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    let mut out: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    let mut worklist: Vec<usize> = (0..n).collect();
-    let mut in_worklist: Vec<bool> = vec![true; n];
-    while let Some(node) = worklist.pop() {
-        in_worklist[node] = false;
-        let mut new_in: HashSet<usize> = HashSet::new();
-        for &pred in &cfg.nodes[node].predecessors {
-            for &w in &out[pred] {
-                new_in.insert(w);
+    // `bit_base[v] .. bit_base[v + 1]` is candidate `v`'s bit run; the extra trailing entry is the total bit count.
+    let mut bit_base: Vec<usize> = Vec::with_capacity(candidates.len() + 1);
+    let mut total = 0usize;
+    for (_, writes, _) in candidates {
+        bit_base.push(total);
+        total += writes.len();
+    }
+    bit_base.push(total);
+    let words = total.div_ceil(64).max(1);
+
+    // Per node: the bits it GENs, and the variables whose runs it KILLs.
+    let mut gen_bits: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut kill_slots: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (slot, (_, writes, _)) in candidates.iter().enumerate() {
+        for (k, &node) in writes.iter().enumerate() {
+            if node >= n {
+                continue;
             }
+            gen_bits[node].push((bit_base[slot] + k) as u32);
+            kill_slots[node].push(slot as u32);
         }
-        let mut new_out = if writes.contains(&node) {
-            let mut s = HashSet::new();
-            s.insert(node);
-            s
-        } else {
-            new_in.clone()
-        };
-        if writes.contains(&node) {
-            // GEN-set already in new_out; KILL is implicit because we
-            // discarded `new_in` and only keep this write.
-            let _ = &mut new_out;
+    }
+    // Kill masks are per variable and reused across nodes.
+    let mut kill_mask: Vec<Vec<u64>> = Vec::with_capacity(candidates.len());
+    for slot in 0..candidates.len() {
+        let mut m = vec![0u64; words];
+        for bit in bit_base[slot]..bit_base[slot + 1] {
+            m[bit / 64] |= 1u64 << (bit % 64);
         }
-        let in_changed = new_in != in_[node];
-        let out_changed = new_out != out[node];
-        in_[node] = new_in;
-        out[node] = new_out;
-        if out_changed || in_changed {
-            for &succ in &cfg.nodes[node].successors {
-                if !in_worklist[succ] {
-                    in_worklist[succ] = true;
-                    worklist.push(succ);
+        kill_mask.push(m);
+    }
+
+    let mut in_: Vec<u64> = vec![0; n * words];
+    let mut out: Vec<u64> = vec![0; n * words];
+    let mut scratch: Vec<u64> = vec![0; words];
+
+    let mut dirty: Vec<bool> = vec![true; n];
+    loop {
+        let mut any_changed = false;
+        for node in 0..n {
+            if !dirty[node] {
+                continue;
+            }
+            dirty[node] = false;
+            scratch.fill(0);
+            for &pred in &cfg.nodes[node].predecessors {
+                let pbase = pred * words;
+                for w in 0..words {
+                    scratch[w] |= out[pbase + w];
                 }
             }
+            let base = node * words;
+            if in_[base..base + words] != scratch[..] {
+                in_[base..base + words].copy_from_slice(&scratch);
+            }
+
+            for &slot in &kill_slots[node] {
+                let m = &kill_mask[slot as usize];
+                for w in 0..words {
+                    scratch[w] &= !m[w];
+                }
+            }
+            for &bit in &gen_bits[node] {
+                scratch[bit as usize / 64] |= 1u64 << (bit as usize % 64);
+            }
+            if out[base..base + words] != scratch[..] {
+                out[base..base + words].copy_from_slice(&scratch);
+                // Successors read `out` and nothing else, so a node whose `in` moved but whose `out` did not cannot change any of them.
+                for &succ in &cfg.nodes[node].successors {
+                    dirty[succ] = true;
+                }
+                any_changed = true;
+            }
+        }
+        if !any_changed {
+            break;
         }
     }
-    let mut result = HashMap::new();
-    for (i, s) in in_.into_iter().enumerate() {
-        if !s.is_empty() {
-            result.insert(i, s);
-        }
+    ReachingDefs {
+        words,
+        in_,
+        bit_base,
     }
-    result
 }
 
 /// Rewrite var references in the IR according to the per-(var, node)
@@ -13652,6 +15475,7 @@ fn rename_stmt(
                 }
             }
         }
+
         Stmt::Get { var, indices } if indices.is_empty() => {
             if let Some(new) = rename_writes.get(&(var.clone(), node_id)) {
                 *var = new.clone();
@@ -13748,10 +15572,18 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
             v.visit_expr_mut(addr);
             v.visit_expr_mut(value);
         }
-        Sys { addr, regs, .. } => {
+        Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             v.visit_expr_mut(addr);
             for e in regs {
                 v.visit_expr_mut(e);
+            }
+            for p in param_vars {
+                v.visit_expr_mut(&mut p.value);
             }
         }
         OnBranch { value, .. } => v.visit_expr_mut(value),

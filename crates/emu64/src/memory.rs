@@ -41,6 +41,14 @@ impl C64Mem {
         (ctrl & 0x04) == 0 && (ctrl & 0x02) != 0
     }
 
+    pub fn basic_mapped(&self) -> bool {
+        Self::basic_visible(self.port01())
+    }
+
+    pub fn kernal_mapped(&self) -> bool {
+        Self::kernal_visible(self.port01())
+    }
+
     pub fn read_byte(&self, addr: u16) -> u8 {
         let a = addr as usize;
         let ctrl = self.port01();

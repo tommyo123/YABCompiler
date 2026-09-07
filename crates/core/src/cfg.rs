@@ -338,6 +338,9 @@ impl<'a> Builder<'a> {
             let line_no = self.module.lines[line_idx].number;
             if let Some(&id) = self.line_first.get(&line_no) {
                 next_first = Some(id);
+            } else if let Some(after) = next_first {
+                // Empty lines remain valid branch targets.
+                self.line_first.insert(line_no, after);
             }
         }
     }
@@ -398,7 +401,7 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) => {
+            Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) | Stmt::Hang => {
                 // No fall-through. RETURN's edges to return-targets
                 // are added in a separate pass after construction.
             }
@@ -533,6 +536,7 @@ impl<'a> Builder<'a> {
                     };
                     if let Some(f) = frame {
                         if let Some(body) = f.body_start {
+
                             self.add_edge(node_id, body);
                         }
                     }
@@ -839,6 +843,7 @@ impl crate::analysis::Analysis for CfgBuild {
         "cfg"
     }
     fn run(&self, m: &Module, deps: &mut crate::analysis::Registry) -> Self::Output {
+
         let orphans = deps
             .get(m, &crate::for_next_runtime::ForNextModel)
             .clone();
@@ -1032,6 +1037,7 @@ mod tests {
             .get(&line)
             .unwrap_or_else(|| panic!("no node for line {line}"))
     }
+
     #[test]
     fn dispatched_next_edges_into_the_loop_it_can_select() {
         let m = Module {
@@ -1055,6 +1061,7 @@ mod tests {
              successors were {:?}",
             cfg.nodes[next].successors
         );
+
         assert!(cfg.nodes[body].predecessors.contains(&next));
     }
 
@@ -1088,6 +1095,7 @@ mod tests {
             "a static loop's NEXT has exactly a back-edge and an exit"
         );
     }
+
     #[test]
     fn reopened_loop_edges_back_to_the_surviving_frame() {
         // 10 FOR I=1 TO 2 / 20 FOR J=1 TO 2 / 30 FOR J=1 TO 1 40 NEXT / 50 NEXT / 60 END
@@ -1114,6 +1122,7 @@ mod tests {
              so it edges back to line 20 and forward to line 60"
         );
     }
+
     #[test]
     fn sequential_loops_on_one_variable_keep_their_own_edges() {
         // 10 FOR I=1 TO 2 / 20 NEXT / 30 FOR I=1 TO 2 / 40 NEXT / 50 END

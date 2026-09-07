@@ -92,6 +92,17 @@ pub const ST: u8 = 0x90;
 /// Print null-terminated PETSCII string at `.A` (lo) `.Y` (hi).
 pub const STROUT: u16 = 0xAB1E;
 
+/// `"?EXTRA IGNORED\r\0"` ; BASIC's own copy, at $ACFC-$AD0B, printed through [`STROUT`] by `$ACF4`.
+pub const MSG_EXTRA_IGNORED: u16 = 0xACFC;
+/// `"?REDO FROM START\r\0"` ; at $AD0C-$AD1D, printed by `$AB6B`.
+pub const MSG_REDO_FROM_START: u16 = 0xAD0C;
+
+/// BASIC routine that advances one PRINT gap column.
+pub const PRINT_GAP: u16 = 0xAB3B;
+
+/// Logical I/O channel number; zero selects the default device.
+pub const CHANNL: u8 = 0x13;
+
 // ---------- BASIC: float ↔ integer ----------
 /// Convert signed 16-bit (`.A` = HIGH byte, `.Y` = LOW byte) to FAC.
 /// Note: opposite register order from the FADD-style routines below.
@@ -104,6 +115,8 @@ pub const MOVFM: u16 = 0xBBA2;
 /// slightly cheaper internal entry but $BBD4 is the documented user
 /// entry and works identically for our purposes.
 pub const MOVMF: u16 = 0xBBD4;
+
+pub const FLOAT_ONE: u16 = 0xB9BC;
 
 // ---------- BASIC: float arithmetic taking memory operand at .A,.Y ----------
 //
@@ -121,6 +134,10 @@ pub const FADD: u16 = 0xB867;
 pub const FSUB: u16 = 0xB850;
 pub const FMULT: u16 = 0xBA28;
 pub const FDIV: u16 = 0xBB0F;
+
+pub const MUL10: u16 = 0xBAE2;
+
+pub const ADD_SIGNED_BYTE: u16 = 0xBD7E;
 
 /// Power. Convention is opposite of the four basic ops — there's no
 /// memory-operand entry in the ROM, so codegen explicitly loads
@@ -197,6 +214,17 @@ pub const BYTEFAC: u16 = 0xB3A2;
 /// implement `VAL(s$)` and the numeric variant of `INPUT`. Caller is
 /// responsible for setting `VALTYPE` ($0D) to 0 (numeric mode).
 pub const VAL_PARSE: u16 = 0xB7B5;
+
+/// ASCII-to-float conversion using TXTPTR and the current character.
+pub const FIN: u16 = 0xBCF3;
+
+/// CHRGOT ; re-fetch the character at `TXTPTR` without advancing, skipping spaces and setting Z when it is a statement terminator (NUL or `:`).
+pub const CHRGOT: u16 = 0x0079;
+
+/// TXTPTR ; the interpreter's text cursor, and the self-modified operand of the zero-page CHRGET routine.
+pub const TXTPTR_LO: u8 = 0x7A;
+pub const TXTPTR_HI: u8 = 0x7B;
+
 /// Zero-page pointer used by VAL and other parsing routines as the
 /// source-of-text address.
 pub const INDEX1_LO: u8 = 0x22;
@@ -222,6 +250,10 @@ pub const LNMX: u8 = 0xD5;
 /// current heap top.
 pub const MEMSIZ_LO: u8 = 0x37;
 pub const MEMSIZ_HI: u8 = 0x38;
+
+/// BASIC pointer to the bottom of string storage.
+pub const FRETOP_LO: u8 = 0x33;
+pub const FRETOP_HI: u8 = 0x34;
 
 // ---------- BASIC error vectors ----------
 //
@@ -250,6 +282,10 @@ pub const IERROR_VEC: u16 = 0x0300;
 pub const IERROR_ROM_HANDLER: u16 = 0xE38B;
 /// BAD SUBSCRIPT — raised when an array index is out of bounds.
 pub const ERR_BAD_SUBSCRIPT: u8 = 18;
+/// BASIC USR jump stub; its target occupies $0311/$0312.
+pub const USRPOK: u16 = 0x0310;
+/// The `$0311/$0312` value a cold start leaves behind ; see [`USRPOK`].
+pub const USR_DEFAULT_TARGET: u16 = 0xB248;
 /// ILLEGAL QUANTITY — raised when a value is outside its expected
 /// range (e.g., bad TI$ format, negative SQR, log of zero).
 pub const ERR_ILLEGAL_QUANTITY: u8 = 14;
@@ -270,8 +306,14 @@ pub const ERR_NEXT_WITHOUT_FOR: u8 = 10;
 pub const ERR_RETURN_WITHOUT_GOSUB: u8 = 12;
 /// READ has passed the last DATA item.
 pub const ERR_OUT_OF_DATA: u8 = 13;
+
+pub const ERR_BREAK: u8 = 0x1E;
 /// DIM targets an array that is already dimensioned.
 pub const ERR_REDIMD_ARRAY: u8 = 19;
+
+pub const ERR_FILE_DATA: u8 = 24;
+
+pub const ERR_SYNTAX: u8 = 11;
 /// A runtime value has the wrong numeric or string type.
 pub const ERR_TYPE_MISMATCH: u8 = 22;
 /// FN has no active definition.
@@ -298,11 +340,9 @@ pub const QINT_RESULT_LO: u8 = 0x65;
 pub const CURLIN_LO: u8 = 0x39;
 pub const CURLIN_HI: u8 = 0x3A;
 
-// ---------- Compiler-owned zero page ----------
-//
-// $FB–$FE are documented as "free for any purpose" in the C64 memory map
-// (no KERNAL or BASIC routine touches them). We split them between the
-// DATA pointer and a scratch slot used by array indexing.
+/// BASIC line number of the DATA statement currently being read.
+pub const ROM_DATLIN_LO: u8 = 0x3F;
+
 pub const DATA_PTR_LO: u8 = 0xFB;
 pub const DATA_PTR_HI: u8 = 0xFC;
 /// Scratch low byte for the runtime address of `A(i)`.

@@ -19,6 +19,10 @@ use crate::ir::{Expr, Module, ReadTarget, Stmt, StrExpr};
 pub trait Lattice: Clone + PartialEq {
     fn bottom() -> Self;
     fn join(&self, other: &Self) -> Self;
+    /// `self = self.join(other)`, given the chance to do it without rebuilding `self`.
+    fn join_into(&mut self, other: &Self) {
+        *self = self.join(other);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +188,7 @@ pub fn solve<D: DataflowAnalysis>(
                     if let Some(first) = preds.next() {
                         let mut acc = edge_out(&state, &per_succ_out, first, id);
                         for p in preds {
-                            acc = acc.join(&edge_out(&state, &per_succ_out, p, id));
+                            acc.join_into(&edge_out(&state, &per_succ_out, p, id));
                         }
                         acc
                     } else {
@@ -225,7 +229,7 @@ pub fn solve<D: DataflowAnalysis>(
                     if let Some(first) = succs.next() {
                         let mut acc = state[first].0.clone();
                         for s in succs {
-                            acc = acc.join(&state[s].0);
+                            acc.join_into(&state[s].0);
                         }
                         acc
                     } else {
@@ -261,6 +265,10 @@ impl Lattice for HashSet<VarName> {
         let mut out = self.clone();
         out.extend(other.iter().cloned());
         out
+    }
+    fn join_into(&mut self, other: &Self) {
+        // The accumulator already owns its storage; extending it is the whole union, with no second set to build and throw away.
+        self.extend(other.iter().cloned());
     }
 }
 
@@ -418,6 +426,18 @@ impl crate::analysis::Analysis for VarInterference {
         let live = deps.get(module, &LiveVars).clone();
         let cfg = deps.get(module, &crate::cfg::CfgBuild).clone();
         let mut graph = InterferenceGraph::default();
+        if module.has_on_key() || module.has_error_continuation() {
+            // A handler can interrupt every live range.
+            let fns = FnBodyReads::build(module);
+            let mut vars = HashSet::new();
+            for id in 0..cfg.nodes.len() {
+                let stmt = cfg.stmt_at(id, module);
+                vars.extend(stmt_defs(stmt));
+                vars.extend(stmt_uses(stmt, &fns));
+            }
+            graph.add_clique(&vars);
+            return graph;
+        }
         for (node_id, (live_in, live_out)) in live.per_node.iter().enumerate() {
             graph.add_clique(live_in);
             let defs = stmt_defs(cfg.stmt_at(node_id, module));
@@ -506,6 +526,9 @@ impl crate::analysis::Analysis for DefinedBeforeUse {
         "defined-before-use"
     }
     fn run(&self, module: &Module, deps: &mut crate::analysis::Registry) -> Self::Output {
+        if module.has_on_key() || module.has_error_continuation() {
+            return HashSet::new();
+        }
         let cfg = deps.get(module, &crate::cfg::CfgBuild).clone();
         let solved = solve(module, &cfg, &DefinedFlow);
         // A variable is "unsafe" if it is read at any node where it is
@@ -546,9 +569,13 @@ pub struct IntRange {
 }
 
 impl IntRange {
+
     pub fn new(min: i32, max: i32) -> Self {
-        debug_assert!(min <= max);
-        Self { min, max }
+        debug_assert!(min <= max, "empty IntRange [{min}, {max}]");
+        Self {
+            min: min.min(max),
+            max: max.max(min),
+        }
     }
 
     pub fn singleton(v: i32) -> Self {
@@ -717,6 +744,22 @@ impl crate::analysis::Analysis for NumericFactAnalysis {
     }
     fn run(&self, module: &Module, deps: &mut crate::analysis::Registry) -> Self::Output {
         let cfg = deps.get(module, &crate::cfg::CfgBuild).clone();
+        if module.has_on_key() || module.has_error_continuation() {
+            // Even an IF-refined or same-line value can change in a keyboard or error handler.
+            return NumericFactsResult {
+                per_node: vec![(NumericState::default(), NumericState::default()); cfg.nodes.len()],
+                node_by_stmt: cfg
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(id, node)| (node.stmt.clone(), id))
+                    .collect(),
+                shadow_int_vars: HashSet::new(),
+                shadow_int_read_counts: HashMap::new(),
+                shadow_only_vars: HashSet::new(),
+                shadow_unsigned_vars: HashSet::new(),
+            };
+        }
         let data_range = compute_data_range(module);
         let per_node = solve(module, &cfg, &NumericFactsFlow { data_range });
         let node_by_stmt = cfg
@@ -755,11 +798,7 @@ pub struct NumericFactsResult {
     /// codegen ZP allocator to pick the hottest candidates first
     /// when the pool is too small for every shadow.
     pub shadow_int_read_counts: HashMap<VarName, usize>,
-    /// Subset of `shadow_int_vars` whose reads are entirely in
-    /// int-context. For these, codegen can skip the V_var MOVMF
-    /// sync at every write — the shadow slot is the only
-    /// observable copy of the value. Saves ~150 cycles per write
-    /// in tight loops.
+    /// Subset of `shadow_int_vars` whose reads the cost model classifies as int-context.
     pub shadow_only_vars: HashSet<VarName>,
     /// Subset of `shadow_int_vars` whose value range doesn't fit
     /// `i16` (e.g. `UC=55296` for the C64 color-RAM base) but does
@@ -836,7 +875,7 @@ impl DataflowAnalysis for NumericFactsFlow {
     ) -> Self::Lattice {
         let stmt = cfg.stmt_at(node_id, module);
         let mut out = transfer_numeric_stmt(stmt, in_state, self.data_range);
-        apply_monotone_inc_loop_cap(&mut out, stmt, cfg, module, node, in_state);
+        apply_monotone_inc_loop_cap(&mut out, stmt, cfg, module, node, node_id, in_state);
         out
     }
 
@@ -1056,28 +1095,27 @@ fn compute_data_range(module: &Module) -> Option<IntRange> {
         for stmt in &line.stmts {
             if let Stmt::Data(values) = stmt {
                 for value in values {
-                    if let crate::ast::DataValue::Float(f) = value {
-                        if !f.is_finite() {
-                            return None;
-                        }
-                        // A fractional entry means a READ target can hold a non-integer, and an
-                        // `IntRange` claims the opposite.
-                        if *f != f.trunc() {
-                            return None;
-                        }
-                        let v = *f as i64;
-                        if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
-                            return None;
-                        }
-                        let v = v as i32;
-                        min = min.min(v);
-                        max = max.max(v);
-                        any = true;
+
+                    let Some(f) = crate::codegen::data_item_numeric_value(value) else {
+                        continue;
+                    };
+                    if !f.is_finite() {
+                        return None;
                     }
-                    // String DATA values are unreadable into numeric
-                    // targets at runtime (SYNTAX ERROR via __VAL_HELPER);
-                    // skipping them keeps the range sound for the
-                    // numeric-target case.
+                    // A fractional entry means a READ target can hold a non-integer, and an
+                    // `IntRange` claims the opposite.
+                    if f != f.trunc() {
+                        return None;
+                    }
+
+                    let v = f as i64;
+                    if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
+                        return None;
+                    }
+                    let v = v as i32;
+                    min = min.min(v);
+                    max = max.max(v);
+                    any = true;
                 }
             }
         }
@@ -1134,6 +1172,7 @@ fn transfer_numeric_stmt(
                 }
             }
         }
+
         Stmt::Get { indices, .. } if !indices.is_empty() => {}
         Stmt::Get { var, .. } | Stmt::KeyGet { var } => {
             // BASIC's `GET` to a numeric var routes through the
@@ -1369,6 +1408,7 @@ fn apply_monotone_inc_loop_cap(
     cfg: &Cfg,
     module: &Module,
     node: &CfgNode,
+    node_id: usize,
     in_state: &NumericState,
 ) {
     let Stmt::Let { var, value } = stmt else {
@@ -1429,9 +1469,57 @@ fn apply_monotone_inc_loop_cap(
     let Some(prev) = out.get(var) else {
         return;
     };
-    if prev.max > cap {
-        out.set(var.clone(), IntRange::new(prev.min, cap));
+    if prev.max <= cap {
+        return;
     }
+
+    if prev.min > cap {
+        return;
+    }
+    // Find the loop associated with the backward branch.
+    let region = natural_loop(cfg, node_id);
+
+    let other_vars = expr_vars(other);
+    for &n in &region {
+        if n == node_id {
+            continue;
+        }
+        for d in stmt_defs(cfg.stmt_at(n, module)) {
+            if &d == var || other_vars.contains(&d) {
+                return;
+            }
+        }
+    }
+    out.set(var.clone(), IntRange::new(prev.min, cap));
+}
+
+fn natural_loop(cfg: &Cfg, header: usize) -> HashSet<usize> {
+    let mut region: HashSet<usize> = HashSet::new();
+    region.insert(header);
+    let self_line = cfg.nodes[header].line_no;
+    let mut work: Vec<usize> = cfg.nodes[header]
+        .predecessors
+        .iter()
+        .copied()
+        .filter(|&p| cfg.nodes[p].line_no >= self_line)
+        .collect();
+    while let Some(n) = work.pop() {
+        if !region.insert(n) {
+            continue;
+        }
+        work.extend(cfg.nodes[n].predecessors.iter().copied());
+    }
+    region
+}
+
+/// Every scalar variable read by `e`.
+fn expr_vars(e: &Expr) -> HashSet<VarName> {
+    let mut c = UseCollector {
+        uses: Vec::new(),
+        fns: None,
+    };
+    crate::visit::Visitor::visit_expr(&mut c, e);
+    c.uses.into_iter().collect()
 }
 
 /// Widening thresholds for [`self_modify_step_range`]. Sorted
@@ -1721,6 +1809,7 @@ enum ShadowCtx {
 
 /// Bounds on the value a FOR loop variable holds *after* the loop exits.
 pub(crate) fn for_exit_range(start: IntRange, end: IntRange, step: IntRange) -> IntRange {
+
     let last_lo = start.min.min(end.min);
     let last_hi = start.max.max(end.max);
     IntRange::new(
@@ -1763,6 +1852,8 @@ fn compute_shadow_int_vars(
 
     let mut out = HashSet::new();
     let mut unsigned_out = HashSet::new();
+    let trace_shadow = std::env::var("SHADOW_DEBUG").is_ok();
+    let mut trace_writes: HashMap<VarName, Vec<String>> = HashMap::new();
     for (var, writes) in &info.writes {
         if var.kind != VarKind::Float || var.base == "TI" || var.base == "ST" {
             continue;
@@ -1808,6 +1899,16 @@ fn compute_shadow_int_vars(
             // would also blow past u16 unless we widen the analysis.
             let i16_ok = direct_i16 || self_step_ok || input_escape;
             let u16_ok = direct_u16 || self_step_ok || input_escape;
+            if trace_shadow {
+
+                trace_writes.entry(var.clone()).or_default().push(format!(
+                    "{}{}{}{}",
+                    if direct_i16 { "i16 " } else { "" },
+                    if direct_u16 && !direct_i16 { "u16 " } else { "" },
+                    if self_step_ok { "self-step " } else { "" },
+                    if input_escape { "input " } else { "" },
+                ));
+            }
             if !i16_ok {
                 all_i16 = false;
             }
@@ -1896,6 +1997,24 @@ fn compute_shadow_int_vars(
         .filter(|v| !info.fac_ctx_reads.contains_key(*v))
         .cloned()
         .collect();
+
+    if trace_shadow {
+        let mut names: Vec<&VarName> = info.writes.keys().collect();
+        names.sort_by_key(|v| v.base.clone());
+        for v in names {
+            eprintln!(
+                "[shadow] {} shadowed={} shadow_only={} int_ctx_reads={} \
+                 fac_ctx_reads={} writes={} admitted_by={:?}",
+                v.base,
+                out.contains(v),
+                shadow_only_vars.contains(v),
+                info.int_ctx_reads.get(v).copied().unwrap_or(0),
+                info.fac_ctx_reads.get(v).copied().unwrap_or(0),
+                info.writes.get(v).map_or(0, Vec::len),
+                trace_writes.get(v).map_or(&[][..], Vec::as_slice),
+            );
+        }
+    }
     (out, info.int_ctx_reads, shadow_only_vars, unsigned_out)
 }
 
@@ -2252,10 +2371,19 @@ fn collect_shadow_stmt(
             }
             collect_shadow_expr(ticks, ShadowCtx::Int, info);
         }
-        Stmt::Sys { addr, regs, .. } => {
+        Stmt::Sys {
+            addr,
+            regs,
+            param_vars,
+            ..
+        } => {
             collect_shadow_expr(addr, ShadowCtx::Int, info);
             for r in regs {
                 collect_shadow_expr(r, ShadowCtx::Int, info);
+            }
+
+            for p in param_vars {
+                collect_shadow_expr(&p.value, ShadowCtx::Float, info);
             }
         }
         Stmt::Wait { addr, mask, eor } => {
@@ -2664,6 +2792,16 @@ fn stmt_uses(stmt: &Stmt, fns: &FnBodyReads) -> Vec<VarName> {
             }
         }
     }
+    // `INPUT` is a conditional def.
+    if let Stmt::Input { targets, .. } = stmt {
+        for t in targets {
+            if let crate::ir::ReadTarget::Scalar(v) = t
+                && !collector.uses.contains(v)
+            {
+                collector.uses.push(v.clone());
+            }
+        }
+    }
     collector.uses
 }
 
@@ -2682,6 +2820,7 @@ impl<'a> crate::visit::Visitor for UseCollector<'a> {
     }
 
     fn visit_expr(&mut self, e: &Expr) {
+
         if let Expr::FnCall(name, _) = e
             && let Some(env) = self.fns
         {
@@ -2711,6 +2850,7 @@ impl FnBodyReads {
     }
 
     pub fn build(module: &Module) -> Self {
+
         let mut defs: Vec<DefFnBody> = Vec::new();
         let mut collector = DefFnBodyCollector { defs: &mut defs };
         for line in &module.lines {
@@ -2749,6 +2889,7 @@ impl FnBodyReads {
                 break;
             }
         }
+
         for v in per_fn.values_mut() {
             v.sort_by(|a, b| (a.base.as_str(), a.kind as u8).cmp(&(b.base.as_str(), b.kind as u8)));
         }
@@ -3146,6 +3287,7 @@ mod tests {
 
     #[test]
     fn interference_covers_a_def_that_is_never_read() {
+
         let a = ivar("A");
         let b = ivar("B");
         let m = Module {
@@ -3187,6 +3329,7 @@ mod tests {
 
     #[test]
     fn interference_lets_a_def_reuse_the_slot_of_a_value_it_reads() {
+
         let a = ivar("A");
         let b = ivar("B");
         let m = Module {

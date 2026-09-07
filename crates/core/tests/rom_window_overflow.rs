@@ -53,6 +53,7 @@ fn first_refused_items() -> usize {
     }
     hi
 }
+
 #[test]
 fn the_forced_off_layout_stops_at_memsiz() {
     let first_bad = first_refused_items();
@@ -72,27 +73,44 @@ fn the_forced_off_layout_stops_at_memsiz() {
         "the refusal must name the ROM window, got: {err}"
     );
 }
+
+/// Decode the `$FFD2` stream the way the machine renders it.
+fn rendered(output: &[u8]) -> String {
+    output
+        .iter()
+        .filter_map(|&b| match b {
+            0x0d => Some('\n'),
+            0x1d => Some(' '),
+            0x20..=0x5a => Some(b as char),
+            0xc1..=0xda => Some((b - 0x80) as char),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn the_auto_predictor_never_ships_a_wrong_image() {
     let first_bad = first_refused_items();
+    let mut shipped = 0;
     for items in [first_bad - 1, first_bad, first_bad + 1] {
         let Ok((end, prg)) = build(&padded(items), CompileOptions::default()) else {
             continue; // Rejected layouts produce no image.
         };
+        shipped += 1;
         let r = emu64::run_prg_to_end(&prg, 80_000_000).expect("runs");
-        let out: String = r
-            .output
-            .iter()
-            .filter_map(|&b| match b {
-                0x0d => Some('\n'),
-                0x20..=0x5a => Some(b as char),
-                0xc1..=0xda => Some((b - 0x80) as char),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(out, " 11  22  33 \n", "items={items} end=${end:04X}");
+        assert_eq!(
+            rendered(&r.output),
+            " 11  22  33 \n",
+            "items={items} end=${end:04X}"
+        );
+        assert!(r.clean_exit, "items={items} end=${end:04X}");
     }
+    assert!(
+        shipped > 0,
+        "the auto predictor refused every size, so this test checked nothing"
+    );
 }
+
 #[test]
 fn images_below_the_window_are_untouched() {
     // Land the image around $9E00-$9F00, well inside the legal range but past the point where a
@@ -119,15 +137,47 @@ fn images_below_the_window_are_untouched() {
         assert!(r.clean_exit, "items={items} end=${end:04X}");
     }
 }
-#[test]
-fn the_extraram_layout_still_has_its_data_ceiling() {
-    let opts = CompileOptions {
+
+fn forced_on() -> CompileOptions {
+    CompileOptions {
         extraram: true,
         ..Default::default()
-    };
-    let err = build(&padded(20_000), opts).expect_err("must be refused");
+    }
+}
+
+#[test]
+fn the_extraram_layout_still_has_its_data_ceiling() {
+    let err = build(&padded(20_000), forced_on()).expect_err("must be refused");
     assert!(
-        err.contains("$9F00") || err.contains("9F00"),
+        err.contains("$A000"),
         "expected the data-ceiling message, got: {err}"
     );
+}
+
+#[test]
+fn the_extraram_data_ceiling_is_the_rom_window_and_not_a_page_below_it() {
+    // Bisect on the largest forced-on build the ceiling accepts.
+    let (mut lo, mut hi) = (1usize, 20_000usize);
+    assert!(build(&padded(lo), forced_on()).is_ok());
+    assert!(build(&padded(hi), forced_on()).is_err());
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if build(&padded(mid), forced_on()).is_ok() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let err = build(&padded(hi), forced_on()).expect_err("one step up is refused");
+    assert!(err.contains("$A000"), "{err}");
+
+    let (_, prg) = build(&padded(lo), forced_on()).expect("one step down builds");
+    let r = emu64::run_prg_to_end(&prg, 80_000_000).expect("runs");
+    assert_eq!(rendered(&r.output), " 11  22  33 \n");
+    assert!(r.clean_exit);
+    let (_, prg_margin) = build(&padded(lo - 100), forced_on()).expect("inside the old margin");
+    let r = emu64::run_prg_to_end(&prg_margin, 80_000_000).expect("runs");
+    assert_eq!(rendered(&r.output), " 11  22  33 \n");
+    assert!(r.clean_exit);
 }

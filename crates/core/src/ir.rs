@@ -32,9 +32,79 @@ pub struct DimSpec {
     pub dims: Vec<Expr>,
 }
 
+/// One variable reference inside a `SYS`'s parameter text, lifted out of the raw bytes so the rest of the compiler sees it as the read it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SysParamVar {
+    /// Byte offset within `Stmt::Sys::params` of the reference this replaces.
+    pub start: usize,
+    /// Its length in bytes.
+    pub len: usize,
+    /// Numeric reads render through FOUT into staged text.
+    pub value: Expr,
+    /// The source read compiled string storage.
+    pub requires_string_bridge: bool,
+}
+
+fn sys_value_reads_string(value: &Expr) -> bool {
+    struct Find(bool);
+    impl crate::visit::Visitor for Find {
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.0 |= v.kind == ast::VarKind::String;
+        }
+        fn visit_str_expr(&mut self, _: &StrExpr) { self.0 = true; }
+        fn visit_expr(&mut self, e: &Expr) {
+            if matches!(e, Expr::String(_))
+                || matches!(e, Expr::ArrayRef(v, _) if v.kind == ast::VarKind::String)
+            {
+                self.0 = true;
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut find = Find(false);
+    crate::visit::Visitor::visit_expr(&mut find, value);
+    find.0
+}
+
 #[derive(Debug, Clone)]
 pub struct Module {
     pub lines: Vec<Line>,
+}
+
+impl Module {
+
+    pub fn has_error_continuation(&self) -> bool {
+        struct Find(bool);
+        impl crate::visit::Visitor for Find {
+            fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+                if matches!(stmt, Stmt::OnError { .. } | Stmt::Resume { .. }) {
+                    self.0 = true;
+                } else if !self.0 {
+                    crate::visit::walk_stmt(self, line, stmt);
+                }
+            }
+        }
+        let mut find = Find(false);
+        crate::visit::walk_module(&mut find, self);
+        find.0
+    }
+
+    /// Keyboard handlers may read or change program state before any statement.
+    pub fn has_on_key(&self) -> bool {
+        struct Find(bool);
+        impl crate::visit::Visitor for Find {
+            fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+                if matches!(stmt, Stmt::OnKey { .. }) {
+                    self.0 = true;
+                } else if !self.0 {
+                    crate::visit::walk_stmt(self, line, stmt);
+                }
+            }
+        }
+        let mut find = Find(false);
+        crate::visit::walk_module(&mut find, self);
+        find.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +243,8 @@ pub enum Stmt {
     Stop,
     /// Raise a BASIC ROM error and stop.
     RaiseError(u8),
+    /// A reached bare `CONT`: stop dead, silently.
+    Hang,
     /// `RUN [line]` — restart the program. See
     /// `ast::Statement::Run`.
     Run(Option<u16>),
@@ -529,6 +601,8 @@ pub enum Stmt {
         /// Raw tokenised BASIC bytes that followed the address — see
         /// [`crate::ast::Statement::Sys::params`]. Empty for plain SYS.
         params: Vec<u8>,
+        /// The variable references inside `params` that codegen will replace with their values.
+        param_vars: Vec<SysParamVar>,
     },
     Wait {
         addr: Expr,
@@ -918,27 +992,15 @@ fn lower_stmt(
         },
         ast::Statement::ProcDef(_) => Stmt::Rem(Vec::new()),
         ast::Statement::ProcCall(name) => {
-            // Real BASIC v2 listings (KingTut'sTomb, RenegadeF-16,
-            // Snake.Wolf, …) often have a stray bare identifier
-            // tail or a corrupt PROC-name fragment that's never
-            // executed at runtime. Rejecting at compile time blocks
-            // the whole program over dead text. Drop unresolved
-            // calls to a Rem so the surrounding code still compiles
-            // — anything that actually flows here would have hit
-            // `?UNDEF'D STATEMENT` in the interpreter too.
+            // A bare identifier that no `PROC` header defines is not a call ; it is a statement BASIC v2 cannot execute.
             match proc_targets.get(name).copied() {
                 Some(target) => Stmt::GoSub { target },
-                None => Stmt::Rem(Vec::new()),
+                None if name.0.first() == Some(&b'.') => Stmt::Rem(Vec::new()),
+                None => Stmt::RaiseError(crate::runtime::ERR_SYNTAX),
             }
         }
         ast::Statement::ProcTailCall(name) => {
-            // `CALL name`: tail jump to the proc body. The
-            // proc's `END PROC` returns to whatever called the
-            // CURRENT proc, not to the statement after the CALL.
-            // Lower to Goto so codegen emits JMP (not JSR) — the
-            // current frame stays in place and the proc's RTS pops
-            // the original return address. Same fallback as the
-            // EXEC path for unresolved names.
+            // `CALL name`: tail jump to the proc body.
             match proc_targets.get(name).copied() {
                 Some(target) => Stmt::Goto { target },
                 None => Stmt::Rem(Vec::new()),
@@ -975,6 +1037,7 @@ fn lower_stmt(
         ast::Statement::End => Stmt::End,
         ast::Statement::Stop => Stmt::Stop,
         ast::Statement::RaiseError(n) => Stmt::RaiseError(*n),
+        ast::Statement::Hang => Stmt::Hang,
         ast::Statement::Run(line) => Stmt::Run(*line),
         ast::Statement::Clr => Stmt::Clr,
         ast::Statement::Poke { addr, value } => Stmt::Poke {
@@ -1423,10 +1486,24 @@ fn lower_stmt(
             addr,
             regs,
             params,
+            param_refs,
         } => Stmt::Sys {
             addr: lower_expr(addr),
             regs: regs.iter().map(lower_expr).collect(),
             params: params.clone(),
+
+            param_vars: param_refs
+                .iter()
+                .map(|r| {
+                    let value = lower_expr(&r.value);
+                    SysParamVar {
+                        start: r.start,
+                        len: r.len,
+                        requires_string_bridge: sys_value_reads_string(&value),
+                        value,
+                    }
+                })
+                .collect(),
         },
         ast::Statement::Wait { addr, mask, eor } => Stmt::Wait {
             addr: lower_expr(addr),
@@ -1787,6 +1864,8 @@ mod tests {
         let s = fvar("S");
         let prog = ast::Program {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![ast::Line {
                 number: 10,
                 statements: vec![ast::Statement::For {
@@ -1813,6 +1892,8 @@ mod tests {
         let name = svar("NAME");
         let prog = ast::Program {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![
                 ast::Line {
                     number: 10,
@@ -1852,6 +1933,8 @@ mod tests {
         let proc = ast::ProcName(b"WORK".to_vec());
         let prog = ast::Program {
             skipped: Vec::new(),
+            traps: Vec::new(),
+            deferred_fn_bodies: Vec::new(),
             lines: vec![
                 ast::Line {
                     number: 10,

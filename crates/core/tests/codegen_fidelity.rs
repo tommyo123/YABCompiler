@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -28,6 +26,7 @@ fn compile_err(src: &str) -> String {
         Err(e) => e.to_string(),
     }
 }
+
 fn raw_output(src: &str) -> Vec<u8> {
     let prg = common::compile_source(src).expect("compiles");
     emu64::run_prg_to_end(&prg, MAX_INSNS)
@@ -39,6 +38,7 @@ fn text_output(src: &str) -> String {
     let prg = common::compile_source(src).expect("compiles");
     common::run_clean(&prg).unwrap_or_else(|| panic!("reaches a clean exit:\n{src}"))
 }
+
 fn screen_bytes(src: &str) -> [u8; 1000] {
     let prg = common::compile_source(src).expect("compiles");
     emu64::run_prg_to_end(&prg, MAX_INSNS)
@@ -57,6 +57,7 @@ fn print_number_advances_with_cursor_right_not_a_space() {
         "PRINT 1;2 must emit <sp>1<crsr-right><sp>2<crsr-right><cr>"
     );
 }
+
 #[test]
 fn print_number_does_not_erase_the_column_it_skips() {
     // All three profiles share `__PRINT_FAC`; assert on each so a profile-specific copy cannot
@@ -69,15 +70,22 @@ fn print_number_does_not_erase_the_column_it_skips() {
             .expect("__PRINT_FAC is emitted");
         let tail: String = body.lines().take(6).collect::<Vec<_>>().join("\n");
         assert!(
-            tail.contains("LDA #$1D"),
-            "{profile:?}: __PRINT_FAC must advance with cursor-right:\n{tail}"
+            tail.contains("JMP $AB3B"),
+            "{profile:?}: __PRINT_FAC must advance through the ROM gap \
+             routine, which is cursor-right on the screen:\n{tail}"
         );
         assert!(
             !tail.contains("LDA #$20"),
-            "{profile:?}: __PRINT_FAC must not write a space:\n{tail}"
+            "{profile:?}: __PRINT_FAC must not hard-code a space:\n{tail}"
+        );
+        assert!(
+            !tail.contains("LDA #$1D"),
+            "{profile:?}: __PRINT_FAC must not hard-code cursor-right \
+             either — that is the channel-blind form:\n{tail}"
         );
     }
 }
+
 #[test]
 fn adjacent_printed_numbers_are_still_separated() {
     assert_eq!(text_output("10 PRINT 1;2;3\n"), " 1  2  3 \n");
@@ -92,6 +100,7 @@ fn fused_poke_loop_runs_its_body_once_on_an_empty_range() {
     assert_eq!(screen[1], 7, "the single mandatory iteration must POKE 1025");
     assert_eq!(screen[0], 0, "and must not POKE 1024");
 }
+
 #[test]
 fn fused_poke_loop_runs_once_with_computed_endpoints() {
     let src = "10 POKE 1024,0:POKE 1025,0\n\
@@ -117,6 +126,7 @@ fn fused_poke_loop_leaves_the_loop_variable_at_its_basic_exit_value() {
         "normal range: BASIC ends at end+1"
     );
 }
+
 #[test]
 fn clear_screen_idiom_still_fuses_with_no_writeback() {
     let asm = asm_of("10 FOR I=0 TO 999:POKE 1024+I,32:NEXT\n20 PRINT \"X\"\n");
@@ -126,6 +136,7 @@ fn clear_screen_idiom_still_fuses_with_no_writeback() {
         "and the FOR/NEXT pair is gone:\n{asm}"
     );
 }
+
 #[test]
 fn fused_poke_loop_still_fills_the_whole_range() {
     let screen = screen_bytes("10 FOR I=1024 TO 1033:POKE I,5:NEXT\n");
@@ -146,6 +157,7 @@ fn prefixing_a_heap_string_with_a_literal_keeps_the_string() {
                40 PRINT S$\n";
     assert_eq!(text_output(src), "07\n");
 }
+
 #[test]
 fn zero_padded_money_formatting_is_exact() {
     let src = "10 C=7\n\
@@ -154,6 +166,7 @@ fn zero_padded_money_formatting_is_exact() {
                40 PRINT \"0.\";S$\n";
     assert_eq!(text_output(src), "0.07\n");
 }
+
 #[test]
 fn in_place_append_still_rewinds_the_heap() {
     let src = "10 S$=CHR$(65)\n\
@@ -166,6 +179,7 @@ fn in_place_append_still_rewinds_the_heap() {
     );
     assert_eq!(text_output(src), "ABBB\n");
 }
+
 #[test]
 fn slicing_a_string_into_itself_is_still_correct() {
     let src = "10 S$=CHR$(65)+CHR$(66)+CHR$(67)\n\
@@ -191,6 +205,7 @@ fn inlined_gosub_body_reports_its_own_line() {
                100 L=PEEK(57)+PEEK(58)*256:PRINT L:RETURN\n";
     assert_eq!(text_output(src), " 100 \n");
 }
+
 #[test]
 fn inlined_gosub_body_reports_its_own_line_from_every_caller() {
     let src = "10 GOSUB 100\n\
@@ -199,6 +214,7 @@ fn inlined_gosub_body_reports_its_own_line_from_every_caller() {
                100 L=PEEK(57):PRINT L:RETURN\n";
     assert_eq!(text_output(src), " 100 \n 100 \n");
 }
+
 #[test]
 fn the_caller_line_is_restored_after_an_inlined_body() {
     let src = "10 GOSUB 100:L=PEEK(57):PRINT L\n\
@@ -206,6 +222,7 @@ fn the_caller_line_is_restored_after_an_inlined_body() {
                100 K=PEEK(57):PRINT K:RETURN\n";
     assert_eq!(text_output(src), " 100 \n 10 \n");
 }
+
 #[test]
 fn a_non_erroring_inlined_body_costs_no_stamp() {
     let asm = asm_of(
@@ -223,6 +240,7 @@ fn a_non_erroring_inlined_body_costs_no_stamp() {
         "…but the body is still inlined:\n{asm}"
     );
 }
+
 #[test]
 fn single_use_gosub_is_still_inlined() {
     let asm = asm_of(
@@ -243,6 +261,7 @@ fn negative_literal_poke_address_traps() {
         "must not fall through to a $FFFF store:\n{asm}"
     );
 }
+
 #[test]
 fn constant_propagated_negative_poke_address_traps() {
     let asm = asm_of("10 A=-1\n20 POKE A,1\n30 PRINT \"NO ERROR\"\n");
@@ -275,6 +294,7 @@ fn a_trapping_poke_still_stamps_its_line() {
         "CURLIN must hold 20 when the trap fires:\n{asm}"
     );
 }
+
 #[test]
 fn high_addresses_that_wrap_i16_still_work() {
     let src = "10 READ I\n\
@@ -345,6 +365,7 @@ fn string_slice_counts_above_255_are_illegal_quantity() {
         );
     }
 }
+
 #[test]
 fn in_range_string_slices_still_fold() {
     let asm = asm_of("10 A$=\"ABCDE\"\n20 PRINT LEFT$(A$,2);MID$(A$,4,2)\n");
@@ -357,6 +378,7 @@ fn in_range_string_slices_still_fold() {
         "ABDE\n"
     );
 }
+
 #[test]
 fn the_argument_checks_that_already_fired_still_fire() {
     for src in [
@@ -372,6 +394,7 @@ fn the_argument_checks_that_already_fired_still_fire() {
         );
     }
 }
+
 #[test]
 fn an_accumulator_that_leaves_i16_is_not_narrowed() {
     let src = "10 POKE 828,200\n\
@@ -389,6 +412,7 @@ fn an_accumulator_that_leaves_i16_is_not_narrowed() {
     );
     assert_eq!(text_output(src), " 40000 \n");
 }
+
 #[test]
 fn bounded_variables_are_still_narrowed() {
     let asm = asm_of(
@@ -404,6 +428,7 @@ fn bounded_variables_are_still_narrowed() {
     assert!(asm.contains("VI_A"), "PEEK-fed A stays promoted:\n{asm}");
     assert!(asm.contains("VI_I"), "the FOR counter stays promoted:\n{asm}");
 }
+
 #[test]
 fn a_product_that_leaves_i16_is_not_narrowed() {
     let src = "10 POKE 828,250\n\
@@ -415,6 +440,7 @@ fn a_product_that_leaves_i16_is_not_narrowed() {
     assert!(!asm.contains("VI_C"), "C reaches 62500:\n{asm}");
     assert_eq!(text_output(src), " 62500 \n");
 }
+
 #[test]
 fn an_externally_bumped_for_counter_keeps_its_integer_slot() {
     let src = "10 FOR I=1 TO 6\n\
@@ -444,6 +470,7 @@ fn a_static_integer_dim_past_the_address_space_is_refused() {
     let msg = compile_err("10 DIM A%(40000)\n20 PRINT \"OK\"\n");
     assert!(msg.contains("OUT OF MEMORY"), "got: {msg}");
 }
+
 #[test]
 fn a_large_but_fitting_dim_still_compiles() {
     let asm = asm_of("10 DIM A(2000)\n20 A(5)=7\n30 PRINT A(5)\n");
@@ -472,6 +499,7 @@ fn nested_fors(depth: usize) -> String {
     s.push_str(&format!("{n} IF A0=99 THEN GOTO {body}\n"));
     s
 }
+
 #[test]
 fn too_many_runtime_fors_is_a_compile_error_not_a_panic() {
     let msg = compile_err(&nested_fors(255));
@@ -480,6 +508,7 @@ fn too_many_runtime_fors_is_a_compile_error_not_a_panic() {
         "expected the id-space diagnostic, got: {msg}"
     );
 }
+
 #[test]
 fn a_reasonable_nesting_depth_still_compiles() {
     let asm = asm_of(&nested_fors(8));

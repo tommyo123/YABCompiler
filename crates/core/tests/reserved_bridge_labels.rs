@@ -1,5 +1,3 @@
-
-
 use yabcompiler_core::{CompileOptions, Compiled, compile_with_options, tokenize_program};
 
 /// Eight distinct PRINTs: enough string-pool entries that a reserved byte can be dropped
@@ -138,6 +136,7 @@ fn a_reservation_inside_the_string_pool_still_prints_the_right_text() {
          program prints"
     );
 }
+
 #[test]
 fn every_single_byte_reservation_inside_the_image_still_prints_the_right_text() {
     let plain = compile_reserved(Vec::new());
@@ -159,6 +158,48 @@ fn every_single_byte_reservation_inside_the_image_still_prints_the_right_text() 
     assert!(
         exercised > 0,
         "the sweep must actually hit the repair path at least once"
+    );
+}
+
+#[test]
+fn a_reservation_in_the_code_keeps_a_fall_through_label_reachable() {
+    let plain = compile_reserved(Vec::new());
+    let want = expected_text();
+    let mut exercised = 0usize;
+    // $0810 is the first byte a reservation may legally cover here.
+    for addr in 0x0810u16..0x0900 {
+        let c = compile_reserved(vec![(addr, addr)]);
+        assert_labels_own_their_bytes(&c);
+        assert_eq!(
+            run(&c),
+            want,
+            "reserving ${addr:04X} changed the program's output"
+        );
+        exercised += usize::from(c.diagnostics.bridge_shims > 0);
+    }
+    assert!(
+        exercised > 0,
+        "the code sweep must hit the repair path at least once"
+    );
+    let _ = plain;
+}
+
+#[test]
+fn the_repair_fills_with_nop_not_brk() {
+    let c = compile_reserved(vec![(0x0920, 0x0920)]);
+    assert!(c.diagnostics.bridge_shims >= 1, "fixture must shim");
+    let filler: Vec<&str> = c
+        .asm
+        .lines()
+        .skip_while(|l| !l.contains("layout: the assembler skips reserved"))
+        .filter(|l| l.trim_start().starts_with(".byte "))
+        .take(1)
+        .collect();
+    let line = filler.first().expect("the shim emits a `.byte` fill");
+    assert!(
+        line.contains("$EA") && !line.contains("$00"),
+        "the fill is executed on the fall-through path, so it must be \
+         `NOP`, not `BRK`: {line}"
     );
 }
 
@@ -189,6 +230,7 @@ fn the_repair_is_deterministic() {
     assert_eq!(a.machine_code, b.machine_code);
     assert_eq!(a.diagnostics.bridge_shims, b.diagnostics.bridge_shims);
 }
+
 #[test]
 fn asm6502_still_strands_a_label_in_front_of_a_bridged_item() {
     use asm6502::Assembler6502;

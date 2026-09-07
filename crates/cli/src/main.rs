@@ -7,50 +7,70 @@ use yabcompiler_core::{
     parse_reserved_ranges, parse_start_address, prg, tokenize_program_with,
 };
 
+/// Output stream for command-line help.
+#[derive(Clone, Copy, PartialEq)]
+enum UsageTo {
+    Stdout,
+    Stderr,
+}
+
+macro_rules! usage_line {
+    ($to:expr, $($arg:tt)*) => {
+        match $to {
+            UsageTo::Stdout => println!($($arg)*),
+            UsageTo::Stderr => eprintln!($($arg)*),
+        }
+    };
+}
+
 fn usage(program: &str) {
-    eprintln!(
+    usage_to(program, UsageTo::Stderr);
+}
+
+fn usage_to(program: &str, to: UsageTo) {
+    usage_line!(
+        to,
         "YABCompiler {} - Yet Another Basic Compiler for the Commodore 64",
         config::VERSION
     );
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("    {program} <command> [args]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("    list <file>           Detokenize a .prg, or echo a .bas after tokenizing.");
-    eprintln!("    dump <file>           Show parsed lines and raw token bytes.");
-    eprintln!("    tokenize <in> <out>   Tokenize BASIC source (.bas) to a .prg.");
-    eprintln!("                          Accepts --dialect=<d> (see below).");
-    eprintln!("    compile <in> <out>    Compile a .bas or tokenized .prg to a runnable .prg.");
-    eprintln!();
-    eprintln!("Compile options:");
-    eprintln!("    --asm <file>          Also write the generated 6502 assembly.");
-    eprintln!("    --profile=<p>         default | speed | size  (default: default)");
-    eprintln!("    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
-    eprintln!(
-        "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
+    usage_line!(to, "");
+    usage_line!(to, "Usage:");
+    usage_line!(to, "    {program} <command> [args]");
+    usage_line!(to, "");
+    usage_line!(to, "Commands:");
+    usage_line!(to, "    list <file>           Detokenize a .prg, or echo a .bas after tokenizing.");
+    usage_line!(to, "    dump <file>           Show parsed lines and raw token bytes.");
+    usage_line!(to, "    tokenize <in> <out>   Tokenize BASIC source (.bas) to a .prg.");
+    usage_line!(to, "                          Accepts --dialect=<d> (see below).");
+    usage_line!(to, "    compile <in> <out>    Compile a .bas or tokenized .prg to a runnable .prg.");
+    usage_line!(to, "");
+    usage_line!(to, "Compile options:");
+    usage_line!(to, "    --asm <file>          Also write the generated 6502 assembly.");
+    usage_line!(to, "    --profile=<p>         default | speed | size  (default: default)");
+    usage_line!(to, "    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
+    usage_line!(to, "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
     );
-    eprintln!(
-        "    --rem-hints=<d>       Honour third-party compiler REM hints: basic64 | basic-boss."
+    usage_line!(to, "    --sys-register-args   Non-v2: read `SYS a,x,y,sr` as A/X/Y/SR preloads instead");
+    usage_line!(to, "                          of as text the callee parses off TXTPTR.");
+    usage_line!(to, "    --rem-hints=<d>       Honour third-party compiler REM hints: basic64 | basic-boss."
     );
-    eprintln!("    --dialect=<d>         auto | basic2 | tsb   (default: auto)");
-    eprintln!("                          Are bare ASCII MOD / LINE / KEY / DO / ... extended");
-    eprintln!("                          keywords, or plain BASIC v2 variables? `auto` decides");
-    eprintln!("                          per program; `basic2` forces stock v2.");
-    eprintln!();
-    eprintln!("Memory layout:");
-    eprintln!("    --extraram            Force RAM under BASIC ROM ($A000-$BFFF) on.");
-    eprintln!("    --force-extraram-off  Disable the auto-extraram predictor.");
-    eprintln!("    --no-auto-reserve     Disable auto-discovery of POKE/PEEK target ranges.");
-    eprintln!("    --reserved=<list>     Manual reserved ranges. Example: $7800-$79FF,$C000");
-    eprintln!(
-        "    --start-address=<a>   Load at <a> with no SYS stub. Start with `SYS <decimal>`."
+    usage_line!(to, "    --dialect=<d>         auto | basic2 | tsb   (default: auto)");
+    usage_line!(to, "                          Are bare ASCII MOD / LINE / KEY / DO / ... extended");
+    usage_line!(to, "                          keywords, or plain BASIC v2 variables? `auto` decides");
+    usage_line!(to, "                          per program; `basic2` forces stock v2.");
+    usage_line!(to, "");
+    usage_line!(to, "Memory layout:");
+    usage_line!(to, "    --extraram            Force RAM under BASIC ROM ($A000-$BFFF) on.");
+    usage_line!(to, "    --force-extraram-off  Disable the auto-extraram predictor.");
+    usage_line!(to, "    --no-auto-reserve     Disable auto-discovery of POKE/PEEK target ranges.");
+    usage_line!(to, "    --reserved=<list>     Manual reserved ranges. Example: $7800-$79FF,$C000");
+    usage_line!(to, "    --start-address=<a>   Load at <a> with no SYS stub. Start with `SYS <decimal>`."
     );
-    eprintln!("                          Example: --start-address=$C000  (run with: SYS 49152)");
-    eprintln!();
-    eprintln!("Input is either a .bas source file or a tokenized .prg. The compiler");
-    eprintln!("auto-detects extraram and reserved ranges by default. Use the flags above");
-    eprintln!("to override.");
+    usage_line!(to, "                          Example: --start-address=$C000  (run with: SYS 49152)");
+    usage_line!(to, "");
+    usage_line!(to, "Input is either a .bas source file or a tokenized .prg. The compiler");
+    usage_line!(to, "auto-detects extraram and reserved ranges by default. Use the flags above");
+    usage_line!(to, "to override.");
 }
 
 fn main() -> ExitCode {
@@ -63,6 +83,15 @@ fn main() -> ExitCode {
     }
 
     match args[1].as_str() {
+        // Explicit help requests succeed on stdout.
+        "help" | "--help" | "-h" => {
+            usage_to(program, UsageTo::Stdout);
+            ExitCode::SUCCESS
+        }
+        "--version" | "-V" => {
+            println!("YABCompiler {}", config::VERSION);
+            ExitCode::SUCCESS
+        }
         "list" if args.len() == 3 => run_list(&args[2]),
         "dump" if args.len() == 3 => run_dump(&args[2]),
         "tokenize" if args.len() >= 4 => run_tokenize(&args[2], &args[3], &args[4..]),
@@ -226,6 +255,10 @@ fn run_compile(args: &[String]) -> ExitCode {
                 options.safe_sys_calls = true;
                 i += 1;
             }
+            "--sys-register-args" => {
+                options.sys_register_args = true;
+                i += 1;
+            }
             arg if arg.starts_with("--dialect=") => {
                 let value = &arg["--dialect=".len()..];
                 match Dialect::parse(value) {
@@ -342,6 +375,44 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
         );
     }
     eprintln!("  extraram: {}", d.extraram);
+    if let Some((before, after)) = d.size_profile_heap_improvement {
+        let layout = if d.compact_heap_layout { "compact " } else { "" };
+        eprintln!(
+            "  profile : selected {layout}--profile=size layout to increase verified heap capacity \
+             from {before} to {after} bytes"
+        );
+    } else if d.size_profile_fallback {
+        // Report when layout limits require the size profile.
+        eprintln!(
+            "  profile : the requested profile did not fit any legal layout; \
+             rebuilt at --profile=size (smaller, slower)"
+        );
+    }
+    if let Some((lo, hi)) = d.original_image {
+        // Report the preserved input image and relocated compiled code.
+        eprintln!(
+            "  original: ${lo:04X}-${hi:04X} of the source .prg materialised in place (source bytes are used at runtime)"
+        );
+    }
+    if !d.manual_reserved_clipped.is_empty() {
+        // Report reservations that overlap the preserved input image.
+        let what = d
+            .manual_reserved_clipped
+            .iter()
+            .map(|(lo, hi)| {
+                if lo == hi {
+                    format!("${lo:04X}")
+                } else {
+                    format!("${lo:04X}-${hi:04X}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "  reserved: {what} dropped from --reserved: it falls inside the image handed \
+             back verbatim above, where no compiled code is placed anyway"
+        );
+    }
     if d.vector_pads > 0 {
         // Indirect jump vectors must not start at a page's last byte.
         let where_at = d
@@ -418,10 +489,68 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
             if zp.machine_code_calls > 0 {
                 eprintln!(
                     "            {} SYS/USR call(s): machine code we cannot analyse. \
-                     Use --safe-sys-calls if it touches zero page.",
+                     DATA cursor moved to absolute memory; add --safe-sys-calls \
+                     if the routine also clobbers promoted zero-page variables.",
                     zp.machine_code_calls
                 );
             }
+        }
+    }
+    if !d.sys_param_vars.is_empty() {
+        // `SYS a,<text>` hands the text to the callee at TXTPTR.
+        let total = d.sys_param_vars.len();
+        let unhandled: Vec<_> = d.sys_param_vars.iter().filter(|s| !s.substituted).collect();
+        eprintln!(
+            "  sys params: {total} variable reference(s) in SYS parameter text; \
+             {} substituted, {} not",
+            total - unhandled.len(),
+            unhandled.len()
+        );
+        // Include totals for sites omitted from the detailed diagnostics.
+        const SHAPES: [&str; 5] = [
+            "FN call",
+            "array",
+            "string variable",
+            "string array",
+            "numeric scalar",
+        ];
+        let shape_ix = |s: &&yabcompiler_core::sys_params::Site| -> usize {
+            let string = matches!(s.var.kind, yabcompiler_core::ast::VarKind::String);
+            match (s.var.is_fn, s.var.subscripted, string) {
+                (true, _, _) => 0,
+                (_, true, false) => 1,
+                (_, false, true) => 2,
+                (_, true, true) => 3,
+                (_, false, false) => 4,
+            }
+        };
+        if !unhandled.is_empty() {
+            let mut by_shape = [0usize; 5];
+            for s in &unhandled {
+                by_shape[shape_ix(s)] += 1;
+            }
+            eprintln!(
+                "              not substituted by shape: {} array, {} string variable, \
+                 {} string array, {} FN call, {} numeric scalar",
+                by_shape[1], by_shape[2], by_shape[3], by_shape[0], by_shape[4]
+            );
+        }
+        for s in unhandled.iter().take(6) {
+            let shape = SHAPES[shape_ix(s)];
+            eprintln!(
+                "  WARNING : line {}: SYS parameter text references {} `{}` — \
+                 no compiled-value bridge; the callee parses the original tokens",
+                s.line, shape, s.var.base
+            );
+        }
+        if unhandled.len() > 6 {
+            eprintln!("            ... and {} more", unhandled.len() - 6);
+        }
+        if d.sys_param_substitution_dropped {
+            eprintln!(
+                "  WARNING : the image did not fit with SYS-parameter substitution, so it \
+                 was dropped: ALL {total} reference(s) are left to the native parser"
+            );
         }
     }
     if !d.effective_reserved.is_empty() {
@@ -454,6 +583,31 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
             o.overshoot,
             o.range.0,
             o.recoverable(),
+        );
+    }
+    // Report statements that raise BASIC errors when reached.
+    for t in &d.syntax_traps {
+        let msg = if t.code == 22 {
+            "?TYPE MISMATCH"
+        } else {
+            "?SYNTAX ERROR"
+        };
+        eprintln!(
+            "  warning: {} — compiled to a runtime {msg}, raised only if line {} runs",
+            t.detail, t.line
+        );
+    }
+    // Invalid DEF FN bodies raise errors at their call sites.
+    for f in &d.deferred_fn_bodies {
+        let msg = if f.code == 22 {
+            "?TYPE MISMATCH"
+        } else {
+            "?SYNTAX ERROR"
+        };
+        eprintln!(
+            "  warning: {} — DEF FN {} body dropped; the ROM parses a body only when the \
+             function is called, so this raises {msg} at a call site, not at line {}",
+            f.detail, f.name.0, f.line
         );
     }
     for s in &d.skipped_statements {

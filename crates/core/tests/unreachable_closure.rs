@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -46,7 +44,10 @@ fn a_handler_reached_only_through_a_word_table_survives() {
             "{profile:?}: the fixture must really build a table:\n{a}"
         );
         assert!(
-            a.contains(".word __FOR_NEXT_HANDLER_1"),
+            a.lines()
+                .filter_map(|line| line.split(';').next()?.trim().strip_prefix(".word "))
+                .flat_map(|operands| operands.split(','))
+                .any(|operand| operand.trim() == "__FOR_NEXT_HANDLER_1"),
             "{profile:?}: the table must still name the handler:\n{a}"
         );
         assert!(
@@ -54,6 +55,7 @@ fn a_handler_reached_only_through_a_word_table_survives() {
             "{profile:?}: the handler body is reachable ONLY through that \
              .word — deleting it jumps through a $0000 vector:\n{a}"
         );
+
         assert_eq!(
             a.matches("__FOR_NEXT_HANDLER_1").count(),
             2,
@@ -72,15 +74,18 @@ fn a_continuation_reached_only_through_a_patched_vector_survives() {
             .position(|l| l.starts_with("__FOR_RT_AFTER_") && l.ends_with(':'))
             .unwrap_or_else(|| panic!("{profile:?}: continuation label missing:\n{a}"));
         let name = lines[def].trim_end_matches(':');
+
         assert!(
             a.contains(&format!("LDA #<{name}")) && a.contains(&format!("LDA #>{name}")),
             "{profile:?}: the vector patch must still be there:\n{a}"
         );
+
         assert!(
             !a.contains(&format!("JMP {name}")) && !a.contains(&format!("JSR {name}")),
             "{profile:?}: {name} must have no static caller, or this is not \
              the shape under test:\n{a}"
         );
+
         let before = lines[..def]
             .iter()
             .rev()
@@ -93,6 +98,7 @@ fn a_continuation_reached_only_through_a_patched_vector_survives() {
         );
     }
 }
+
 #[test]
 fn the_orphan_next_fixture_still_produces_the_right_output() {
     let prg = common::compile_source(ORPHAN_NEXT).expect("compiles");
@@ -119,6 +125,7 @@ fn a_tail_behind_an_unconditional_trap_is_dropped() {
             "{gone} is behind the trap and must go:\n{a}"
         );
     }
+
     assert!(a.contains("__LOGIC_B:"), "data is left alone:\n{a}");
 }
 
@@ -146,6 +153,7 @@ fn a_chain_of_helpers_below_a_dead_head_is_dropped() {
     }
     assert!(got.contains("LDA #$42"), "the live body stays:\n{got}");
 }
+
 #[test]
 fn taking_the_head_s_address_keeps_the_whole_chain() {
     let src = concat!(
@@ -166,6 +174,7 @@ fn taking_the_head_s_address_keeps_the_whole_chain() {
         "    RTS\n",
     );
     let got = yabcompiler_core::peephole::run(src, Profile::Default);
+
     assert!(
         got.contains("__DEAD_HEAD:"),
         "the patched entry must stay:\n{got}"
@@ -230,8 +239,10 @@ fn code_after_a_jsr_is_reachable() {
     assert!(got.contains("LDA #$07"), "{got}");
     assert!(got.contains("LDA #$08"), "{got}");
 }
+
 #[test]
 fn the_corpus_still_compiles_and_never_grows() {
+
     let sources = [
         ORPHAN_NEXT,
         "10 DIM A(20)\n20 FOR I=0 TO 20:A(I)=I*2:NEXT\n\

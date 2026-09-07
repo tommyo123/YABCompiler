@@ -56,6 +56,7 @@ pub struct System {
     pub output: Vec<u8>,
     /// Bytes the ROM's error reporter wrote once the program raised an error.
     pub error_output: Vec<u8>,
+
     pub error_code: Option<u8>,
     pub error_line: Option<u16>,
     /// Whether execution has reached BASIC's READY prompt.
@@ -90,10 +91,10 @@ impl System {
         set16(&mut mem, 0x33, 0xA000); // FRETOP - bottom of string space
         set16(&mut mem, 0x37, 0xA000); // MEMSIZ - top of BASIC RAM
 
-        // TEMPPT ($16): pointer into the temporary string-descriptor
-        // stack ($0019..$0021). A cold start sets it to $19; if left 0,
-        // STROUT's descriptor write (STA $00,X) lands on the 6510 port
-        // at $00/$01 and kills the ROM banking.
+// TEMPPT ($16): pointer into the temporary string-descriptor
+// stack ($0019..$0021). A cold start sets it to $19; if left 0,
+// STROUT's descriptor write (STA $00,X) lands on the 6510 port
+// at $00/$01 and kills the ROM banking.
         mem.ram[0x16] = 0x19;
 
         // CHRGET: the cold start copies this 24-byte routine into
@@ -139,6 +140,10 @@ impl System {
         };
         rom_copy(&mut mem, 0xE447, 0x0300, 12);
         rom_copy(&mut mem, 0xFD30, 0x0314, 32);
+
+        mem.ram[0x0310] = 0x4C;
+        mem.ram[0x0311] = 0x48;
+        mem.ram[0x0312] = 0xB2; // $B248: LDX #$0E / JMP $A437
         debug_assert_eq!(
             (mem.ram[0x0300] as u16) | ((mem.ram[0x0301] as u16) << 8),
             IERROR_ROM_HANDLER,
@@ -206,16 +211,22 @@ impl System {
     /// on a trapped KERNAL entry. Returns false on BRK / JAM.
     pub fn step(&mut self) -> bool {
         let pc = self.cpu.regs.pc;
-        if pc == BASIC_ERROR && self.error_code.is_none() {
+
+        let basic_rom = self.mem.basic_mapped();
+
+        if basic_rom && pc == BASIC_ERROR && self.error_code.is_none() {
             self.error_code = Some(self.cpu.regs.x);
             let curlin = (self.mem.ram[0x39] as u16) | ((self.mem.ram[0x3A] as u16) << 8);
             self.error_line = (curlin != 0xFFFF).then_some(curlin);
         }
-        if pc == BASIC_READY {
+
+        if basic_rom && pc == BASIC_READY {
             self.ready_reached = true;
             return false;
         }
-        match pc {
+
+        const NO_TRAP: u16 = 0x0000;
+        match if self.mem.kernal_mapped() { pc } else { NO_TRAP } {
             FFD2 => {
                 let ch = self.cpu.regs.a;
                 if self.error_code.is_some() {
@@ -289,6 +300,7 @@ impl System {
             self.mem.ram[ZP_CURS_X as usize] = col;
             self.bump_row(1);
         } else {
+
             self.mem.ram[ZP_LNMX as usize] = LINE_END;
             self.mem.ram[ZP_CURS_X as usize] = 0;
             self.bump_row(1);
