@@ -1,8 +1,8 @@
-COL0COL10COL20
-ABC
-INDENTED
-XY
-*
-*
-*
+COL0      COL10     COL20
+A     B   C
+               INDENTED
+X       Y
+     *
+          *
+               *
 DONE

@@ -5,6 +5,11 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-09-07
+
+- Extensive bug fixes across BASIC parsing, numeric and string operations, loops, subroutines and memory handling.
+- Broad speed and size optimizations across code generation, arrays, loops and memory use, with repeatable output.
+
 ## [0.9.11] - 2026-07-27
 
 ### Fixed
@@ -220,6 +225,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[1.0.0]: https://github.com/tommyo123/YABCompiler/releases/tag/v1.0.0
 [0.9.11]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.11
 [0.9.10]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.10
 [0.9.9]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.9

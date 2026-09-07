@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use yabcompiler_core::{
-    BasicHintDialect, CompileOptions, Profile, compile, config, is_basic_source_path,
-    parse_reserved_ranges, parse_start_address, prg, tokenize_program,
+    BasicHintDialect, CompileOptions, Dialect, Profile, compile, config, is_basic_source_path,
+    parse_reserved_ranges, parse_start_address, prg, tokenize_program_with,
 };
 
 fn usage(program: &str) {
@@ -20,18 +20,21 @@ fn usage(program: &str) {
     eprintln!("    list <file>           Detokenize a .prg, or echo a .bas after tokenizing.");
     eprintln!("    dump <file>           Show parsed lines and raw token bytes.");
     eprintln!("    tokenize <in> <out>   Tokenize BASIC source (.bas) to a .prg.");
+    eprintln!("                          Accepts --dialect=<d> (see below).");
     eprintln!("    compile <in> <out>    Compile a .bas or tokenized .prg to a runnable .prg.");
     eprintln!();
     eprintln!("Compile options:");
     eprintln!("    --asm <file>          Also write the generated 6502 assembly.");
     eprintln!("    --profile=<p>         default | speed | size  (default: default)");
     eprintln!("    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
-    eprintln!(
-        "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
-    );
+    eprintln!("    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS.");
     eprintln!(
         "    --rem-hints=<d>       Honour third-party compiler REM hints: basic64 | basic-boss."
     );
+    eprintln!("    --dialect=<d>         auto | basic2 | tsb   (default: auto)");
+    eprintln!("                          Are bare ASCII MOD / LINE / KEY / DO / ... extended");
+    eprintln!("                          keywords, or plain BASIC v2 variables? `auto` decides");
+    eprintln!("                          per program; `basic2` forces stock v2.");
     eprintln!();
     eprintln!("Memory layout:");
     eprintln!("    --extraram            Force RAM under BASIC ROM ($A000-$BFFF) on.");
@@ -60,7 +63,7 @@ fn main() -> ExitCode {
     match args[1].as_str() {
         "list" if args.len() == 3 => run_list(&args[2]),
         "dump" if args.len() == 3 => run_dump(&args[2]),
-        "tokenize" if args.len() == 4 => run_tokenize(&args[2], &args[3]),
+        "tokenize" if args.len() >= 4 => run_tokenize(&args[2], &args[3], &args[4..]),
         "compile" => run_compile(&args[2..]),
         _ => {
             usage(program);
@@ -73,19 +76,19 @@ fn main() -> ExitCode {
 /// files are passed through the tokenizer first; everything else is
 /// treated as already-tokenized .prg bytes. Centralising this here
 /// keeps `list` / `dump` / `compile` accepting both shapes.
-fn load_prg_bytes(path: &str) -> Result<Vec<u8>, String> {
+fn load_prg_bytes(path: &str, dialect: Dialect) -> Result<Vec<u8>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?;
     if is_basic_source_path(Path::new(path)) {
         let source = String::from_utf8(bytes)
             .map_err(|e| format!("{path} is not valid UTF-8 source: {e}"))?;
-        tokenize_program(&source).map_err(|e| format!("tokenize {path}: {e}"))
+        tokenize_program_with(&source, dialect).map_err(|e| format!("tokenize {path}: {e}"))
     } else {
         Ok(bytes)
     }
 }
 
 fn run_list(path: &str) -> ExitCode {
-    let bytes = match load_prg_bytes(path) {
+    let bytes = match load_prg_bytes(path, Dialect::default()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {e}");
@@ -106,7 +109,7 @@ fn run_list(path: &str) -> ExitCode {
 }
 
 fn run_dump(path: &str) -> ExitCode {
-    let bytes = match load_prg_bytes(path) {
+    let bytes = match load_prg_bytes(path, Dialect::default()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {e}");
@@ -126,7 +129,23 @@ fn run_dump(path: &str) -> ExitCode {
     }
 }
 
-fn run_tokenize(in_path: &str, out_path: &str) -> ExitCode {
+fn run_tokenize(in_path: &str, out_path: &str, rest: &[String]) -> ExitCode {
+    let mut dialect = Dialect::default();
+    for arg in rest {
+        match arg.strip_prefix("--dialect=") {
+            Some(value) => match Dialect::parse(value) {
+                Ok(d) => dialect = d,
+                Err(e) => {
+                    eprintln!("tokenize: --dialect: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+            None => {
+                eprintln!("tokenize: unknown arg '{arg}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
     let source = match std::fs::read_to_string(in_path) {
         Ok(s) => s,
         Err(e) => {
@@ -134,7 +153,7 @@ fn run_tokenize(in_path: &str, out_path: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let prg = match tokenize_program(&source) {
+    let prg = match tokenize_program_with(&source, dialect) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: tokenize {in_path}: {e}");
@@ -205,6 +224,17 @@ fn run_compile(args: &[String]) -> ExitCode {
                 options.safe_sys_calls = true;
                 i += 1;
             }
+            arg if arg.starts_with("--dialect=") => {
+                let value = &arg["--dialect=".len()..];
+                match Dialect::parse(value) {
+                    Ok(d) => options.dialect = d,
+                    Err(e) => {
+                        eprintln!("compile: --dialect: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
             arg if arg.starts_with("--rem-hints=") => {
                 let value = &arg["--rem-hints=".len()..];
                 match BasicHintDialect::parse(value) {
@@ -245,7 +275,7 @@ fn run_compile(args: &[String]) -> ExitCode {
         }
     }
 
-    let bytes = match load_prg_bytes(in_path) {
+    let bytes = match load_prg_bytes(in_path, options.dialect) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {e}");
@@ -302,7 +332,96 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
         "  layout : load ${:04X}, code ends ${:04X} ({} bytes)",
         d.start_address, d.end_address, code_bytes
     );
+    if d.bss_truncated > 0 {
+        // Trailing zeros are initialized at startup and omitted from the file.
+        eprintln!(
+            "  bss    : {} trailing zero byte(s) left out of the file and zero-filled at entry",
+            d.bss_truncated
+        );
+    }
     eprintln!("  extraram: {}", d.extraram);
+    if d.vector_pads > 0 {
+        // Indirect jump vectors must not start at a page's last byte.
+        let where_at = d
+            .indirect_vectors
+            .iter()
+            .map(|(name, addr)| format!("{name}=${addr:04X}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "  vectors : {} pad byte(s) inserted to keep indirect-JMP vectors off a \
+             $xxFF page boundary ({where_at})",
+            d.vector_pads
+        );
+    }
+    if d.bridge_shims > 0 {
+        // Padding keeps reserved-range jumps separate from labels and their data.
+        eprintln!(
+            "  reserved: {} filler block(s) inserted so no label is stranded on a \
+             reserved-range bridge",
+            d.bridge_shims
+        );
+    }
+    if d.zp_pressure.pool_initial > 0 {
+        let zp = &d.zp_pressure;
+        let mut line = format!(
+            "  zp pool : {}/{} bytes used",
+            zp.pool_initial - zp.pool_left,
+            zp.pool_initial
+        );
+        if zp.denied_total() > 0 {
+            let mut denied = Vec::new();
+            for (n, what) in [
+                (zp.counter_denied, "FOR counter(s)"),
+                (zp.array_base_denied, "array base(s)"),
+                (zp.int_denied, "int var(s)"),
+                (zp.shadow_denied, "shadow int(s)"),
+            ] {
+                if n > 0 {
+                    denied.push(format!("{n} {what}"));
+                }
+            }
+            line.push_str(&format!(", left out: {}", denied.join(", ")));
+        }
+        eprintln!("{line}");
+    }
+    {
+        // Report the program's zero-page use and allocation limits.
+        let zp = &d.zp_pressure;
+        let touched = zp.program_zp_writes + zp.program_zp_reads;
+        if touched > 0 || zp.pairs_relocated > 0 || zp.addrs_unprotectable > 0 {
+            eprintln!(
+                "  zp reach: program touches {} byte(s) ({} write, {} read); \
+                 addresses: {} clear of ZP, {} narrowed, {} unbounded",
+                touched,
+                zp.program_zp_writes,
+                zp.program_zp_reads,
+                zp.addrs_proved_clear,
+                zp.addrs_narrowed,
+                zp.addrs_unprotectable
+            );
+            if zp.pairs_relocated > 0 || zp.pool_lost_to_program > 0 {
+                eprintln!(
+                    "            relocated {} pointer pair(s), pool lost {} byte(s)",
+                    zp.pairs_relocated, zp.pool_lost_to_program
+                );
+            }
+            if zp.pairs_unresolved > 0 {
+                eprintln!(
+                    "  WARNING : {} compiler pointer pair(s) had to stay on zero page \
+                     the program also uses — expect corruption",
+                    zp.pairs_unresolved
+                );
+            }
+            if zp.machine_code_calls > 0 {
+                eprintln!(
+                    "            {} SYS/USR call(s): machine code we cannot analyse. \
+                     Use --safe-sys-calls if it touches zero page.",
+                    zp.machine_code_calls
+                );
+            }
+        }
+    }
     if !d.effective_reserved.is_empty() {
         let source = match (d.auto_reserved.is_empty(), d.manual_reserved.is_empty()) {
             (true, true) => "",
@@ -313,6 +432,26 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
         eprintln!(
             "  reserved{source}: {}",
             format_ranges(&d.effective_reserved)
+        );
+    }
+    for o in &d.reserved_overshoots {
+        // A contiguous load image includes padding for every reserved hole it spans.
+        eprintln!(
+            "  warning: image ends ${:04X}, {} byte(s) past reserved ${:04X}-${:04X}; \
+             the hole costs {} padding byte(s) in the .prg",
+            u32::from(o.range.1) + o.overshoot,
+            o.overshoot,
+            o.range.0,
+            o.range.1,
+            o.hole,
+        );
+        // Removing the overshoot also removes the hole's padding and jump bridge.
+        eprintln!(
+            "           losing those {} byte(s) of code would drop the image below \
+             ${:04X} and shrink the file by at least {} byte(s)",
+            o.overshoot,
+            o.range.0,
+            o.recoverable(),
         );
     }
     for s in &d.skipped_statements {

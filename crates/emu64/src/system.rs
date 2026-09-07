@@ -24,19 +24,42 @@ pub const FFCF: u16 = 0xFFCF;
 /// pointers from the row.
 pub const FFF0: u16 = 0xFFF0;
 
+/// BASIC's ERROR entry.
+pub const BASIC_ERROR: u16 = 0xA437;
+/// The KERNAL-side default IERROR handler a cold start installs.
+pub const IERROR_ROM_HANDLER: u16 = 0xE38B;
+/// BASIC's READY prompt.
+pub const BASIC_READY: u16 = 0xA474;
+
 // Conio zeropage variables.
 const ZP_RVS: u16 = 0xC7;
 const ZP_SCREEN_PTR: u16 = 0xD1;
+/// Cursor column within the current logical line.
 const ZP_CURS_X: u16 = 0xD3;
+/// Last logical-line column: 39 for one screen row, 79 for two.
+const ZP_LNMX: u16 = 0xD5;
 const ZP_CURS_Y: u16 = 0xD6;
 const ZP_CRAM_PTR: u16 = 0xF3;
 const ZP_CHARCOLOR: u16 = 0x0286;
 
+/// Bottom text row.
+const LAST_ROW: u8 = 24;
+/// Last column of an unwrapped logical line.
+const LINE_END: u8 = 39;
+/// Last column of a logical line that has wrapped onto a second row.
+const WRAPPED_LINE_END: u8 = 79;
+
 pub struct System {
     pub cpu: Cpu,
     pub mem: C64Mem,
-    /// Bytes captured from trapped CHROUT calls, in PETSCII.
+    /// Bytes the *program* wrote through CHROUT, in PETSCII.
     pub output: Vec<u8>,
+    /// Bytes the ROM's error reporter wrote once the program raised an error.
+    pub error_output: Vec<u8>,
+    pub error_code: Option<u8>,
+    pub error_line: Option<u16>,
+    /// Whether execution has reached BASIC's READY prompt.
+    pub ready_reached: bool,
 }
 
 impl System {
@@ -103,13 +126,37 @@ impl System {
         mem.ram[(ZP_CRAM_PTR + 1) as usize] = 0xD8;
         mem.ram[ZP_CURS_X as usize] = 0;
         mem.ram[ZP_CURS_Y as usize] = 0;
+        mem.ram[ZP_LNMX as usize] = LINE_END;
         mem.ram[ZP_RVS as usize] = 0;
         mem.ram[ZP_CHARCOLOR as usize] = 0x0E;
+
+        // Indirect vectors.
+        let rom_copy = |mem: &mut C64Mem, src: u16, dst: u16, len: usize| {
+            for i in 0..len {
+                let b = mem.kernal_rom[(src as usize - 0xE000) + i];
+                mem.ram[dst as usize + i] = b;
+            }
+        };
+        rom_copy(&mut mem, 0xE447, 0x0300, 12);
+        rom_copy(&mut mem, 0xFD30, 0x0314, 32);
+        debug_assert_eq!(
+            (mem.ram[0x0300] as u16) | ((mem.ram[0x0301] as u16) << 8),
+            IERROR_ROM_HANDLER,
+            "unexpected BASIC vector table in basic.bin"
+        );
+
+        // Default I/O channels: keyboard in, screen out.
+        mem.ram[0x99] = 0; // DFLTN - keyboard
+        mem.ram[0x9A] = 3; // DFLTO - screen
 
         Self {
             cpu: Cpu::new(),
             mem,
             output: Vec::new(),
+            error_output: Vec::new(),
+            error_code: None,
+            error_line: None,
+            ready_reached: false,
         }
     }
 
@@ -159,9 +206,24 @@ impl System {
     /// on a trapped KERNAL entry. Returns false on BRK / JAM.
     pub fn step(&mut self) -> bool {
         let pc = self.cpu.regs.pc;
+        if pc == BASIC_ERROR && self.error_code.is_none() {
+            self.error_code = Some(self.cpu.regs.x);
+            let curlin = (self.mem.ram[0x39] as u16) | ((self.mem.ram[0x3A] as u16) << 8);
+            self.error_line = (curlin != 0xFFFF).then_some(curlin);
+        }
+        if pc == BASIC_READY {
+            self.ready_reached = true;
+            return false;
+        }
         match pc {
             FFD2 => {
-                self.output.push(self.cpu.regs.a);
+                let ch = self.cpu.regs.a;
+                if self.error_code.is_some() {
+                    self.error_output.push(ch);
+                } else {
+                    self.output.push(ch);
+                }
+                self.track_cursor(ch);
                 // Real CHROUT returns carry clear on success; KERNAL
                 // callers (e.g. $E10C) do `BCS error` afterwards, so a
                 // stale carry would send them into the error handler.
@@ -187,6 +249,96 @@ impl System {
         self.cpu.step(&mut self.mem)
     }
 
+    // Cursor bookkeeping for the trapped CHROUT.
+
+    /// Apply the cursor movement a byte sent to CHROUT would cause.
+    fn track_cursor(&mut self, ch: u8) {
+        match ch {
+            // CR and shifted CR both end the logical line.
+            0x0D | 0x8D => self.cursor_crlf(),
+            // CLR and HOME both park the cursor at the top left; CLR additionally wipes the
+            // screen, which nothing here reads.
+            0x93 | 0x13 => {
+                self.mem.ram[ZP_CURS_X as usize] = 0;
+                self.mem.ram[ZP_CURS_Y as usize] = 0;
+                self.mem.ram[ZP_LNMX as usize] = LINE_END;
+                self.refresh_line_ptr();
+            }
+            0x1D => self.cursor_advance(),
+            // Cursor-left and DELETE both step back a column.
+            0x9D | 0x14 => self.cursor_left(),
+            0x11 => self.cursor_row(1),
+            0x91 => self.cursor_row(-1),
+            // Printable PETSCII.
+            0x20..=0x7F | 0xA0..=0xFF => self.cursor_advance(),
+            _ => {}
+        }
+    }
+
+    /// Move one column right, wrapping the way the screen editor does.
+    fn cursor_advance(&mut self) {
+        let col = self.mem.ram[ZP_CURS_X as usize].wrapping_add(1);
+        let lnmx = self.mem.ram[ZP_LNMX as usize];
+        if col <= lnmx {
+            self.mem.ram[ZP_CURS_X as usize] = col;
+            return;
+        }
+        if lnmx < WRAPPED_LINE_END {
+            // Ran off the first row: link the next one into the same logical line.
+            self.mem.ram[ZP_LNMX as usize] = WRAPPED_LINE_END;
+            self.mem.ram[ZP_CURS_X as usize] = col;
+            self.bump_row(1);
+        } else {
+            self.mem.ram[ZP_LNMX as usize] = LINE_END;
+            self.mem.ram[ZP_CURS_X as usize] = 0;
+            self.bump_row(1);
+            self.refresh_line_ptr();
+        }
+    }
+
+    fn cursor_left(&mut self) {
+        let col = self.mem.ram[ZP_CURS_X as usize];
+        if col > 0 {
+            self.mem.ram[ZP_CURS_X as usize] = col - 1;
+        } else if self.mem.ram[ZP_CURS_Y as usize] > 0 {
+            self.bump_row(-1);
+            self.mem.ram[ZP_CURS_X as usize] = LINE_END;
+            self.mem.ram[ZP_LNMX as usize] = LINE_END;
+            self.refresh_line_ptr();
+        }
+    }
+
+    fn cursor_crlf(&mut self) {
+        self.mem.ram[ZP_CURS_X as usize] = 0;
+        self.mem.ram[ZP_LNMX as usize] = LINE_END;
+        self.bump_row(1);
+        self.refresh_line_ptr();
+    }
+
+    fn cursor_row(&mut self, delta: i8) {
+        self.bump_row(delta);
+        self.refresh_line_ptr();
+    }
+
+    /// Move the cursor row, clamped to the screen.
+    fn bump_row(&mut self, delta: i8) {
+        let row = self.mem.ram[ZP_CURS_Y as usize] as i16 + delta as i16;
+        self.mem.ram[ZP_CURS_Y as usize] = row.clamp(0, LAST_ROW as i16) as u8;
+    }
+
+    /// Point PNT ($D1) / colour ($F3) at the start of the current logical line, which is one
+    /// row up while the line is wrapped.
+    fn refresh_line_ptr(&mut self) {
+        let wrapped = self.mem.ram[ZP_LNMX as usize] > LINE_END;
+        let row = self.mem.ram[ZP_CURS_Y as usize].saturating_sub(wrapped as u8);
+        let screen = 0x0400u16 + (row as u16) * 40;
+        let cram = 0xD800u16 + (row as u16) * 40;
+        self.mem.ram[ZP_SCREEN_PTR as usize] = screen as u8;
+        self.mem.ram[(ZP_SCREEN_PTR + 1) as usize] = (screen >> 8) as u8;
+        self.mem.ram[ZP_CRAM_PTR as usize] = cram as u8;
+        self.mem.ram[(ZP_CRAM_PTR + 1) as usize] = (cram >> 8) as u8;
+    }
+
     /// Carry clear: set cursor from X (row) and Y (col), update screen
     /// and colour pointers. Carry set: return current position in X and
     /// Y.
@@ -199,6 +351,9 @@ impl System {
             let col = self.cpu.regs.y;
             self.mem.ram[ZP_CURS_Y as usize] = row;
             self.mem.ram[ZP_CURS_X as usize] = col;
+            // PLOT lands on a physical row, so the logical line it puts the cursor on is a
+            // single row again.
+            self.mem.ram[ZP_LNMX as usize] = LINE_END;
             let screen_base = 0x0400u16 + (row as u16) * 40;
             let cram_base = 0xD800u16 + (row as u16) * 40;
             self.mem.ram[ZP_SCREEN_PTR as usize] = screen_base as u8;

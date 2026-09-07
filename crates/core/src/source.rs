@@ -19,6 +19,8 @@
 //!      uppercased so vars/keywords land in the editor-canonical
 //!      form.
 
+pub use crate::tokens::Dialect;
+
 /// BASIC v2 keyword tokens, $80–$CB. Order matters for matching:
 /// the lookup uses longest-first so `GOSUB` matches before `GO`,
 /// `INPUT#` before `INPUT`, etc.
@@ -464,12 +466,7 @@ impl std::fmt::Display for TokenizeError {
 impl std::error::Error for TokenizeError {}
 
 /// Tokenize one source line body (everything after the line number).
-///
-/// `body` is the raw text after the leading line number and one
-/// optional separator space. The output is the per-line body bytes
-/// — the caller is responsible for the surrounding `.prg` framing
-/// (next-link pointer, line number word, terminating `0x00`).
-fn tokenize_body(body: &str) -> Vec<u8> {
+fn tokenize_body(body: &str, tsb_table: &[(&str, u8)], tsb_demoted: &[(&str, u8)]) -> Vec<u8> {
     let bytes = body.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -528,22 +525,23 @@ fn tokenize_body(body: &str) -> Vec<u8> {
             continue;
         }
         if in_data {
-            // After DATA, every byte up to a `:` (statement
-            // terminator) or end-of-line is a raw value byte —
-            // never a tokenized keyword. Without this, words like
-            // "BORING" were partly tokenized: the embedded "OR"
-            // ($B0) replaced two characters, so the runtime READ
-            // pulled in PETSCII $B0 instead of the letters O and
-            // R, and PRINT spat out a graphic glyph in the middle
-            // of the word. (`:` ends the DATA scope.)
-            //
-            // Case handling matches the outside-string default:
-            // lowercase ASCII folds to uppercase PETSCII (= screen
-            // letters in upper/graphics charset), uppercase
-            // letters pass through verbatim (= also screen
-            // letters). The string-literal case-swap is intentionally
-            // not applied here; DATA text should print as letters, not
-            // upper/graphics glyphs.
+            if c == b'"' {
+                out.push(c);
+                i += 1;
+                while i < bytes.len() {
+                    let d = bytes[i];
+                    out.push(if d.is_ascii_lowercase() {
+                        d.to_ascii_uppercase()
+                    } else {
+                        d
+                    });
+                    i += 1;
+                    if d == b'"' {
+                        break;
+                    }
+                }
+                continue;
+            }
             if c == b':' {
                 in_data = false;
                 out.push(c);
@@ -572,7 +570,9 @@ fn tokenize_body(body: &str) -> Vec<u8> {
         // keywords. Without this ordering "END LOOP" would tokenise
         // as the BASIC v2 END followed by a literal " LOOP" string,
         // which the parser would never accept.
-        if let Some((len, tok)) = match_keyword(KEYWORDS_TSB, bytes, i) {
+        if match_keyword(tsb_demoted, bytes, i).is_none()
+            && let Some((len, tok)) = match_keyword(tsb_table, bytes, i)
+        {
             out.push(0x64);
             out.push(tok);
             i += len;
@@ -594,6 +594,20 @@ fn tokenize_body(body: &str) -> Vec<u8> {
         if let Some((len, tok)) = match_keyword(OPS_V2, bytes, i) {
             out.push(tok);
             i += len;
+            continue;
+        }
+
+        // PI is a first-class BASIC v2 constant stored as the single PETSCII byte $FF.
+        if c == 0xCF && bytes.get(i + 1) == Some(&0x80) {
+            out.push(0xFF);
+            i += 2;
+            continue;
+        }
+
+        // `?` is the editor's abbreviation for PRINT.
+        if c == b'?' {
+            out.push(0x99);
+            i += 1;
             continue;
         }
 
@@ -788,10 +802,118 @@ pub fn tokenize_program(source: &str) -> Result<Vec<u8>, TokenizeError> {
     tokenize_program_at(source, LOAD_ADDR_C64)
 }
 
+pub fn tokenize_program_with(source: &str, dialect: Dialect) -> Result<Vec<u8>, TokenizeError> {
+    tokenize_program_at_with(source, LOAD_ADDR_C64, dialect)
+}
+
 /// Same as [`tokenize_program`] but with an explicit load address.
 /// Exposed for tests and for future targets (C128/PET) that don't
 /// share the C64 default.
 pub fn tokenize_program_at(source: &str, load_addr: u16) -> Result<Vec<u8>, TokenizeError> {
+    tokenize_program_at_with(source, load_addr, Dialect::default())
+}
+
+/// The extended keyword table to use for `source`, per `dialect`.
+fn tsb_table_for(
+    source: &str,
+    dialect: Dialect,
+) -> (Vec<(&'static str, u8)>, Vec<(&'static str, u8)>) {
+    match dialect {
+        Dialect::Tsb => (KEYWORDS_TSB.to_vec(), Vec::new()),
+        Dialect::BasicV2 => (Vec::new(), Vec::new()),
+        Dialect::Auto => {
+            let names = tsb_words_used_as_variables(source);
+            if names.is_empty() {
+                return (KEYWORDS_TSB.to_vec(), Vec::new());
+            }
+            let (demoted, live): (Vec<_>, Vec<_>) =
+                KEYWORDS_TSB.iter().partition(|(kw, _)| names.contains(kw));
+            (live, demoted)
+        }
+    }
+}
+
+/// Find extended keyword spellings used as variables outside strings, REM and DATA.
+fn tsb_words_used_as_variables(source: &str) -> std::collections::HashSet<&'static str> {
+    let mut found = std::collections::HashSet::new();
+    for raw_line in source.lines() {
+        let bytes = raw_line.as_bytes();
+        let mut i = 0usize;
+        let mut in_string = false;
+        let mut in_data = false;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_string {
+                if c == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            if in_data {
+                // Mirror `tokenize_body`: a quoted DATA item is copied whole, so a `:` inside
+                // it does not end DATA scope.
+                if c == b'"' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if c == b':' {
+                    in_data = false;
+                }
+                i += 1;
+                continue;
+            }
+            if match_keyword(&[("REM", 0x8Fu8)], bytes, i).is_some() {
+                break;
+            }
+            if match_keyword(&[("DATA", 0x83u8)], bytes, i).is_some() {
+                in_data = true;
+                i += 4;
+                continue;
+            }
+            if let Some((len, _)) = match_keyword(KEYWORDS_TSB, bytes, i) {
+                let mut j = i + len;
+                while bytes.get(j) == Some(&b' ') {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'=') {
+                    let kw = KEYWORDS_TSB
+                        .iter()
+                        .find(|(k, _)| {
+                            k.len() == len
+                                && k.as_bytes()
+                                    .iter()
+                                    .zip(&bytes[i..i + len])
+                                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                        })
+                        .map(|(k, _)| *k);
+                    if let Some(kw) = kw {
+                        found.insert(kw);
+                    }
+                }
+                i += len;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    found
+}
+
+pub fn tokenize_program_at_with(
+    source: &str,
+    load_addr: u16,
+    dialect: Dialect,
+) -> Result<Vec<u8>, TokenizeError> {
     let mut out = Vec::with_capacity(source.len() + 64);
     out.push((load_addr & 0xFF) as u8);
     out.push(((load_addr >> 8) & 0xFF) as u8);
@@ -803,6 +925,8 @@ pub fn tokenize_program_at(source: &str, load_addr: u16) -> Result<Vec<u8>, Toke
     } else {
         source.to_string()
     };
+
+    let (tsb_table, tsb_demoted) = tsb_table_for(&normalized, dialect);
 
     let mut cur_addr: u32 = load_addr as u32;
     for (idx, raw_line) in normalized.lines().enumerate() {
@@ -829,7 +953,7 @@ pub fn tokenize_program_at(source: &str, load_addr: u16) -> Result<Vec<u8>, Toke
         }
 
         let body_start = stripped[line_no_str.len()..].trim_start_matches(' ');
-        let body = tokenize_body(body_start);
+        let body = tokenize_body(body_start, &tsb_table, &tsb_demoted);
 
         let line_len: u32 = 4 + body.len() as u32 + 1; // link + line# + body + NUL
         let next_addr = cur_addr
@@ -867,7 +991,31 @@ mod tests {
     use super::*;
 
     fn body(line: &str) -> Vec<u8> {
-        tokenize_body(line)
+        tokenize_body(line, KEYWORDS_TSB, &[])
+    }
+
+    #[test]
+    fn question_mark_folds_to_the_print_token() {
+        // The ROM's CRUNCH rewrites `?` to PRINT ($99).
+        assert_eq!(body("?\"HI\""), vec![0x99, 0x22, 0xC8, 0xC9, 0x22]);
+        assert_eq!(body("?"), vec![0x99]);
+        assert_eq!(body("A=1:?A"), vec![b'A', 0xB2, b'1', b':', 0x99, b'A']);
+    }
+
+    #[test]
+    fn pi_folds_to_the_rom_token() {
+        assert_eq!(body("PRINT π"), vec![0x99, b' ', 0xFF]);
+        assert_eq!(body("A=π*2"), vec![b'A', 0xB2, 0xFF, 0xAC, b'2']);
+    }
+
+    #[test]
+    fn question_mark_stays_literal_in_strings_data_and_rem() {
+        // Only a `?` in code position is an abbreviation; text keeps it.
+        assert_eq!(body("PRINT \"?\""), vec![0x99, b' ', 0x22, b'?', 0x22]);
+        assert!(body("DATA A?B").contains(&b'?'));
+        assert!(!body("DATA A?B").contains(&0x99));
+        assert!(body("REM ?").contains(&b'?'));
+        assert_eq!(body("REM ?").iter().filter(|&&b| b == 0x99).count(), 0);
     }
 
     #[test]
@@ -1194,9 +1342,10 @@ mod tests {
         // reproduce the original byte.
         let rendered = crate::petscii::byte_to_string(0xA6);
         assert_eq!(rendered, "{$A6}");
-        assert_eq!(body(&format!("PRINT \"{rendered}\"")), vec![
-            0x99, b' ', 0x22, 0xA6, 0x22
-        ]);
+        assert_eq!(
+            body(&format!("PRINT \"{rendered}\"")),
+            vec![0x99, b' ', 0x22, 0xA6, 0x22]
+        );
     }
 
     #[test]

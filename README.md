@@ -36,7 +36,7 @@ To build from source instead, see [BUILD.md](BUILD.md).
 
 ## Build
 
-Rust 1.85 or newer:
+Rust 1.92 or newer:
 
 ```sh
 cargo build --release -p yabcompiler-cli
@@ -58,6 +58,14 @@ yabcompiler compile mygame.bas mygame.prg
 Run `yabcompiler` with no arguments for the full list of commands and
 options.
 
+Use `--dialect=basic2` for BASIC V2 or `--dialect=tsb` for extended
+keywords. The default, `--dialect=auto`, detects extended commands and
+keeps names used as BASIC V2 variables. Both `compile` and `tokenize`
+accept this option.
+
+Choose `--profile=speed` or `--profile=size` to favor speed or smaller
+programs. The default profile balances both.
+
 GUI: launch `yabcompiler-gui`, pick a `.bas` or `.prg` as the input,
 press Compile. The menu bar holds the same actions plus theme and
 about. The settings panel is on the left, the output and generated
@@ -69,6 +77,8 @@ assembly on the right.
   Simons' BASIC commands (see below).
 * Type inference promotes integer-only variables to byte or word
   storage where it is safe to do so.
+* Optimizations for loops, array access and shared instruction sequences.
+  Trailing zero data can be initialized at startup to reduce file size.
 * Optional extra RAM mode banks BASIC ROM out and uses
   `$A000-$BFFF` for program code or data. The compiler decides
   automatically based on size, or you can force it.
@@ -107,7 +117,7 @@ crates/core     parser, IR, optimisation passes, code generator
 crates/cli      command line front-end
 crates/gui      egui GUI
 crates/emu64    small in-process C64 emulator used by the tests
-test_corpus     regression programs saved as .bas and .prg
+test_corpus     synthetic language tests saved as .bas and .prg
 test_synthetic  behavioural tests with expected output
 ```
 

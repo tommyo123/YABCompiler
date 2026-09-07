@@ -1007,6 +1007,12 @@ fn format_diagnostics(d: &yabcompiler_core::Diagnostics) -> String {
         "  layout : load ${:04X}, code ends ${:04X}\n",
         d.start_address, d.end_address
     ));
+    if d.bss_truncated > 0 {
+        out.push_str(&format!(
+            "  bss    : {} trailing zero byte(s) zero-filled at entry, not stored\n",
+            d.bss_truncated
+        ));
+    }
     out.push_str(&format!("  extraram: {}\n", d.extraram));
     if !d.effective_reserved.is_empty() {
         let source = match (d.auto_reserved.is_empty(), d.manual_reserved.is_empty()) {
@@ -1018,6 +1024,21 @@ fn format_diagnostics(d: &yabcompiler_core::Diagnostics) -> String {
         out.push_str(&format!(
             "  reserved{source}: {}\n",
             format_ranges(&d.effective_reserved)
+        ));
+    }
+    for o in &d.reserved_overshoots {
+        out.push_str(&format!(
+            "  warning: image ends {} byte(s) past reserved ${:04X}-${:04X}; \
+             the hole costs {} padding byte(s) in the .prg\n\
+             \x20          losing those {} byte(s) of code would drop the image below \
+             ${:04X} and shrink the file by at least {} byte(s)\n",
+            o.overshoot,
+            o.range.0,
+            o.range.1,
+            o.hole,
+            o.overshoot,
+            o.range.0,
+            o.recoverable(),
         ));
     }
     for s in &d.skipped_statements {

@@ -3,11 +3,12 @@
 //! Stages: parse PRG → AST → IR → optimization passes → asm text →
 //! machine code → SYS-stub-wrapped PRG.
 
-use asm6502::Assembler6502;
+use asm6502::{Assembler6502, Item};
 
 use crate::{ast, codegen, extraram, ir, pack, parse, prg, rem_hints};
 
 pub use crate::rem_hints::BasicHintDialect;
+pub use crate::tokens::Dialect;
 
 pub use crate::codegen::Profile;
 
@@ -60,6 +61,8 @@ pub struct CompileOptions {
     /// one dialect may be active at a time; `BasicHintDialect::None`
     /// (the default) treats REM as plain comment text.
     pub rem_hint_dialect: BasicHintDialect,
+    /// Source dialect used to interpret extended keyword spellings.
+    pub dialect: Dialect,
     /// Place machine code at a custom origin and ship a raw .prg with
     /// no SYS launcher. The user is expected to start the program
     /// manually (`SYS <address>` from BASIC, or load+jmp from ML).
@@ -91,6 +94,7 @@ impl Default for CompileOptions {
             lenient_syntax: false,
             safe_sys_calls: false,
             rem_hint_dialect: BasicHintDialect::None,
+            dialect: Dialect::default(),
             custom_start_address: None,
         }
     }
@@ -172,14 +176,14 @@ fn parse_hex_addr(s: &str) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
-/// Memory address the load-image (code+data, excluding runtime heap)
-/// must stay strictly below if we want to skip extraram. At or above
-/// this point the program would start encroaching on the BASIC-ROM
-/// shadow (\$A000-\$BFFF), so the auto-predictor switches extraram
-/// on. Set 256 bytes below \$A000 so a marginal probe build still
-/// has runtime breathing room (string-heap allocations, runtime DIM
-/// arrays, FAC temporaries) before MEMSIZ/heap collisions bite.
+/// Load-image boundary that triggers automatic extra RAM mode.
 pub const AUTO_EXTRARAM_TRIGGER: u32 = 0x9F00;
+
+/// Default KERNAL memory limit and string-heap ceiling without extra RAM.
+pub const DEFAULT_MEMSIZ: u32 = 0xA000;
+
+/// Smallest string heap the extraram-OFF layout may ship with.
+pub const MIN_STRING_HEAP: u32 = 0x0800;
 
 /// First runtime address we hand to user code: BASIC's load address
 /// (\$0801) plus the 12-byte SYS stub. Used by the predictor to
@@ -329,6 +333,65 @@ pub struct Diagnostics {
     /// the keyword. A live one silently does nothing, so callers
     /// should surface these.
     pub skipped_statements: Vec<crate::ast::SkippedStatement>,
+    /// Zero-page usage and denied promotions.
+    pub zp_pressure: crate::codegen::ZpPressure,
+    pub indirect_vectors: Vec<(String, u16)>,
+    pub vector_pads: usize,
+    pub bridge_shims: usize,
+    /// Trailing zero bytes initialized at startup and omitted from the load image.
+    pub bss_truncated: usize,
+    /// Reserved holes with a small amount of code above them.
+    pub reserved_overshoots: Vec<ReservedOvershoot>,
+}
+
+/// A reserved hole and the short image tail that requires its padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedOvershoot {
+    /// The reserved range, inclusive.
+    pub range: (u16, u16),
+    /// Bytes of image stored above `range.1`.
+    pub overshoot: u32,
+    /// Size of the hole, i.e. the padding bytes the file is paying.
+    pub hole: u32,
+}
+
+impl ReservedOvershoot {
+    /// Bytes saved by removing the image tail and the hole's padding.
+    pub fn recoverable(&self) -> u32 {
+        self.hole + self.overshoot
+    }
+}
+
+/// Maximum image tail above a reserved hole to report.
+const RESERVED_OVERSHOOT_MAX: u32 = 256;
+
+/// Find reserved holes followed by a short tail in the stored image range.
+pub fn reserved_tail_overshoots(
+    file_start: u16,
+    file_end: u16,
+    reserved: &[(u16, u16)],
+) -> Vec<ReservedOvershoot> {
+    let mut out: Vec<ReservedOvershoot> = reserved
+        .iter()
+        .filter_map(|&(lo, hi)| {
+            if hi >= file_end || lo < file_start {
+                return None;
+            }
+            let overshoot = u32::from(file_end) - u32::from(hi);
+            let hole = u32::from(hi) - u32::from(lo) + 1;
+            (overshoot <= RESERVED_OVERSHOOT_MAX && overshoot < hole).then_some(ReservedOvershoot {
+                range: (lo, hi),
+                overshoot,
+                hole,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.recoverable()
+            .cmp(&a.recoverable())
+            .then(a.range.0.cmp(&b.range.0))
+    });
+    out
 }
 
 /// Heuristic: does this parsed .prg look like genuine tokenized
@@ -358,10 +421,21 @@ fn looks_like_basic(prg: &prg::Program) -> bool {
     consistent > 0
 }
 
+/// Whether the input contains only a load address and optional end link.
+fn is_empty_basic_program(prg_bytes: &[u8], prg: &prg::Program) -> bool {
+    prg.lines.is_empty() && prg_bytes.len() <= 4
+}
+
 pub fn compile_with_options(
     prg_bytes: &[u8],
     options: CompileOptions,
 ) -> Result<Compiled, CompileError> {
+    let compiled = compile_pipeline(prg_bytes, options)?;
+    reject_io_area_overlap(&compiled)?;
+    Ok(compiled)
+}
+
+fn compile_pipeline(prg_bytes: &[u8], options: CompileOptions) -> Result<Compiled, CompileError> {
     if options.extraram && options.force_extraram_off {
         return Err(CompileError::Assemble {
             message: "--extraram and --force-extraram-off are mutually exclusive".to_string(),
@@ -369,18 +443,8 @@ pub fn compile_with_options(
         });
     }
     let prg = prg::Program::parse(prg_bytes).map_err(CompileError::Prg)?;
-    // Reject machine-language .prgs up front. A tokenized BASIC
-    // program has self-consistent next-line links (each line's link
-    // points at the following line); an ML program — a $C000 sprite
-    // editor, a $7000 music player, a $CC00 DOS wedge — has effectively
-    // random bytes there and satisfies none of them. Without this the
-    // BASIC parser walks the ML and reports a confusing "token $XX is
-    // not yet supported" deep inside the code, or worse, parses it as a
-    // garbage program and emits nonsense. The load address alone isn't
-    // enough to tell them apart (relocated BASIC saved at $1001/$4001
-    // is real, while some ML carries a leading $00 and looks like an
-    // $0800 BASIC load), so we check the structure instead.
-    if !looks_like_basic(&prg) {
+    // Reject machine-language .prgs up front.
+    if !looks_like_basic(&prg) && !is_empty_basic_program(prg_bytes, &prg) {
         return Err(CompileError::NotBasic {
             load_address: prg.load_address,
         });
@@ -399,6 +463,7 @@ pub fn compile_with_options(
     let parse_opts = parse::ParseOptions {
         lenient_syntax: options.lenient_syntax,
         int_hint_vars: hints.int_vars.clone(),
+        dialect: options.dialect,
     };
     let ast = parse::program_with_options(&prg, parse_opts).map_err(CompileError::Parse)?;
     let skipped_statements = ast.skipped.clone();
@@ -407,7 +472,7 @@ pub fn compile_with_options(
         .custom_start_address
         .map(u32::from)
         .unwrap_or(CODE_ORIGIN);
-    let asm = codegen::emit_with_profile_at_opts(
+    let (asm, zp_pressure) = codegen::emit_with_profile_at_opts_diag(
         &module,
         options.profile,
         origin as u16,
@@ -415,9 +480,15 @@ pub fn compile_with_options(
         &hints,
     )
     .map_err(CompileError::Codegen)?;
-    // Run asm-level peephole passes before extraram rewrites so
-    // liveness analysis sees raw ROM calls.
-    let asm = crate::peephole::run(&asm, options.profile);
+    let has_reservations = !options.reserved_ranges.is_empty()
+        || (options.auto_reserve && !discover_reserved_ranges(&module).is_empty());
+    let asm = crate::peephole::run_with_options(
+        &asm,
+        options.profile,
+        crate::peephole::Options {
+            inline_str_print_args: !has_reservations,
+        },
+    );
     // Programs that load ML embedded in REM lines via the
     // `SYS PEEK(44)*256+N` idiom (CavernRun, lots of crackme-style
     // 80s code) read the BASIC TXTTAB pointer at ZP $2B/$2C to
@@ -448,24 +519,29 @@ pub fn compile_with_options(
     // decides "yes extraram", we throw away the probe binary and run
     // the assemble step a second time with the extraram rewrite.
     if options.extraram {
-        return assemble_pass(
+        return assemble_pass_dropping_unpaid_bss_fill(
             &asm,
             &module,
             true,
             &options,
             ExtraRamDecision::ForcedOn,
             &skipped_statements,
+            zp_pressure,
         );
     }
     if options.force_extraram_off {
-        return assemble_pass(
+        let built = assemble_pass_dropping_unpaid_bss_fill(
             &asm,
             &module,
             false,
             &options,
             ExtraRamDecision::ForcedOff,
             &skipped_statements,
-        );
+            zp_pressure,
+        )?;
+        verify_below_rom_window(&built, origin)?;
+        verify_string_heap(&built, origin)?;
+        return Ok(built);
     }
     // When the custom origin already sits at or above the BASIC-ROM
     // shadow ($A000-$BFFF), extraram can't add code space — that area
@@ -475,41 +551,172 @@ pub fn compile_with_options(
     // below so a program at $8000 that grows past $9F00 picks up the
     // extra 8 KB just like a default-origin build would.
     if matches!(options.custom_start_address, Some(addr) if u32::from(addr) >= 0xC000) {
-        return assemble_pass(
+        return assemble_pass_dropping_unpaid_bss_fill(
             &asm,
             &module,
             false,
             &options,
             ExtraRamDecision::SkippedHighOrigin,
             &skipped_statements,
+            zp_pressure,
         );
     }
-    let probe = assemble_pass(
+    let probe = assemble_pass_dropping_unpaid_bss_fill(
         &asm,
         &module,
         false,
         &options,
         ExtraRamDecision::AutoOff,
         &skipped_statements,
+        zp_pressure,
     )?;
     let probe_end = origin + probe.machine_code.len() as u32;
-    if probe_end < AUTO_EXTRARAM_TRIGGER {
+    if probe_end < AUTO_EXTRARAM_TRIGGER && string_heap_window(&probe, origin).is_ok() {
         return Ok(probe);
     }
-    // Predictor: program would land at or past \$9F00. Re-assemble
-    // with extraram on so the data hoists and ROM-bank-out give the
-    // program 8 KB more code space ($A000-$BFFF). If the data
-    // section itself overflows the \$9F00 ceiling, `verify_data_fits`
-    // surfaces the error; there is no third pass that could rescue
-    // it (extraram is the largest available memory layout).
-    assemble_pass(
+    // Predictor: either the *image* would land at or past \$9F00, or it fits but leaves the
+    // runtime *string heap* starved (see `MIN_STRING_HEAP`).
+    let extraram_build = assemble_pass_dropping_unpaid_bss_fill(
         &asm,
         &module,
         true,
         &options,
         ExtraRamDecision::AutoOn,
         &skipped_statements,
-    )
+        zp_pressure,
+    );
+    match extraram_build {
+        Ok(built) => Ok(built),
+        Err(err) if probe_end >= AUTO_EXTRARAM_TRIGGER => Err(err),
+        Err(_) => {
+            verify_below_rom_window(&probe, origin)?;
+            verify_string_heap(&probe, origin)?;
+            Ok(probe)
+        }
+    }
+}
+
+/// Require enough space for the string heap when extra RAM is disabled.
+fn verify_string_heap(build: &Compiled, origin: u32) -> Result<(), CompileError> {
+    if build.diagnostics.extraram.is_on() {
+        // $A000-$BFFF is RAM in this layout, so MEMSIZ is not the heap's real ceiling and this
+        // window means nothing.
+        return Ok(());
+    }
+    let Err(window) = string_heap_window(build, origin) else {
+        return Ok(());
+    };
+    let end = origin + build.machine_code.len() as u32;
+    Err(CompileError::Assemble {
+        message: format!(
+            "?OUT OF MEMORY: the program ends at ${end:04X}, leaving only {window} bytes \
+             of string heap below MEMSIZ (${DEFAULT_MEMSIZ:04X}); at least {} are needed. \
+             Strings allocated past ${DEFAULT_MEMSIZ:04X} are written to RAM but read back \
+             from BASIC ROM, so they come back as garbage with no error. Drop \
+             --force-extraram-off so the RAM-under-ROM layout can be used, or shrink the \
+             program.",
+            MIN_STRING_HEAP,
+        ),
+        asm: Some(build.asm.clone()),
+    })
+}
+
+/// Reject a load image that overlaps BASIC ROM without extra RAM enabled.
+fn verify_below_rom_window(build: &Compiled, origin: u32) -> Result<(), CompileError> {
+    if build.diagnostics.extraram.is_on() || origin >= DEFAULT_MEMSIZ {
+        return Ok(());
+    }
+    let end = origin + build.machine_code.len() as u32;
+    if end <= DEFAULT_MEMSIZ {
+        return Ok(());
+    }
+    Err(CompileError::Assemble {
+        message: format!(
+            "?OUT OF MEMORY: without extraram the program may not pass \
+             ${DEFAULT_MEMSIZ:04X}, but this image ends at ${end:04X} — {} bytes of it lie \
+             under the BASIC ROM window ($A000-$BFFF). Those bytes are written to RAM and \
+             read back as ROM, so the program runs on garbage with no error. Drop \
+             --force-extraram-off so the RAM-under-ROM layout can be used, or remove about \
+             {} bytes (shorter DATA, smaller arrays, fewer string literals).",
+            end - DEFAULT_MEMSIZ,
+            end - DEFAULT_MEMSIZ,
+        ),
+        asm: Some(build.asm.clone()),
+    })
+}
+
+/// Bytes of string heap the finished extraram-OFF `build` leaves between the top of its load
+/// image and MEMSIZ, or `Err(window)` when that is below [`MIN_STRING_HEAP`].
+fn string_heap_window(build: &Compiled, origin: u32) -> Result<Option<u32>, u32> {
+    if !build.asm.contains("__HEAP_BOTTOM:") {
+        return Ok(None);
+    }
+    if origin >= DEFAULT_MEMSIZ {
+        return Ok(None);
+    }
+    let end = origin + build.machine_code.len() as u32;
+    let window = DEFAULT_MEMSIZ.saturating_sub(end);
+    if window < MIN_STRING_HEAP {
+        Err(window)
+    } else {
+        Ok(Some(window))
+    }
+}
+
+/// [`assemble_pass`], plus the guarantee that the BSS zero-fill loop never costs a program
+/// bytes.
+fn assemble_pass_dropping_unpaid_bss_fill(
+    asm: &str,
+    module: &ir::Module,
+    extraram_on: bool,
+    options: &CompileOptions,
+    extraram_decision: ExtraRamDecision,
+    skipped_statements: &[crate::ast::SkippedStatement],
+    zp_pressure: codegen::ZpPressure,
+) -> Result<Compiled, CompileError> {
+    let with_fill = assemble_pass(
+        asm,
+        module,
+        extraram_on,
+        options,
+        extraram_decision,
+        skipped_statements,
+        zp_pressure,
+    );
+    if !extraram::has_bss_tail_fill(asm) {
+        return with_fill;
+    }
+    let settled = match &with_fill {
+        // extraram strips the fill itself, so the retry would assemble byte-identical input.
+        Ok(c) => {
+            c.diagnostics.bss_truncated > 0
+                && c.diagnostics.effective_reserved.is_empty()
+                && !c.diagnostics.extraram.is_on()
+        }
+        Err(_) => false,
+    };
+    if settled {
+        return with_fill;
+    }
+    let without_fill = assemble_pass(
+        &extraram::strip_bss_tail_fill(asm),
+        module,
+        extraram_on,
+        options,
+        extraram_decision,
+        skipped_statements,
+        zp_pressure,
+    );
+    match (with_fill, without_fill) {
+        (Ok(a), Ok(b)) => Ok(if b.prg_bytes.len() < a.prg_bytes.len() {
+            b
+        } else {
+            a
+        }),
+        (Err(_), Ok(b)) => Ok(b),
+        (Ok(a), Err(_)) => Ok(a),
+        (Err(a), Err(_)) => Err(a),
+    }
 }
 
 /// Run the assemble + extraram-rewrite + reserved-range setup once
@@ -524,6 +731,7 @@ fn assemble_pass(
     options: &CompileOptions,
     extraram_decision: ExtraRamDecision,
     skipped_statements: &[crate::ast::SkippedStatement],
+    zp_pressure: codegen::ZpPressure,
 ) -> Result<Compiled, CompileError> {
     let auto_ranges: Vec<(u16, u16)> = if options.auto_reserve {
         discover_reserved_ranges(module)
@@ -560,33 +768,33 @@ fn assemble_pass(
         relocate_data_past_reservations(asm, &merged)
     };
 
-    let mut assembler = Assembler6502::new();
-    // Reserved-region pass: feed the assembler regions of memory that
-    // it must NOT place generated code or data into. Auto-discovered
-    // ranges (POKE/PEEK literal addresses) come first, then user-
-    // supplied ranges; the assembler refuses overlap so the sort+
-    // merge in apply_reserved_ranges has to dedupe before either set
-    // reaches the underlying `add_reserved_range` calls.
-    for (start, end) in &merged {
-        assembler
-            .add_reserved_range(*start, *end)
-            .map_err(|e| CompileError::Assemble {
-                message: format!("reserved range ${start:04X}-${end:04X}: {e}"),
-                asm: None,
-            })?;
-    }
+    let Assembled {
+        assembler,
+        machine_code,
+        asm: final_asm,
+        vectors: indirect_vectors,
+        pads: vector_pads,
+        shims: bridge_shims,
+    } = assemble_with_aligned_vectors(final_asm, &merged)?;
 
-    let machine_code =
-        assembler
-            .assemble_bytes(&final_asm)
-            .map_err(|e| CompileError::Assemble {
-                // The asm6502 error text is short and self-explanatory
-                // ("undefined label 'foo'", "branch out of range"). The
-                // full asm goes in `asm` so callers can write it to disk
-                // when they need to grep — see `CompileError::generated_asm`.
-                message: format!("{e}"),
+    // The image has to fit the 6502's address space.
+    {
+        let origin = options.custom_start_address.unwrap_or(CODE_ORIGIN as u16) as usize;
+        let end = origin + machine_code.len();
+        if end > 0x1_0000 {
+            let over = end - 0x1_0000;
+            return Err(CompileError::Assemble {
+                message: format!(
+                    "?OUT OF MEMORY: the program needs {} bytes from ${:04X}, which is \
+                     {over} bytes past the top of memory. Reduce data (smaller arrays, \
+                     fewer string literals, less DATA).",
+                    machine_code.len(),
+                    origin,
+                ),
                 asm: Some(final_asm.clone()),
-            })?;
+            });
+        }
+    }
 
     if extraram_on {
         extraram::verify_data_fits(|name| assembler.lookup(name)).map_err(|message| {
@@ -606,11 +814,34 @@ fn assemble_pass(
             asm: Some(final_asm.clone()),
         }
     })?;
+    verify_label_bytes(
+        &final_asm,
+        &machine_code,
+        options.custom_start_address.unwrap_or(CODE_ORIGIN as u16),
+        |name| assembler.lookup(name),
+    )
+    .map_err(|message| CompileError::Assemble {
+        message,
+        asm: Some(final_asm.clone()),
+    })?;
+    verify_addressing_modes(&final_asm, |name| assembler.lookup(name)).map_err(|message| {
+        CompileError::Assemble {
+            message,
+            asm: Some(final_asm.clone()),
+        }
+    })?;
 
+    let keep = bss_tail_keep_len(
+        &machine_code,
+        options.custom_start_address.unwrap_or(CODE_ORIGIN as u16),
+        |name| assembler.lookup(name),
+    );
+    let bss_truncated = machine_code.len() - keep;
+    let stored = &machine_code[..keep];
     let (prg_bytes, start_address) = if let Some(addr) = options.custom_start_address {
-        (pack::pack_raw(addr, &machine_code), addr)
+        (pack::pack_raw(addr, stored), addr)
     } else {
-        (pack::pack(&machine_code), 0x0801)
+        (pack::pack(stored), 0x0801)
     };
     // end_address is the inclusive last byte of compiled code in
     // memory after the program has loaded. For default builds the
@@ -619,6 +850,9 @@ fn assemble_pass(
     let code_origin = options.custom_start_address.unwrap_or(CODE_ORIGIN as u16);
     let end_address = code_origin
         .saturating_add(machine_code.len().saturating_sub(1).min(u16::MAX as usize) as u16);
+    let file_end = start_address
+        .saturating_add((prg_bytes.len().saturating_sub(3)).min(u16::MAX as usize) as u16);
+    let reserved_overshoots = reserved_tail_overshoots(start_address, file_end, &merged);
     let diagnostics = Diagnostics {
         start_address,
         end_address,
@@ -627,6 +861,12 @@ fn assemble_pass(
         manual_reserved: manual_ranges,
         effective_reserved: merged.clone(),
         skipped_statements: skipped_statements.to_vec(),
+        zp_pressure,
+        indirect_vectors,
+        vector_pads,
+        bridge_shims,
+        bss_truncated,
+        reserved_overshoots,
     };
     Ok(Compiled {
         asm: final_asm,
@@ -634,6 +874,868 @@ fn assemble_pass(
         prg_bytes,
         diagnostics,
     })
+}
+
+/// Final assembly, bytes and symbol table after layout checks.
+struct Assembled {
+    assembler: Assembler6502,
+    machine_code: Vec<u8>,
+    asm: String,
+    /// Every `JMP (vector)` in the image, sorted by address.
+    vectors: Vec<(String, u16)>,
+    /// Pad bytes inserted to settle the layout; normally 0.
+    pads: usize,
+    /// Filler bytes inserted to keep a label attached to the item it names across a
+    /// reserved-range bridge; normally 0.
+    shims: usize,
+}
+
+/// Assemble until indirect vectors and reserved-range bridges have valid placement.
+fn assemble_with_aligned_vectors(
+    mut asm: String,
+    reserved: &[(u16, u16)],
+) -> Result<Assembled, CompileError> {
+    let mut pads = 0usize;
+    let mut shims = 0usize;
+    loop {
+        let mut assembler = Assembler6502::new();
+        // Reserved-region pass: feed the assembler regions of memory that it must NOT place
+        // generated code or data into.
+        for (start, end) in reserved {
+            assembler
+                .add_reserved_range(*start, *end)
+                .map_err(|e| CompileError::Assemble {
+                    message: format!("reserved range ${start:04X}-${end:04X}: {e}"),
+                    asm: None,
+                })?;
+        }
+
+        let (machine_code, items) =
+            assembler
+                .assemble_full(&asm)
+                .map_err(|e| CompileError::Assemble {
+                    message: format!("{e}"),
+                    asm: Some(asm.clone()),
+                })?;
+
+        if let Some(orphan) = bridge_orphans(&items, reserved)
+            .into_iter()
+            .filter_map(|o| o.resolve(|n| assembler.lookup(n)))
+            .min_by_key(|o| o.addr)
+        {
+            if shims > reserved.len() + 2 {
+                return Err(CompileError::Assemble {
+                    message: orphan.internal_error_message(shims),
+                    asm: Some(asm),
+                });
+            }
+            asm = insert_bridge_shim(&asm, &orphan).ok_or_else(|| CompileError::Assemble {
+                message: orphan.unfixable_message(),
+                asm: Some(asm.clone()),
+            })?;
+            shims += 1;
+            continue;
+        }
+
+        let mut vectors =
+            resolve_indirect_vectors(&asm, |name| assembler.lookup(name)).map_err(|message| {
+                CompileError::Assemble {
+                    message,
+                    asm: Some(asm.clone()),
+                }
+            })?;
+        let Some((label, addr)) = vector_page_offenders(&vectors).into_iter().next() else {
+            vectors.sort_by_key(|(_, addr)| *addr);
+            return Ok(Assembled {
+                assembler,
+                machine_code,
+                asm,
+                vectors,
+                pads,
+                shims,
+            });
+        };
+        if pads > vectors.len() + 2 {
+            return Err(CompileError::Assemble {
+                message: format!(
+                    "internal error: could not keep the indirect-JMP vector '{label}' off a \
+                     page boundary (still at ${addr:04X}) after {pads} pad bytes"
+                ),
+                asm: Some(asm),
+            });
+        }
+        asm = insert_vector_pad(&asm, &label).ok_or_else(|| CompileError::Assemble {
+            message: format!(
+                "internal error: the indirect-JMP vector '{label}' is linked at ${addr:04X}, \
+                 the last byte of a page, where an NMOS 6502 `JMP ({label})` reads its high \
+                 byte from ${:04X} instead of ${:04X} — and there is no `{label}:` definition \
+                 to pad in front of",
+                addr & 0xFF00,
+                addr.wrapping_add(1),
+            ),
+            asm: Some(asm.clone()),
+        })?;
+        pads += 1;
+    }
+}
+
+// I/O-area overlap
+
+/// First byte of the C64 I/O block.
+pub const IO_AREA_LO: u16 = 0xD000;
+/// Last byte of the C64 I/O block.
+pub const IO_AREA_HI: u16 = 0xDFFF;
+
+/// The `[start, end]` slice of `$D000-$DFFF` that a loaded image covers, or `None` when it
+/// clears the I/O block entirely.
+fn bss_tail_keep_len(
+    machine_code: &[u8],
+    origin: u16,
+    lookup: impl Fn(&str) -> Option<u16>,
+) -> usize {
+    let full = machine_code.len();
+    let (Some(start), Some(end)) = (
+        lookup(codegen::BSS_START_LABEL),
+        lookup(codegen::BSS_END_LABEL),
+    ) else {
+        return full;
+    };
+    let (Some(from), Some(to)) = (
+        (start as usize).checked_sub(origin as usize),
+        (end as usize).checked_sub(origin as usize),
+    ) else {
+        return full;
+    };
+    if to != full || from > to {
+        return full;
+    }
+    if machine_code[from..].iter().any(|b| *b != 0) {
+        return full;
+    }
+    from
+}
+
+fn io_area_overlap(image_start: u16, image_len: usize) -> Option<(u16, u16)> {
+    let last = (image_start as usize).checked_add(image_len.checked_sub(1)?)?;
+    let lo = image_start.max(IO_AREA_LO);
+    let hi = u16::try_from(last).unwrap_or(u16::MAX).min(IO_AREA_HI);
+    (lo <= hi && last >= IO_AREA_LO as usize).then_some((lo, hi))
+}
+
+/// Reject a load image that overlaps the I/O area at $D000-$DFFF.
+fn reject_io_area_overlap(compiled: &Compiled) -> Result<(), CompileError> {
+    let start = compiled.diagnostics.start_address;
+    let len = compiled.prg_bytes.len().saturating_sub(2) + compiled.diagnostics.bss_truncated;
+    let Some((lo, hi)) = io_area_overlap(start, len) else {
+        return Ok(());
+    };
+    let count = hi as u32 - lo as u32 + 1;
+    let end = start as u32 + len as u32 - 1;
+    let ceiling = u32::from(IO_AREA_LO - 1);
+    let excess = end.saturating_sub(ceiling);
+    Err(CompileError::Assemble {
+        message: format!(
+            "the compiled image spans ${start:04X}-${end:04X} and covers {count} bytes of \
+             the I/O area ${lo:04X}-${hi:04X}. A KERNAL LOAD stores that range into the \
+             VIC/SID/CIA registers instead of RAM, so those {count} bytes never reach \
+             memory and the loaded program is corrupt — it would not run. Code cannot be \
+             placed around the hole either, so the image has to end at or before \
+             ${ceiling:04X}: remove about {excess} bytes (shorter DATA, smaller arrays, \
+             fewer or shorter string literals).",
+        ),
+        asm: Some(compiled.asm.clone()),
+    })
+}
+
+/// Collect indirect-JMP operands in source order, without duplicates.
+fn indirect_jmp_operands(asm: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if !line.get(..3).is_some_and(|m| m.eq_ignore_ascii_case("JMP")) {
+            continue;
+        }
+        let Some(inner) = line[3..].trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let Some(end) = inner.find(')') else {
+            continue;
+        };
+        let operand = inner[..end].trim().to_string();
+        if !operand.is_empty() && !out.contains(&operand) {
+            out.push(operand);
+        }
+    }
+    out
+}
+
+/// Split a vector operand into its label and byte offset.
+fn split_vector_operand(operand: &str) -> Option<(&str, i32)> {
+    let cut = operand.find(['+', '-'])?;
+    let (base, off) = operand.split_at(cut);
+    let base = base.trim();
+    let (sign, digits) = off.split_at(1);
+    let digits = digits.trim();
+    let magnitude = if let Some(hex) = digits.strip_prefix('$') {
+        i32::from_str_radix(hex, 16).ok()?
+    } else {
+        digits.parse::<i32>().ok()?
+    };
+    let signed = if sign == "-" { -magnitude } else { magnitude };
+    Some((base, signed))
+}
+
+/// Parse a literal address operand: `$XXXX` hex, or bare decimal.
+fn parse_literal_operand(operand: &str) -> Option<u16> {
+    if let Some(hex) = operand.strip_prefix('$') {
+        u16::from_str_radix(hex, 16).ok()
+    } else if operand.chars().all(|c| c.is_ascii_digit()) && !operand.is_empty() {
+        operand.parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
+/// Resolve indirect-JMP operands to their final addresses.
+fn resolve_indirect_vectors(
+    asm: &str,
+    lookup: impl Fn(&str) -> Option<u16>,
+) -> Result<Vec<(String, u16)>, String> {
+    let mut out = Vec::new();
+    for operand in indirect_jmp_operands(asm) {
+        if let Some(addr) = parse_literal_operand(&operand) {
+            out.push((operand, addr));
+            continue;
+        }
+        let (base, offset) = split_vector_operand(&operand).unwrap_or((operand.as_str(), 0));
+        let Some(base_addr) = lookup(base) else {
+            return Err(format!(
+                "internal error: cannot resolve the operand of `JMP ({operand})`, so the \
+                 NMOS `JMP ($xxFF)` page-boundary check cannot be applied to it"
+            ));
+        };
+        let addr = (i32::from(base_addr) + offset) as u16;
+        out.push((operand, addr));
+    }
+    Ok(out)
+}
+
+/// The vectors from [`resolve_indirect_vectors`] that start on the last byte of a page, lowest
+/// address first.
+fn vector_page_offenders(vectors: &[(String, u16)]) -> Vec<(String, u16)> {
+    let mut bad: Vec<(String, u16)> = vectors
+        .iter()
+        .filter(|(_, addr)| addr & 0x00FF == 0x00FF)
+        .cloned()
+        .collect();
+    bad.sort_by_key(|(_, addr)| *addr);
+    bad
+}
+
+/// Insert a byte ahead of the vector label to move it off the page boundary.
+fn insert_vector_pad(asm: &str, label: &str) -> Option<String> {
+    let (base, _) = split_vector_operand(label).unwrap_or((label, 0));
+    let def = format!("{base}:\n");
+    // Anchor on a line start so `__FOO:` doesn't match inside `__BAR__FOO:`.
+    let at = if asm.starts_with(&def) {
+        0
+    } else {
+        asm.find(&format!("\n{def}"))? + 1
+    };
+    let mut out = String::with_capacity(asm.len() + 96);
+    out.push_str(&asm[..at]);
+    out.push_str(
+        "; pad: an NMOS 6502 `JMP ($xxFF)` reads its high byte from $xx00, so this\n\
+         ; vector must not start on the last byte of a page.\n    .byte $00\n",
+    );
+    out.push_str(&asm[at..]);
+    Some(out)
+}
+
+const ZP_X_MNEMONICS: &[&str] = &[
+    "ADC", "AND", "ASL", "CMP", "DEC", "EOR", "INC", "LDA", "LDY", "LSR", "ORA", "ROL", "ROR",
+    "SBC", "STA", "STY",
+];
+
+/// Mnemonics with a `zeropage,Y` encoding.
+const ZP_Y_MNEMONICS: &[&str] = &["LDX", "STX"];
+
+/// Mnemonics with a plain `zeropage` encoding.
+const ZP_MNEMONICS: &[&str] = &[
+    "ADC", "AND", "ASL", "BIT", "CMP", "CPX", "CPY", "DEC", "EOR", "INC", "LDA", "LDX", "LDY",
+    "LSR", "ORA", "ROL", "ROR", "SBC", "STA", "STX", "STY",
+];
+
+/// Mnemonics that take `(zp),Y` / `(zp,X)`.
+const INDIRECT_MNEMONICS: &[&str] = &["ADC", "AND", "CMP", "EOR", "LDA", "ORA", "SBC", "STA"];
+
+/// One instruction line of the finished assembly.
+struct AsmInsn<'a> {
+    line: usize,
+    mnemonic: &'a str,
+    /// Operand text with the comment and surrounding space removed; empty for
+    /// implied/accumulator instructions.
+    operand: &'a str,
+}
+
+/// The instruction lines of `asm`, in order.
+fn asm_instructions(asm: &str) -> Vec<AsmInsn<'_>> {
+    let mut out = Vec::new();
+    for (i, raw) in asm.lines().enumerate() {
+        let code = raw.split(';').next().unwrap_or("");
+        if !code.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let trimmed = code.trim();
+        let Some(mnemonic) = trimmed.get(..3) else {
+            continue;
+        };
+        if !mnemonic.bytes().all(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        let rest = trimmed[3..].trim();
+        if !trimmed[3..].is_empty() && !trimmed[3..].starts_with(char::is_whitespace) {
+            continue;
+        }
+        out.push(AsmInsn {
+            line: i + 1,
+            mnemonic,
+            operand: rest,
+        });
+    }
+    out
+}
+
+/// Resolve a literal address, label or label with an offset.
+fn resolve_addr_operand(operand: &str, lookup: &impl Fn(&str) -> Option<u16>) -> Option<u16> {
+    if let Some(v) = parse_literal_operand(operand) {
+        return Some(v);
+    }
+    if let Some((base, off)) = split_vector_operand(operand) {
+        let base = base.trim();
+        let base_addr = parse_literal_operand(base).or_else(|| lookup(base))?;
+        return Some((i32::from(base_addr) + off) as u16);
+    }
+    lookup(operand)
+}
+
+/// Split `"$1234,X"` into `("$1234", 'X')`.
+fn split_indexed_operand(operand: &str) -> Option<(&str, char)> {
+    if operand.starts_with('(') {
+        return None;
+    }
+    let (base, idx) = operand.rsplit_once(',')?;
+    let idx = idx.trim();
+    let reg = match idx {
+        "X" | "x" => 'X',
+        "Y" | "y" => 'Y',
+        _ => return None,
+    };
+    Some((base.trim(), reg))
+}
+
+/// Split `"($FB),Y"` into `("$FB", true)` and `"($FB,X)"` into `("$FB", false)`; the flag says
+/// whether it is the `,Y` form.
+fn split_indirect_operand(operand: &str) -> Option<(&str, bool)> {
+    let inner = operand.strip_prefix('(')?;
+    if let Some(pos) = inner.find("),") {
+        let idx = inner[pos + 2..].trim();
+        if idx.eq_ignore_ascii_case("Y") {
+            return Some((inner[..pos].trim(), true));
+        }
+        return None;
+    }
+    let inner = inner.strip_suffix(')')?;
+    let (base, idx) = inner.rsplit_once(',')?;
+    idx.trim()
+        .eq_ignore_ascii_case("X")
+        .then(|| (base.trim(), false))
+}
+
+/// Reject indexed operands whose zero-page addressing can wrap.
+fn verify_no_narrowed_index(
+    asm: &str,
+    lookup: &impl Fn(&str) -> Option<u16>,
+) -> Result<(), String> {
+    for insn in asm_instructions(asm) {
+        let Some((base, reg)) = split_indexed_operand(insn.operand) else {
+            continue;
+        };
+        let table = if reg == 'X' {
+            ZP_X_MNEMONICS
+        } else {
+            ZP_Y_MNEMONICS
+        };
+        if !table.contains(&insn.mnemonic) {
+            continue;
+        }
+        let Some(addr) = resolve_addr_operand(base, lookup) else {
+            continue;
+        };
+        if addr == 0 || addr >= 0x100 {
+            continue;
+        }
+        let wraps_at = 0x100 - addr;
+        return Err(format!(
+            "internal error: line {} emits `{} {}`, whose base resolves to ${addr:04X}. \
+             asm6502 picks the addressing mode from the operand's value, not from the width \
+             it was written at, so this assembles as `zeropage,{reg}` and computes \
+             `(${addr:02X} + {reg}) & $FF`. For {reg} >= {wraps_at} that reads $0000-${:04X} \
+             where the absolute form reads $0100-${:04X}. Only a base of $0000 or one at \
+             $0100 and above is wrap-free for an unrestricted byte index (see \
+             `indexed_base_cannot_wrap` in codegen.rs); this emit site has to decline the \
+             indexed form and use a self-modifying operand instead.",
+            insn.line,
+            insn.mnemonic,
+            insn.operand,
+            addr - 1,
+            addr.wrapping_add(0xFF),
+        ));
+    }
+    Ok(())
+}
+
+/// Require indirect pointers to occupy a complete zero-page pair.
+fn verify_indirect_zp_pointers(
+    asm: &str,
+    lookup: &impl Fn(&str) -> Option<u16>,
+) -> Result<(), String> {
+    for insn in asm_instructions(asm) {
+        if !INDIRECT_MNEMONICS.contains(&insn.mnemonic) {
+            continue;
+        }
+        let Some((base, is_y)) = split_indirect_operand(insn.operand) else {
+            continue;
+        };
+        let form = if is_y { "(zp),Y" } else { "(zp,X)" };
+        let Some(addr) = resolve_addr_operand(base, lookup) else {
+            return Err(format!(
+                "internal error: line {} emits `{} {}` and the operand `{base}` cannot be \
+                 resolved, so the {form} zero-page requirement cannot be checked against it",
+                insn.line, insn.mnemonic, insn.operand,
+            ));
+        };
+        if addr >= 0x100 {
+            return Err(format!(
+                "internal error: line {} emits `{} {}`, but `{base}` is linked at \
+                 ${addr:04X} — outside zero page. A {form} pointer is a single byte: \
+                 asm6502 truncates the operand to ${:02X} without complaint, so the \
+                 instruction would read its pointer from ${:04X} instead of ${addr:04X}.",
+                insn.line,
+                insn.mnemonic,
+                insn.operand,
+                addr & 0xFF,
+                addr & 0xFF,
+            ));
+        }
+        if addr == 0xFF {
+            return Err(format!(
+                "internal error: line {} emits `{} {}` with `{base}` at $00FF, the last \
+                 byte of zero page. The 6502 wraps the second pointer fetch inside page \
+                 zero, so it reads the high byte from $0000 rather than $0100 — the pair \
+                 codegen laid out is not the pair the CPU reads.",
+                insn.line, insn.mnemonic, insn.operand,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encoded_len(insn: &AsmInsn<'_>, lookup: &impl Fn(&str) -> Option<u16>) -> Option<usize> {
+    if insn.operand.is_empty() {
+        return Some(1);
+    }
+    if insn.operand.starts_with('#') {
+        return Some(2);
+    }
+    if matches!(
+        insn.mnemonic,
+        "BCC" | "BCS" | "BEQ" | "BMI" | "BNE" | "BPL" | "BVC" | "BVS"
+    ) {
+        return Some(2);
+    }
+    if insn.mnemonic == "JMP" || insn.mnemonic == "JSR" {
+        return Some(3);
+    }
+    if insn.operand.starts_with('(') {
+        return Some(2);
+    }
+    let (base, table) = match split_indexed_operand(insn.operand) {
+        Some((base, 'X')) => (base, ZP_X_MNEMONICS),
+        Some((base, _)) => (base, ZP_Y_MNEMONICS),
+        None => (insn.operand, ZP_MNEMONICS),
+    };
+    let addr = resolve_addr_operand(base, lookup)?;
+    Some(if addr < 0x100 && table.contains(&insn.mnemonic) {
+        2
+    } else {
+        3
+    })
+}
+
+/// Require self-modifying offsets to stay inside the target instruction.
+fn verify_smc_patch_offsets(
+    asm: &str,
+    lookup: &impl Fn(&str) -> Option<u16>,
+) -> Result<(), String> {
+    // label -> the instruction it names, for labels immediately followed by one.
+    let mut named: std::collections::HashMap<&str, AsmInsn<'_>> = std::collections::HashMap::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for (i, raw) in asm.lines().enumerate() {
+        let code = raw.split(';').next().unwrap_or("");
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !code.starts_with(char::is_whitespace) {
+            if let Some(name) = trimmed.strip_suffix(':') {
+                pending.push(name);
+            } else {
+                // An equate or a directive at column 0 ends the run without naming an
+                // instruction.
+                pending.clear();
+            }
+            continue;
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        let Some(mnemonic) = trimmed.get(..3).filter(|m| {
+            m.bytes().all(|c| c.is_ascii_uppercase())
+                && (trimmed[3..].is_empty() || trimmed[3..].starts_with(char::is_whitespace))
+        }) else {
+            pending.clear();
+            continue;
+        };
+        for name in pending.drain(..) {
+            named.insert(
+                name,
+                AsmInsn {
+                    line: i + 1,
+                    mnemonic,
+                    operand: trimmed[3..].trim(),
+                },
+            );
+        }
+    }
+
+    for insn in asm_instructions(asm) {
+        let core = insn
+            .operand
+            .trim_start_matches(['#', '<', '>'])
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let Some((base, off)) = split_vector_operand(core) else {
+            continue;
+        };
+        if off <= 0 {
+            continue;
+        }
+        let Some(target) = named.get(base.trim()) else {
+            continue;
+        };
+        let Some(len) = encoded_len(target, lookup) else {
+            continue;
+        };
+        if (off as usize) < len {
+            continue;
+        }
+        return Err(format!(
+            "internal error: line {} references `{core}`, but `{}` names the {len}-byte \
+             instruction `{} {}` on line {}. Offset +{off} is past its last byte, so a \
+             store through it lands on the instruction that follows instead of on this \
+             one's operand. A self-modifying template patched at +1 and +2 has to be a \
+             three-byte absolute instruction; this one narrowed to zero page.",
+            insn.line,
+            base.trim(),
+            target.mnemonic,
+            target.operand,
+            target.line,
+        ));
+    }
+    Ok(())
+}
+
+/// Run all three addressing-mode guards over the finished assembly.
+fn verify_addressing_modes(asm: &str, lookup: impl Fn(&str) -> Option<u16>) -> Result<(), String> {
+    verify_no_narrowed_index(asm, &lookup)?;
+    verify_indirect_zp_pointers(asm, &lookup)?;
+    verify_smc_patch_offsets(asm, &lookup)?;
+    Ok(())
+}
+
+/// Decode leading literal data operands, up to the requested byte limit.
+fn leading_data_literals(operands: &str, word: bool, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for tok in operands.split(',') {
+        if out.len() >= max {
+            break;
+        }
+        let tok = tok.trim();
+        let Some(hex) = tok.strip_prefix('$') else {
+            break;
+        };
+        let width = if word { 4 } else { 2 };
+        match u16::from_str_radix(hex, 16) {
+            Ok(v) if hex.len() <= width => {
+                out.push((v & 0xFF) as u8);
+                if word {
+                    out.push((v >> 8) as u8);
+                }
+            }
+            _ => break,
+        }
+    }
+    out.truncate(max);
+    out
+}
+
+/// Post-condition: every `LABEL:` in the asm that is immediately followed by a `.byte`/`.word`
+/// run of literals must be linked at exactly those bytes in the finished image.
+fn verify_label_bytes(
+    asm: &str,
+    machine_code: &[u8],
+    origin: u16,
+    lookup: impl Fn(&str) -> Option<u16>,
+) -> Result<(), String> {
+    // How many bytes to compare.
+    const WINDOW: usize = 4;
+    let mut pending: Vec<&str> = Vec::new();
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(name) = trimmed.strip_suffix(':') {
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
+                pending.push(name);
+                continue;
+            }
+        }
+        let head = trimmed.get(..5).unwrap_or_default();
+        let word = head.eq_ignore_ascii_case(".word");
+        if !word && !head.eq_ignore_ascii_case(".byte") {
+            pending.clear();
+            continue;
+        }
+        let want = leading_data_literals(trimmed[5..].trim(), word, WINDOW);
+        if want.is_empty() {
+            pending.clear();
+            continue;
+        }
+        for name in pending.drain(..) {
+            let Some(addr) = lookup(name) else { continue };
+            let Some(off) = usize::from(addr).checked_sub(usize::from(origin)) else {
+                continue;
+            };
+            let Some(got) = machine_code.get(off..off + want.len()) else {
+                continue;
+            };
+            if got != want.as_slice() {
+                return Err(format!(
+                    "internal error: `{name}:` is linked at ${addr:04X}, but the image \
+                     holds {got:02X?} there instead of the {want:02X?} the label names. \
+                     The label was separated from its own bytes during layout — code \
+                     that takes its address (`LDA #<{name}`) reads the wrong memory."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A run of labels the assembler stranded on a reserved-range bridge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BridgeOrphan {
+    /// Labels stranded on the bridge, in emission order.
+    labels: Vec<String>,
+    /// First byte of the reserved range the bridge skips over.
+    r_start: u16,
+    /// Last byte of that range; the bridge `JMP` targets `r_end + 1`.
+    r_end: u16,
+}
+
+/// A [`BridgeOrphan`] with the address the assembler linked it at, and with names that cannot
+/// be repaired filtered out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedOrphan {
+    labels: Vec<String>,
+    r_start: u16,
+    r_end: u16,
+    /// Linked address of the label displaced by a reserved-range bridge.
+    addr: u16,
+}
+
+fn is_assembler_generated_label(name: &str) -> bool {
+    name.starts_with("__skip_")
+}
+
+impl BridgeOrphan {
+    /// Resolve the stranded run against the assembler's symbol table, dropping names that need
+    /// no repair.
+    fn resolve(self, lookup: impl Fn(&str) -> Option<u16>) -> Option<ResolvedOrphan> {
+        let labels: Vec<String> = self
+            .labels
+            .into_iter()
+            .filter(|n| !is_assembler_generated_label(n))
+            .collect();
+        let addr = labels.iter().find_map(|n| lookup(n))?;
+        Some(ResolvedOrphan {
+            labels,
+            r_start: self.r_start,
+            r_end: self.r_end,
+            addr,
+        })
+    }
+}
+
+impl ResolvedOrphan {
+    fn names(&self) -> String {
+        self.labels.join(", ")
+    }
+
+    fn unfixable_message(&self) -> String {
+        format!(
+            "internal error: the label(s) {} resolve to ${:04X}, which is the \
+             `JMP ${:04X}` the assembler inserted to skip reserved range \
+             ${:04X}-${:04X} — their actual bytes start at ${:04X}. Any code that \
+             takes the address of one of these reads the bridge instead of its \
+             data. No `<label>:` definition was found in the generated asm to \
+             splice filler in front of, so the layout cannot be repaired.",
+            self.names(),
+            self.addr,
+            self.r_end.wrapping_add(1),
+            self.r_start,
+            self.r_end,
+            self.r_end.wrapping_add(1),
+        )
+    }
+
+    fn internal_error_message(&self, shims: usize) -> String {
+        format!(
+            "internal error: after {shims} layout shims the label(s) {} are still \
+             stranded at ${:04X} on the bridge over reserved range ${:04X}-${:04X}",
+            self.names(),
+            self.addr,
+            self.r_start,
+            self.r_end,
+        )
+    }
+}
+
+/// Every label run that a reserved-range bridge separated from the item it names.
+fn bridge_orphans(items: &[Item], reserved: &[(u16, u16)]) -> Vec<BridgeOrphan> {
+    let mut out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if !matches!(item, Item::Pad(_)) {
+            continue;
+        }
+        let Some(Item::Instruction {
+            mnemonic,
+            operand: Some(op),
+        }) = items.get(i + 1)
+        else {
+            continue;
+        };
+        if !mnemonic.eq_ignore_ascii_case("JMP") {
+            continue;
+        }
+        if !matches!(items.get(i + 2), Some(Item::Pad(_))) {
+            continue;
+        }
+        let Some(target) = op
+            .strip_prefix('$')
+            .and_then(|h| u16::from_str_radix(h, 16).ok())
+        else {
+            continue;
+        };
+        let Some(&(r_start, r_end)) = reserved
+            .iter()
+            .find(|(_, end)| u32::from(*end) + 1 == u32::from(target))
+        else {
+            continue;
+        };
+        let mut labels: Vec<String> = Vec::new();
+        let mut j = i;
+        while j > 0 {
+            match &items[j - 1] {
+                Item::Label(name) => labels.push(name.clone()),
+                Item::Constant(..) => {}
+                _ => break,
+            }
+            j -= 1;
+        }
+        if labels.is_empty() {
+            continue;
+        }
+        labels.reverse();
+        out.push(BridgeOrphan {
+            labels,
+            r_start,
+            r_end,
+        });
+    }
+    out
+}
+
+/// Insert filler so a reserved-range bridge lands ahead of the label's data.
+fn insert_bridge_shim(asm: &str, orphan: &ResolvedOrphan) -> Option<String> {
+    let (label, at) = orphan.labels.iter().find_map(|name| {
+        let def = format!("{name}:\n");
+        let at = if asm.starts_with(&def) {
+            0
+        } else {
+            // Anchor on a line start so `__FOO:` doesn't match inside `__BAR__FOO:`.
+            asm.find(&format!("\n{def}"))? + 1
+        };
+        Some((name.clone(), at))
+    })?;
+
+    let addr = u32::from(orphan.addr);
+    let r_start = u32::from(orphan.r_start);
+    // The assembler only places a bridge where its 3-byte `JMP` fits, so a stranded label is
+    // always at `r_start - 3` or below.
+    if addr + 3 > r_start {
+        return None;
+    }
+    // Split long fills across `.byte` lines so the asm stays readable.
+    fn emit_fill(out: &mut String, mut count: u32) {
+        const PER_LINE: u32 = 32;
+        while count > 0 {
+            let take = count.min(PER_LINE);
+            out.push_str("    .byte ");
+            out.push_str(&vec!["$00"; take as usize].join(","));
+            out.push('\n');
+            count -= take;
+        }
+    }
+
+    let mut filler = String::new();
+    if addr + 6 <= r_start {
+        filler.push_str(&format!("    JMP {label}\n"));
+        emit_fill(&mut filler, (r_start - 3) - (addr + 3));
+        filler.push_str("    .byte $00\n");
+    } else {
+        emit_fill(&mut filler, (r_start - 2).saturating_sub(addr).max(1));
+    }
+
+    let mut out = String::with_capacity(asm.len() + filler.len() + 256);
+    out.push_str(&asm[..at]);
+    out.push_str(&format!(
+        "; layout: the assembler skips reserved ${:04X}-${:04X} with a `JMP ${:04X}`\n\
+         ; placed at the first item that would cross it. Without this filler that\n\
+         ; bridge lands between `{label}:` and the bytes it names, and the label\n\
+         ; resolves to the JMP. The filler is what gets bridged instead.\n",
+        orphan.r_start,
+        orphan.r_end,
+        orphan.r_end.wrapping_add(1),
+    ));
+    out.push_str(&filler);
+    out.push_str(&asm[at..]);
+    Some(out)
 }
 
 /// Hoist the `__DATA:` block to the front of the code stream so it
@@ -972,16 +2074,11 @@ fn collect_reserved_in_stmt(
             dst_end,
             value,
         } => {
-            // PokeFill is the canonical bulk-init shape — treat the
-            // whole inclusive range as reserved when both endpoints
-            // fold to literals.
             if let (Some(s), Some(e)) = (
                 addr_literal_in_window(dst_start),
                 addr_literal_in_window(dst_end),
             ) {
-                if s <= e {
-                    ranges.push((s, e));
-                }
+                ranges.push((s, s.max(e)));
             }
             note_peek_in_expr(value, points);
         }
@@ -1657,6 +2754,132 @@ mod tests {
         );
     }
 
+    /// A program that builds a string on the heap at runtime, so codegen emits `__HEAP_BOTTOM`
+    /// and the window matters.
+    fn heap_using_prg() -> Vec<u8> {
+        crate::source::tokenize_program(
+            "10 A$=\"X\"\n20 FOR I=1 TO 5:A$=A$+\"Y\":NEXT\n30 PRINT A$\n",
+        )
+        .expect("tokenizes")
+    }
+
+    #[test]
+    fn string_program_with_room_below_memsiz_keeps_extraram_off() {
+        let bytes = heap_using_prg();
+        let opts = CompileOptions {
+            custom_start_address: Some(0x9000),
+            ..CompileOptions::default()
+        };
+        let out = compile_with_options(&bytes, opts).expect("compiles");
+        assert!(
+            out.asm.contains("__HEAP_BOTTOM:"),
+            "the fixture really does use the string heap"
+        );
+        assert!(
+            matches!(out.diagnostics.extraram, ExtraRamDecision::AutoOff),
+            "predictor left extraram off, got {:?}",
+            out.diagnostics.extraram
+        );
+        assert!(!out.asm.contains("__EXRAM_ENTRY"), "no JT preamble");
+        let window = string_heap_window(&out, 0x9000).expect("window is adequate");
+        assert!(
+            window.expect("program has a heap") >= MIN_STRING_HEAP,
+            "window {window:?} clears the floor"
+        );
+    }
+
+    #[test]
+    fn string_program_starved_of_heap_switches_to_extraram() {
+        let bytes = heap_using_prg();
+        let opts = CompileOptions {
+            custom_start_address: Some(0x9C00),
+            ..CompileOptions::default()
+        };
+        let out = compile_with_options(&bytes, opts).expect("compiles");
+        assert!(
+            matches!(out.diagnostics.extraram, ExtraRamDecision::AutoOn),
+            "starved heap forces the extraram layout, got {:?}",
+            out.diagnostics.extraram
+        );
+        assert!(
+            out.asm.contains("__EXRAM_ENTRY"),
+            "extraram preamble injected"
+        );
+    }
+
+    #[test]
+    fn heapless_program_near_memsiz_keeps_extraram_off() {
+        let bytes = tiny_prg();
+        let opts = CompileOptions {
+            custom_start_address: Some(0x9C00),
+            ..CompileOptions::default()
+        };
+        let out = compile_with_options(&bytes, opts).expect("compiles");
+        assert!(
+            !out.asm.contains("__HEAP_BOTTOM:"),
+            "fixture has no runtime string heap"
+        );
+        assert!(
+            matches!(out.diagnostics.extraram, ExtraRamDecision::AutoOff),
+            "no heap means no heap window to protect, got {:?}",
+            out.diagnostics.extraram
+        );
+        assert_eq!(
+            string_heap_window(&out, 0x9C00),
+            Ok(None),
+            "window question does not apply"
+        );
+    }
+
+    #[test]
+    fn force_extraram_off_refuses_a_starved_string_heap() {
+        // The build-time assertion.
+        let bytes = heap_using_prg();
+        let opts = CompileOptions {
+            custom_start_address: Some(0x9C00),
+            force_extraram_off: true,
+            ..CompileOptions::default()
+        };
+        match compile_with_options(&bytes, opts) {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("string heap"),
+                    "diagnoses the heap window: {msg}"
+                );
+                assert!(msg.contains("$A000"), "names MEMSIZ: {msg}");
+                assert!(
+                    msg.contains("BASIC ROM"),
+                    "explains why the bytes come back wrong: {msg}"
+                );
+            }
+            Ok(out) => panic!(
+                "must refuse; shipped {} bytes ending at ${:04X}",
+                out.machine_code.len(),
+                0x9C00 + out.machine_code.len(),
+            ),
+        }
+    }
+
+    #[test]
+    fn string_heap_window_is_skipped_above_the_rom_window() {
+        let bytes = heap_using_prg();
+        let opts = CompileOptions {
+            custom_start_address: Some(0xC000),
+            ..CompileOptions::default()
+        };
+        let out = compile_with_options(&bytes, opts).expect("compiles at $C000");
+        assert_eq!(string_heap_window(&out, 0xC000), Ok(None));
+        assert!(
+            matches!(
+                out.diagnostics.extraram,
+                ExtraRamDecision::SkippedHighOrigin
+            ),
+            "got {:?}",
+            out.diagnostics.extraram
+        );
+    }
+
     #[test]
     fn custom_start_address_skips_sys_launcher_and_relocates_origin() {
         let bytes = tiny_prg();
@@ -1983,6 +3206,544 @@ mod tests {
         let err = verify_data_pool_unsplit(&[(0x2000, 0x27FF)], lookup)
             .expect_err("overlap must be rejected");
         assert!(err.contains("$2000-$27FF"), "names the range: {err}");
+    }
+
+    /// Tokenize ASCII BASIC source and compile with defaults.
+    fn compile_src(src: &str) -> Compiled {
+        let prg = crate::source::tokenize_program(src).expect("tokenize");
+        compile_with_options(&prg, CompileOptions::default()).expect("compile")
+    }
+
+    /// Whether the prologue initializes the shared CURLIN high byte.
+    fn hoists_curlin_hi(asm: &str) -> bool {
+        match (asm.find("STA $3A"), asm.find("STA $39")) {
+            (Some(hi), Some(lo)) => hi < lo,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    #[test]
+    fn question_mark_print_is_compiled_not_dropped() {
+        // `?` is the PRINT abbreviation.
+        let c = compile_src("10 ?\"HI\"\n20 END\n");
+        assert!(
+            c.diagnostics.skipped_statements.is_empty(),
+            "nothing may be dropped: {:?}",
+            c.diagnostics.skipped_statements
+        );
+        assert!(
+            c.asm.contains("STR_PRINT") || c.asm.contains("$AB1E") || c.asm.contains("$FFD2"),
+            "the PRINT must actually be emitted:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn question_mark_print_matches_spelled_out_print() {
+        // The abbreviation must compile to exactly the same program as the long form.
+        let short = compile_src("10 ?\"HI\":?42\n20 END\n");
+        let long = compile_src("10 PRINT\"HI\":PRINT42\n20 END\n");
+        assert_eq!(
+            short.machine_code, long.machine_code,
+            "`?` and PRINT must produce identical code"
+        );
+    }
+
+    #[test]
+    fn question_mark_print_survives_inside_a_conditional() {
+        let c = compile_src("10 A=1\n20 IF A=1 THEN ?\"YES\"\n30 END\n");
+        assert!(
+            c.diagnostics.skipped_statements.is_empty(),
+            "conditional body must survive: {:?}",
+            c.diagnostics.skipped_statements
+        );
+    }
+
+    #[test]
+    fn curlin_hi_hoisted_when_all_lines_share_a_high_byte() {
+        // Float division makes every line fallible, so each one wants a CURLIN stamp.
+        let c = compile_src("10 A=1/2\n20 PRINT A\n30 B=A/3\n40 PRINT B\n50 END\n");
+        assert!(
+            hoists_curlin_hi(&c.asm),
+            "high byte belongs in the prologue:\n{}",
+            c.asm
+        );
+        assert_eq!(
+            c.asm.matches("STA $3A").count(),
+            1,
+            "exactly one high-byte stamp for the whole module:\n{}",
+            c.asm
+        );
+        assert!(
+            c.asm.matches("STA $39").count() >= 2,
+            "every fallible line still stamps its own low byte:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn curlin_hi_not_hoisted_across_mixed_high_bytes() {
+        let c = compile_src("10 A=1/2\n20 PRINT A\n300 B=A/3\n310 PRINT B\n320 END\n");
+        assert!(
+            !hoists_curlin_hi(&c.asm),
+            "mixed high bytes must not hoist:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn curlin_hi_not_hoisted_when_program_uses_sys() {
+        let c = compile_src("10 A=1/2\n20 PRINT A\n30 SYS 49152\n40 B=A/3\n50 PRINT B\n60 END\n");
+        assert!(
+            !hoists_curlin_hi(&c.asm),
+            "SYS must disable the invariant:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn curlin_hi_not_hoisted_when_program_uses_usr() {
+        let c = compile_src("10 A=1/2\n20 PRINT A\n30 B=USR(3)\n40 PRINT B\n50 END\n");
+        assert!(
+            !hoists_curlin_hi(&c.asm),
+            "USR must disable the invariant:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn absx_static_int_array_uses_indexed_addressing() {
+        let c =
+            compile_src("10 DIM A%(10)\n20 J%=PEEK(830)\n30 A%(J%)=5\n40 PRINT A%(J%)\n50 END\n");
+        assert!(
+            c.asm.contains("__ARR_A_I,X"),
+            "read/write go through abs,X:\n{}",
+            c.asm
+        );
+        assert!(
+            c.asm.contains("CMP #$0B") && c.asm.contains("__BAD_SUBSCRIPT"),
+            "?BAD SUBSCRIPT semantics preserved via byte compare:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn absx_bounds_check_elided_for_proven_counter() {
+        let c = compile_src("10 DIM A%(10)\n20 FOR J=0 TO 10\n30 A%(J)=J\n40 NEXT\n50 END\n");
+        assert!(
+            c.asm.contains("__ARR_A_I,X"),
+            "store goes through abs,X:\n{}",
+            c.asm
+        );
+        assert!(
+            !c.asm.contains("__ABX_OK") && !c.asm.contains("__BNDS"),
+            "FOR range proof elides every bounds check:\n{}",
+            c.asm
+        );
+    }
+
+    #[test]
+    fn absx_declines_oversized_and_runtime_arrays() {
+        let big = compile_src("10 DIM A%(200)\n20 J%=PEEK(830)\n30 PRINT A%(J%)\n40 END\n");
+        assert!(
+            !big.asm.contains("__ARR_A_I,X"),
+            "oversized array stays on the pointer path:\n{}",
+            big.asm
+        );
+        let rt = compile_src(
+            "10 N=PEEK(830)+5\n20 DIM A%(N)\n30 J%=PEEK(831)\n40 PRINT A%(J%)\n50 END\n",
+        );
+        assert!(
+            !rt.asm.contains("__ARR_A_I,X"),
+            "runtime array stays on the pointer path:\n{}",
+            rt.asm
+        );
+    }
+
+    // indirect-JMP vector page alignment: the plumbing
+
+    #[test]
+    fn indirect_jmp_operands_ignores_direct_jumps_and_prose() {
+        let asm = "\
+    JMP __PLAIN
+    JMP $E37B
+; DEF FN dispatch does not use JMP (__FNV_A)
+    JMP (__FOR_DISP_VEC)
+    JSR (__NOT_A_JMP)
+JMPTBL:
+    JMP ($0311)
+    JMP (__FOR_DISP_VEC)   ; a second site for the same vector
+    jmp\t(__LOWER)
+";
+        assert_eq!(
+            indirect_jmp_operands(&asm.replace("\\t", "\t")),
+            vec![
+                "__FOR_DISP_VEC".to_string(),
+                "$0311".to_string(),
+                "__LOWER".to_string()
+            ],
+        );
+    }
+
+    #[test]
+    fn vector_operands_resolve_through_labels_literals_and_offsets() {
+        let asm = "    JMP (__V)\n    JMP (__V+2)\n    JMP (__W-1)\n    JMP ($0311)\n";
+        let got = resolve_indirect_vectors(asm, |n| match n {
+            "__V" => Some(0x9000),
+            "__W" => Some(0x9100),
+            _ => None,
+        })
+        .expect("all four resolve");
+        assert_eq!(
+            got,
+            vec![
+                ("__V".to_string(), 0x9000),
+                ("__V+2".to_string(), 0x9002),
+                ("__W-1".to_string(), 0x90FF),
+                ("$0311".to_string(), 0x0311),
+            ]
+        );
+        // Only the one that lands on the last byte of a page is bad.
+        assert_eq!(
+            vector_page_offenders(&got),
+            vec![("__W-1".to_string(), 0x90FF)]
+        );
+    }
+
+    #[test]
+    fn unresolvable_vector_operand_is_an_error_not_a_silent_pass() {
+        let err = resolve_indirect_vectors("    JMP (__MYSTERY)\n", |_| None)
+            .expect_err("unknown label is rejected");
+        assert!(err.contains("__MYSTERY"), "{err}");
+    }
+
+    #[test]
+    fn pad_goes_in_front_of_the_vector_definition() {
+        let asm = "__OTHER__V:\n    .byte $00\n__V:\n    .byte $00,$00\n";
+        let out = insert_vector_pad(asm, "__V+1").expect("label found");
+        let pad_at = out.find("    .byte $00\n__V:").expect("pad before __V");
+        assert!(out[..pad_at].contains("__OTHER__V:"));
+        assert_eq!(out.matches("    .byte $00\n").count(), 2);
+        assert!(insert_vector_pad(asm, "$0311").is_none());
+    }
+
+    /// A symbol table for the guard tests.
+    fn syms(pairs: &[(&str, u16)]) -> impl Fn(&str) -> Option<u16> + use<> {
+        let map: std::collections::HashMap<String, u16> =
+            pairs.iter().map(|(n, a)| ((*n).to_string(), *a)).collect();
+        move |name: &str| map.get(name).copied()
+    }
+
+    #[test]
+    fn indexed_base_inside_zero_page_is_refused() {
+        let none = syms(&[]);
+        // `PEEK(200 + I%)`.
+        let bad = "    LDX VI_X\n    LDY $00C8,X\n";
+        let err = verify_no_narrowed_index(bad, &none).expect_err("must refuse");
+        assert!(err.contains("$00C8"), "{err}");
+        assert!(err.contains("zeropage,X"), "{err}");
+        verify_no_narrowed_index("    LDY $0100,X\n", &none).expect("above zero page is fine");
+        // Base $0000 is the other wrap-free case: `0 + X` never leaves the page, so the two
+        // encodings agree for every index.
+        verify_no_narrowed_index("    LDA $0000,Y\n", &none).expect("base zero is fine");
+        verify_no_narrowed_index("    LDA $0000,X\n", &none).expect("base zero is fine");
+        // `LDA abs,Y` has no `zeropage,Y` encoding at all, so a low base cannot narrow it.
+        verify_no_narrowed_index("    LDA $0080,Y\n", &none).expect("no zeropage,Y for LDA");
+        assert!(verify_no_narrowed_index("    LDX $0080,Y\n", &none).is_err());
+    }
+
+    #[test]
+    fn indexed_base_is_checked_through_labels_too() {
+        // A zero-page-promoted variable used as an index base: nothing in the operand text says
+        // `$00xx`, only the symbol table does.
+        let zp = syms(&[("VI_K", 0x00C8), ("__TABLE", 0x1234)]);
+        assert!(verify_no_narrowed_index("    STA VI_K,X\n", &zp).is_err());
+        verify_no_narrowed_index("    STA __TABLE,X\n", &zp).expect("data label is fine");
+        verify_no_narrowed_index("    STA __TABLE+1,X\n", &zp).expect("offset label is fine");
+    }
+
+    #[test]
+    fn indirect_pointer_outside_zero_page_is_refused() {
+        let high = syms(&[("V_P", 0x0834)]);
+        let err = verify_indirect_zp_pointers("    LDA (V_P),Y\n", &high).expect_err("refuse");
+        assert!(err.contains("$0834"), "{err}");
+        assert!(err.contains("$34"), "{err}");
+        // The `(zp,X)` form truncates the same way.
+        assert!(verify_indirect_zp_pointers("    STA (V_P,X)\n", &high).is_err());
+        // A real promotion resolves inside zero page and is fine.
+        let zp = syms(&[("V_P", 0x00FB)]);
+        verify_indirect_zp_pointers("    LDA (V_P),Y\n", &zp).expect("zero page is fine");
+        // Literal operands, which is what nearly every site emits.
+        let none = syms(&[]);
+        verify_indirect_zp_pointers("    LDA ($FD),Y\n", &none).expect("literal zp is fine");
+        // `JMP (vector)` is a 16-bit indirect and belongs to the vector-alignment pass, not to
+        // this one.
+        verify_indirect_zp_pointers("    JMP (__FOR_DISP_VEC)\n", &none).expect("JMP is not ours");
+    }
+
+    #[test]
+    fn indirect_pointer_on_the_last_zero_page_byte_is_refused() {
+        let none = syms(&[]);
+        // `LDA ($FF),Y` reads the high byte from $0000, not $0100.
+        let err = verify_indirect_zp_pointers("    LDA ($FF),Y\n", &none).expect_err("refuse");
+        assert!(err.contains("$00FF"), "{err}");
+        // One byte down the pair is contiguous and legal.
+        verify_indirect_zp_pointers("    LDA ($FE),Y\n", &none).expect("$FE/$FF is a real pair");
+    }
+
+    #[test]
+    fn smc_patch_past_the_end_of_its_template_is_refused() {
+        let none = syms(&[]);
+        let good = "    LDA #$00\n    STA __SITE+1\n    LDA #$08\n    STA __SITE+2\n\
+                    __SITE:\n    LDA $FFFF\n    RTS\n";
+        verify_smc_patch_offsets(good, &none).expect("three-byte template is fine");
+        let bad = "    LDA #$00\n    STA __SITE+1\n    LDA #$08\n    STA __SITE+2\n\
+                   __SITE:\n    LDA $00FF,X\n    RTS\n";
+        let err = verify_smc_patch_offsets(bad, &none).expect_err("must refuse");
+        assert!(err.contains("+2"), "{err}");
+        assert!(err.contains("2-byte"), "{err}");
+        let one_only = "    STA __SITE+1\n__SITE:\n    LDA $00FF,X\n    RTS\n";
+        verify_smc_patch_offsets(one_only, &none).expect("+1 is inside a two-byte instruction");
+        // `+1` on an implied one-byte instruction is not.
+        let implied = "    STA __SITE+1\n__SITE:\n    RTS\n";
+        assert!(verify_smc_patch_offsets(implied, &none).is_err());
+    }
+
+    #[test]
+    fn smc_check_leaves_data_labels_alone() {
+        let none = syms(&[]);
+        // `V_A+2` is the third byte of a five-byte float slot, and `__ARR_A_I+1,X` the high
+        // half of an integer array element.
+        let data = "    LDA V_A+2\n    LDA __ARR_A_I+1,X\n\
+                    V_A:\n    .byte $00,$00,$00,$00,$00\n\
+                    __ARR_A_I:\n    .byte $00,$00,$00,$00\n";
+        verify_smc_patch_offsets(data, &none).expect("data offsets are not SMC patches");
+        let run = "    STA __HCS_SRC+2\n__HCS_PAGE:\n__HCS_SRC:\n    LDA $0000,Y\n";
+        verify_smc_patch_offsets(run, &none).expect("abs,Y template is three bytes");
+        let run_bad = "    STA __HCS_SRC+2\n__HCS_PAGE:\n__HCS_SRC:\n    LDA $0000,X\n";
+        assert!(
+            verify_smc_patch_offsets(run_bad, &none).is_err(),
+            "LDA $0000,X is zeropage,X — two bytes — so +2 is off the end"
+        );
+    }
+
+    // reserved-range bridge orphans
+
+    fn bridge(target: u16) -> Vec<Item> {
+        vec![
+            Item::Pad(0),
+            Item::Instruction {
+                mnemonic: "JMP".to_string(),
+                operand: Some(format!("${target:04X}")),
+            },
+            Item::Pad(4),
+        ]
+    }
+
+    #[test]
+    fn bridge_orphans_reports_the_whole_label_run_before_a_bridge() {
+        let mut items = vec![
+            Item::Label("__EARLIER".into()),
+            Item::Data(Vec::new()),
+            Item::Label("__A".into()),
+            Item::Label("__B".into()),
+        ];
+        items.extend(bridge(0x3880));
+        items.push(Item::Data(Vec::new()));
+        let got = bridge_orphans(&items, &[(0x3800, 0x387F)]);
+        assert_eq!(
+            got,
+            vec![BridgeOrphan {
+                labels: vec!["__A".into(), "__B".into()],
+                r_start: 0x3800,
+                r_end: 0x387F,
+            }],
+            "both stacked labels sit on the bridge; the one before the \
+             intervening data item does not"
+        );
+    }
+
+    #[test]
+    fn a_bridge_with_no_label_in_front_of_it_is_not_an_orphan() {
+        // The repaired shape: filler takes the bridge, the label follows it.
+        let mut items = vec![Item::Data(Vec::new())];
+        items.extend(bridge(0x3880));
+        items.push(Item::Data(Vec::new()));
+        items.push(Item::Label("__A".into()));
+        items.push(Item::Data(Vec::new()));
+        assert!(bridge_orphans(&items, &[(0x3800, 0x387F)]).is_empty());
+    }
+
+    #[test]
+    fn a_plain_jmp_that_happens_to_target_past_a_reservation_is_not_a_bridge() {
+        // Without the leading `Pad` marker this is user code, not an assembler bridge.
+        let items = vec![
+            Item::Label("__A".into()),
+            Item::Instruction {
+                mnemonic: "JMP".to_string(),
+                operand: Some("$3880".to_string()),
+            },
+            Item::Pad(4),
+        ];
+        assert!(bridge_orphans(&items, &[(0x3800, 0x387F)]).is_empty());
+    }
+
+    #[test]
+    fn a_zero_page_equate_beside_a_bridge_is_not_reported_as_stranded() {
+        let mut asm = String::from("*=$0800\n");
+        for _ in 0..0xF0 {
+            asm.push_str("    NOP\n");
+        }
+        asm.push_str("MYDATA:\nZPSLOT = $FB\n    .byte ");
+        let bytes: Vec<String> = (1..=32u32).map(|n| format!("${n:02X}")).collect();
+        asm.push_str(&bytes.join(","));
+        asm.push('\n');
+
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF)
+            .expect("range accepted");
+        let (_, items) = a.assemble_full(&asm).expect("assembles");
+        assert_eq!(a.lookup("ZPSLOT"), Some(0x00FB), "equate keeps its value");
+        assert_eq!(
+            bridge_orphans(&items, &[(0x0900, 0x09FF)]),
+            vec![BridgeOrphan {
+                labels: vec!["MYDATA".into()],
+                r_start: 0x0900,
+                r_end: 0x09FF,
+            }],
+            "only the label is stranded; the equate must not be listed"
+        );
+    }
+
+    #[test]
+    fn assembler_generated_skip_labels_need_no_repair() {
+        let orphan = BridgeOrphan {
+            labels: vec!["__skip_7".into()],
+            r_start: 0x3800,
+            r_end: 0x387F,
+        };
+        assert!(orphan.resolve(|_| Some(0x37FD)).is_none());
+    }
+
+    #[test]
+    fn shim_lets_the_bridge_land_in_front_of_filler_not_the_label() {
+        let asm = "S78:\n    .byte $01\nS79:\n    .byte $02,$03\n";
+        let orphan = ResolvedOrphan {
+            labels: vec!["S79".into()],
+            r_start: 0x3800,
+            r_end: 0x387E,
+            addr: 0x37D6,
+        };
+        let out = insert_bridge_shim(asm, &orphan).expect("label found");
+        let at = out.find("\nS79:\n").expect("label survives") + 1;
+        let head = &out[..at];
+        assert!(head.contains("    JMP S79\n"), "{out}");
+        assert_eq!(head.matches("$00").count(), 36 + 1, "{out}");
+        assert!(head.ends_with("    .byte $00\n"), "{out}");
+        assert!(out.starts_with("S78:\n    .byte $01\n"), "{out}");
+    }
+
+    #[test]
+    fn a_shim_too_close_to_the_reservation_degrades_to_bare_filler() {
+        let asm = "S79:\n    .byte $02\n";
+        let orphan = ResolvedOrphan {
+            labels: vec!["S79".into()],
+            r_start: 0x3800,
+            r_end: 0x387E,
+            addr: 0x37FD,
+        };
+        let out = insert_bridge_shim(asm, &orphan).expect("label found");
+        assert!(!out.contains("    JMP "), "{out}");
+        let at = out.find("\nS79:\n").expect("label survives") + 1;
+        assert_eq!(out[..at].matches("$00").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn shim_finds_nothing_to_splice_in_front_of() {
+        let orphan = ResolvedOrphan {
+            labels: vec!["__NOT_IN_THE_TEXT".into()],
+            r_start: 0x3800,
+            r_end: 0x387E,
+            addr: 0x37D6,
+        };
+        assert!(insert_bridge_shim("S79:\n    .byte $02\n", &orphan).is_none());
+    }
+
+    #[test]
+    fn label_bytes_check_accepts_a_label_on_its_own_data() {
+        let asm = "*=$0801\n__A:\n    .byte $27,$93,$11\n";
+        assert!(verify_label_bytes(asm, &[0x27, 0x93, 0x11], 0x0801, |_| Some(0x0801)).is_ok());
+    }
+
+    #[test]
+    fn label_bytes_check_catches_a_label_stranded_on_a_bridge() {
+        // What SNOOPY shipped: `S79` linked at the bridge, so the image holds `4C 7F 38 00`
+        // where the string's length prefix and first three bytes belong.
+        let asm = "*=$0801\nS79:\n    .byte $27,$93,$11,$11\n";
+        let image = [0x4C, 0x7F, 0x38, 0x00, 0x27, 0x93, 0x11, 0x11];
+        let err = verify_label_bytes(asm, &image, 0x0801, |_| Some(0x0801))
+            .expect_err("a label off its own bytes must be rejected");
+        assert!(err.contains("S79"), "{err}");
+    }
+
+    #[test]
+    fn label_bytes_check_skips_what_it_cannot_compare() {
+        assert_eq!(leading_data_literals("<S1,>S1", false, 4), Vec::<u8>::new());
+        assert_eq!(
+            leading_data_literals("$01,$02,<S1,$04", false, 4),
+            vec![1, 2]
+        );
+        assert_eq!(
+            leading_data_literals("$01,$02,$03,$04,$05", false, 3),
+            vec![1, 2, 3]
+        );
+        let asm = "*=$0801\n__ZP:\n    .byte $99\n";
+        assert!(verify_label_bytes(asm, &[0x00], 0x0801, |_| Some(0x00FB)).is_ok());
+    }
+
+    #[test]
+    fn label_bytes_check_covers_the_word_table_too() {
+        // `__FOR_HANDLER_TABLE:` names `.word` entries and is indexed at runtime, so it is
+        // address-taken exactly like a string.
+        assert_eq!(
+            leading_data_literals("$0000,$1234", true, 4),
+            vec![0x00, 0x00, 0x34, 0x12]
+        );
+        assert_eq!(
+            leading_data_literals("$0000,__FOR_NEXT_HANDLER_1", true, 4),
+            vec![0x00, 0x00]
+        );
+        let asm = "*=$0801\n__T:\n    .word $0000,$1234\n";
+        assert!(verify_label_bytes(asm, &[0, 0, 0x34, 0x12], 0x0801, |_| Some(0x0801)).is_ok());
+        let err = verify_label_bytes(asm, &[0x4C, 0x00, 0x40, 0x00], 0x0801, |_| Some(0x0801))
+            .expect_err("a stranded word table must be rejected");
+        assert!(err.contains("__T"), "{err}");
+    }
+
+    // I/O area overlap: the arithmetic
+
+    #[test]
+    fn io_overlap_is_the_intersection_with_d000_dfff() {
+        // Ends one byte short of the I/O block: clean.
+        assert_eq!(io_area_overlap(0x0801, 0xD000 - 0x0801), None);
+        // Ends on the first I/O byte: one byte of overlap.
+        assert_eq!(
+            io_area_overlap(0x0801, 0xD000 - 0x0801 + 1),
+            Some((0xD000, 0xD000))
+        );
+        // Straight through: the whole 4 KB is lost.
+        assert_eq!(
+            io_area_overlap(0x0801, 0xF978 - 0x0801),
+            Some((0xD000, 0xDFFF))
+        );
+        // Loads above the block ($E000 origin): writes there fall through to the RAM under
+        // KERNAL ROM, so nothing is lost.
+        assert_eq!(io_area_overlap(0xE000, 0x1000), None);
+        // Starts inside the block.
+        assert_eq!(io_area_overlap(0xDF00, 0x200), Some((0xDF00, 0xDFFF)));
+        // Empty image can't overlap anything.
+        assert_eq!(io_area_overlap(0x0801, 0), None);
     }
 }
 

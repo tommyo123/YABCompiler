@@ -24,7 +24,12 @@ pub mod visit;
 
 pub use compile::{
     BasicHintDialect, CompileError, CompileOptions, Compiled, Diagnostics, ExtraRamDecision,
-    Profile, compile_with_options, parse_reserved_ranges, parse_start_address,
+    Profile, ReservedOvershoot, compile_with_options, parse_reserved_ranges, parse_start_address,
+    reserved_tail_overshoots,
 };
 pub use prg::Program;
-pub use source::{TokenizeError, is_basic_source_path, tokenize_program};
+pub use source::{
+    TokenizeError, is_basic_source_path, tokenize_program, tokenize_program_at_with,
+    tokenize_program_with,
+};
+pub use tokens::Dialect;

@@ -1,11 +1,11 @@
 AB
-XY
-*
-*
-*
-*
-*
-HELLOWORLD
-COL15
-X
+X     Y
+  *
+    *
+      *
+        *
+          *
+HELLO     WORLD
+               COL15
+               X
 ABCDEF

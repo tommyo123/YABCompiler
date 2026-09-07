@@ -113,6 +113,10 @@ const ROM_CALLS: &[RomCall] = &[
         label: "FOUT",
     },
     RomCall {
+        addr: 0xBDCD,
+        label: "LINPRT",
+    },
+    RomCall {
         addr: 0xBC58,
         label: "FN_ABS",
     },
@@ -139,6 +143,10 @@ const ROM_CALLS: &[RomCall] = &[
     RomCall {
         addr: 0xB7F7,
         label: "FACWORD",
+    },
+    RomCall {
+        addr: 0xB1BF,
+        label: "AYINT",
     },
     RomCall {
         addr: 0xB3A2,
@@ -210,6 +218,42 @@ fn rom_lookup(addr: u16) -> Option<&'static RomCall> {
     ROM_CALLS.iter().find(|c| c.addr == addr)
 }
 
+/// Delimiters `codegen::bss_fill_block` wraps the entry-time zero-fill in, plus the two labels
+/// it measures.
+const BSS_FILL_OPEN: &str = "; --- BSS zero-fill ---";
+const BSS_FILL_CLOSE: &str = "; --- end BSS zero-fill ---";
+
+/// True iff [`strip_bss_tail_fill`] has anything to remove.
+pub(crate) fn has_bss_tail_fill(asm: &str) -> bool {
+    asm.contains(BSS_FILL_OPEN)
+}
+
+/// Drop the BSS zero-fill loop and its `__BSS_START:` / `__BSS_END:` brackets, returning the
+/// asm to its "zeros are stored in the image" form.
+pub(crate) fn strip_bss_tail_fill(asm: &str) -> String {
+    if !asm.contains(BSS_FILL_OPEN) {
+        return asm.to_string();
+    }
+    let mut out = String::with_capacity(asm.len());
+    let mut inside = false;
+    for line in asm.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == BSS_FILL_OPEN {
+            inside = true;
+            continue;
+        }
+        if inside {
+            inside = trimmed != BSS_FILL_CLOSE;
+            continue;
+        }
+        if trimmed == "__BSS_START:" || trimmed == "__BSS_END:" {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Returns true when `addr` is a ROM call that the JT must wrap.
 ///
 /// Two cases:
@@ -234,6 +278,7 @@ fn needs_jt_wrapping(addr: u16) -> bool {
 /// asm and returns the rewritten asm with the JT injected and data
 /// pulled to the low half of the binary.
 pub fn inject(asm: &str) -> String {
+    let asm = &strip_bss_tail_fill(asm);
     // Phase 1: scan for unique ROM addresses referenced by JSR/JMP.
     let mut used: BTreeSet<u16> = BTreeSet::new();
     for line in asm.lines() {
@@ -283,15 +328,7 @@ pub fn inject(asm: &str) -> String {
     for block in blocks {
         if block.label.as_deref() == Some("__HEAP_BOTTOM:") {
             heap_marker = Some(block);
-        } else if block.is_data() || is_data_pool_marker_label(block.label.as_deref()) {
-            // The bare `__DATA:` label sits right above the first
-            // `__DATA_LINE_<n>:` label and has no body of its own,
-            // so `is_data()` returns false. Hoisting the data
-            // bytes without `__DATA:` makes `__DATA_INIT` (which
-            // does `LDA #<__DATA`) point at the LEFT-BEHIND empty
-            // label far past the actual bytes — and `READ` then
-            // walks unrelated memory. Treat the marker label as
-            // data so it stays adjacent to its content.
+        } else if block.is_data() || is_data_anchor_label(block.label.as_deref()) {
             data_blocks.push(block);
         } else {
             code_blocks.push(block);
@@ -324,8 +361,60 @@ pub fn inject(asm: &str) -> String {
     // debug_assertions so it costs nothing in release builds.
     #[cfg(debug_assertions)]
     debug_assert_no_unwrapped_rom_calls(&out);
+    #[cfg(debug_assertions)]
+    debug_assert_data_anchors_hoisted(&out);
 
     out
+}
+
+/// Check that data anchors and variable bounds move together above the extra-RAM code.
+#[cfg(debug_assertions)]
+fn debug_assert_data_anchors_hoisted(asm: &str) {
+    let Some(code_start) = asm.find("__EXRAM_CODE_START:") else {
+        return;
+    };
+    for anchor in DATA_ANCHOR_LABELS {
+        // Match at line start so `__DATA:` doesn't match inside `__DATA_END:` or a comment.
+        let Some(pos) = find_label_line(asm, anchor) else {
+            continue;
+        };
+        assert!(
+            pos < code_start,
+            "extraram: data anchor `{anchor}` was left behind in the code \
+             section — it must hoist with the pool it brackets. Add it to \
+             `is_data_anchor_label`."
+        );
+    }
+    if let (Some(start), Some(end)) = (
+        find_label_line(asm, "__VARS_START:"),
+        find_label_line(asm, "__VARS_END:"),
+    ) {
+        assert!(
+            start < end,
+            "extraram: `__VARS_START` must precede `__VARS_END`"
+        );
+        assert!(
+            asm[start..end].contains(".byte"),
+            "extraram: `__VARS_START`..`__VARS_END` encloses no data — \
+             __STATE_RESET would memzero 0 bytes and CLR/RUN would clear \
+             nothing:\n{}",
+            &asm[start..end]
+        );
+    }
+}
+
+/// Byte offset of the line that consists solely of `label` (modulo leading whitespace), or
+/// `None`.
+#[cfg(debug_assertions)]
+fn find_label_line(asm: &str, label: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in asm.lines() {
+        if line.trim() == label {
+            return Some(offset);
+        }
+        offset += line.len() + 1;
+    }
+    None
 }
 
 /// Scan the post-inject asm for any direct `JSR/JMP $XXXX` that
@@ -490,13 +579,18 @@ impl Block {
     }
 }
 
-/// Empty label that sits as a header above one or more data blocks.
-/// `__DATA:` immediately precedes the first `__DATA_LINE_<n>:` and has
-/// no body of its own — without this hint it would land in the code
-/// section even though every byte it points at went to data.
-fn is_data_pool_marker_label(label: Option<&str>) -> bool {
-    matches!(label, Some("__DATA:"))
+/// Bodyless labels that bracket a data pool and must be hoisted WITH the pool they bracket.
+fn is_data_anchor_label(label: Option<&str>) -> bool {
+    matches!(
+        label,
+        Some("__DATA:") | Some("__DATA_END:") | Some("__VARS_START:") | Some("__VARS_END:")
+    )
 }
+
+/// Every anchor label from `is_data_anchor_label`, in the bare form used for substring searches
+/// (no trailing colon-newline concerns).
+#[cfg(debug_assertions)]
+const DATA_ANCHOR_LABELS: &[&str] = &["__DATA:", "__DATA_END:", "__VARS_START:", "__VARS_END:"];
 
 fn split_into_blocks(body: &str) -> Vec<Block> {
     // Two-stage parse:
@@ -893,6 +987,65 @@ S0:
         assert!(s0_pos < code_start, "S0 above CODE_START:\n{out}");
         assert!(lda_pos > code_start, "LDA below CODE_START:\n{out}");
         assert!(out.contains("__EXRAM_DATA_END:"));
+    }
+
+    #[test]
+    fn vars_anchors_hoist_with_their_slots() {
+        let input = "\
+*=$080D
+    JSR __STATE_RESET
+    RTS
+
+; --- variable slots ---
+__VARS_START:
+V_A:
+    .byte $00,$00,$00,$00,$00
+VI_C:
+    .byte $00
+__VARS_END:
+
+__HEAP_BOTTOM:
+";
+        let out = inject(input);
+        let code_start = out
+            .find("__EXRAM_CODE_START:")
+            .expect("CODE_START boundary");
+        let start = out.find("__VARS_START:").expect("__VARS_START present");
+        let end = out.find("__VARS_END:").expect("__VARS_END present");
+        assert!(start < code_start, "__VARS_START hoisted:\n{out}");
+        assert!(end < code_start, "__VARS_END hoisted:\n{out}");
+        let a = out.find("V_A:").expect("V_A present");
+        let c = out.find("VI_C:").expect("VI_C present");
+        assert!(
+            start < a && a < c && c < end,
+            "anchors must still bracket every slot:\n{out}"
+        );
+    }
+
+    #[test]
+    fn data_pool_anchors_hoist_with_their_pool() {
+        let input = "\
+*=$080D
+    JSR __DATA_INIT
+    RTS
+
+__DATA:
+__DATA_LINE_10:
+    .byte $01,$02
+__DATA_END:
+
+__HEAP_BOTTOM:
+";
+        let out = inject(input);
+        let code_start = out
+            .find("__EXRAM_CODE_START:")
+            .expect("CODE_START boundary");
+        for anchor in ["__DATA:", "__DATA_LINE_10:", "__DATA_END:"] {
+            let pos = out
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{anchor} present:\n{out}"));
+            assert!(pos < code_start, "{anchor} hoisted:\n{out}");
+        }
     }
 
     #[test]

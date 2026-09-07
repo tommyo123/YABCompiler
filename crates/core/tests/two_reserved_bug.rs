@@ -2,10 +2,7 @@ use asm6502::Assembler6502;
 
 #[test]
 fn two_reserved_ranges_with_branches_dense() {
-    // Stress test: many short branches sprinkled throughout a long
-    // code stream that crosses two reserved ranges. Each branch
-    // targets a label far away (forcing long-form expansion). Models
-    // maze eater's branch-heavy IF/FOR pattern.
+    // Long branches cross two reserved ranges.
     let mut asm = String::from("*=$0810\nstart:\n");
     let label_count = 50;
     // Forward branches that cross the reservations.

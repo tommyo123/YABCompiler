@@ -31,14 +31,13 @@ pub fn repo_path(sub: &str) -> PathBuf {
         .join(sub)
 }
 
-/// Decode a CHROUT byte stream to readable text. C64 PETSCII letters
-/// arrive either as `$41..$5A` or shifted `$C1..$DA`; both map to A-Z.
-/// Control and colour codes are dropped so the golden stays stable.
+/// Decode a CHROUT byte stream to readable text.
 pub fn petscii_to_string(bytes: &[u8]) -> String {
     let mut s = String::new();
     for &b in bytes {
         match b {
             0x0d => s.push('\n'),
+            0x1d => s.push(' '),
             0x20..=0x5a => s.push(b as char),
             0xc1..=0xda => s.push((b - 0x80) as char),
             _ => {}

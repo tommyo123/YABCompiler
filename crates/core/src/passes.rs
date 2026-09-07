@@ -43,7 +43,11 @@ pub fn localize_proc_vars(prog: &mut ast::Program) {
     if bodies.is_empty() {
         return;
     }
-    for (proc_name, body) in &bodies {
+    // Source order, not `HashMap` order: `rewrite_body_vars` mutates `prog` in place, so with
+    // overlapping/nested bodies the visit order is observable in the output.
+    let mut ordered: Vec<(&ProcName, &ProcBody)> = bodies.iter().collect();
+    ordered.sort_by_key(|(_, body)| (body.start_line, body.end_line));
+    for (proc_name, body) in ordered {
         let mangle_map = collect_local_mangle_map(prog, body, proc_name);
         if mangle_map.is_empty() {
             continue;
@@ -265,6 +269,7 @@ fn rewrite_vars_in_then(branch: &mut ast::ThenBranch, map: &HashMap<VarName, Var
 fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarName>) {
     use ast::Statement;
     match stmt {
+        Statement::RaiseError(_) => {}
         Statement::Print(p) => {
             for item in &mut p.items {
                 rewrite_vars_in_print_item(item, map);
@@ -352,7 +357,13 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
                 }
             }
         }
-        Statement::Get { var } | Statement::KeyGet { var } => map_var(map, var),
+        Statement::Get { var, indices } => {
+            map_var(map, var);
+            for ix in indices {
+                rewrite_vars_in_expr(ix, map);
+            }
+        }
+        Statement::KeyGet { var } => map_var(map, var),
         Statement::Input { targets, .. } => {
             for t in targets {
                 rewrite_vars_in_read_target(t, map);
@@ -1575,7 +1586,9 @@ impl ir::Pass for ConstantFold {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        let mut folder = ConstantFolder;
+        let mut folder = ConstantFolder {
+            fre_observable: module_uses_fre(module),
+        };
         crate::visit::walk_module_mut(&mut folder, module);
         Ok(())
     }
@@ -1695,9 +1708,36 @@ fn then_has_rcomp(then: &ThenIr) -> bool {
     matches!(then, ThenIr::Stmts(inner) if inner.iter().any(stmt_has_rcomp))
 }
 
-struct ConstantFolder;
+/// Whether folding a string binding changes heap usage visible through FRE.
+fn str_binding_fold_is_fre_visible(value: &StrExpr, fre_observable: bool) -> bool {
+    fre_observable && !str_is_pure(value)
+}
+
+struct ConstantFolder {
+    /// Whether the program observes string-heap usage through FRE.
+    fre_observable: bool,
+}
 
 impl crate::visit::MutVisitor for ConstantFolder {
+    fn visit_stmt_mut(&mut self, line_no: u16, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::LetStr { value, .. }
+                if str_binding_fold_is_fre_visible(value, self.fre_observable) =>
+            {
+                crate::visit::walk_str_expr_mut(self, value);
+            }
+            Stmt::ArrayLetStr { indices, value, .. }
+                if str_binding_fold_is_fre_visible(value, self.fre_observable) =>
+            {
+                for e in indices.iter_mut() {
+                    self.visit_expr_mut(e);
+                }
+                crate::visit::walk_str_expr_mut(self, value);
+            }
+            _ => crate::visit::walk_stmt_mut(self, line_no, stmt),
+        }
+    }
+
     fn visit_expr_mut(&mut self, e: &mut Expr) {
         // Recurse first so children fold before we look at this node.
         crate::visit::walk_expr_mut(self, e);
@@ -1714,19 +1754,6 @@ impl crate::visit::MutVisitor for ConstantFolder {
         if let Some(simplified) = try_simplify_identity(e) {
             *e = simplified;
             return;
-        }
-        // Strength reduction: small integer powers of a cheap base
-        // expand to a chain of multiplications. FMULT runs in roughly
-        // 200 cycles; FPWRT in 1000+. "Cheap" duplicate-able operands
-        // (Var/Number) keep us from re-evaluating expensive subtrees.
-        if let Expr::Bin(BinOp::Pow, base, exponent) = e {
-            if let Expr::Number(n) = exponent.as_ref() {
-                if n.fract() == 0.0 && *n >= 1.0 && *n <= 4.0 && is_cheap_to_duplicate(base) {
-                    let n = *n as u32;
-                    let new_expr = build_pow_chain(base, n);
-                    *e = new_expr;
-                }
-            }
         }
     }
 
@@ -1759,20 +1786,20 @@ fn try_fold_str(s: &StrExpr) -> Option<Vec<u8>> {
         }
         StrExpr::Left(inner, n) => {
             let bytes = try_fold_str(inner)?;
-            let n = nonneg_int_from_expr(n)?;
+            let n = byte_arg_from_expr(n)?;
             // BASIC clamps to length but raises on negative; we already
             // bail above if n is negative.
             Some(bytes.iter().take(n).copied().collect())
         }
         StrExpr::Right(inner, n) => {
             let bytes = try_fold_str(inner)?;
-            let n = nonneg_int_from_expr(n)?;
+            let n = byte_arg_from_expr(n)?;
             let take = n.min(bytes.len());
             Some(bytes[bytes.len() - take..].to_vec())
         }
         StrExpr::Mid(inner, start, n) => {
             let bytes = try_fold_str(inner)?;
-            let start = nonneg_int_from_expr(start)?;
+            let start = byte_arg_from_expr(start)?;
             // BASIC raises ?ILL QTY for start == 0; let runtime handle.
             if start == 0 {
                 return None;
@@ -1780,7 +1807,7 @@ fn try_fold_str(s: &StrExpr) -> Option<Vec<u8>> {
             let begin = (start - 1).min(bytes.len());
             let end = match n {
                 Some(boxed) => {
-                    let count = nonneg_int_from_expr(boxed)?;
+                    let count = byte_arg_from_expr(boxed)?;
                     (begin + count).min(bytes.len())
                 }
                 None => bytes.len(),
@@ -1791,34 +1818,10 @@ fn try_fold_str(s: &StrExpr) -> Option<Vec<u8>> {
     }
 }
 
-/// True iff `e` is cheap enough to duplicate inline — anything more
-/// expensive than a Var read would re-evaluate the subtree at every
-/// occurrence in the expanded multiply chain. Used by the strength
-/// reduction in ConstantFold to gate `Pow` → multiply-chain rewrites.
-fn is_cheap_to_duplicate(e: &Expr) -> bool {
-    matches!(e, Expr::Number(_) | Expr::Var(_))
-}
-
-/// Expand `base ^ n` into a chain of `base * base * ... * base`
-/// (n total operands). Caller has already gated on `n` being a
-/// small positive integer and `base` being cheap to duplicate.
-fn build_pow_chain(base: &Expr, n: u32) -> Expr {
-    if n == 1 {
-        return base.clone();
-    }
-    let mut acc = base.clone();
-    for _ in 1..n {
-        acc = Expr::Bin(BinOp::Mul, Box::new(acc), Box::new(base.clone()));
-    }
-    acc
-}
-
-/// Pull a non-negative usize out of a `Number(...)` expression. Returns
-/// None for any non-literal, non-finite, negative, or fractional value
-/// so the caller falls back to runtime evaluation.
-fn nonneg_int_from_expr(e: &Expr) -> Option<usize> {
+/// Read a constant byte argument for a string function.
+fn byte_arg_from_expr(e: &Expr) -> Option<usize> {
     if let Expr::Number(n) = e {
-        if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n <= u16::MAX as f64 {
+        if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n <= 255.0 {
             return Some(*n as usize);
         }
     }
@@ -1835,8 +1838,9 @@ fn try_fold(e: &Expr) -> Option<f64> {
         }
         Expr::Not(inner) => {
             let v = try_fold(inner)?;
-            // Bitwise NOT of the signed-16 truncation, per BASIC v2.
-            Some((!(v as i32 as i16)) as i16 as f64)
+            // `NOT` narrows through AYINT ($B1BF) exactly like AND/OR do, so it FLOORS and it
+            // TRAPS outside -32768..32767.
+            Some(!(ayint(crate::codegen::round_to_mflpt(v))? as i16) as f64)
         }
         Expr::Bin(op, l, r) => {
             let lv = try_fold(l)?;
@@ -1872,13 +1876,28 @@ fn try_fold(e: &Expr) -> Option<f64> {
             let bytes = try_fold_str(s)?;
             let text = std::str::from_utf8(&bytes).ok()?;
             let trimmed = text.trim();
-            trimmed.parse::<f64>().ok().filter(|n| n.is_finite())
+            let n = trimmed.parse::<f64>().ok().filter(|n| n.is_finite())?;
+            if crate::codegen::mflpt_overflows(n) {
+                return None;
+            }
+            Some(crate::codegen::round_to_mflpt(n))
         }
         _ => None,
     }
 }
 
+/// Constant-fold `l <op> r` the way the BASIC ROM would.
 fn fold_bin(op: BinOp, l: f64, r: f64) -> Option<f64> {
+    let l = crate::codegen::round_to_mflpt(l);
+    let r = crate::codegen::round_to_mflpt(r);
+    let folded = fold_bin_exact(op, l, r)?;
+    if crate::codegen::mflpt_overflows(folded) {
+        return None;
+    }
+    Some(crate::codegen::round_to_mflpt(folded))
+}
+
+fn fold_bin_exact(op: BinOp, l: f64, r: f64) -> Option<f64> {
     let bool_to_basic = |b: bool| if b { -1.0 } else { 0.0 };
     match op {
         BinOp::Add => Some(l + r),
@@ -1893,14 +1912,14 @@ fn fold_bin(op: BinOp, l: f64, r: f64) -> Option<f64> {
                 Some(l / r)
             }
         }
-        // BASIC raises ?ILLEGAL QUANTITY for negative bases with
-        // fractional exponents; sidestep that whole edge by leaving
-        // such forms to the runtime.
+        // `^` is NOT `powf`.
         BinOp::Pow => {
-            if l < 0.0 && r.fract() != 0.0 {
-                None
+            if r == 0.0 {
+                Some(1.0)
+            } else if l == 0.0 {
+                Some(0.0)
             } else {
-                Some(l.powf(r))
+                None
             }
         }
         BinOp::Eq => Some(bool_to_basic(l == r)),
@@ -1909,38 +1928,31 @@ fn fold_bin(op: BinOp, l: f64, r: f64) -> Option<f64> {
         BinOp::Le => Some(bool_to_basic(l <= r)),
         BinOp::Gt => Some(bool_to_basic(l > r)),
         BinOp::Ge => Some(bool_to_basic(l >= r)),
-        // BASIC AND/OR are 16-bit bitwise on the operands' integer
-        // truncations. This matches the runtime: codegen emits AND/ORA
-        // after FACINT-style coercion.
-        BinOp::And => Some((l as i32 as u16 & r as i32 as u16) as i16 as f64),
-        BinOp::Or => Some((l as i32 as u16 | r as i32 as u16) as i16 as f64),
-        BinOp::Xor => Some((l as i32 as u16 ^ r as i32 as u16) as i16 as f64),
+        BinOp::And => ayint(l).zip(ayint(r)).map(|(a, b)| (a & b) as i16 as f64),
+        BinOp::Or => ayint(l).zip(ayint(r)).map(|(a, b)| (a | b) as i16 as f64),
+        BinOp::Xor => ayint(l).zip(ayint(r)).map(|(a, b)| (a ^ b) as i16 as f64),
     }
 }
 
-/// Algebraic identity simplifications that only apply when one
-/// operand is a specific constant (0, 1, -1) and the OTHER operand
-/// can stay live.
-///
-/// Only the rewrites that PRESERVE the non-constant operand are
-/// included here — `Mul(x, 0) = 0` would drop `x` and is unsound for
-/// expressions with side effects (USR, ArrayRef bounds checks). The
-/// safe variants give us:
-///   * Add(x, 0) -> x
-///   * Sub(x, 0) -> x
-///   * Sub(0, x) -> Neg(x)
-///   * Mul(x, 1) / Mul(1, x) -> x
-///   * Mul(x, -1) / Mul(-1, x) -> Neg(x)
-///   * Div(x, 1) -> x
-///   * And(x, -1) / And(-1, x) -> x   (-1 = 0xFFFF, all-ones)
-///   * Or(x, 0) / Or(0, x) -> x
-///   * Xor(x, 0) / Xor(0, x) -> x
-///
-/// These mostly fire after ConstVarProp substitutes a literal 0/1/-1
-/// into one operand of an otherwise-unfoldable expression (the other
-/// operand is a Var or sub-tree). Without this pass codegen emits
-/// the dead arithmetic (ADC #$00, ASL chain, etc.) wasting bytes
-/// and cycles.
+/// BASIC's AYINT: floor to a signed 16-bit integer, or `None` when the value is out of range
+/// (?ILLEGAL QUANTITY at runtime).
+fn ayint(v: f64) -> Option<u16> {
+    let f = v.floor();
+    (f >= i16::MIN as f64 && f <= i16::MAX as f64).then(|| f as i32 as u16)
+}
+
+/// Apply BASIC assignment conversion, returning None for a range error.
+pub(crate) fn narrow_for_int_store(var: &VarName, v: f64) -> Option<f64> {
+    if var.kind == VarKind::Integer && var.base != "TI" && var.base != "ST" {
+        let f = v.floor();
+        (-32768.0..=32767.0).contains(&f).then_some(f)
+    } else {
+        Some(v)
+    }
+}
+
+/// Algebraic identity simplifications that only apply when one operand is a specific constant
+/// (0, 1, -1) and the OTHER operand can stay live.
 fn try_simplify_identity(e: &Expr) -> Option<Expr> {
     let Expr::Bin(op, l, r) = e else { return None };
     let l_lit = as_simple_literal(l);
@@ -1960,15 +1972,49 @@ fn try_simplify_identity(e: &Expr) -> Option<Expr> {
         // Div: x / 1 -> x  (NOT 0/x: x might be 0 -> ?DIVISION BY ZERO)
         (BinOp::Div, _, Some(1.0)) => Some((**l).clone()),
         // Or:  x | 0  /  0 | x -> x
-        (BinOp::Or, _, Some(0.0)) => Some((**l).clone()),
-        (BinOp::Or, Some(0.0), _) => Some((**r).clone()),
+        (BinOp::Or, _, Some(0.0)) if expr_is_ayint_narrowed(l) => Some((**l).clone()),
+        (BinOp::Or, Some(0.0), _) if expr_is_ayint_narrowed(r) => Some((**r).clone()),
         // Xor: x ^ 0  /  0 ^ x -> x
-        (BinOp::Xor, _, Some(0.0)) => Some((**l).clone()),
-        (BinOp::Xor, Some(0.0), _) => Some((**r).clone()),
+        (BinOp::Xor, _, Some(0.0)) if expr_is_ayint_narrowed(l) => Some((**l).clone()),
+        (BinOp::Xor, Some(0.0), _) if expr_is_ayint_narrowed(r) => Some((**r).clone()),
         // And: x & -1  /  -1 & x -> x  (BASIC -1 = 0xFFFF)
-        (BinOp::And, _, Some(-1.0)) => Some((**l).clone()),
-        (BinOp::And, Some(-1.0), _) => Some((**r).clone()),
+        (BinOp::And, _, Some(-1.0)) if expr_is_ayint_narrowed(l) => Some((**l).clone()),
+        (BinOp::And, Some(-1.0), _) if expr_is_ayint_narrowed(r) => Some((**r).clone()),
         _ => None,
+    }
+}
+
+/// Whether the expression is an integer in the signed 16-bit range.
+fn expr_is_ayint_narrowed(e: &Expr) -> bool {
+    // A literal survives AYINT iff it is integral and in range.
+    let narrow_lit = |n: f64| n.fract() == 0.0 && (-32768.0..=32767.0).contains(&n);
+    match e {
+        Expr::Number(n) => narrow_lit(*n),
+        Expr::Neg(inner) => matches!(inner.as_ref(), Expr::Number(n) if narrow_lit(-n)),
+        // `%` scalars and `%` array elements live in signed 16-bit slots, so a read is narrow
+        // by construction.
+        Expr::Var(v) | Expr::ArrayRef(v, _) => {
+            v.kind == VarKind::Integer && v.base != "TI" && v.base != "ST"
+        }
+        // Comparisons yield 0/-1; the bitwise operators yield the 16-bit result of their own
+        // AYINT-narrowed operands.
+        Expr::Bin(op, _, _) => matches!(
+            op,
+            BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or
+                | BinOp::Xor
+        ),
+        Expr::StrCompare(..) => true,
+        Expr::Not(_) => true,
+        // Byte-valued by construction: 0..=255.
+        Expr::Peek(_) | Expr::MemPeek(_) | Expr::Len(_) | Expr::Asc(_) => true,
+        _ => false,
     }
 }
 
@@ -1986,33 +2032,37 @@ fn as_simple_literal(e: &Expr) -> Option<f64> {
     }
 }
 
+/// Fold a unary function only when its result matches BASIC floating-point behavior.
 fn fold_func1(f: Func1, v: f64) -> Option<f64> {
-    match f {
-        Func1::Abs => Some(v.abs()),
-        Func1::Int => Some(v.floor()),
+    let v = crate::codegen::round_to_mflpt(v);
+    let folded = match f {
+        Func1::Abs => v.abs(),
+        Func1::Int => v.floor(),
         Func1::Sgn => {
             // BASIC SGN: -1, 0, or 1. Use a direct compare so SGN(-0.0)
             // returns 0.0 rather than f64::signum's -0.0 quirk.
-            Some(if v > 0.0 {
+            if v > 0.0 {
                 1.0
             } else if v < 0.0 {
                 -1.0
             } else {
                 0.0
-            })
+            }
         }
-        Func1::Sqr if v >= 0.0 => Some(v.sqrt()),
-        Func1::Sqr => None, // BASIC raises ?ILLEGAL QUANTITY for sqrt of negative
-        Func1::Sin => Some(v.sin()),
-        Func1::Cos => Some(v.cos()),
-        Func1::Tan => Some(v.tan()),
-        Func1::Atn => Some(v.atan()),
-        Func1::Log if v > 0.0 => Some(v.ln()),
-        Func1::Log => None,
-        Func1::Exp => Some(v.exp()),
+        Func1::Sqr
+        | Func1::Sin
+        | Func1::Cos
+        | Func1::Tan
+        | Func1::Atn
+        | Func1::Log
+        | Func1::Exp => return None,
         // RND is non-deterministic: never fold.
-        Func1::Rnd => None,
+        Func1::Rnd => return None,
+    };
+    if crate::codegen::mflpt_overflows(folded) {
+        return None;
     }
+    Some(crate::codegen::round_to_mflpt(folded))
 }
 
 /// Removes lines that no execution path can reach.
@@ -2352,37 +2402,7 @@ impl ir::Pass for IntForBodyAnalysis {
     }
 }
 
-/// Detects per-FOR loop-induction opportunities of the form
-/// `Var(loop_var) * K` (or `K * Var(loop_var)`) where `K` is a
-/// literal numeric constant whose multiply isn't already a cheap
-/// ASL chain. Stores the chosen `K` on `Stmt::For.induction_const`
-/// so codegen can materialise a per-FOR float slot that holds the
-/// running value of `loop_var * K` and substitute reads at every
-/// matching multiplication site.
-///
-/// The pass is conservative: it requires `body_int_safe` (so the
-/// loop var doesn't get clobbered mid-body) and a literal STEP (so
-/// the per-iteration `step * K` advance is a compile-time
-/// constant). When several distinct `K` values appear, it picks
-/// the most frequent one — single-induction-per-FOR keeps the
-/// codegen change small and covers the common case.
-/// `FOR I=A TO B [STEP 1]: POKE I, V: NEXT [I]` collapsed into a
-/// single `Stmt::PokeFill` so codegen lowers it to a tight memory
-/// fill loop instead of a per-iteration FOR/NEXT/POKE dance.
-///
-/// The classic clear-screen / set-color-RAM pattern is the main
-/// target — at 1000 byte fills it's roughly 6× faster than the
-/// general FOR loop because there's no V_var sync, no bound check,
-/// no FAC dance, and no per-iteration line-stamp.
-///
-/// Conservative gate:
-///   * Same line, three statements: FOR ... POKE I,V ... NEXT [I].
-///   * STEP folds to literal 1 (or absent).
-///   * The POKE address is exactly `Var(I)` (the loop variable).
-///   * The POKE value doesn't reference I.
-///   * The loop variable isn't read again after the loop on the
-///     same line (preserves the BASIC v2 semantics where I ends at
-///     B+1. The pass preserves that value when later code reads it.
+/// Combine a FOR loop that writes a constant value to a contiguous address range.
 pub struct PokeLoopFusion;
 
 impl ir::Pass for PokeLoopFusion {
@@ -2391,24 +2411,52 @@ impl ir::Pass for PokeLoopFusion {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        let reads = count_var_reads(module);
         for line in &mut module.lines {
-            fuse_poke_loops(&mut line.stmts);
+            fuse_poke_loops(&mut line.stmts, &reads);
         }
         Ok(())
     }
 }
 
-fn fuse_poke_loops(stmts: &mut Vec<Stmt>) {
+/// Census of variable READS (expression positions only) across the whole module.
+fn count_var_reads(module: &ir::Module) -> HashMap<VarName, u32> {
+    use crate::visit::Visitor;
+    struct Census {
+        counts: HashMap<VarName, u32>,
+    }
+    impl Visitor for Census {
+        fn visit_var_read(&mut self, v: &VarName) {
+            *self.counts.entry(v.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut c = Census {
+        counts: HashMap::new(),
+    };
+    c.visit_module(module);
+    c.counts
+}
+
+fn fuse_poke_loops(stmts: &mut Vec<Stmt>, reads: &HashMap<VarName, u32>) {
     let mut i = 0;
     while i + 2 < stmts.len() {
-        if let Some((dst_start, dst_end, value)) = match_poke_fill_triplet(&stmts[i..i + 3]) {
+        if let Some(fused) = match_poke_fill_triplet(&stmts[i..i + 3], reads) {
             // Replace 3 stmts with 1 PokeFill at position i.
             stmts[i] = Stmt::PokeFill {
-                dst_start,
-                dst_end,
-                value,
+                dst_start: fused.dst_start,
+                dst_end: fused.dst_end,
+                value: fused.value,
             };
             stmts.drain(i + 1..i + 3);
+            if let Some((var, exit)) = fused.loop_var_exit {
+                stmts.insert(
+                    i + 1,
+                    Stmt::Let {
+                        var,
+                        value: Expr::Number(exit),
+                    },
+                );
+            }
             // Don't advance i — a previous fusion could have left
             // another candidate adjacent (e.g., two consecutive
             // FOR/POKE/NEXT on one line). Re-check from i.
@@ -2418,11 +2466,33 @@ fn fuse_poke_loops(stmts: &mut Vec<Stmt>) {
     }
 }
 
-/// Match `[For{I,A,B,STEP=1}, Poke{<addr expr in I>,V}, Next{...}]`
-/// where the address expression is `I`, `I+K`, `K+I`, or `I-K` for
-/// some literal `K`. Returns the rewritten `(dst_start, dst_end,
-/// value)` with the offset folded into the endpoints.
-fn match_poke_fill_triplet(stmts: &[Stmt]) -> Option<(Expr, Expr, Expr)> {
+/// Value the loop variable holds once a `FOR I=s TO e STEP 1` loop has finished, or `None` when
+/// the endpoints aren't both literals.
+fn poke_fill_loop_var_exit(start: &Expr, end: &Expr) -> Option<f64> {
+    let s = expr_as_f64_literal(start)?;
+    let e = expr_as_f64_literal(end)?;
+    if !s.is_finite() || !e.is_finite() {
+        return None;
+    }
+    let iters = ((e - s).floor() + 1.0).max(1.0);
+    let exit = s + iters;
+    if !exit.is_finite() {
+        return None;
+    }
+    Some(exit)
+}
+
+/// What a matched triplet lowers to.
+struct FusedPokeFill {
+    dst_start: Expr,
+    dst_end: Expr,
+    value: Expr,
+    /// `Some` when the loop variable is read elsewhere and therefore needs an explicit
+    /// exit-value store after the fill.
+    loop_var_exit: Option<(VarName, f64)>,
+}
+
+fn match_poke_fill_triplet(stmts: &[Stmt], reads: &HashMap<VarName, u32>) -> Option<FusedPokeFill> {
     if stmts.len() != 3 {
         return None;
     }
@@ -2466,6 +2536,18 @@ fn match_poke_fill_triplet(stmts: &[Stmt]) -> Option<(Expr, Expr, Expr)> {
         [Some(v)] if v == loop_var => {}
         _ => return None,
     }
+    let read_elsewhere = reads.get(loop_var).copied().unwrap_or(0) > 1;
+    let loop_var_exit = if read_elsewhere {
+        let exit = poke_fill_loop_var_exit(start, end)?;
+        // An int-promoted counter can only hold the exit value if it fits i16; `B+1` at the top
+        // of the range does not.
+        if loop_var.kind == VarKind::Integer && !(-32768.0..=32767.0).contains(&exit) {
+            return None;
+        }
+        Some((loop_var.clone(), exit))
+    } else {
+        None
+    };
     let (dst_start, dst_end) = if offset == 0 {
         (start.clone(), end.clone())
     } else {
@@ -2479,7 +2561,12 @@ fn match_poke_fill_triplet(stmts: &[Stmt]) -> Option<(Expr, Expr, Expr)> {
             Expr::Bin(BinOp::Add, Box::new(end.clone()), Box::new(off_expr)),
         )
     };
-    Some((dst_start, dst_end, value.clone()))
+    Some(FusedPokeFill {
+        dst_start,
+        dst_end,
+        value: value.clone(),
+        loop_var_exit,
+    })
 }
 
 /// Recognise `Var(loop_var)`, `Var(loop_var) + K`, `K + Var(loop_var)`,
@@ -3259,6 +3346,12 @@ impl ir::Pass for ArrayPtrInductionDetect {
             if safe.is_empty() {
                 continue;
             }
+            safe.sort_by(|a, b| {
+                a.name
+                    .label()
+                    .cmp(&b.name.label())
+                    .then_with(|| a.indices.cmp(&b.indices))
+            });
             assignments.push(((*fli, *fsi), safe));
         }
         for ((fli, fsi), arrs) in assignments {
@@ -4048,24 +4141,16 @@ fn u8_for_literal_params(start: i16, end: i16, step: i16) -> bool {
             return false;
         }
         let span = end - start;
-        if span % step == 0 {
-            true
-        } else {
-            let last = start + (span / step) * step;
-            last + step <= u8::MAX as i16
-        }
+        let last = start + (span / step) * step;
+        last + step <= u8::MAX as i16
     } else {
         if start < end {
             return false;
         }
         let span = start - end;
         let mag = -step;
-        if span % mag == 0 {
-            true
-        } else {
-            let last = start - (span / mag) * mag;
-            last + step >= 0
-        }
+        let last = start - (span / mag) * mag;
+        last + step >= 0
     }
 }
 
@@ -4393,21 +4478,38 @@ fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
     let routines = build_routine_writes(module);
     let mut unsafe_counters: HashSet<VarName> = HashSet::new();
     for ((fli, fsi), (nli, nsi)) in pairs {
-        let (loop_var, start_lit, end_lit, step_lit) = match &module.lines[fli].stmts[fsi] {
-            Stmt::For {
-                var,
-                start,
-                end,
-                step,
-                ..
-            } => (
-                var.clone(),
-                expr_is_i16_literal(start),
-                expr_is_i16_literal(end),
-                expr_is_i16_nonzero_literal(step),
-            ),
-            _ => continue,
-        };
+        let (loop_var, start_lit, end_lit, step_lit, bounds_read_var, exit_fits) =
+            match &module.lines[fli].stmts[fsi] {
+                Stmt::For {
+                    var,
+                    start,
+                    end,
+                    step,
+                    ..
+                } => {
+                    let exit_fits = match (
+                        expr_as_i16_literal(start),
+                        expr_as_i16_literal(end),
+                        expr_as_f64_literal(step).and_then(f64_to_i16_lit),
+                    ) {
+                        (Some(s), Some(e), Some(st)) => crate::codegen::int_for_exit_fits_i16(
+                            (s.min(e)) as i32,
+                            (s.max(e)) as i32,
+                            st as i32,
+                        ),
+                        _ => false,
+                    };
+                    (
+                        var.clone(),
+                        expr_is_i16_literal(start),
+                        expr_is_i16_literal(end),
+                        expr_is_i16_nonzero_literal(step),
+                        crate::codegen::for_bounds_read_loop_var(var, end, step),
+                        exit_fits,
+                    )
+                }
+                _ => continue,
+            };
         // The codegen's int-FOR fast path requires literal i16
         // start AND step (and either a literal end or one that
         // proves to fit i16 via range analysis). When any of those
@@ -4417,7 +4519,7 @@ fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
         // such counters as "unsafe to promote" so V_<var> stays
         // a 5-byte float slot and the float-FOR can write to it
         // without overshooting into the next BSS variable.
-        if !start_lit || !end_lit || !step_lit {
+        if !start_lit || !end_lit || !step_lit || bounds_read_var || !exit_fits {
             unsafe_counters.insert(loop_var.clone());
             continue;
         }
@@ -4583,7 +4685,14 @@ fn compute_routine_effect(
         }
         let stmts = &module.lines[li].stmts;
         match scan_routine_stmts(
-            stmts, false, module, line_index, memo, visiting, &mut writes, &mut stack,
+            stmts,
+            false,
+            module,
+            line_index,
+            memo,
+            visiting,
+            &mut writes,
+            &mut stack,
         ) {
             RoutineCf::Escaped => return RoutineEffect::Unknown,
             RoutineCf::FallThrough => {
@@ -4627,7 +4736,7 @@ fn scan_routine_stmts(
     };
     for stmt in stmts {
         match stmt {
-            Stmt::Return | Stmt::End | Stmt::Stop => {
+            Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) => {
                 if conditional {
                     continue;
                 }
@@ -4642,11 +4751,17 @@ fn scan_routine_stmts(
                 }
                 return RoutineCf::Stop;
             }
-            Stmt::GoSub { target } => match routine_effect(*target, module, line_index, memo, visiting) {
-                RoutineEffect::Writes(s) => writes.extend(s),
-                RoutineEffect::Unknown => return RoutineCf::Escaped,
-            },
-            Stmt::OnBranch { kind, targets, value } => {
+            Stmt::GoSub { target } => {
+                match routine_effect(*target, module, line_index, memo, visiting) {
+                    RoutineEffect::Writes(s) => writes.extend(s),
+                    RoutineEffect::Unknown => return RoutineCf::Escaped,
+                }
+            }
+            Stmt::OnBranch {
+                kind,
+                targets,
+                value,
+            } => {
                 if !expr_is_int_safe(value, &probe) {
                     return RoutineCf::Escaped;
                 }
@@ -4752,9 +4867,9 @@ fn scan_routine_then(
             }
             None => RoutineCf::Escaped,
         },
-        ThenIr::Stmts(inner) => {
-            scan_routine_stmts(inner, true, module, line_index, memo, visiting, writes, stack)
-        }
+        ThenIr::Stmts(inner) => scan_routine_stmts(
+            inner, true, module, line_index, memo, visiting, writes, stack,
+        ),
     }
 }
 
@@ -4782,7 +4897,7 @@ fn collect_stmt_direct_writes(stmt: &Stmt, out: &mut HashSet<VarName>) {
             out.insert(var.clone());
         }
         Stmt::Next { vars } => out.extend(vars.iter().flatten().cloned()),
-        Stmt::Get { var } | Stmt::KeyGet { var } => {
+        Stmt::Get { var, .. } | Stmt::KeyGet { var } => {
             out.insert(var.clone());
         }
         Stmt::GetFile { vars, .. } => out.extend(vars.iter().cloned()),
@@ -4856,7 +4971,12 @@ fn stmt_is_int_safe_with(
                 indices.iter().all(|e| expr_is_int_safe(e, loop_var))
             }
         }),
-        Stmt::Get { var } | Stmt::KeyGet { var } => var != loop_var,
+        Stmt::KeyGet { var } => var != loop_var,
+        // `GET A(I)` also reads the subscripts, so they have to clear the same int-safety bar
+        // the INPUT array form does.
+        Stmt::Get { var, indices } => {
+            var != loop_var && indices.iter().all(|e| expr_is_int_safe(e, loop_var))
+        }
         Stmt::Fetch {
             control,
             max_len,
@@ -5419,8 +5539,10 @@ fn stmt_is_int_safe_with(
         | Stmt::EndLoop
         | Stmt::Disable
         | Stmt::Rem(_)
+        | Stmt::LineMark(_)
         | Stmt::End
         | Stmt::Stop
+        | Stmt::RaiseError(_)
         // RUN abandons the loop entirely (jumps to L<first>) so it
         // doesn't matter whether the int-counter and float V_var are
         // in sync at the time of the jump.
@@ -5582,10 +5704,63 @@ impl ir::Pass for TailGosubRewrite {
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
         let inline_bodies = tail_gosub_inline_bodies(module);
+        // A `GOSUB` also pushes a marker that FNDFOR stops at.
+        let mut direct: HashMap<u16, u32> = HashMap::new();
+        let mut on_targets: HashSet<u16> = HashSet::new();
+        for line in &module.lines {
+            for stmt in &line.stmts {
+                collect_gosub_uses(stmt, &mut direct, &mut on_targets);
+            }
+        }
+        let keep_marker = crate::for_next_runtime::gosub_targets_needing_marker(
+            module,
+            direct.keys().chain(on_targets.iter()).copied(),
+        );
+        let mut sites: Vec<(u16, u16)> = Vec::new();
+        for line in &module.lines {
+            collect_gosub_call_sites(line.number, &line.stmts, &mut sites);
+        }
+        let recursive = crate::for_next_runtime::recursive_gosub_call_lines(module, sites);
         for line in &mut module.lines {
-            rewrite_tail_gosubs_in_stmts(&mut line.stmts, &inline_bodies, false);
+            let no = line.number;
+            rewrite_tail_gosubs_in_stmts(
+                &mut line.stmts,
+                &inline_bodies,
+                false,
+                &keep_marker,
+                no,
+                &recursive,
+            );
         }
         Ok(())
+    }
+}
+
+/// Every `(line, target)` a direct `GOSUB` in `stmts` names, including under a `THEN`.
+fn collect_gosub_call_sites(line: u16, stmts: &[Stmt], out: &mut Vec<(u16, u16)>) {
+    fn from_then(line: u16, then: &ThenIr, out: &mut Vec<(u16, u16)>) {
+        if let ThenIr::Stmts(inner) = then {
+            collect_gosub_call_sites(line, inner, out);
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            Stmt::GoSub { target } => out.push((line, *target)),
+            Stmt::If { then, .. } => from_then(line, then, out),
+            Stmt::IfElse {
+                then, else_then, ..
+            } => {
+                from_then(line, then, out);
+                from_then(line, else_then, out);
+            }
+            Stmt::Rcomp { then, else_then } => {
+                from_then(line, then, out);
+                if let Some(else_then) = else_then {
+                    from_then(line, else_then, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -5618,6 +5793,9 @@ fn rewrite_tail_gosubs_in_stmts(
     stmts: &mut Vec<Stmt>,
     inline_bodies: &HashMap<u16, Vec<Stmt>>,
     allow_inline: bool,
+    keep_marker: &HashSet<u16>,
+    line: u16,
+    recursive: &HashSet<(u16, u16)>,
 ) {
     for stmt in stmts.iter_mut() {
         match stmt {
@@ -5625,18 +5803,31 @@ fn rewrite_tail_gosubs_in_stmts(
                 then: ThenIr::Stmts(inner),
                 ..
             } => {
-                rewrite_tail_gosubs_in_stmts(inner, inline_bodies, true);
+                rewrite_tail_gosubs_in_stmts(
+                    inner,
+                    inline_bodies,
+                    true,
+                    keep_marker,
+                    line,
+                    recursive,
+                );
             }
             Stmt::IfElse {
                 then, else_then, ..
             } => {
-                rewrite_tail_gosubs_in_then(then, inline_bodies);
-                rewrite_tail_gosubs_in_then(else_then, inline_bodies);
+                rewrite_tail_gosubs_in_then(then, inline_bodies, keep_marker, line, recursive);
+                rewrite_tail_gosubs_in_then(else_then, inline_bodies, keep_marker, line, recursive);
             }
             Stmt::Rcomp { then, else_then } => {
-                rewrite_tail_gosubs_in_then(then, inline_bodies);
+                rewrite_tail_gosubs_in_then(then, inline_bodies, keep_marker, line, recursive);
                 if let Some(else_then) = else_then {
-                    rewrite_tail_gosubs_in_then(else_then, inline_bodies);
+                    rewrite_tail_gosubs_in_then(
+                        else_then,
+                        inline_bodies,
+                        keep_marker,
+                        line,
+                        recursive,
+                    );
                 }
             }
             _ => {}
@@ -5645,7 +5836,11 @@ fn rewrite_tail_gosubs_in_stmts(
     let mut i = 0;
     while i + 1 < stmts.len() {
         let target = match (&stmts[i], &stmts[i + 1]) {
-            (Stmt::GoSub { target }, Stmt::Return) => Some(*target),
+            (Stmt::GoSub { target }, Stmt::Return)
+                if !keep_marker.contains(target) && !recursive.contains(&(line, *target)) =>
+            {
+                Some(*target)
+            }
             _ => None,
         };
         if let Some(target) = target {
@@ -5663,9 +5858,15 @@ fn rewrite_tail_gosubs_in_stmts(
     }
 }
 
-fn rewrite_tail_gosubs_in_then(then: &mut ThenIr, inline_bodies: &HashMap<u16, Vec<Stmt>>) {
+fn rewrite_tail_gosubs_in_then(
+    then: &mut ThenIr,
+    inline_bodies: &HashMap<u16, Vec<Stmt>>,
+    keep_marker: &HashSet<u16>,
+    line: u16,
+    recursive: &HashSet<(u16, u16)>,
+) {
     if let ThenIr::Stmts(inner) = then {
-        rewrite_tail_gosubs_in_stmts(inner, inline_bodies, true);
+        rewrite_tail_gosubs_in_stmts(inner, inline_bodies, true, keep_marker, line, recursive);
     }
 }
 
@@ -5709,7 +5910,7 @@ impl ir::Pass for GosubSingleUseInline {
             return Ok(());
         }
         for line in &mut module.lines {
-            inline_gosubs_in_stmts(&mut line.stmts, &inline_bodies);
+            inline_gosubs_in_stmts(&mut line.stmts, &inline_bodies, line.number);
         }
         Ok(())
     }
@@ -5779,7 +5980,7 @@ impl ir::Pass for GosubShortBodyInline {
             return Ok(());
         }
         for line in &mut module.lines {
-            inline_gosubs_in_stmts(&mut line.stmts, &inline_bodies);
+            inline_gosubs_in_stmts(&mut line.stmts, &inline_bodies, line.number);
         }
         Ok(())
     }
@@ -5938,6 +6139,9 @@ fn stmt_safe_for_gosub_inline(stmt: &Stmt) -> bool {
         | Stmt::End
         | Stmt::Stop
         | Stmt::Run(_)
+        // `CLR` resets BASIC's interpreter stack pointer, which throws away the caller's GOSUB
+        // frame along with every FOR frame.
+        | Stmt::Clr
         | Stmt::ComputedGoto { .. }
         | Stmt::OnKey { .. }
         | Stmt::Resume { .. }
@@ -5987,14 +6191,19 @@ fn stmt_is_unconditional_transfer(stmt: &Stmt) -> bool {
     )
 }
 
-fn inline_gosubs_in_stmts(stmts: &mut Vec<Stmt>, bodies: &HashMap<u16, Vec<Stmt>>) {
+/// Splice inlinable GOSUB bodies into their call sites.
+fn inline_gosubs_in_stmts(stmts: &mut Vec<Stmt>, bodies: &HashMap<u16, Vec<Stmt>>, here: u16) {
     let mut i = 0;
     while i < stmts.len() {
         match &mut stmts[i] {
             Stmt::GoSub { target } => {
                 if let Some(body) = bodies.get(target) {
-                    let len = body.len();
-                    stmts.splice(i..=i, body.clone());
+                    let mut spliced = Vec::with_capacity(body.len() + 2);
+                    spliced.push(Stmt::LineMark(*target));
+                    spliced.extend(body.iter().cloned());
+                    spliced.push(Stmt::LineMark(here));
+                    let len = spliced.len();
+                    stmts.splice(i..=i, spliced);
                     i += len;
                 } else {
                     i += 1;
@@ -6004,20 +6213,20 @@ fn inline_gosubs_in_stmts(stmts: &mut Vec<Stmt>, bodies: &HashMap<u16, Vec<Stmt>
                 then: ThenIr::Stmts(inner),
                 ..
             } => {
-                inline_gosubs_in_stmts(inner, bodies);
+                inline_gosubs_in_stmts(inner, bodies, here);
                 i += 1;
             }
             Stmt::IfElse {
                 then, else_then, ..
             } => {
-                inline_gosubs_in_then(then, bodies);
-                inline_gosubs_in_then(else_then, bodies);
+                inline_gosubs_in_then(then, bodies, here);
+                inline_gosubs_in_then(else_then, bodies, here);
                 i += 1;
             }
             Stmt::Rcomp { then, else_then } => {
-                inline_gosubs_in_then(then, bodies);
+                inline_gosubs_in_then(then, bodies, here);
                 if let Some(else_then) = else_then {
-                    inline_gosubs_in_then(else_then, bodies);
+                    inline_gosubs_in_then(else_then, bodies, here);
                 }
                 i += 1;
             }
@@ -6026,9 +6235,9 @@ fn inline_gosubs_in_stmts(stmts: &mut Vec<Stmt>, bodies: &HashMap<u16, Vec<Stmt>
     }
 }
 
-fn inline_gosubs_in_then(then: &mut ThenIr, bodies: &HashMap<u16, Vec<Stmt>>) {
+fn inline_gosubs_in_then(then: &mut ThenIr, bodies: &HashMap<u16, Vec<Stmt>>, here: u16) {
     if let ThenIr::Stmts(inner) = then {
-        inline_gosubs_in_stmts(inner, bodies);
+        inline_gosubs_in_stmts(inner, bodies, here);
     }
 }
 
@@ -6148,9 +6357,13 @@ fn trim_transfer_in_then(then: &mut ThenIr) {
 /// time; without string propagation, the `Var(RL$)` in the concat
 /// blocks the fold and INSERT errors out.
 pub fn run_str_const_var_prop(module: &mut ir::Module) -> bool {
-    let mut scanner = StrConstVarScanner::default();
+    let fre_observable = module_uses_fre(module);
+    let mut scanner = StrConstVarScanner {
+        fre_observable,
+        ..StrConstVarScanner::default()
+    };
     crate::visit::walk_module(&mut scanner, module);
-    if scanner.saw_clr {
+    if scanner.saw_var_reset {
         return false;
     }
     let in_sub = compute_in_sub_lines(module);
@@ -6179,7 +6392,10 @@ pub fn run_str_const_var_prop(module: &mut ir::Module) -> bool {
     if consts.is_empty() {
         return false;
     }
-    let mut substituter = StrConstVarSubstituter { consts: &consts };
+    let mut substituter = StrConstVarSubstituter {
+        consts: &consts,
+        fre_observable,
+    };
     crate::visit::walk_module_mut(&mut substituter, module);
     for line in &mut module.lines {
         line.stmts
@@ -6193,7 +6409,10 @@ struct StrConstVarScanner {
     info: HashMap<VarName, StrVarInfo>,
     nested: bool,
     current_line: u16,
-    saw_clr: bool,
+    /// See `ConstVarScanner::saw_var_reset`.
+    saw_var_reset: bool,
+    /// See `str_binding_fold_is_fre_visible`.
+    fre_observable: bool,
 }
 
 #[derive(Default)]
@@ -6251,7 +6470,12 @@ impl crate::visit::Visitor for StrConstVarScanner {
                     let entry = self.info.entry(var.clone()).or_insert_with(StrVarInfo::new);
                     entry.let_count = entry.let_count.saturating_add(1);
                     entry.let_line = line_no;
-                    entry.let_value = try_fold_str(value);
+                    entry.let_value = if str_binding_fold_is_fre_visible(value, self.fre_observable)
+                    {
+                        None
+                    } else {
+                        try_fold_str(value)
+                    };
                 }
             }
             Stmt::Let { var, .. } => {
@@ -6294,15 +6518,15 @@ impl crate::visit::Visitor for StrConstVarScanner {
                     }
                 }
             }
-            Stmt::Get { var } | Stmt::KeyGet { var } => self.mark_nonlet_write(var),
+            Stmt::Get { var, .. } | Stmt::KeyGet { var } => self.mark_nonlet_write(var),
             Stmt::GetFile { file_num, vars } => {
                 self.visit_expr(file_num);
                 for v in vars {
                     self.mark_nonlet_write(v);
                 }
             }
-            Stmt::Clr => {
-                self.saw_clr = true;
+            Stmt::Clr | Stmt::Run(_) => {
+                self.saw_var_reset = true;
             }
             _ => crate::visit::walk_stmt(self, line_no, stmt),
         }
@@ -6312,9 +6536,29 @@ impl crate::visit::Visitor for StrConstVarScanner {
 
 struct StrConstVarSubstituter<'a> {
     consts: &'a HashMap<VarName, Vec<u8>>,
+    fre_observable: bool,
 }
 
 impl<'a> crate::visit::MutVisitor for StrConstVarSubstituter<'a> {
+    fn visit_stmt_mut(&mut self, line_no: u16, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::LetStr { value, .. }
+                if str_binding_fold_is_fre_visible(value, self.fre_observable) =>
+            {
+                crate::visit::walk_str_expr_mut(self, value);
+            }
+            Stmt::ArrayLetStr { indices, value, .. }
+                if str_binding_fold_is_fre_visible(value, self.fre_observable) =>
+            {
+                for e in indices.iter_mut() {
+                    self.visit_expr_mut(e);
+                }
+                crate::visit::walk_str_expr_mut(self, value);
+            }
+            _ => crate::visit::walk_stmt_mut(self, line_no, stmt),
+        }
+    }
+
     fn visit_str_expr_mut(&mut self, s: &mut StrExpr) {
         if let StrExpr::Var(v) = s {
             if let Some(bytes) = self.consts.get(v) {
@@ -6343,7 +6587,7 @@ pub fn run_const_var_prop(module: &mut ir::Module) -> bool {
     // "non-LET write" mechanism touches it, and use-line range.
     let mut scanner = ConstVarScanner::default();
     crate::visit::walk_module(&mut scanner, module);
-    if scanner.saw_clr {
+    if scanner.saw_var_reset {
         return false;
     }
     let info = scanner.info;
@@ -6605,10 +6849,8 @@ struct ConstVarScanner {
     /// True while walking a DIM size expression. Reads here aren't
     /// counted as "non-DIM uses" — see `VarInfo::non_dim_use_count`.
     in_dim_expr: bool,
-    /// CLR clears every scalar/array at runtime. The global
-    /// ConstVarProp pass is line-order based, not control-flow based,
-    /// so any CLR makes whole-program substitution unsafe.
-    saw_clr: bool,
+    /// Whether CLR or RUN can reset variables.
+    saw_var_reset: bool,
 }
 
 impl ConstVarScanner {
@@ -6658,15 +6900,7 @@ impl crate::visit::Visitor for ConstVarScanner {
                         },
                         _ => None,
                     };
-                    // BASIC v2 truncates the RHS toward zero when
-                    // assigning to an `%`-typed integer var.
-                    entry.let_value = raw_value.map(|v| {
-                        if var.kind == VarKind::Integer && var.base != "TI" && var.base != "ST" {
-                            v.trunc()
-                        } else {
-                            v
-                        }
-                    });
+                    entry.let_value = raw_value.and_then(|v| narrow_for_int_store(var, v));
                 }
             }
             Stmt::LetStr { var, .. } => {
@@ -6724,15 +6958,15 @@ impl crate::visit::Visitor for ConstVarScanner {
                     }
                 }
             }
-            Stmt::Get { var } | Stmt::KeyGet { var } => self.mark_nonlet_write(var),
+            Stmt::Get { var, .. } | Stmt::KeyGet { var } => self.mark_nonlet_write(var),
             Stmt::GetFile { file_num, vars } => {
                 self.visit_expr(file_num);
                 for v in vars {
                     self.mark_nonlet_write(v);
                 }
             }
-            Stmt::Clr => {
-                self.saw_clr = true;
+            Stmt::Clr | Stmt::Run(_) => {
+                self.saw_var_reset = true;
             }
             Stmt::Dim(specs) => {
                 for spec in specs {
@@ -6854,15 +7088,20 @@ impl ir::Pass for LocalConstProp {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        let fre_observable = module_uses_fre(module);
         for line in &mut module.lines {
             let mut env = HashMap::new();
-            local_const_prop_stmts(&mut line.stmts, &mut env);
+            local_const_prop_stmts(&mut line.stmts, &mut env, fre_observable);
         }
         Ok(())
     }
 }
 
-fn local_const_prop_stmts(stmts: &mut [Stmt], env: &mut HashMap<VarName, f64>) {
+fn local_const_prop_stmts(
+    stmts: &mut [Stmt],
+    env: &mut HashMap<VarName, f64>,
+    fre_observable: bool,
+) {
     for stmt in stmts {
         match stmt {
             Stmt::If { cond, then } => {
@@ -6871,7 +7110,7 @@ fn local_const_prop_stmts(stmts: &mut [Stmt], env: &mut HashMap<VarName, f64>) {
                     ThenIr::Goto(_) => {}
                     ThenIr::Stmts(inner) => {
                         let mut inner_env = env.clone();
-                        local_const_prop_stmts(inner, &mut inner_env);
+                        local_const_prop_stmts(inner, &mut inner_env, fre_observable);
                         let effects = local_effects(inner);
                         if effects.opaque {
                             env.clear();
@@ -6892,7 +7131,7 @@ fn local_const_prop_stmts(stmts: &mut [Stmt], env: &mut HashMap<VarName, f64>) {
                 for branch in [then, else_then] {
                     if let ThenIr::Stmts(inner) = branch {
                         let mut inner_env = env.clone();
-                        local_const_prop_stmts(inner, &mut inner_env);
+                        local_const_prop_stmts(inner, &mut inner_env, fre_observable);
                         let effects = local_effects(inner);
                         if effects.opaque {
                             env.clear();
@@ -6908,7 +7147,7 @@ fn local_const_prop_stmts(stmts: &mut [Stmt], env: &mut HashMap<VarName, f64>) {
                 for branch in std::iter::once(then).chain(else_then.iter_mut()) {
                     if let ThenIr::Stmts(inner) = branch {
                         let mut inner_env = env.clone();
-                        local_const_prop_stmts(inner, &mut inner_env);
+                        local_const_prop_stmts(inner, &mut inner_env, fre_observable);
                         let effects = local_effects(inner);
                         if effects.opaque {
                             env.clear();
@@ -6921,17 +7160,26 @@ fn local_const_prop_stmts(stmts: &mut [Stmt], env: &mut HashMap<VarName, f64>) {
                 }
             }
             _ => {
-                local_rewrite_stmt_exprs(stmt, env);
+                local_rewrite_stmt_exprs(stmt, env, fre_observable);
                 local_update_env(stmt, env);
             }
         }
     }
 }
 
-fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
+fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_observable: bool) {
     match stmt {
+        Stmt::RaiseError(_) => {}
         Stmt::Let { value, .. } => local_const_expr(value, env),
-        Stmt::LetStr { value, .. } => local_const_str(value, env),
+        // Binding RHS: fold the sub-trees but leave an allocating outermost node alone when
+        // `FRE` can see the heap.
+        Stmt::LetStr { value, .. } => {
+            if str_binding_fold_is_fre_visible(value, fre_observable) {
+                local_const_str_children(value, env);
+            } else {
+                local_const_str(value, env);
+            }
+        }
         Stmt::ArrayLet { indices, value, .. } => {
             for e in indices {
                 local_const_expr(e, env);
@@ -6942,7 +7190,11 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
             for e in indices {
                 local_const_expr(e, env);
             }
-            local_const_str(value, env);
+            if str_binding_fold_is_fre_visible(value, fre_observable) {
+                local_const_str_children(value, env);
+            } else {
+                local_const_str(value, env);
+            }
         }
         Stmt::For {
             start, end, step, ..
@@ -7531,6 +7783,7 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
         | Stmt::Nrm
         | Stmt::MemModeOn
         | Stmt::Rem(_)
+        | Stmt::LineMark(_)
         | Stmt::End
         | Stmt::Stop
         | Stmt::Run(_)
@@ -7549,11 +7802,16 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>) {
 
 fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
     match stmt {
+        Stmt::RaiseError(_) => {}
         Stmt::Let { var, value } => {
             if var.kind != VarKind::String && expr_is_pure(value) {
                 if let Some(n) = local_expr_literal(value) {
-                    env.insert(var.clone(), n);
-                    return;
+                    // The fact recorded here is what the *variable* holds afterwards, not what
+                    // the RHS evaluated to.
+                    if let Some(narrowed) = narrow_for_int_store(var, n) {
+                        env.insert(var.clone(), narrowed);
+                        return;
+                    }
                 }
             }
             env.remove(var);
@@ -7570,7 +7828,7 @@ fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
         Stmt::InputFile { targets, .. } => {
             local_kill_read_targets(targets, env);
         }
-        Stmt::Get { var } | Stmt::KeyGet { var } => {
+        Stmt::Get { var, .. } | Stmt::KeyGet { var } => {
             env.remove(var);
         }
         Stmt::GetFile { vars, .. } => {
@@ -7683,6 +7941,7 @@ fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
             ..
         }
         | Stmt::Rem(_)
+        | Stmt::LineMark(_)
         | Stmt::Wait { .. }
         | Stmt::Open { .. }
         | Stmt::Close { .. }
@@ -7803,6 +8062,14 @@ fn local_const_expr(e: &mut Expr, env: &HashMap<VarName, f64>) {
 }
 
 fn local_const_str(s: &mut StrExpr, env: &HashMap<VarName, f64>) {
+    local_const_str_children(s, env);
+    if let Some(folded) = try_fold_str(s) {
+        *s = StrExpr::Literal(folded);
+    }
+}
+
+/// Propagate and fold string children while preserving the outer allocation.
+fn local_const_str_children(s: &mut StrExpr, env: &HashMap<VarName, f64>) {
     match s {
         StrExpr::Chr(e) | StrExpr::Str(e) | StrExpr::HexFmt(e) | StrExpr::BinFmt(e) => {
             local_const_expr(e, env)
@@ -7837,9 +8104,6 @@ fn local_const_str(s: &mut StrExpr, env: &HashMap<VarName, f64>) {
             }
         }
         StrExpr::Literal(_) | StrExpr::Var(_) | StrExpr::GetKey => {}
-    }
-    if let Some(folded) = try_fold_str(s) {
-        *s = StrExpr::Literal(folded);
     }
 }
 
@@ -7907,9 +8171,10 @@ fn local_effects(stmts: &[Stmt]) -> LocalEffects {
 
 fn local_note_effects(stmt: &Stmt, effects: &mut LocalEffects) {
     match stmt {
+        Stmt::RaiseError(_) => {}
         Stmt::Let { var, .. }
         | Stmt::LetStr { var, .. }
-        | Stmt::Get { var }
+        | Stmt::Get { var, .. }
         | Stmt::KeyGet { var } => {
             effects.writes.insert(var.clone());
         }
@@ -8039,6 +8304,7 @@ fn local_note_effects(stmt: &Stmt, effects: &mut LocalEffects) {
         | Stmt::ExitLoop { .. }
         | Stmt::Disable
         | Stmt::Rem(_)
+        | Stmt::LineMark(_)
         | Stmt::Wait { .. }
         | Stmt::ScreenRect { .. }
         | Stmt::ScreenMove { .. }
@@ -8165,6 +8431,17 @@ struct ArrayPromoteFacts {
     disq_arrays: HashSet<VarName>,
     scalar_writes: HashMap<VarName, Vec<WriteReq>>,
     array_writes: HashMap<VarName, Vec<WriteReq>>,
+    /// Array names that have a separate integer-typed form.
+    int_array_bases: HashSet<String>,
+}
+
+impl ArrayPromoteFacts {
+    /// Record an integer-typed array name.
+    fn note_array_name(&mut self, name: &VarName) {
+        if name.kind == VarKind::Integer {
+            self.int_array_bases.insert(name.base.clone());
+        }
+    }
 }
 
 impl crate::visit::Visitor for ArrayPromoteFacts {
@@ -8173,8 +8450,11 @@ impl crate::visit::Visitor for ArrayPromoteFacts {
             Expr::Var(v) if v.kind == VarKind::Float => {
                 self.float_scalars.insert(v.clone());
             }
-            Expr::ArrayRef(a, _) if a.kind == VarKind::Float => {
-                self.float_arrays.insert(a.clone());
+            Expr::ArrayRef(a, _) => {
+                if a.kind == VarKind::Float {
+                    self.float_arrays.insert(a.clone());
+                }
+                self.note_array_name(a);
             }
             _ => {}
         }
@@ -8182,6 +8462,30 @@ impl crate::visit::Visitor for ArrayPromoteFacts {
     }
 
     fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+        match stmt {
+            Stmt::ArrayLet { name, .. } | Stmt::ArrayLetStr { name, .. } => {
+                self.note_array_name(name)
+            }
+            Stmt::Dim(specs) => {
+                for spec in specs {
+                    self.note_array_name(&spec.name);
+                }
+            }
+            Stmt::Read(targets) | Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+                for t in targets {
+                    if let ir::ReadTarget::Array { name, .. } = t {
+                        self.note_array_name(name);
+                    }
+                }
+            }
+            Stmt::Get { var, indices } if !indices.is_empty() => self.note_array_name(var),
+            Stmt::Fetch {
+                target,
+                target_indices,
+                ..
+            } if !target_indices.is_empty() => self.note_array_name(target),
+            _ => {}
+        }
         match stmt {
             Stmt::Let { var, value } if var.kind == VarKind::Float => {
                 self.float_scalars.insert(var.clone());
@@ -8250,7 +8554,15 @@ impl crate::visit::Visitor for ArrayPromoteFacts {
                     }
                 }
             }
-            Stmt::Get { var } | Stmt::KeyGet { var } if var.kind == VarKind::Float => {
+            // GET's value is runtime-unknown, so its target can never be promoted.
+            Stmt::Get { var, indices } if var.kind == VarKind::Float => {
+                if indices.is_empty() {
+                    self.disq_scalars.insert(var.clone());
+                } else {
+                    self.disq_arrays.insert(var.clone());
+                }
+            }
+            Stmt::KeyGet { var } if var.kind == VarKind::Float => {
                 self.disq_scalars.insert(var.clone());
             }
             Stmt::GetFile { vars, .. } => {
@@ -8258,6 +8570,17 @@ impl crate::visit::Visitor for ArrayPromoteFacts {
                     if v.kind == VarKind::Float {
                         self.disq_scalars.insert(v.clone());
                     }
+                }
+            }
+            Stmt::Fetch {
+                target,
+                target_indices,
+                ..
+            } if target.kind == VarKind::Float => {
+                if target_indices.is_empty() {
+                    self.disq_scalars.insert(target.clone());
+                } else {
+                    self.disq_arrays.insert(target.clone());
                 }
             }
             _ => {}
@@ -8381,6 +8704,8 @@ impl ir::Pass for IntArrayPromote {
         let mut array_cand: HashSet<VarName> = facts
             .float_arrays
             .difference(&facts.disq_arrays)
+            // BASIC v2 gives `A()` and `A%()` separate storage and separate DIM bounds.
+            .filter(|a| !facts.int_array_bases.contains(&a.base))
             .cloned()
             .collect();
 
@@ -8495,6 +8820,7 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     for v in scalar_used.intersection(&array_used) {
         bad.insert(v.clone());
     }
+    disqualify_percent_twins(&scalar_used, &array_used, &mut bad);
 
     // Step 2: seed candidates. Any Float var that has at least one
     // structured write and no bad writes is in the running.
@@ -8514,8 +8840,7 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
         return candidates;
     }
 
-    // Step 3: iteratively drop any candidate whose definitions don't
-    // all pass `int_stayable` against the current candidate set.
+    let for_counters = collect_for_counter_vars(module);
     loop {
         let mut to_drop: Vec<VarName> = Vec::new();
         for v in &candidates {
@@ -8528,7 +8853,10 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
             }
         }
         if to_drop.is_empty() {
-            break;
+            to_drop = int_range_escapees(&defs, &candidates, &for_counters);
+            if to_drop.is_empty() {
+                break;
+            }
         }
         for v in to_drop {
             candidates.remove(&v);
@@ -9064,7 +9392,20 @@ impl crate::visit::Visitor for WriteCollector {
                 entry.push(end.clone());
                 entry.push(step.clone());
             }
-            Stmt::Get { var } | Stmt::KeyGet { var } => {
+            Stmt::Next { vars } => {
+                for v in vars.iter().flatten() {
+                    self.note_scalar(v);
+                }
+            }
+            Stmt::Get { var, indices } => {
+                if indices.is_empty() {
+                    self.note_scalar(var);
+                } else {
+                    self.note_array(var);
+                }
+                self.bad.insert(var.clone());
+            }
+            Stmt::KeyGet { var } => {
                 self.note_scalar(var);
                 self.bad.insert(var.clone());
             }
@@ -9111,20 +9452,258 @@ impl crate::visit::Visitor for WriteCollector {
                     self.note_array(&spec.name);
                 }
             }
+            Stmt::Fetch {
+                target,
+                target_indices,
+                ..
+            } => {
+                if target_indices.is_empty() {
+                    self.note_scalar(target);
+                } else {
+                    self.note_array(target);
+                }
+                self.bad.insert(target.clone());
+            }
             _ => {}
         }
         crate::visit::walk_stmt(self, line_no, stmt);
     }
 }
 
-/// Predicate: does evaluating `e` always produce an i16-range integer
-/// at runtime? `int_vars` is the current "treat as int" candidate set
-/// — Var nodes whose name is in it count as int sources, propagating
-/// through the recursive check.
-///
-/// Conservative on overflow: we trust Add/Sub/Mul not to overflow
-/// i16 in well-formed programs. Stricter range analysis would tighten
-/// this; for the v1 pass, we assume the program is well-typed.
+/// Prevent promotion from merging distinct float and integer variables or arrays.
+fn disqualify_percent_twins(
+    scalar_used: &HashSet<VarName>,
+    array_used: &HashSet<VarName>,
+    bad: &mut HashSet<VarName>,
+) {
+    for used in [scalar_used, array_used] {
+        let int_bases: HashSet<&str> = used
+            .iter()
+            .filter(|v| v.kind == VarKind::Integer)
+            .map(|v| v.base.as_str())
+            .collect();
+        if int_bases.is_empty() {
+            continue;
+        }
+        for v in used.iter().filter(|v| v.kind == VarKind::Float) {
+            if int_bases.contains(v.base.as_str()) {
+                bad.insert(v.clone());
+            }
+        }
+    }
+}
+
+/// Interval bounds for the range half of the promotion gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PromRange {
+    min: i64,
+    max: i64,
+}
+
+impl PromRange {
+    fn new(min: i64, max: i64) -> Self {
+        Self { min, max }
+    }
+    fn i16() -> Self {
+        Self::new(i16::MIN as i64, i16::MAX as i64)
+    }
+    fn u8() -> Self {
+        Self::new(0, 255)
+    }
+    fn join(self, other: Self) -> Self {
+        Self::new(self.min.min(other.min), self.max.max(other.max))
+    }
+    fn contains(self, other: Self) -> bool {
+        self.min <= other.min && self.max >= other.max
+    }
+    fn fits_i16(self) -> bool {
+        self.min >= i16::MIN as i64 && self.max <= i16::MAX as i64
+    }
+}
+
+/// Maximum interval-propagation rounds before treating a changing range as unbounded.
+const PROM_RANGE_ROUNDS: usize = 24;
+
+/// Every variable that some `FOR` header controls.
+fn collect_for_counter_vars(module: &ir::Module) -> HashSet<VarName> {
+    use crate::visit::Visitor;
+    struct Collect {
+        out: HashSet<VarName>,
+    }
+    impl Visitor for Collect {
+        fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+            if let Stmt::For { var, .. } = stmt {
+                self.out.insert(var.clone());
+            }
+            crate::visit::walk_stmt(self, line_no, stmt);
+        }
+    }
+    let mut c = Collect {
+        out: HashSet::new(),
+    };
+    c.visit_module(module);
+    c.out
+}
+
+/// Candidates whose value cannot be proved to stay inside i16.
+fn int_range_escapees(
+    defs: &HashMap<VarName, Vec<Expr>>,
+    candidates: &HashSet<VarName>,
+    for_counters: &HashSet<VarName>,
+) -> Vec<VarName> {
+    let mut ranges: HashMap<VarName, PromRange> = HashMap::new();
+    let mut unstable: HashSet<VarName> = HashSet::new();
+    for round in 0..=PROM_RANGE_ROUNDS {
+        let mut changed = false;
+        // Deterministic order: the fixpoint result does not depend on it, but the escapee list
+        // handed back does.
+        let mut names: Vec<&VarName> = candidates.iter().collect();
+        names.sort_by_key(|v| prom_sort_key(v));
+        for v in names {
+            let Some(values) = defs.get(v) else { continue };
+            let mut acc: Option<PromRange> = None;
+            for value in values {
+                let Some(r) = prom_range_of(value, candidates, &ranges) else {
+                    continue;
+                };
+                acc = Some(match acc {
+                    Some(a) => a.join(r),
+                    None => r,
+                });
+            }
+            let Some(next) = acc else { continue };
+            match ranges.get(v) {
+                Some(&old) if old.contains(next) => {}
+                Some(&old) => {
+                    ranges.insert(v.clone(), old.join(next));
+                    changed = true;
+                    if round == PROM_RANGE_ROUNDS && !for_counters.contains(v) {
+                        unstable.insert(v.clone());
+                    }
+                }
+                None => {
+                    ranges.insert(v.clone(), next);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out: Vec<VarName> = candidates
+        .iter()
+        .filter(|v| unstable.contains(*v) || ranges.get(*v).is_some_and(|r| !r.fits_i16()))
+        .cloned()
+        .collect();
+    out.sort_by_key(prom_sort_key);
+    out
+}
+
+/// Stable variable order for interval propagation.
+fn prom_sort_key(v: &VarName) -> (String, u8) {
+    let k = match v.kind {
+        VarKind::Float => 0u8,
+        VarKind::Integer => 1,
+        VarKind::String => 2,
+    };
+    (v.base.clone(), k)
+}
+
+/// Interval of `e` under the current partial solution.
+fn prom_range_of(
+    e: &Expr,
+    candidates: &HashSet<VarName>,
+    ranges: &HashMap<VarName, PromRange>,
+) -> Option<PromRange> {
+    let bin = |l: &Expr, r: &Expr| -> Option<(PromRange, PromRange)> {
+        Some((
+            prom_range_of(l, candidates, ranges)?,
+            prom_range_of(r, candidates, ranges)?,
+        ))
+    };
+    Some(match e {
+        Expr::Number(n) => {
+            if !n.is_finite() || n.fract() != 0.0 {
+                return None;
+            }
+            PromRange::new(*n as i64, *n as i64)
+        }
+        Expr::Var(v) => {
+            if v.kind == VarKind::Integer {
+                PromRange::i16()
+            } else {
+                // A candidate with no interval yet is bottom.
+                *ranges.get(v)?
+            }
+        }
+        Expr::ArrayRef(a, _) => {
+            if a.kind == VarKind::Integer {
+                PromRange::i16()
+            } else {
+                *ranges.get(a)?
+            }
+        }
+        Expr::Neg(inner) => {
+            let r = prom_range_of(inner, candidates, ranges)?;
+            PromRange::new(-r.max, -r.min)
+        }
+        // NOT / AND / OR / EOR all narrow through AYINT and produce an i16 result by
+        // construction.
+        Expr::Not(_) => PromRange::i16(),
+        Expr::Bin(op, l, r) => match op {
+            BinOp::Add => {
+                let (a, b) = bin(l, r)?;
+                PromRange::new(a.min.saturating_add(b.min), a.max.saturating_add(b.max))
+            }
+            BinOp::Sub => {
+                let (a, b) = bin(l, r)?;
+                PromRange::new(a.min.saturating_sub(b.max), a.max.saturating_sub(b.min))
+            }
+            BinOp::Mul => {
+                let (a, b) = bin(l, r)?;
+                let p = [
+                    a.min.saturating_mul(b.min),
+                    a.min.saturating_mul(b.max),
+                    a.max.saturating_mul(b.min),
+                    a.max.saturating_mul(b.max),
+                ];
+                PromRange::new(*p.iter().min().unwrap(), *p.iter().max().unwrap())
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                PromRange::new(-1, 0)
+            }
+            BinOp::And | BinOp::Or | BinOp::Xor => PromRange::i16(),
+            _ => return None,
+        },
+        Expr::Func1(f, arg) => match f {
+            Func1::Abs => {
+                let r = prom_range_of(arg, candidates, ranges)?;
+                let hi = r.min.saturating_abs().max(r.max.saturating_abs());
+                PromRange::new(0, hi)
+            }
+            Func1::Int => prom_range_of(arg, candidates, ranges)?,
+            Func1::Sgn => PromRange::new(-1, 1),
+            _ => return None,
+        },
+        Expr::Peek(_) | Expr::MemPeek(_) | Expr::Asc(_) | Expr::Len(_) => PromRange::u8(),
+        // Everything `int_stayable` accepts without being able to narrow it further.
+        Expr::Pos(_)
+        | Expr::Fre(_)
+        | Expr::Joy(_)
+        | Expr::Pot(_)
+        | Expr::Inkey
+        | Expr::Lin
+        | Expr::At(_, _)
+        | Expr::Test(_, _)
+        | Expr::Check { .. }
+        | Expr::Inst { .. }
+        | Expr::StrCompare(_, _, _) => PromRange::i16(),
+        _ => return None,
+    })
+}
+
+/// Predicate: does evaluating `e` always produce an i16-range integer at runtime?
 fn int_stayable(e: &Expr, int_vars: &HashSet<VarName>) -> bool {
     match e {
         Expr::Number(n) => n.is_finite() && n.fract() == 0.0 && (-32768.0..=32767.0).contains(n),
@@ -9892,25 +10471,8 @@ impl<'a> VarKindPromoter<'a> {
 
 // ===== Dead-store elimination =====
 
-/// Remove `LET x = expr` statements whose target `x` isn't live
-/// afterward AND whose RHS is provably side-effect free. Built on
-/// top of the `LiveVars` dataflow analysis.
-///
-/// Catches patterns ConstVarProp can't, in particular vars that get
-/// multiple assignments where only the last one's value escapes the
-/// region:
-/// ```basic
-/// 100 X = 5      ' overwritten before any read; dead
-/// 110 X = 7
-/// 120 PRINT X
-/// ```
-/// Conservative on side-effects: keeps any LET whose RHS could
-/// raise an error or call user code (Rnd is non-deterministic but
-/// observation-only — also kept since dropping it changes the RNG
-/// stream).
-/// Rewrites bare `NEXT` (`vars = [None]`) into `NEXT V` by threading
-/// a compile-time FOR-stack. Liveness analysis can then see that
-/// NEXT reads its loop counter.
+/// Remove `LET x = expr` statements whose target `x` isn't live afterward AND whose RHS is
+/// provably side-effect free.
 pub struct ResolveBareNext;
 
 impl ir::Pass for ResolveBareNext {
@@ -9919,36 +10481,82 @@ impl ir::Pass for ResolveBareNext {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        let mut for_stack: Vec<VarName> = Vec::new();
-        for line in &mut module.lines {
-            for stmt in &mut line.stmts {
-                resolve_bare_next_stmt(stmt, &mut for_stack);
+        // Computed up front, on the un-renamed module, so the ids line up with the walk below.
+        let orphans = crate::for_next_runtime::analyze(module);
+        let mut st = BareNextState::default();
+        for (line_idx, line) in module.lines.iter_mut().enumerate() {
+            let line_no = line.number;
+            for (top_idx, stmt) in line.stmts.iter_mut().enumerate() {
+                resolve_bare_next_stmt(stmt, &mut st, &orphans, line_no, line_idx, &[top_idx]);
             }
         }
         Ok(())
     }
 }
 
-fn resolve_bare_next_stmt(stmt: &mut Stmt, for_stack: &mut Vec<VarName>) {
+/// Walk state for `ResolveBareNext`.
+#[derive(Default)]
+struct BareNextState {
+    for_stack: Vec<VarName>,
+    /// A FOR frame opened only on a conditional path.
+    conditional_open: bool,
+}
+
+impl BareNextState {
+    /// Model BASIC's FNDFOR discard at `FOR V`: drop the newest live frame for `V` together
+    /// with everything stacked on top of it.
+    fn discard_same_var(&mut self, var: &VarName) {
+        if let Some(pos) = self.for_stack.iter().rposition(|v| v == var) {
+            self.for_stack.truncate(pos);
+        }
+    }
+
+    fn pop_frame(&mut self) -> Option<VarName> {
+        let top = self.for_stack.pop();
+        if self.for_stack.is_empty() {
+            // Back to an empty stack: whatever a conditional branch left open cannot be the
+            // innermost frame of any loop opened from here on, so the ambiguity is resolved.
+            self.conditional_open = false;
+        }
+        top
+    }
+}
+
+fn resolve_bare_next_stmt(
+    stmt: &mut Stmt,
+    st: &mut BareNextState,
+    orphans: &crate::for_next_runtime::OrphanAnalysis,
+    line_no: u16,
+    line_idx: usize,
+    path: &[usize],
+) {
     match stmt {
         Stmt::For { var, .. } => {
-            for_stack.push(var.clone());
+            st.discard_same_var(var);
+            st.for_stack.push(var.clone());
         }
         Stmt::Next { vars } => {
+            // Routed through the runtime dispatcher: the innermost frame is a runtime fact, so
+            // leave the NEXT bare and let the dispatcher take the top of the real stack.
+            let dispatched = orphans.is_orphan_next(line_no, line_idx, path);
             for v in vars.iter_mut() {
                 match v {
                     None => {
-                        if let Some(top) = for_stack.pop() {
+                        // Only name the loop when the compile-time stack really is the runtime
+                        // stack.
+                        let ambiguous = st.conditional_open || dispatched;
+                        let top = st.pop_frame();
+                        if !ambiguous && let Some(top) = top {
                             *v = Some(top);
                         }
                     }
                     Some(name) => {
-                        while let Some(top) = for_stack.last() {
+                        while let Some(top) = st.for_stack.last() {
                             if top == name {
-                                for_stack.pop();
+                                st.pop_frame();
                                 break;
                             }
-                            for_stack.pop();
+                            st.pop_frame();
                         }
                     }
                 }
@@ -9959,38 +10567,59 @@ fn resolve_bare_next_stmt(stmt: &mut Stmt, for_stack: &mut Vec<VarName>) {
             // condition only closes the FOR when the condition holds,
             // so the fall-through path still has it open and its own
             // `NEXT` must still resolve to that loop variable.
-            let snapshot = for_stack.clone();
-            resolve_bare_next_then(then, for_stack);
-            *for_stack = snapshot;
+            resolve_bare_next_branch(then, st, orphans, line_no, line_idx, path);
         }
         Stmt::IfElse {
             then, else_then, ..
         } => {
             // Snapshot so a NEXT in one branch doesn't drain the
             // sibling branch's view of the stack.
-            let snapshot = for_stack.clone();
-            resolve_bare_next_then(then, for_stack);
-            *for_stack = snapshot.clone();
-            resolve_bare_next_then(else_then, for_stack);
-            *for_stack = snapshot;
+            resolve_bare_next_branch(then, st, orphans, line_no, line_idx, path);
+            resolve_bare_next_branch(else_then, st, orphans, line_no, line_idx, path);
         }
         Stmt::Rcomp { then, else_then } => {
-            let snapshot = for_stack.clone();
-            resolve_bare_next_then(then, for_stack);
-            *for_stack = snapshot.clone();
+            resolve_bare_next_branch(then, st, orphans, line_no, line_idx, path);
             if let Some(et) = else_then {
-                resolve_bare_next_then(et, for_stack);
-                *for_stack = snapshot;
+                resolve_bare_next_branch(et, st, orphans, line_no, line_idx, path);
             }
         }
         _ => {}
     }
 }
 
-fn resolve_bare_next_then(then: &mut crate::ir::ThenIr, for_stack: &mut Vec<VarName>) {
+/// Walk one conditional branch.
+fn resolve_bare_next_branch(
+    then: &mut crate::ir::ThenIr,
+    st: &mut BareNextState,
+    orphans: &crate::for_next_runtime::OrphanAnalysis,
+    line_no: u16,
+    line_idx: usize,
+    path: &[usize],
+) {
+    let snapshot = st.for_stack.clone();
+    let depth = snapshot.len();
+    resolve_bare_next_then(then, st, orphans, line_no, line_idx, path);
+    if st.for_stack.len() > depth {
+        st.conditional_open = true;
+    }
+    st.for_stack = snapshot;
+}
+
+fn resolve_bare_next_then(
+    then: &mut crate::ir::ThenIr,
+    st: &mut BareNextState,
+    orphans: &crate::for_next_runtime::OrphanAnalysis,
+    line_no: u16,
+    line_idx: usize,
+    path: &[usize],
+) {
     if let crate::ir::ThenIr::Stmts(inner) = then {
-        for s in inner {
-            resolve_bare_next_stmt(s, for_stack);
+        // Per-arm 0-based indices, matching `for_next_runtime`'s `recurse_then` and codegen's
+        // `emit_then_body`.
+        for (idx, s) in inner.iter_mut().enumerate() {
+            let mut child = path.to_vec();
+            child.push(idx);
+            resolve_bare_next_stmt(s, st, orphans, line_no, line_idx, &child);
         }
     }
 }
@@ -10026,7 +10655,10 @@ impl ir::Pass for DeadStoreElim {
             let drop = match stmt {
                 Stmt::Let { var, value } => {
                     let live_out = &live.per_node[id].1;
-                    !live_out.contains(var) && expr_is_pure(value)
+                    !live_out.contains(var)
+                        && expr_is_pure(value)
+                        && expr_cannot_trap(value)
+                        && int_store_cannot_trap(var, value)
                 }
                 Stmt::LetStr { var, value } => {
                     let live_out = &live.per_node[id].1;
@@ -10128,17 +10760,55 @@ fn then_branch_len(then: &ThenIr) -> usize {
     }
 }
 
-/// True iff evaluating `e` has no observable side effects and can't
-/// raise a runtime error. Conservative: when in doubt, return false.
-fn expr_is_pure(e: &Expr) -> bool {
+/// True iff evaluating `e` provably cannot raise a BASIC error.
+pub(crate) fn expr_cannot_trap(e: &Expr) -> bool {
+    match e {
+        Expr::Number(n) => n.is_finite() && !crate::codegen::mflpt_overflows(*n),
+        // A plain slot read converts nothing and traps on nothing.
+        Expr::Var(_) | Expr::String(_) => true,
+        // Sign flip cannot leave the representable range.
+        Expr::Neg(inner) => expr_cannot_trap(inner),
+        Expr::Bin(op, l, r) => match op {
+            // FCOMP yields -1/0 and cannot overflow.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                expr_cannot_trap(l) && expr_cannot_trap(r)
+            }
+            // FADD/FSUB/FMULT can overflow, and there is nothing in the IR that bounds a
+            // variable's magnitude.
+            BinOp::Add | BinOp::Sub | BinOp::Mul => match (l.as_ref(), r.as_ref()) {
+                (Expr::Number(a), Expr::Number(b)) => fold_bin(*op, *a, *b).is_some(),
+                _ => false,
+            },
+            _ => false,
+        },
+        Expr::Func1(f, arg) => {
+            matches!(f, Func1::Abs | Func1::Int | Func1::Sgn) && expr_cannot_trap(arg)
+        }
+        Expr::Peek(_) | Expr::MemPeek(_) => true,
+        // String compare walks two descriptors byte by byte and drops -1/0 in FAC ($B02E).
+        Expr::StrCompare(_, l, r) => str_is_pure(l) && str_is_pure(r),
+        _ => false,
+    }
+}
+
+/// True iff evaluating `e` has no observable side effects on memory, the string heap or the
+/// RNG.
+fn int_store_cannot_trap(var: &VarName, value: &Expr) -> bool {
+    if var.kind != VarKind::Integer || var.base == "TI" || var.base == "ST" {
+        return true;
+    }
+    if let Some(n) = as_simple_literal(value) {
+        return narrow_for_int_store(var, n).is_some();
+    }
+    expr_is_ayint_narrowed(value)
+}
+
+pub(crate) fn expr_is_pure(e: &Expr) -> bool {
     match e {
         Expr::Number(n) => n.is_finite(),
         Expr::Var(_) => true,
         Expr::String(_) => true,
         Expr::Neg(inner) | Expr::Not(inner) => expr_is_pure(inner),
-        // Add/Sub/Mul/Compare can't error for finite operands; Div
-        // and Pow can (?DIVISION BY ZERO, ?ILL QTY for negative
-        // base with frac exponent), so play it safe and bail.
         Expr::Bin(op, l, r) => {
             matches!(
                 op,
@@ -10333,6 +11003,56 @@ mod tests {
     use crate::ir::Pass;
     use crate::ir::{ArrayInductionIndex, Expr, Line, Module, Stmt, ThenIr};
 
+    #[test]
+    fn fold_refuses_results_outside_the_mflpt_range() {
+        assert_eq!(fold_bin(BinOp::Mul, 1e38, 1e38), None);
+        assert_eq!(fold_bin(BinOp::Add, 1.7e38, 1.7e38), None);
+        assert!(fold_bin(BinOp::Mul, 1e19, 1e19).is_some());
+    }
+
+    /// The ROM keeps a 32-bit mantissa and rounds after every op, so `0.1+0.2` and `0.3` really
+    /// are the same value on a C64.
+    #[test]
+    fn fold_rounds_to_c64_precision_after_each_operation() {
+        assert_eq!(fold_bin(BinOp::Sub, 0.1 + 0.2, 0.3), Some(0.0));
+        let sum = fold_bin(BinOp::Add, 0.1, 0.2).unwrap();
+        assert_eq!(fold_bin(BinOp::Eq, sum, 0.3), Some(-1.0));
+        // (2^32 + 1) - 2^32 is 2 on a C64: the sum rounds up.
+        let inc = fold_bin(BinOp::Add, 4294967296.0, 1.0).unwrap();
+        assert_eq!(fold_bin(BinOp::Sub, inc, 4294967296.0), Some(2.0));
+    }
+
+    /// AND/OR/XOR narrow through AYINT, which floors and rejects out-of-range operands.
+    #[test]
+    fn fold_logic_floors_and_declines_out_of_range() {
+        assert_eq!(fold_bin(BinOp::And, -1.5, 3.0), Some(2.0));
+        assert_eq!(fold_bin(BinOp::And, 40000.0, 1.0), None);
+        assert_eq!(fold_bin(BinOp::Or, 4.0, 1.0), Some(5.0));
+    }
+
+    /// Raising a BASIC error is observable, so a dead store whose RHS can raise one must
+    /// survive DCE.
+    #[test]
+    fn trapping_expressions_are_not_droppable() {
+        let a = Expr::Var(fvar("A"));
+        let mul = Expr::Bin(BinOp::Mul, Box::new(a.clone()), Box::new(a.clone()));
+        assert!(expr_is_pure(&mul), "purity is unchanged");
+        assert!(!expr_cannot_trap(&mul), "FMULT can raise ?OVERFLOW");
+        // Reads and comparisons stay droppable.
+        assert!(expr_cannot_trap(&a));
+        assert!(expr_cannot_trap(&Expr::Bin(
+            BinOp::Lt,
+            Box::new(a.clone()),
+            Box::new(Expr::Number(3.0))
+        )));
+        // AND narrows through AYINT, which can raise ?ILLEGAL QUANTITY.
+        assert!(!expr_cannot_trap(&Expr::Bin(
+            BinOp::And,
+            Box::new(a),
+            Box::new(Expr::Number(3.0))
+        )));
+    }
+
     fn fvar(base: &str) -> VarName {
         VarName {
             base: base.to_string(),
@@ -10360,6 +11080,20 @@ mod tests {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Find an array's type from writes, independent of DIM declarations.
+    fn array_let_kind_in(m: &Module, base: &str) -> Option<VarKind> {
+        for line in &m.lines {
+            for st in &line.stmts {
+                if let Stmt::ArrayLet { name, .. } = st
+                    && name.base == base
+                {
+                    return Some(name.kind);
                 }
             }
         }
@@ -10483,6 +11217,64 @@ mod tests {
                         crate::ast::DataValue::Float(8.0),
                     ])],
                 },
+            ],
+        };
+        IntArrayPromote.run(&mut m).unwrap();
+        assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Integer));
+    }
+
+    #[test]
+    fn int_array_promote_skips_array_with_percent_twin() {
+        let mut m = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::Dim(vec![crate::ir::DimSpec {
+                        name: ivar("A"),
+                        dims: vec![Expr::Number(2.0)],
+                    }])],
+                },
+                aset(20, "A", 5.0, Expr::Number(1.0)),
+            ],
+        };
+        IntArrayPromote.run(&mut m).unwrap();
+        assert_eq!(array_let_kind_in(&m, "A"), Some(VarKind::Float));
+    }
+
+    #[test]
+    fn int_array_promote_skips_array_with_fetch_percent_twin() {
+        let mut m = Module {
+            lines: vec![
+                aset(10, "A", 0.0, Expr::Number(4.0)),
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::Fetch {
+                        control: StrExpr::Literal(b"N".to_vec()),
+                        max_len: Expr::Number(2.0),
+                        target: ivar("A"),
+                        target_indices: vec![Expr::Number(0.0)],
+                        force: None,
+                        position: None,
+                    }],
+                },
+            ],
+        };
+        IntArrayPromote.run(&mut m).unwrap();
+        assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Float));
+    }
+
+    #[test]
+    fn int_array_promote_ignores_percent_scalar_twin() {
+        let mut m = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::Let {
+                        var: ivar("A"),
+                        value: Expr::Number(7.0),
+                    }],
+                },
+                aset(20, "A", 0.0, Expr::Number(4.0)),
             ],
         };
         IntArrayPromote.run(&mut m).unwrap();
@@ -10735,6 +11527,68 @@ mod tests {
         );
         let simplified = try_simplify_identity(&e).unwrap();
         assert!(matches!(&simplified, Expr::Var(v) if v == &ivar("X")));
+    }
+
+    /// The bitwise identities are only identities on values AYINT leaves alone.
+    #[test]
+    fn identity_simplifier_keeps_bitwise_ops_on_unnarrowed_operands() {
+        for (op, lit) in [(BinOp::And, -1.0), (BinOp::Or, 0.0), (BinOp::Xor, 0.0)] {
+            let float_operand = Expr::Bin(
+                op,
+                Box::new(Expr::Var(fvar("X"))),
+                Box::new(Expr::Number(lit)),
+            );
+            assert!(
+                try_simplify_identity(&float_operand).is_none(),
+                "{op:?} with a float var must keep its AYINT narrowing"
+            );
+            let float_operand_rhs = Expr::Bin(
+                op,
+                Box::new(Expr::Number(lit)),
+                Box::new(Expr::Var(fvar("X"))),
+            );
+            assert!(
+                try_simplify_identity(&float_operand_rhs).is_none(),
+                "{op:?} with a float var on the right must keep its narrowing"
+            );
+            let out_of_range = Expr::Bin(
+                op,
+                Box::new(Expr::Number(40000.0)),
+                Box::new(Expr::Number(lit)),
+            );
+            assert!(
+                try_simplify_identity(&out_of_range).is_none(),
+                "{op:?} with an out-of-range literal must not simplify"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_simplifier_still_drops_bitwise_ops_on_narrowed_operands() {
+        for (op, lit) in [(BinOp::And, -1.0), (BinOp::Or, 0.0), (BinOp::Xor, 0.0)] {
+            let e = Expr::Bin(
+                op,
+                Box::new(Expr::Var(ivar("X"))),
+                Box::new(Expr::Number(lit)),
+            );
+            let simplified = try_simplify_identity(&e)
+                .unwrap_or_else(|| panic!("{op:?} with a % var should simplify"));
+            assert!(matches!(&simplified, Expr::Var(v) if v == &ivar("X")));
+            // A comparison result is 0/-1, likewise narrow.
+            let cmp = Expr::Bin(
+                op,
+                Box::new(Expr::Number(lit)),
+                Box::new(Expr::Bin(
+                    BinOp::Eq,
+                    Box::new(Expr::Var(fvar("A"))),
+                    Box::new(Expr::Number(1.0)),
+                )),
+            );
+            assert!(
+                try_simplify_identity(&cmp).is_some(),
+                "{op:?} with a comparison operand should simplify"
+            );
+        }
     }
 
     #[test]
@@ -11233,9 +12087,11 @@ mod tests {
 
         GosubSingleUseInline.run(&mut module).unwrap();
 
-        assert!(matches!(module.lines[0].stmts[0], Stmt::Let { .. }));
+        assert!(matches!(module.lines[0].stmts[0], Stmt::LineMark(100)));
+        assert!(matches!(module.lines[0].stmts[1], Stmt::Let { .. }));
+        assert!(matches!(module.lines[0].stmts[2], Stmt::LineMark(10)));
         assert!(matches!(
-            module.lines[0].stmts[1],
+            module.lines[0].stmts[3],
             Stmt::Goto { target: 200 }
         ));
         assert!(
@@ -11278,15 +12134,20 @@ mod tests {
 
         GosubShortBodyInline.run(&mut module).unwrap();
 
-        // Both call sites should now start with the inlined LET.
         for (idx, line_no) in [(0usize, 10), (1, 20)] {
             assert_eq!(module.lines[idx].number, line_no);
             assert!(
-                matches!(module.lines[idx].stmts[0], Stmt::Let { .. }),
+                matches!(module.lines[idx].stmts[0], Stmt::LineMark(100)),
+                "line {line_no} should open the inlined body with a mark:\n{:#?}",
+                module.lines[idx].stmts
+            );
+            assert!(
+                matches!(module.lines[idx].stmts[1], Stmt::Let { .. }),
                 "line {line_no} should be `LET a=7; END` after inline:\n{:#?}",
                 module.lines[idx].stmts
             );
-            assert!(matches!(module.lines[idx].stmts[1], Stmt::End));
+            assert!(matches!(module.lines[idx].stmts[2], Stmt::LineMark(n) if n == line_no));
+            assert!(matches!(module.lines[idx].stmts[3], Stmt::End));
         }
     }
 
@@ -11712,7 +12573,10 @@ mod tests {
                         },
                     ],
                 },
-                Line { number: 20, stmts: vec![Stmt::End] },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::End],
+                },
                 Line {
                     number: 100,
                     stmts: vec![Stmt::GoSub { target: 200 }, Stmt::Return],
@@ -11819,7 +12683,9 @@ mod tests {
         // Endpoints carry the +1024 offset as `start + 1024`,
         // `end + 1024`. ConstantFold (run later in the pipeline)
         // collapses these to literals at codegen time.
-        let mut folder = ConstantFolder;
+        let mut folder = ConstantFolder {
+            fre_observable: false,
+        };
         let mut start = dst_start.clone();
         let mut end = dst_end.clone();
         crate::visit::MutVisitor::visit_expr_mut(&mut folder, &mut start);
@@ -12302,8 +13168,7 @@ impl ir::Pass for SplitMultiTypeVars {
                     let write_node = writes[write_local];
                     rename_writes.insert((var.clone(), write_node), new_var.clone());
                 }
-                let cluster_writes: HashSet<usize> =
-                    cluster.iter().map(|&i| writes[i]).collect();
+                let cluster_writes: HashSet<usize> = cluster.iter().map(|&i| writes[i]).collect();
                 for &r in reads {
                     let Some(reaching) = reach.get(&r) else {
                         continue;
@@ -12372,10 +13237,7 @@ impl UnionFind {
     }
 }
 
-/// Walk every CFG node and collect, per scalar var, which nodes
-/// write and which nodes read it. A node that does both is recorded
-/// in both maps. Arrays are out of scope here; the splitter targets
-/// scalars only.
+/// Walk every CFG node and collect, per scalar var, which nodes write and which nodes read it.
 fn collect_var_io(
     module: &ir::Module,
     cfg: &crate::cfg::Cfg,
@@ -12398,15 +13260,7 @@ fn collect_var_io(
     (writes, reads)
 }
 
-/// Collect vars whose name is structural rather than purely a
-/// storage slot. Splitting these by dataflow would break the
-/// pairing that codegen depends on:
-///
-/// * FOR counter: NEXT references the same name to close the loop.
-/// * GOSUB targets aren't named, so no entry here.
-/// * String swap, INPUT vars: kept conservatively for the first
-///   version; future tightening could allow these once we audit
-///   their downstream consumers.
+/// Exclude variables whose names are needed for loop pairing or function binding.
 fn scan_skip_vars(stmts: &[Stmt], skip: &mut HashSet<VarName>) {
     for s in stmts {
         match s {
@@ -12418,14 +13272,16 @@ fn scan_skip_vars(stmts: &[Stmt], skip: &mut HashSet<VarName>) {
                     skip.insert(v.clone());
                 }
             }
+            Stmt::DefFn { param, body, .. } => {
+                skip.insert(param.clone());
+                collect_expr_reads(body, skip);
+            }
             Stmt::If {
                 then: ThenIr::Stmts(inner),
                 ..
             } => scan_skip_vars(inner, skip),
             Stmt::IfElse {
-                then,
-                else_then,
-                ..
+                then, else_then, ..
             } => {
                 if let ThenIr::Stmts(inner) = then {
                     scan_skip_vars(inner, skip);
@@ -12450,7 +13306,11 @@ fn collect_stmt_writes_reads(
             collect_expr_reads(value, reads);
         }
         Stmt::For {
-            var, start, end, step, ..
+            var,
+            start,
+            end,
+            step,
+            ..
         } => {
             writes.insert(var.clone());
             collect_expr_reads(start, reads);
@@ -12459,13 +13319,29 @@ fn collect_stmt_writes_reads(
         }
         Stmt::Read(targets) | Stmt::Input { targets, .. } => {
             for t in targets {
-                if let ir::ReadTarget::Scalar(v) = t {
-                    writes.insert(v.clone());
+                match t {
+                    ir::ReadTarget::Scalar(v) => {
+                        writes.insert(v.clone());
+                    }
+                    // An array target's subscripts READ the scalars they mention: `READ
+                    // A$(B*2)` reads B.
+                    ir::ReadTarget::Array { indices, .. } => {
+                        for e in indices {
+                            collect_expr_reads(e, reads);
+                        }
+                    }
                 }
             }
         }
-        Stmt::Get { var } => {
-            writes.insert(var.clone());
+        // `GET A(I)` writes an array element.
+        Stmt::Get { var, indices } => {
+            if indices.is_empty() {
+                writes.insert(var.clone());
+            } else {
+                for e in indices {
+                    collect_expr_reads(e, reads);
+                }
+            }
         }
         Stmt::GetFile { vars, file_num, .. } => {
             for v in vars {
@@ -12495,7 +13371,9 @@ fn collect_stmt_writes_reads(
                 collect_print_piece_reads(piece, reads);
             }
         }
-        Stmt::Cmd { items, file_num, .. } => {
+        Stmt::Cmd {
+            items, file_num, ..
+        } => {
             collect_expr_reads(file_num, reads);
             for piece in items {
                 collect_print_piece_reads(piece, reads);
@@ -12541,8 +13419,15 @@ fn collect_expr_reads(e: &Expr, reads: &mut HashSet<VarName>) {
             reads.insert(v.clone());
         }
         Number(_) | String(_) => {}
-        Neg(inner) | Not(inner) | Func1(_, inner) | Peek(inner) | MemPeek(inner)
-        | Pos(inner) | Fre(inner) | Usr(inner) | Joy(inner)
+        Neg(inner)
+        | Not(inner)
+        | Func1(_, inner)
+        | Peek(inner)
+        | MemPeek(inner)
+        | Pos(inner)
+        | Fre(inner)
+        | Usr(inner)
+        | Joy(inner)
         | Pot(inner) => collect_expr_reads(inner, reads),
         Bin(_, l, r) => {
             collect_expr_reads(l, reads);
@@ -12635,10 +13520,7 @@ fn collect_expr_reads_fallback(e: &Expr, reads: &mut HashSet<VarName>) {
 /// A write GENs itself and KILLs every other write of the same var,
 /// so once a write executes, only that write is "live" downstream
 /// until the next assignment.
-fn reaching_defs(
-    cfg: &crate::cfg::Cfg,
-    writes: &HashSet<usize>,
-) -> HashMap<usize, HashSet<usize>> {
+fn reaching_defs(cfg: &crate::cfg::Cfg, writes: &HashSet<usize>) -> HashMap<usize, HashSet<usize>> {
     let n = cfg.nodes.len();
     let mut in_: Vec<HashSet<usize>> = vec![HashSet::new(); n];
     let mut out: Vec<HashSet<usize>> = vec![HashSet::new(); n];
@@ -12715,9 +13597,7 @@ fn stmt_at_mut<'a>(module: &'a mut ir::Module, path: &crate::cfg::StmtPath) -> &
                 ..
             } => s = &mut inner[idx],
             Stmt::IfElse {
-                then,
-                else_then,
-                ..
+                then, else_then, ..
             } => {
                 let then_len = match then {
                     ThenIr::Stmts(inner) => {
@@ -12789,7 +13669,7 @@ fn rename_stmt(
                 }
             }
         }
-        Stmt::Get { var } => {
+        Stmt::Get { var, indices } if indices.is_empty() => {
             if let Some(new) = rename_writes.get(&(var.clone(), node_id)) {
                 *var = new.clone();
             }
@@ -12869,7 +13749,9 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
         }
         If { cond, .. } => v.visit_expr_mut(cond),
         IfElse { cond, .. } => v.visit_expr_mut(cond),
-        For { start, end, step, .. } => {
+        For {
+            start, end, step, ..
+        } => {
             v.visit_expr_mut(start);
             v.visit_expr_mut(end);
             v.visit_expr_mut(step);
@@ -12911,7 +13793,9 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
         }
         GetFile { file_num, .. } => v.visit_expr_mut(file_num),
         InputFile { file_num, .. } => v.visit_expr_mut(file_num),
-        Cmd { file_num, items, .. } => {
+        Cmd {
+            file_num, items, ..
+        } => {
             v.visit_expr_mut(file_num);
             for piece in items {
                 match piece {

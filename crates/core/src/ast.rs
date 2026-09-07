@@ -187,6 +187,8 @@ pub enum Statement {
     /// Same as END except it prints `BREAK IN <line>` before returning
     /// to READY. Useful for marking debug halts.
     Stop,
+    /// Raise the BASIC error in X and return to READY.
+    RaiseError(u8),
     /// `RUN [line]` — restart from the first line (when None) or
     /// from `Some(line)`. Resets variables, arrays, the string heap,
     /// and the DATA pointer to their startup state in both cases.
@@ -777,6 +779,8 @@ pub enum Statement {
     /// variable. Non-blocking; sets the variable to 0 if no key.
     Get {
         var: VarName,
+        /// Array subscripts; empty for a scalar target.
+        indices: Vec<Expr>,
     },
     /// `KEYGET var` — blocking GET. Waits until a key is
     /// available, then applies regular BASIC GET assignment semantics.

@@ -59,7 +59,8 @@ pub struct ArrayInduction {
     pub indices: Vec<ArrayInductionIndex>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Array induction indices have a stable order for deterministic slot allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArrayInductionIndex {
     LoopVar,
     Const(i16),
@@ -166,8 +167,12 @@ pub enum Stmt {
     /// passes (e.g. a `--listing` mode that echoes source) can read
     /// them without re-parsing. Codegen ignores them.
     Rem(#[allow(dead_code)] Vec<u8>),
+    /// Set the BASIC line number for later runtime errors.
+    LineMark(u16),
     End,
     Stop,
+    /// Raise a BASIC ROM error and stop.
+    RaiseError(u8),
     /// `RUN [line]` — restart the program. See
     /// `ast::Statement::Run`.
     Run(Option<u16>),
@@ -584,6 +589,8 @@ pub enum Stmt {
     },
     Get {
         var: VarName,
+        /// Array subscripts; empty for the scalar `GET A` form.
+        indices: Vec<Expr>,
     },
     KeyGet {
         var: VarName,
@@ -967,6 +974,7 @@ fn lower_stmt(
         ast::Statement::Rem(b) => Stmt::Rem(b.clone()),
         ast::Statement::End => Stmt::End,
         ast::Statement::Stop => Stmt::Stop,
+        ast::Statement::RaiseError(n) => Stmt::RaiseError(*n),
         ast::Statement::Run(line) => Stmt::Run(*line),
         ast::Statement::Clr => Stmt::Clr,
         ast::Statement::Poke { addr, value } => Stmt::Poke {
@@ -1411,11 +1419,7 @@ fn lower_stmt(
             message: message.as_ref().map(lower_str),
             ticks: lower_expr(ticks),
         },
-        ast::Statement::Sys {
-            addr,
-            regs,
-            params,
-        } => Stmt::Sys {
+        ast::Statement::Sys { addr, regs, params } => Stmt::Sys {
             addr: lower_expr(addr),
             regs: regs.iter().map(lower_expr).collect(),
             params: params.clone(),
@@ -1557,7 +1561,10 @@ fn lower_stmt(
         ),
         ast::Statement::Restore => Stmt::Restore,
         ast::Statement::Reset { line } => Stmt::Reset { line: *line },
-        ast::Statement::Get { var } => Stmt::Get { var: var.clone() },
+        ast::Statement::Get { var, indices } => Stmt::Get {
+            var: var.clone(),
+            indices: indices.iter().map(lower_expr).collect(),
+        },
         ast::Statement::KeyGet { var } => Stmt::KeyGet { var: var.clone() },
         ast::Statement::Fetch {
             control,

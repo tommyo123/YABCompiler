@@ -4,33 +4,11 @@
 // dormant infrastructure.
 
 //! Control-flow graph for the IR.
-//!
-//! Each statement (top-level on a line, or nested inside an IF THEN
-//! body) becomes a node. Edges follow control flow:
-//!
-//!   * Sequential statements: fall-through to the next stmt on the
-//!     line, or to the first stmt of the next line.
-//!   * GOTO target: edge to the first stmt of the target line.
-//!   * GOSUB target: edge to the target's first stmt; the
-//!     after-GOSUB stmt is recorded as a "return target" so every
-//!     RETURN can edge back to it.
-//!   * IF body = ThenIr::Goto: branch to target + fall-through.
-//!   * IF body = ThenIr::Stmts: branch to first inner stmt + fall-
-//!     through. Last inner stmt re-joins the fall-through path.
-//!   * ON GOTO/GOSUB: edges to every listed target plus fall-through
-//!     (out-of-range selector falls through per BASIC v2).
-//!   * FOR / NEXT: NEXT has a back-edge to the FOR's first body stmt
-//!     plus a forward fall-through (loop exits).
-//!   * END / STOP: no successors.
-//!
-//! GOSUB/RETURN modelling is necessarily over-approximate without
-//! interprocedural analysis: every RETURN edges back to every
-//! after-GOSUB site we recorded. Sound for the analyses we plan to
-//! run, just less precise than ideal.
 
 use std::collections::HashMap;
 
 use crate::ast::VarName;
+use crate::for_next_runtime::{ForTier, OrphanAnalysis};
 use crate::ir::{Module, Stmt, ThenIr};
 
 /// Path identifying one Stmt in the IR. `line_idx` indexes
@@ -67,8 +45,15 @@ pub struct Cfg {
 }
 
 impl Cfg {
+    /// Build the control-flow graph and its FOR/NEXT model.
     pub fn build(module: &Module) -> Self {
-        let mut builder = Builder::new(module);
+        let orphans = crate::for_next_runtime::analyze(module);
+        Self::build_with(module, &orphans)
+    }
+
+    /// Build the graph using a FOR/NEXT model from the same module.
+    pub fn build_with(module: &Module, orphans: &OrphanAnalysis) -> Self {
+        let mut builder = Builder::new(module, orphans);
         builder.build();
         builder.finish()
     }
@@ -128,6 +113,11 @@ impl Cfg {
 
 struct Builder<'a> {
     module: &'a Module,
+    /// FOR/NEXT lowering model.
+    orphans: &'a OrphanAnalysis,
+    /// Body-start node of every tier-2 (`Dispatched`) `FOR`, tagged with the loop variable its
+    /// frame carries.
+    dispatch_targets: Vec<(VarName, usize)>,
     nodes: Vec<CfgNode>,
     /// Reverse index: StmtPath → CfgNode id. Lets edges resolve back-
     /// references after both endpoints exist.
@@ -177,9 +167,11 @@ struct StmtPathKey {
 }
 
 impl<'a> Builder<'a> {
-    fn new(module: &'a Module) -> Self {
+    fn new(module: &'a Module, orphans: &'a OrphanAnalysis) -> Self {
         Self {
             module,
+            orphans,
+            dispatch_targets: Vec::new(),
             nodes: Vec::new(),
             by_path: HashMap::new(),
             line_first: HashMap::new(),
@@ -213,6 +205,8 @@ impl<'a> Builder<'a> {
         for (line_idx, line) in self.module.lines.iter().enumerate() {
             self.connect_top_level(line_idx, &line.stmts);
         }
+        // Add back-edges for NEXT statements bound at runtime.
+        self.add_dispatched_back_edges();
         // Pass 3: every RETURN node edges to every recorded return
         // target — over-approximation but sound.
         let return_targets = self.return_targets.clone();
@@ -404,7 +398,7 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            Stmt::Return | Stmt::End | Stmt::Stop => {
+            Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) => {
                 // No fall-through. RETURN's edges to return-targets
                 // are added in a separate pass after construction.
             }
@@ -493,35 +487,54 @@ impl<'a> Builder<'a> {
                 if let Some(a) = fallthrough {
                     self.add_edge(node_id, a);
                 }
+                // A tier-2 loop's frame is reachable by the run-time dispatcher, so its body
+                // start is a possible target of every dispatched `NEXT` that can name its
+                // variable.
+                if let Some(body) = fallthrough {
+                    let line_no = self.nodes[node_id].line_no;
+                    let tier = self.orphans.for_tier(line_no, line_idx, path_prefix);
+                    if tier == ForTier::Dispatched {
+                        self.dispatch_targets.push((var.clone(), body));
+                    }
+                }
+                // Reopening a loop variable discards its active frame and all frames above it.
+                let key = (var_hash(var), var_kind_marker(var));
+                if let Some(pos) = self
+                    .for_stack
+                    .iter()
+                    .rposition(|f| (f.var, f.var_kind_marker) == key)
+                {
+                    self.for_stack.truncate(pos);
+                }
                 self.for_stack.push(ForFrame {
                     body_start: fallthrough,
-                    var: var_hash(var),
-                    var_kind_marker: var_kind_marker(var),
+                    var: key.0,
+                    var_kind_marker: key.1,
                 });
             }
             Stmt::Next { vars } => {
-                let target_var = vars.iter().find_map(|v| v.as_ref());
-                let frame = match target_var {
-                    None => self.for_stack.pop(),
-                    Some(target) => {
-                        let key = (var_hash(target), var_kind_marker(target));
-                        let mut popped = None;
-                        while let Some(top) = self.for_stack.last() {
-                            if (top.var, top.var_kind_marker) == key {
-                                popped = self.for_stack.pop();
-                                break;
+                // `NEXT J,I` closes J first, then I: each name runs BASIC's FNDFOR search
+                // independently and each one can jump back to *its own* loop body.
+                for target_var in vars {
+                    let frame = match target_var {
+                        None => self.for_stack.pop(),
+                        Some(target) => {
+                            let key = (var_hash(target), var_kind_marker(target));
+                            let mut popped = None;
+                            while let Some(top) = self.for_stack.last() {
+                                if (top.var, top.var_kind_marker) == key {
+                                    popped = self.for_stack.pop();
+                                    break;
+                                }
+                                self.for_stack.pop();
                             }
-                            self.for_stack.pop();
+                            popped
                         }
-                        popped
-                    }
-                };
-                if let Some(f) = frame {
-                    if let Some(body) = f.body_start {
-                        // Back-edge to the first body stmt — re-runs
-                        // the body from the top with the incremented
-                        // counter.
-                        self.add_edge(node_id, body);
+                    };
+                    if let Some(f) = frame {
+                        if let Some(body) = f.body_start {
+                            self.add_edge(node_id, body);
+                        }
                     }
                 }
                 // Forward fall-through when the loop exits.
@@ -615,7 +628,7 @@ impl<'a> Builder<'a> {
                 }
             }
             Stmt::ComputedGoto { .. } => {
-                for target in self.line_first.values().copied().collect::<Vec<_>>() {
+                for target in self.all_line_entry_nodes() {
                     self.add_edge(node_id, target);
                 }
             }
@@ -625,14 +638,14 @@ impl<'a> Builder<'a> {
             // line so live-vars sees variables set in the handler
             // as live for downstream lines.
             Stmt::Resume { .. } => {
-                for target in self.line_first.values().copied().collect::<Vec<_>>() {
+                for target in self.all_line_entry_nodes() {
                     self.add_edge(node_id, target);
                 }
             }
             // ERROR n jumps to the ON ERROR handler — likewise a
             // runtime-determined edge to one of the line targets.
             Stmt::ErrorRaise { .. } => {
-                for target in self.line_first.values().copied().collect::<Vec<_>>() {
+                for target in self.all_line_entry_nodes() {
                     self.add_edge(node_id, target);
                 }
             }
@@ -702,13 +715,56 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Add edges from dispatched NEXT statements to every matching loop body.
+    fn add_dispatched_back_edges(&mut self) {
+        if self.dispatch_targets.is_empty() {
+            return;
+        }
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for node_id in 0..self.nodes.len() {
+            let path = self.nodes[node_id].stmt.clone();
+            let line_no = self.nodes[node_id].line_no;
+            let Stmt::Next { vars } = self.resolve_path(&path) else {
+                continue;
+            };
+            // Each variable in a dispatched NEXT statement uses runtime binding.
+            if !self
+                .orphans
+                .is_orphan_next(line_no, path.line_idx, &path.path)
+            {
+                continue;
+            }
+            for slot in vars {
+                for (target_var, body) in &self.dispatch_targets {
+                    let selectable = match slot {
+                        None => true,
+                        Some(named) => named == target_var,
+                    };
+                    if selectable {
+                        edges.push((node_id, *body));
+                    }
+                }
+            }
+        }
+        for (from, to) in edges {
+            self.add_edge(from, to);
+        }
+    }
+
     fn add_edge(&mut self, from: usize, to: usize) {
         if !self.nodes[from].successors.contains(&to) {
             self.nodes[from].successors.push(to);
         }
     }
 
-    fn resolve_path(&self, p: &StmtPath) -> &Stmt {
+    /// Return line-entry nodes in sorted order for deterministic traversal.
+    fn all_line_entry_nodes(&self) -> Vec<usize> {
+        let mut targets: Vec<usize> = self.line_first.values().copied().collect();
+        targets.sort_unstable();
+        targets
+    }
+
+    fn resolve_path(&self, p: &StmtPath) -> &'a Stmt {
         let mut s = &self.module.lines[p.line_idx].stmts[p.path[0]];
         for &idx in &p.path[1..] {
             match s {
@@ -785,8 +841,9 @@ impl crate::analysis::Analysis for CfgBuild {
     fn name(&self) -> &'static str {
         "cfg"
     }
-    fn run(&self, m: &Module, _deps: &mut crate::analysis::Registry) -> Self::Output {
-        Cfg::build(m)
+    fn run(&self, m: &Module, deps: &mut crate::analysis::Registry) -> Self::Output {
+        let orphans = deps.get(m, &crate::for_next_runtime::ForNextModel).clone();
+        Cfg::build_with(m, &orphans)
     }
 }
 
@@ -939,5 +996,255 @@ mod tests {
         let next_succ = &cfg.nodes[2].successors;
         assert!(next_succ.contains(&1), "back-edge to body start");
         assert!(next_succ.contains(&3), "forward exit to END");
+    }
+
+    // Dispatched NEXT back-edges.
+
+    fn fvar(name: &str) -> VarName {
+        VarName {
+            base: name.to_string(),
+            kind: crate::ast::VarKind::Float,
+        }
+    }
+
+    fn for_of(var: &str, start: f64, end: f64) -> Stmt {
+        Stmt::For {
+            var: fvar(var),
+            start: crate::ir::Expr::Number(start),
+            end: crate::ir::Expr::Number(end),
+            step: crate::ir::Expr::Number(1.0),
+            body_int_safe: false,
+            body_reads_loop_var: false,
+            induction_const: None,
+            array_inductions: Vec::new(),
+        }
+    }
+
+    fn print_of(var: &str) -> Stmt {
+        Stmt::Print {
+            items: vec![crate::ir::PrintPiece::Expr(crate::ir::Expr::Var(fvar(var)))],
+            newline: true,
+        }
+    }
+
+    /// Node id of the first statement on a BASIC line.
+    fn node_at(cfg: &Cfg, line: u16) -> usize {
+        *cfg.line_first
+            .get(&line)
+            .unwrap_or_else(|| panic!("no node for line {line}"))
+    }
+
+    #[test]
+    fn dispatched_next_edges_into_the_loop_it_can_select() {
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![Stmt::Goto { target: 30 }]),
+                make_line(20, vec![Stmt::Next { vars: vec![None] }, Stmt::End]),
+                make_line(30, vec![for_of("I", 0.0, 10.0)]),
+                make_line(40, vec![Stmt::Goto { target: 20 }]),
+            ],
+        };
+        // Check that this NEXT uses runtime dispatch.
+        let orphans = crate::for_next_runtime::analyze(&m);
+        assert!(orphans.needs_runtime_stack(), "line 20 NEXT is an orphan");
+
+        let cfg = Cfg::build(&m);
+        let next = node_at(&cfg, 20);
+        let body = node_at(&cfg, 40); // FOR's fall-through == body start
+        assert!(
+            cfg.nodes[next].successors.contains(&body),
+            "dispatched NEXT must reach the body of the loop it runs; \
+             successors were {:?}",
+            cfg.nodes[next].successors
+        );
+        assert!(cfg.nodes[body].predecessors.contains(&next));
+    }
+
+    /// Loops without crossing branches keep lexical back-edges.
+    #[test]
+    fn static_loop_gets_no_dispatch_edges() {
+        // 10 FOR I=1 TO 10 / 20 PRINT I / 30 NEXT I / 40 END
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![for_of("I", 1.0, 10.0)]),
+                make_line(20, vec![print_of("I")]),
+                make_line(
+                    30,
+                    vec![Stmt::Next {
+                        vars: vec![Some(fvar("I"))],
+                    }],
+                ),
+                make_line(40, vec![Stmt::End]),
+            ],
+        };
+        let orphans = crate::for_next_runtime::analyze(&m);
+        assert!(!orphans.needs_runtime_stack(), "nothing crosses this body");
+
+        let cfg = Cfg::build(&m);
+        let next = node_at(&cfg, 30);
+        let mut succ = cfg.nodes[next].successors.clone();
+        succ.sort_unstable();
+        assert_eq!(
+            succ,
+            vec![node_at(&cfg, 20), node_at(&cfg, 40)],
+            "a static loop's NEXT has exactly a back-edge and an exit"
+        );
+    }
+
+    #[test]
+    fn reopened_loop_edges_back_to_the_surviving_frame() {
+        // 10 FOR I=1 TO 2 / 20 FOR J=1 TO 2 / 30 FOR J=1 TO 1 40 NEXT / 50 NEXT / 60 END
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![for_of("I", 1.0, 2.0)]),
+                make_line(20, vec![for_of("J", 1.0, 2.0)]),
+                make_line(30, vec![for_of("J", 1.0, 1.0)]),
+                make_line(40, vec![Stmt::Next { vars: vec![None] }]),
+                make_line(50, vec![Stmt::Next { vars: vec![None] }]),
+                make_line(60, vec![Stmt::End]),
+            ],
+        };
+        let cfg = Cfg::build(&m);
+        // Line 40 closes the reopened `J` from line 30, whose body starts at line 40 itself
+        // (the FOR is the whole line).
+        let n50 = node_at(&cfg, 50);
+        let mut succ = cfg.nodes[n50].successors.clone();
+        succ.sort_unstable();
+        assert_eq!(
+            succ,
+            vec![node_at(&cfg, 20), node_at(&cfg, 60)],
+            "line 50 closes `I` — the frame that survived the discard — \
+             so it edges back to line 20 and forward to line 60"
+        );
+    }
+
+    #[test]
+    fn sequential_loops_on_one_variable_keep_their_own_edges() {
+        // 10 FOR I=1 TO 2 / 20 NEXT / 30 FOR I=1 TO 2 / 40 NEXT / 50 END
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![for_of("I", 1.0, 2.0)]),
+                make_line(20, vec![Stmt::Next { vars: vec![None] }]),
+                make_line(30, vec![for_of("I", 1.0, 2.0)]),
+                make_line(40, vec![Stmt::Next { vars: vec![None] }]),
+                make_line(50, vec![Stmt::End]),
+            ],
+        };
+        let cfg = Cfg::build(&m);
+        for (next_line, body, exit) in [(20u16, 20u16, 30u16), (40, 40, 50)] {
+            let mut succ = cfg.nodes[node_at(&cfg, next_line)].successors.clone();
+            succ.sort_unstable();
+            assert_eq!(
+                succ,
+                vec![node_at(&cfg, body), node_at(&cfg, exit)],
+                "line {next_line} closes its own loop"
+            );
+        }
+    }
+
+    /// `NEXT V` runs FNDFOR against the *variable*: it compares `__FOR_STACK_VAR` and can only
+    /// stop on a frame a `FOR V` opened.
+    #[test]
+    fn dispatched_next_var_does_not_edge_into_a_foreign_loop() {
+        // 10 GOTO 40 20 NEXT I : END 30 NEXT J : END 40 FOR I=0 TO 3 50 FOR J=0 TO 3 60 GOTO 20
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![Stmt::Goto { target: 40 }]),
+                make_line(
+                    20,
+                    vec![
+                        Stmt::Next {
+                            vars: vec![Some(fvar("I"))],
+                        },
+                        Stmt::End,
+                    ],
+                ),
+                make_line(
+                    30,
+                    vec![
+                        Stmt::Next {
+                            vars: vec![Some(fvar("J"))],
+                        },
+                        Stmt::End,
+                    ],
+                ),
+                make_line(40, vec![for_of("I", 0.0, 3.0)]),
+                make_line(50, vec![for_of("J", 0.0, 3.0)]),
+                make_line(60, vec![Stmt::Goto { target: 20 }]),
+            ],
+        };
+        let cfg = Cfg::build(&m);
+        let next_i = node_at(&cfg, 20);
+        let body_i = node_at(&cfg, 50); // FOR I's body starts at line 50
+        let body_j = node_at(&cfg, 60); // FOR J's body starts at line 60
+        assert!(
+            cfg.nodes[next_i].successors.contains(&body_i),
+            "NEXT I reaches FOR I's body"
+        );
+        assert!(
+            !cfg.nodes[next_i].successors.contains(&body_j),
+            "NEXT I cannot select a J frame, so it must not edge into \
+             FOR J's body"
+        );
+    }
+
+    /// A bare `NEXT` takes whatever frame is on top of the run-time stack, so it can land in
+    /// any dispatched loop regardless of variable.
+    #[test]
+    fn bare_dispatched_next_edges_into_every_dispatched_body() {
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![Stmt::Goto { target: 40 }]),
+                make_line(20, vec![Stmt::Next { vars: vec![None] }, Stmt::End]),
+                make_line(40, vec![for_of("I", 0.0, 3.0)]),
+                make_line(50, vec![for_of("J", 0.0, 3.0)]),
+                make_line(60, vec![Stmt::Goto { target: 20 }]),
+            ],
+        };
+        let cfg = Cfg::build(&m);
+        let next = node_at(&cfg, 20);
+        for body in [node_at(&cfg, 50), node_at(&cfg, 60)] {
+            assert!(
+                cfg.nodes[next].successors.contains(&body),
+                "bare NEXT can select any frame; missing edge to node {body} \
+                 (successors {:?})",
+                cfg.nodes[next].successors
+            );
+        }
+    }
+
+    /// `NEXT J,I` closes J then I, and each name runs its own FNDFOR search that can jump back
+    /// into its own body.
+    #[test]
+    fn multi_var_next_back_edges_to_every_loop_it_closes() {
+        // 10 FOR I=1 TO 2 / 20 FOR J=1 TO 2 / 30 PRINT J 40 NEXT J,I / 50 END
+        let m = Module {
+            lines: vec![
+                make_line(10, vec![for_of("I", 1.0, 2.0)]),
+                make_line(20, vec![for_of("J", 1.0, 2.0)]),
+                make_line(30, vec![print_of("J")]),
+                make_line(
+                    40,
+                    vec![Stmt::Next {
+                        vars: vec![Some(fvar("J")), Some(fvar("I"))],
+                    }],
+                ),
+                make_line(50, vec![Stmt::End]),
+            ],
+        };
+        let cfg = Cfg::build(&m);
+        let next = node_at(&cfg, 40);
+        assert!(
+            cfg.nodes[next].successors.contains(&node_at(&cfg, 30)),
+            "back-edge to FOR J's body"
+        );
+        assert!(
+            cfg.nodes[next].successors.contains(&node_at(&cfg, 20)),
+            "back-edge to FOR I's body — the loop the second name closes"
+        );
+        assert!(
+            cfg.nodes[next].successors.contains(&node_at(&cfg, 50)),
+            "forward exit"
+        );
     }
 }

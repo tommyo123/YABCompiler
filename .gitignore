@@ -49,3 +49,6 @@ portable-package/
 # ...but the bundled VC++ runtime DLL is checked in (shipped in the
 # portable ZIP and conditionally by the MSI).
 !external-utils/vcruntime140.dll
+
+# Local development data
+local_tests/

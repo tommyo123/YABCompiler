@@ -138,7 +138,8 @@ impl Visitor for VarUsageCounter {
             Stmt::For { var, .. } => {
                 self.stats.entry(var.clone()).or_default().other_writes += 1;
             }
-            Stmt::Get { var } => {
+            // GET with subscripts writes an array element.
+            Stmt::Get { var, indices } if indices.is_empty() => {
                 self.stats.entry(var.clone()).or_default().other_writes += 1;
             }
             Stmt::GetFile { vars, .. } => {
@@ -1106,7 +1107,22 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
                 summarize_read_target_write(target, &mut out);
             }
         }
-        Stmt::Get { var } | Stmt::KeyGet { var } => {
+        Stmt::Get { var, indices } => {
+            out.reads.insert(EffectRegion::IoState);
+            out.writes.insert(EffectRegion::IoState);
+            if indices.is_empty() {
+                out.write_scalar(var);
+            } else {
+                for idx in indices {
+                    summarize_expr(idx, &mut out);
+                }
+                out.write_array_data(var);
+            }
+            if var.kind == VarKind::String {
+                out.may_allocate = true;
+            }
+        }
+        Stmt::KeyGet { var } => {
             out.reads.insert(EffectRegion::IoState);
             out.writes.insert(EffectRegion::IoState);
             out.write_scalar(var);
@@ -1284,6 +1300,7 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
         | Stmt::Return
         | Stmt::End
         | Stmt::Stop
+        | Stmt::RaiseError(_)
         | Stmt::Loop
         | Stmt::EndLoop
         | Stmt::Else
@@ -1304,7 +1321,12 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
             out.reads.insert(EffectRegion::IoState);
             out.writes.insert(EffectRegion::IoState);
         }
-        Stmt::Data(_) | Stmt::Rem(_) | Stmt::Do | Stmt::Repeat | Stmt::Disable => {}
+        Stmt::Data(_)
+        | Stmt::Rem(_)
+        | Stmt::LineMark(_)
+        | Stmt::Do
+        | Stmt::Repeat
+        | Stmt::Disable => {}
     }
     out
 }

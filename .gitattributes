@@ -3,6 +3,10 @@
 # under core.autocrlf or edited on Windows.
 *.out text eol=lf
 
+# Spaces in expected output are part of the test data.
+test_corpus/emu_golden/*.out whitespace=-blank-at-eol
+test_synthetic/emu_golden/*.out whitespace=-blank-at-eol
+
 # C64 binary fixtures must never be line-ending converted.
 *.prg binary
 *.bin binary

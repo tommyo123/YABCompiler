@@ -288,7 +288,10 @@ impl crate::analysis::Analysis for LiveVars {
         // Note: cloning the CFG keeps the dataflow `solve` function
         // free of borrow gymnastics with the registry. Cheap for
         // small modules; revisit if it ever shows up in profiles.
-        let solved = solve(module, &cfg, &Self);
+        let flow = LiveVarsFlow {
+            fns: FnBodyReads::build(module),
+        };
+        let solved = solve(module, &cfg, &flow);
         LiveVarsResult { per_node: solved }
     }
 }
@@ -301,7 +304,12 @@ pub struct LiveVarsResult {
     pub per_node: Vec<(HashSet<VarName>, HashSet<VarName>)>,
 }
 
-impl DataflowAnalysis for LiveVars {
+/// The transfer half of `LiveVars`.
+struct LiveVarsFlow {
+    fns: FnBodyReads,
+}
+
+impl DataflowAnalysis for LiveVarsFlow {
     type Lattice = HashSet<VarName>;
     fn direction(&self) -> Direction {
         Direction::Backward
@@ -322,7 +330,7 @@ impl DataflowAnalysis for LiveVars {
             live.remove(&v);
         }
         // …then use (revive read vars).
-        for v in stmt_uses(stmt) {
+        for v in stmt_uses(stmt, &self.fns) {
             live.insert(v);
         }
         live
@@ -398,18 +406,7 @@ impl InterferenceGraph {
     }
 }
 
-/// Builds the [`InterferenceGraph`] from live-variable results: at
-/// every CFG node, all variables live together (on entry and on exit)
-/// form a clique of mutual interference.
-///
-/// Uses both the live-IN and live-OUT sets at each node so a value
-/// that is live across a statement boundary still conflicts with its
-/// neighbours regardless of whether the statement is a def or a use.
-/// This is a sound over-approximation: it may add a few edges at node
-/// boundaries that a finer def/use analysis would omit, but it never
-/// *misses* an interference — and a missed edge is the dangerous
-/// direction (it would let two simultaneously-live vars share a slot
-/// and silently corrupt one).
+/// Build variable conflicts from liveness and writes at each control-flow node.
 pub struct VarInterference;
 
 impl crate::analysis::Analysis for VarInterference {
@@ -419,10 +416,18 @@ impl crate::analysis::Analysis for VarInterference {
     }
     fn run(&self, module: &Module, deps: &mut crate::analysis::Registry) -> Self::Output {
         let live = deps.get(module, &LiveVars).clone();
+        let cfg = deps.get(module, &crate::cfg::CfgBuild).clone();
         let mut graph = InterferenceGraph::default();
-        for (live_in, live_out) in &live.per_node {
+        for (node_id, (live_in, live_out)) in live.per_node.iter().enumerate() {
             graph.add_clique(live_in);
-            graph.add_clique(live_out);
+            let defs = stmt_defs(cfg.stmt_at(node_id, module));
+            if defs.is_empty() {
+                graph.add_clique(live_out);
+            } else {
+                let mut out_and_defs = live_out.clone();
+                out_and_defs.extend(defs);
+                graph.add_clique(&out_and_defs);
+            }
         }
         graph
     }
@@ -509,12 +514,13 @@ impl crate::analysis::Analysis for DefinedBeforeUse {
         // self-modifying first write (`X = X + 1` with no prior X) is
         // correctly flagged — the use is checked against IN, before
         // this statement's own def lands.
+        let fns = FnBodyReads::build(module);
         let mut unsafe_vars: HashSet<VarName> = HashSet::new();
         let mut written: HashSet<VarName> = HashSet::new();
         for (id, _node) in cfg.nodes.iter().enumerate() {
             let stmt = cfg.stmt_at(id, module);
             let in_defined = &solved[id].0;
-            for used in stmt_uses(stmt) {
+            for used in stmt_uses(stmt, &fns) {
                 if !in_defined.vars.contains(&used) {
                     unsafe_vars.insert(used);
                 }
@@ -578,7 +584,7 @@ impl IntRange {
         self.min >= 0 && self.max <= u8::MAX as i32
     }
 
-    fn join(self, other: Self) -> Self {
+    pub(crate) fn join(self, other: Self) -> Self {
         Self {
             min: self.min.min(other.min),
             max: self.max.max(other.max),
@@ -644,13 +650,20 @@ impl IntRange {
             self.max as f64 / other.min as f64,
             self.max as f64 / other.max as f64,
         ];
-        let lo = corners.iter().copied().fold(f64::INFINITY, f64::min).floor();
+        let lo = corners
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            .floor();
         let hi = corners
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max)
             .floor();
-        Some(Self::new(clamp_fact_i64(lo as i64)?, clamp_fact_i64(hi as i64)?))
+        Some(Self::new(
+            clamp_fact_i64(lo as i64)?,
+            clamp_fact_i64(hi as i64)?,
+        ))
     }
 }
 
@@ -1040,12 +1053,8 @@ fn expr_as_int_literal(e: &Expr) -> Option<i32> {
     }
 }
 
-/// Walk every Stmt::Data in source order and compute the i32 range
-/// covering every numeric entry's truncation toward zero. Returns
-/// `None` when the module has no DATA, any value is non-finite, or
-/// any value's truncation falls outside i16 (would trap FAC→i16
-/// downstream — better to kill the READ target's range than promise
-/// a fact that becomes unsound at runtime).
+/// Walk every Stmt::Data in source order and compute the i32 range covering every numeric
+/// entry.
 fn compute_data_range(module: &Module) -> Option<IntRange> {
     let mut min = i32::MAX;
     let mut max = i32::MIN;
@@ -1058,10 +1067,11 @@ fn compute_data_range(module: &Module) -> Option<IntRange> {
                         if !f.is_finite() {
                             return None;
                         }
-                        // BASIC v2's FAC→i16 truncates toward zero
-                        // (matches Rust's `as i32`). Reject anything
-                        // whose truncation can't fit i16 — sync would
-                        // trap on the runtime conversion.
+                        // A fractional entry means a READ target can hold a non-integer, and an
+                        // `IntRange` claims the opposite.
+                        if *f != f.trunc() {
+                            return None;
+                        }
                         let v = *f as i64;
                         if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
                             return None;
@@ -1131,7 +1141,8 @@ fn transfer_numeric_stmt(
                 }
             }
         }
-        Stmt::Get { var } | Stmt::KeyGet { var } => {
+        Stmt::Get { indices, .. } if !indices.is_empty() => {}
+        Stmt::Get { var, .. } | Stmt::KeyGet { var } => {
             // BASIC's `GET` to a numeric var routes through the
             // compiler's `__GET_NUM` helper, which accepts only the
             // digit chars 0-9 (with `+ , - . E` plus no-key all
@@ -1715,6 +1726,27 @@ enum ShadowCtx {
     Float,
 }
 
+/// Bounds on the value a FOR loop variable holds *after* the loop exits.
+pub(crate) fn for_exit_range(start: IntRange, end: IntRange, step: IntRange) -> IntRange {
+    let last_lo = start.min.min(end.min);
+    let last_hi = start.max.max(end.max);
+    IntRange::new(
+        last_lo.saturating_add(step.min.min(0)),
+        last_hi.saturating_add(step.max.max(0)),
+    )
+}
+
+/// The full range a FOR loop variable can be observed holding: the body envelope joined with
+/// the post-loop value.
+pub(crate) fn for_var_lifetime_range(
+    body: Option<IntRange>,
+    start: Option<IntRange>,
+    end: Option<IntRange>,
+    step: Option<IntRange>,
+) -> Option<IntRange> {
+    Some(body?.join(for_exit_range(start?, end?, step?)))
+}
+
 fn compute_shadow_int_vars(
     module: &Module,
     cfg: &Cfg,
@@ -1756,9 +1788,24 @@ fn compute_shadow_int_vars(
             let range = per_node
                 .get(node_id)
                 .and_then(|(_, out_state)| out_state.get(var));
+            let stmt = cfg.stmt_at(node_id, module);
+            // A FOR header's out-state is the *body* envelope; the variable also takes on the
+            // post-loop value that NEXT stores.
+            let range = match stmt {
+                Stmt::For {
+                    start, end, step, ..
+                } => per_node.get(node_id).and_then(|(in_state, _)| {
+                    for_var_lifetime_range(
+                        range,
+                        expr_int_range(start, in_state),
+                        expr_int_range(end, in_state),
+                        expr_int_range(step, in_state),
+                    )
+                }),
+                _ => range,
+            };
             let direct_i16 = range.map_or(false, IntRange::fits_i16);
             let direct_u16 = range.map_or(false, IntRange::fits_u16);
-            let stmt = cfg.stmt_at(node_id, module);
             let self_step_ok = stmt_self_modify_small_step(stmt, var);
             let input_escape = input_fed && matches!(stmt, Stmt::Input { .. });
             // Self-step and INPUT are i16-safe by construction
@@ -1902,7 +1949,10 @@ fn collect_shadow_stmt(
             collect_shadow_expr(end, ShadowCtx::Float, info);
             collect_shadow_expr(step, ShadowCtx::Float, info);
         }
-        Stmt::Get { var } => {
+        // Array-element form writes no scalar; its subscripts are collected by the generic
+        // expression walk.
+        Stmt::Get { indices, .. } if !indices.is_empty() => {}
+        Stmt::Get { var, .. } => {
             info.scalar_used.insert(var.clone());
             // GET produces a 0..=9 byte (per `__GET_NUM`) — well
             // within i16, so the shadow gate's `all_i16` check
@@ -2257,7 +2307,10 @@ fn collect_shadow_stmt(
             }
         }
         Stmt::ComputedGoto { target } => collect_shadow_expr(target, ShadowCtx::Int, info),
-        Stmt::Rcomp { then: _, else_then: _ } => {
+        Stmt::Rcomp {
+            then: _,
+            else_then: _,
+        } => {
             // Body stmts get their own CFG nodes — see Stmt::If above.
         }
         Stmt::OnKey { keys, .. } => collect_shadow_str(keys, info),
@@ -2569,7 +2622,10 @@ fn stmt_defs(stmt: &Stmt) -> Vec<VarName> {
                 out.push(v.clone());
             }
         }
-        Stmt::Get { var } | Stmt::KeyGet { var } => out.push(var.clone()),
+        // `GET A(I)` defines an array element, not the scalar `A`; listing `A` here would let a
+        // live scalar def look dead.
+        Stmt::Get { indices, .. } if !indices.is_empty() => {}
+        Stmt::Get { var, .. } | Stmt::KeyGet { var } => out.push(var.clone()),
         Stmt::GetFile { vars, .. } => {
             for v in vars {
                 out.push(v.clone());
@@ -2605,8 +2661,11 @@ fn stmt_defs(stmt: &Stmt) -> Vec<VarName> {
 /// NEXT, which performs an implicit increment-and-compare on the
 /// loop counter so the counter must be considered both read and
 /// written.
-fn stmt_uses(stmt: &Stmt) -> Vec<VarName> {
-    let mut collector = UseCollector { uses: Vec::new() };
+fn stmt_uses(stmt: &Stmt, fns: &FnBodyReads) -> Vec<VarName> {
+    let mut collector = UseCollector {
+        uses: Vec::new(),
+        fns: Some(fns),
+    };
     crate::visit::Visitor::visit_stmt(&mut collector, 0, stmt);
     if let Stmt::Next { vars } = stmt {
         for v in vars.iter().flatten() {
@@ -2618,16 +2677,144 @@ fn stmt_uses(stmt: &Stmt) -> Vec<VarName> {
     collector.uses
 }
 
-struct UseCollector {
+struct UseCollector<'a> {
     uses: Vec<VarName>,
+    /// FN bodies to charge to this statement.
+    fns: Option<&'a FnBodyReads>,
 }
 
-impl crate::visit::Visitor for UseCollector {
+impl<'a> crate::visit::Visitor for UseCollector<'a> {
     fn visit_var_read(&mut self, v: &VarName) {
         // De-dup at insertion time — the bag grows small in practice.
         if !self.uses.contains(v) {
             self.uses.push(v.clone());
         }
+    }
+
+    fn visit_expr(&mut self, e: &Expr) {
+        if let Expr::FnCall(name, _) = e
+            && let Some(env) = self.fns
+        {
+            for v in env.free_vars(name) {
+                if !self.uses.contains(v) {
+                    self.uses.push(v.clone());
+                }
+            }
+        }
+        crate::visit::walk_expr(self, e);
+    }
+}
+
+// DEF FN body reads
+
+/// The free variables of every `DEF FN` body, keyed by function name.
+#[derive(Debug, Clone, Default)]
+pub struct FnBodyReads {
+    per_fn: HashMap<crate::ast::FnName, Vec<VarName>>,
+}
+
+impl FnBodyReads {
+    /// Free variables of `name`'s body, or an empty slice for a name with no `DEF FN` (the call
+    /// is a runtime `?UNDEF'D FUNCTION`).
+    pub fn free_vars(&self, name: &crate::ast::FnName) -> &[VarName] {
+        self.per_fn.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn build(module: &Module) -> Self {
+        let mut defs: Vec<DefFnBody> = Vec::new();
+        let mut collector = DefFnBodyCollector { defs: &mut defs };
+        for line in &module.lines {
+            for s in &line.stmts {
+                crate::visit::Visitor::visit_stmt(&mut collector, line.number, s);
+            }
+        }
+
+        let mut per_fn: HashMap<crate::ast::FnName, Vec<VarName>> = HashMap::new();
+        for d in &defs {
+            per_fn.entry(d.name.clone()).or_default();
+        }
+        // Ascending fixpoint from the empty set.
+        loop {
+            let mut changed = false;
+            for d in &defs {
+                let mut acc: Vec<VarName> = d.direct.clone();
+                for g in &d.called {
+                    if let Some(inner) = per_fn.get(g) {
+                        for v in inner {
+                            if !acc.contains(v) {
+                                acc.push(v.clone());
+                            }
+                        }
+                    }
+                }
+                let slot = per_fn.entry(d.name.clone()).or_default();
+                for v in acc {
+                    if v != d.param && !slot.contains(&v) {
+                        slot.push(v);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for v in per_fn.values_mut() {
+            v.sort_by(|a, b| (a.base.as_str(), a.kind as u8).cmp(&(b.base.as_str(), b.kind as u8)));
+        }
+        Self { per_fn }
+    }
+}
+
+/// One `DEF FN` statement, reduced to what the fixpoint needs.
+struct DefFnBody {
+    name: crate::ast::FnName,
+    param: VarName,
+    /// Variables the body names directly.
+    direct: Vec<VarName>,
+    /// Functions the body calls directly.
+    called: Vec<crate::ast::FnName>,
+}
+
+/// Pulls a [`DefFnBody`] out of every `DEF FN` in the module, including ones nested in IF
+/// bodies.
+struct DefFnBodyCollector<'a> {
+    defs: &'a mut Vec<DefFnBody>,
+}
+
+impl<'a> crate::visit::Visitor for DefFnBodyCollector<'a> {
+    fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+        if let Stmt::DefFn { name, param, body } = stmt {
+            let mut uses = UseCollector {
+                uses: Vec::new(),
+                fns: None,
+            };
+            crate::visit::Visitor::visit_expr(&mut uses, body);
+            let mut calls = FnCallCollector { names: Vec::new() };
+            crate::visit::Visitor::visit_expr(&mut calls, body);
+            self.defs.push(DefFnBody {
+                name: name.clone(),
+                param: param.clone(),
+                direct: uses.uses,
+                called: calls.names,
+            });
+        }
+        crate::visit::walk_stmt(self, line_no, stmt);
+    }
+}
+
+struct FnCallCollector {
+    names: Vec<crate::ast::FnName>,
+}
+
+impl crate::visit::Visitor for FnCallCollector {
+    fn visit_expr(&mut self, e: &Expr) {
+        if let Expr::FnCall(name, _) = e
+            && !self.names.contains(name)
+        {
+            self.names.push(name.clone());
+        }
+        crate::visit::walk_expr(self, e);
     }
 }
 
@@ -2645,6 +2832,42 @@ mod tests {
             base: name.to_string(),
             kind: VarKind::Float,
         }
+    }
+
+    /// The variable a FOR writes is not bounded by `start..end`: NEXT stores `last + STEP` on
+    /// the way out, so `FOR I=0 TO 255` leaves 256 behind.
+    #[test]
+    fn for_exit_range_includes_the_post_loop_value() {
+        let r = for_exit_range(
+            IntRange::singleton(0),
+            IntRange::singleton(255),
+            IntRange::singleton(1),
+        );
+        assert!(r.max >= 256, "{r:?}");
+        assert!(!r.fits_u8());
+
+        let r = for_exit_range(
+            IntRange::singleton(1),
+            IntRange::singleton(32000),
+            IntRange::singleton(20000),
+        );
+        assert!(!r.fits_i16(), "{r:?}");
+
+        // Descending loops overshoot the other way.
+        let r = for_exit_range(
+            IntRange::singleton(10),
+            IntRange::singleton(0),
+            IntRange::singleton(-1),
+        );
+        assert!(r.min <= -1, "{r:?}");
+
+        // A loop with headroom must stay narrow.
+        let r = for_exit_range(
+            IntRange::singleton(0),
+            IntRange::singleton(9),
+            IntRange::singleton(1),
+        );
+        assert!(r.fits_u8(), "{r:?}");
     }
 
     fn ivar(name: &str) -> VarName {
@@ -2929,6 +3152,88 @@ mod tests {
             "A and B are simultaneously live and must interfere"
         );
         assert!(g.interferes(&b, &a), "interference is symmetric");
+    }
+
+    #[test]
+    fn interference_covers_a_def_that_is_never_read() {
+        let a = ivar("A");
+        let b = ivar("B");
+        let m = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::Let {
+                        var: a.clone(),
+                        value: Expr::Number(1.0),
+                    }],
+                },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::Let {
+                        var: b.clone(),
+                        value: Expr::Number(2.0),
+                    }],
+                },
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::Print {
+                        items: vec![crate::ir::PrintPiece::Expr(Expr::Var(a.clone()))],
+                        newline: true,
+                    }],
+                },
+                Line {
+                    number: 40,
+                    stmts: vec![Stmt::End],
+                },
+            ],
+        };
+        let mut reg = Registry::new();
+        let g = reg.get(&m, &VarInterference).clone();
+        assert!(
+            g.interferes(&a, &b),
+            "the store to B lands while A is live; they must interfere"
+        );
+    }
+
+    #[test]
+    fn interference_lets_a_def_reuse_the_slot_of_a_value_it_reads() {
+        let a = ivar("A");
+        let b = ivar("B");
+        let m = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::Let {
+                        var: a.clone(),
+                        value: Expr::Number(1.0),
+                    }],
+                },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::Let {
+                        var: b.clone(),
+                        value: Expr::Var(a.clone()),
+                    }],
+                },
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::Print {
+                        items: vec![crate::ir::PrintPiece::Expr(Expr::Var(b.clone()))],
+                        newline: true,
+                    }],
+                },
+                Line {
+                    number: 40,
+                    stmts: vec![Stmt::End],
+                },
+            ],
+        };
+        let mut reg = Registry::new();
+        let g = reg.get(&m, &VarInterference).clone();
+        assert!(
+            !g.interferes(&a, &b),
+            "A dies at the statement that defines B; they may share a slot"
+        );
     }
 
     #[test]
@@ -3264,7 +3569,10 @@ mod tests {
                 },
                 Line {
                     number: 20,
-                    stmts: vec![Stmt::Get { var: x.clone() }],
+                    stmts: vec![Stmt::Get {
+                        var: x.clone(),
+                        indices: Vec::new(),
+                    }],
                 },
                 Line {
                     number: 30,

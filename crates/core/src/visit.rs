@@ -722,17 +722,23 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
         | Nrm
         | MemModeOn
         | Rem(_)
+        | LineMark(_)
         | End
         | Stop
+        | RaiseError(_)
         | Run(_)
         | Clr
         | Data(_)
-        | Get { .. }
         | KeyGet { .. }
         | DisplayKeys
         | SwapStr { .. }
         | Restore
         | Reset { .. } => {}
+        Get { indices, .. } => {
+            for e in indices {
+                v.visit_expr(e);
+            }
+        }
         InsertBox {
             pattern,
             row,
@@ -1561,17 +1567,23 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
         | Nrm
         | MemModeOn
         | Rem(_)
+        | LineMark(_)
         | End
         | Stop
+        | RaiseError(_)
         | Run(_)
         | Clr
         | Data(_)
-        | Get { .. }
         | KeyGet { .. }
         | DisplayKeys
         | SwapStr { .. }
         | Restore
         | Reset { .. } => {}
+        Get { indices, .. } => {
+            for e in indices {
+                v.visit_expr_mut(e);
+            }
+        }
         InsertBox {
             pattern,
             row,

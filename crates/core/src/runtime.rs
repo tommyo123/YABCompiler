@@ -186,6 +186,10 @@ pub const FN_RND: u16 = 0xE097;
 // reading LINNUM works for the full 0..65535 range that POKE/PEEK
 // addresses need.
 pub const FACWORD: u16 = 0xB7F7;
+
+/// Floor FAC to signed 16-bit; raise ILLEGAL QUANTITY outside -32768..=32767.
+pub const AYINT: u16 = 0xB1BF;
+
 /// Convert unsigned byte in `.Y` (not `.A`) to FAC.
 pub const BYTEFAC: u16 = 0xB3A2;
 
@@ -209,6 +213,9 @@ pub const LINNUM_HI: u8 = 0x15;
 /// (a.k.a. PNTR). Used by `TAB(n)` to compute how many spaces to emit,
 /// and by `POS()` to report the current column.
 pub const PNTR: u8 = 0xD3;
+
+/// Last logical-line column: 39 on one row, 79 after wrapping to a second row.
+pub const LNMX: u8 = 0xD5;
 
 /// KERNAL's top-of-RAM pointer (MEMSIZ). Set at boot and respected by
 /// BASIC and our heap allocator. `FRE()` returns MEMSIZ minus the
@@ -257,11 +264,30 @@ pub const ERR_OUT_OF_MEMORY: u8 = 16;
 pub const ERR_UNDEF_STATEMENT: u8 = 17;
 /// DIVISION BY ZERO — raised by `__DIV16` when the divisor is zero.
 pub const ERR_DIVISION_BY_ZERO: u8 = 20;
+/// NEXT has no matching FOR frame.
+pub const ERR_NEXT_WITHOUT_FOR: u8 = 10;
+/// RETURN has no active GOSUB frame.
+pub const ERR_RETURN_WITHOUT_GOSUB: u8 = 12;
+/// READ has passed the last DATA item.
+pub const ERR_OUT_OF_DATA: u8 = 13;
+/// DIM targets an array that is already dimensioned.
+pub const ERR_REDIMD_ARRAY: u8 = 19;
+/// A runtime value has the wrong numeric or string type.
+pub const ERR_TYPE_MISMATCH: u8 = 22;
+/// FN has no active definition.
+pub const ERR_UNDEFD_FUNCTION: u8 = 27;
+
+/// Print an unsigned 16-bit value from A (high) and X (low), without leading space.
+pub const LINPRT: u16 = 0xBDCD;
 
 /// QINT — convert FAC to signed 32-bit integer, deposited big-endian
 /// in the FAC mantissa bytes ($62 MSB through $65 LSB). For values
 /// fitting 24 bits, $62 is zero and $63/$64/$65 carry the result.
 pub const QINT: u16 = 0xBC9B;
+
+/// AYINT result bytes: high at $64, low at $65.
+pub const QINT_RESULT_HI: u8 = 0x64;
+pub const QINT_RESULT_LO: u8 = 0x65;
 
 /// Current line number, used by BASIC's error printer to show
 /// `IN <line>`. Set to $FFFF in direct mode (suppresses "IN ..."),

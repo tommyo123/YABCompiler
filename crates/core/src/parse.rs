@@ -27,6 +27,8 @@ use crate::ast::{
     StrExpr, ThenBranch, VarKind, VarName,
 };
 use crate::prg;
+use crate::runtime::ERR_TYPE_MISMATCH as BASIC_ERR_TYPE_MISMATCH;
+use crate::tokens::Dialect;
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -71,6 +73,9 @@ pub enum ParseError {
         line: u16,
         byte: u8,
     },
+    TypeMismatch {
+        line: u16,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -110,6 +115,10 @@ impl std::fmt::Display for ParseError {
             ParseError::BadStatementBoundary { line, byte } => write!(
                 f,
                 "line {line}: unexpected byte ${byte:02X} where ':' or end of line was expected"
+            ),
+            ParseError::TypeMismatch { line } => write!(
+                f,
+                "line {line}: string where a number belongs (?TYPE MISMATCH at run time)"
             ),
         }
     }
@@ -405,15 +414,68 @@ pub struct ParseOptions {
     /// whose base appears here to Integer kind, so the rest of the
     /// pipeline sees them as if the user had written the `%` suffix.
     pub int_hint_vars: std::collections::HashSet<String>,
+    /// Dialect used to interpret bare extended keyword spellings.
+    pub dialect: Dialect,
+}
+
+/// Whether the program contains extended keyword tokens in code.
+fn program_uses_tsb_tokens(prg: &prg::Program) -> bool {
+    prg.lines
+        .iter()
+        .any(|line| body_uses_tsb_tokens(&line.body))
+}
+
+fn body_uses_tsb_tokens(body: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < body.len() {
+        match body[i] {
+            b'"' => {
+                // Skip the string literal, closing quote included.
+                i += 1;
+                while i < body.len() && body[i] != b'"' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            TOK_REM => return false, // rest of the line is comment text
+            TOK_DATA => {
+                // DATA runs to the next `:` that is not inside quotes.
+                i += 1;
+                let mut quoted = false;
+                while i < body.len() {
+                    match body[i] {
+                        b'"' => quoted = !quoted,
+                        b':' if !quoted => break,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            TOK_TSB_PREFIX
+                if body
+                    .get(i + 1)
+                    .is_some_and(|&t| crate::tokens::tsb_keyword(t).is_some()) =>
+            {
+                return true;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Program, ParseError> {
+    let tsb_ascii = match opts.dialect {
+        Dialect::Auto => program_uses_tsb_tokens(prg),
+        Dialect::BasicV2 => false,
+        Dialect::Tsb => true,
+    };
     let mut lines = Vec::with_capacity(prg.lines.len());
     let mut skipped = Vec::new();
     for raw in &prg.lines {
         lines.push(Line {
             number: raw.number,
-            statements: line_body_with_options(raw.number, &raw.body, &opts, &mut skipped)?,
+            statements: line_body_inner(raw.number, &raw.body, &opts, tsb_ascii, &mut skipped)?,
         });
     }
     Ok(Program { lines, skipped })
@@ -424,15 +486,43 @@ fn line_body(line_no: u16, body: &[u8]) -> Result<Vec<Statement>, ParseError> {
     line_body_with_options(line_no, body, &ParseOptions::default(), &mut Vec::new())
 }
 
+/// Parse one line with the extended dialect forced on, for the tests that exercise the
+/// bare-ASCII spellings of extension keywords.
+#[cfg(test)]
+fn line_body_tsb(line_no: u16, body: &[u8]) -> Result<Vec<Statement>, ParseError> {
+    let opts = ParseOptions {
+        dialect: Dialect::Tsb,
+        ..ParseOptions::default()
+    };
+    line_body_with_options(line_no, body, &opts, &mut Vec::new())
+}
+
+#[cfg(test)]
 fn line_body_with_options(
     line_no: u16,
     body: &[u8],
     opts: &ParseOptions,
     skipped: &mut Vec<SkippedStatement>,
 ) -> Result<Vec<Statement>, ParseError> {
+    let tsb_ascii = match opts.dialect {
+        Dialect::Auto => body_uses_tsb_tokens(body),
+        Dialect::BasicV2 => false,
+        Dialect::Tsb => true,
+    };
+    line_body_inner(line_no, body, opts, tsb_ascii, skipped)
+}
+
+fn line_body_inner(
+    line_no: u16,
+    body: &[u8],
+    opts: &ParseOptions,
+    tsb_ascii: bool,
+    skipped: &mut Vec<SkippedStatement>,
+) -> Result<Vec<Statement>, ParseError> {
     let mut p = Cursor::new(body, line_no);
     p.lenient_syntax = opts.lenient_syntax;
     p.int_hint_vars = &opts.int_hint_vars;
+    p.tsb_ascii = tsb_ascii;
     let mut out = Vec::new();
     loop {
         p.skip_spaces();
@@ -456,12 +546,10 @@ fn line_body_with_options(
         let stmt = match statement(&mut p) {
             Ok(s) => s,
             Err(err) => {
-                // A keyword from another Commodore BASIC isn't a syntax
-                // error on the target — v2 only looks at those bytes if
-                // it executes them, and listings guard them by machine
-                // (`IF BV=67 THEN SPRDEF ...`). Compile it away and let
-                // the caller report it. Malformed syntax still aborts
-                // unless --lenient-syntax is on.
+                if let ParseError::TypeMismatch { .. } = err {
+                    out.push(Statement::RaiseError(BASIC_ERR_TYPE_MISMATCH));
+                    break;
+                }
                 let offending = match err {
                     ParseError::UnsupportedToken { byte, .. } => Some(byte),
                     _ => None,
@@ -639,7 +727,8 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         return Ok(Statement::ProcCall(proc_name(p)?));
     }
     match b {
-        TOK_PRINT => {
+        // `?` is PRINT.
+        TOK_PRINT | b'?' => {
             p.advance(1);
             p.skip_spaces();
             if p.peek() == Some(b'#') {
@@ -926,15 +1015,28 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 return Ok(Statement::GetFile { file_num, vars });
             }
             let var = var_name(p)?;
-            // GET A$ is a string assignment whose right-hand side is the
-            // GetKey "expression" — folds into the regular LetStr path.
-            if var.kind == VarKind::String {
-                Ok(Statement::LetStr {
-                    var,
-                    value: StrExpr::GetKey,
-                })
+            p.skip_spaces();
+            let indices = if p.peek() == Some(b'(') {
+                p.advance(1);
+                index_list(p)?
             } else {
-                Ok(Statement::Get { var })
+                Vec::new()
+            };
+            if var.kind == VarKind::String {
+                if indices.is_empty() {
+                    Ok(Statement::LetStr {
+                        var,
+                        value: StrExpr::GetKey,
+                    })
+                } else {
+                    Ok(Statement::ArrayLetStr {
+                        name: var,
+                        indices,
+                        value: StrExpr::GetKey,
+                    })
+                }
+            } else {
+                Ok(Statement::Get { var, indices })
             }
         }
         TOK_DIM => {
@@ -3046,6 +3148,7 @@ fn consume_ascii_d_bang(p: &mut Cursor<'_>) -> bool {
     }
 }
 
+/// Does the cursor sit on the ASCII spelling of `word`, at a word boundary?
 fn peek_ascii_command_word(p: &Cursor<'_>, word: &[u8]) -> bool {
     let rest = &p.bytes[p.pos..];
     if rest.len() < word.len() {
@@ -3059,7 +3162,11 @@ fn peek_ascii_command_word(p: &Cursor<'_>, word: &[u8]) -> bool {
         return false;
     }
     let next = rest.get(word.len()).copied();
-    !next.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'$' | b'%'))
+    if next.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'$' | b'%')) {
+        return false;
+    }
+    // Only reached on an actual spelling hit, so the table scan is off the hot path.
+    p.tsb_ascii || !crate::tokens::is_tsb_keyword_name(word)
 }
 
 /// Same as `peek_ascii_command_word` but also rejects when the word
@@ -4268,7 +4375,18 @@ fn string_expression(p: &mut Cursor<'_>) -> Result<StrExpr, ParseError> {
         p.skip_spaces();
         if p.peek() == Some(TOK_PLUS) {
             p.advance(1);
-            let rhs = string_atom(p)?;
+            let after_plus = p.pos;
+            let rhs = match string_atom(p) {
+                Ok(r) => r,
+                Err(e) => {
+                    p.pos = after_plus;
+                    if expression(p).is_ok() {
+                        return Err(ParseError::TypeMismatch { line: p.line });
+                    }
+                    p.pos = after_plus;
+                    return Err(e);
+                }
+            };
             lhs = StrExpr::Concat(Box::new(lhs), Box::new(rhs));
         } else {
             break;
@@ -4659,7 +4777,7 @@ fn index_list(p: &mut Cursor<'_>) -> Result<Vec<Expr>, ParseError> {
 }
 
 fn if_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
-    let cond = expression(p)?;
+    let cond = parse_truthy_expression(p)?;
     p.skip_spaces();
     if p.peek() == Some(TOK_THEN) {
         p.advance(1);
@@ -4899,7 +5017,9 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                     let bytes = take_unquoted_data_item(p);
                     values.push(DataValue::String(bytes));
                 } else {
-                    values.push(DataValue::Float(-n));
+                    let mut raw = vec![b'-'];
+                    raw.extend_from_slice(&p.bytes[start + 1..p.pos]);
+                    values.push(data_item_from_number(&raw, -n));
                 }
             }
             // Real numeric literal: digit, or a leading `.` that's
@@ -4923,7 +5043,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                     let bytes = take_unquoted_data_item(p);
                     values.push(DataValue::String(bytes));
                 } else {
-                    values.push(DataValue::Float(n));
+                    values.push(data_item_from_number(&p.bytes[start..p.pos], n));
                 }
             }
             // Bare token / identifier without quotes — BASIC v2 actually
@@ -4938,17 +5058,22 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         p.skip_spaces();
         if p.peek() == Some(TOK_COMMA) {
             p.advance(1);
+            p.skip_spaces();
+            if matches!(p.peek(), None | Some(b':')) {
+                values.push(DataValue::String(Vec::new()));
+                break;
+            }
         } else {
             break;
         }
     }
+    if values.is_empty() {
+        values.push(DataValue::String(Vec::new()));
+    }
     Ok(Statement::Data(values))
 }
 
-/// Collect bytes for an unquoted DATA item up to the next `,` or `:`
-/// or end-of-line. Trims one trailing space (BASIC v2 strips a single
-/// trailing space because of how its tokeniser handles statement
-/// boundaries; multiple trailing spaces are kept).
+/// Collect bytes for an unquoted DATA item up to the next `,` or `:` or end-of-line.
 fn take_unquoted_data_item(p: &mut Cursor<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some(b) = p.peek() {
@@ -4958,10 +5083,17 @@ fn take_unquoted_data_item(p: &mut Cursor<'_>) -> Vec<u8> {
         out.push(b);
         p.advance(1);
     }
-    while out.last() == Some(&b' ') {
-        out.pop();
-    }
     out
+}
+
+/// Decide how to store a DATA item that scanned as a number.
+fn data_item_from_number(raw: &[u8], n: f64) -> crate::ast::DataValue {
+    use crate::ast::DataValue;
+    if crate::codegen::format_data_float(n).as_bytes() == raw {
+        DataValue::Float(n)
+    } else {
+        DataValue::String(raw.to_vec())
+    }
 }
 
 fn read_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
@@ -5096,19 +5228,31 @@ fn next_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     Ok(Statement::Next { vars })
 }
 
+/// Scan a branch target (`GOTO`/`GOSUB`/`THEN <line>`/`ON..GOTO`).
 fn line_number(p: &mut Cursor<'_>) -> Result<u16, ParseError> {
-    let start = p.pos;
+    let mut digits: Vec<u8> = Vec::new();
     while let Some(b) = p.peek() {
-        if !b.is_ascii_digit() {
+        if b.is_ascii_digit() {
+            digits.push(b);
+            p.advance(1);
+        } else if b == b' ' {
+            let (spaces, next) = p.peek_past_spaces(p.pos);
+            match next {
+                Some(c) if c.is_ascii_digit() => {
+                    digits.push(c);
+                    p.advance(spaces + 1);
+                }
+                _ => break,
+            }
+        } else {
             break;
         }
-        p.advance(1);
     }
-    if p.pos == start {
+    if digits.is_empty() {
         return Err(ParseError::ExpectedLineNumber { line: p.line });
     }
-    let s = std::str::from_utf8(&p.bytes[start..p.pos]).expect("ASCII digits");
-    let n: u32 = s.parse().expect("digits parse");
+    let s = std::str::from_utf8(&digits).expect("ASCII digits");
+    let n: u32 = s.parse().unwrap_or(u32::MAX);
     // BASIC v2's interactive editor caps at 63999, but the tokenised
     // format stores line numbers as u16 — and programs in the wild
     // (Cylon Zap line 490: `GOTO 65535`) use a high non-existent
@@ -5404,8 +5548,11 @@ fn cmp_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         // numeric-array assignment `NM(9)="DEAD PLANT"`). Emit
         // `VAL(string)` so the parse succeeds and the affected
         // line evaluates to a (likely zero) numeric value at run.
-        if p.lenient_syntax && !is_compare_op_byte(p.peek()) {
-            return Ok(Expr::Val(Box::new(lhs)));
+        if !is_compare_op_byte(p.peek()) {
+            if p.lenient_syntax {
+                return Ok(Expr::Val(Box::new(lhs)));
+            }
+            return Err(ParseError::TypeMismatch { line: p.line });
         }
         let op = parse_compare_op(p)?;
         let rhs = string_expression(p)?;
@@ -5518,14 +5665,15 @@ fn unary_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         p.advance(1);
         return unary_expr(p);
     }
+    if p.peek() == Some(TOK_NOT) {
+        p.advance(1);
+        let inner = not_expr(p)?;
+        return Ok(Expr::Not(Box::new(inner)));
+    }
     pow_expr(p)
 }
 
-/// `^` — left-associative exponentiation, matching C64 BASIC v2's
-/// behaviour: `2^3^2` parses as `(2^3)^2 = 64`, not `2^(3^2)`. The RHS
-/// of each `^` accepts a leading `-` (so `2^-2` is valid) but does NOT
-/// recurse back through the full unary/pow chain — that's what makes
-/// the operator left-associative.
+/// Parse left-associative exponentiation with signed operands on the right.
 fn pow_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut lhs = atom(p)?;
     loop {
@@ -5535,15 +5683,20 @@ fn pow_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         }
         p.advance(1);
         p.skip_spaces();
-        // Allow `2^-3`: pull off any number of unary minuses, then the
-        // RHS atom. Each pair cancels, so the boolean toggle is enough.
+        // Pull off any run of unary signs.
         let mut neg = false;
-        while p.peek() == Some(TOK_MINUS) {
-            neg = !neg;
+        let mut saw_minus = false;
+        while matches!(p.peek(), Some(TOK_MINUS) | Some(TOK_PLUS)) {
+            if p.peek() == Some(TOK_MINUS) {
+                neg = !neg;
+                saw_minus = true;
+            }
             p.advance(1);
             p.skip_spaces();
         }
-        let mut rhs = atom(p)?;
+        // Inside a negation frame the operand is a whole `^` chain; otherwise it is a bare
+        // atom, which is what makes `^` itself left-associative.
+        let mut rhs = if saw_minus { pow_expr(p)? } else { atom(p)? };
         if neg {
             rhs = Expr::Neg(Box::new(rhs));
         }
@@ -5555,12 +5708,9 @@ fn pow_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 fn atom(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     p.skip_spaces();
     match p.peek() {
-        // C64 BASIC v2 stores `π` as a single-byte $FF token. The
-        // ROM constant matches the float at $BAEC, with the same
-        // 7-digit precision MFLPT carries.
         Some(0xFF) => {
             p.advance(1);
-            Ok(Expr::Number(std::f64::consts::PI))
+            Ok(Expr::Number(3_373_259_425.0 / 1_073_741_824.0))
         }
         Some(b'(') => {
             p.advance(1);
@@ -6103,13 +6253,67 @@ fn d_bang_peek_expr(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     ))
 }
 
-/// Scan past one string atom starting at `i` (assumes
-/// `peek_is_string_atom` already returned true). Returns the byte
-/// index immediately after the atom. Conservative: handles literals
-/// (`"..."`), `var$` references, and the simple string-builtin
-/// tokens by stepping past their token byte plus a parenthesised
-/// argument list. Falls back to returning `i` for shapes it can't
-/// quickly skip — callers should treat that as "don't know".
+/// Find the end of a balanced parenthesized group, skipping string literals.
+fn paren_group_end(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            b'"' => {
+                j += 1;
+                while j < bytes.len() && bytes[j] != b'"' && bytes[j] != 0 {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Whether a parenthesized expression has string type.
+fn paren_group_is_string(bytes: &[u8], i: usize) -> bool {
+    let Some(end) = paren_group_end(bytes, i) else {
+        return false;
+    };
+    if !peek_is_string_atom_at(bytes, i + 1) {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < end {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'"' => {
+                j += 1;
+                while j < end && bytes[j] != b'"' && bytes[j] != 0 {
+                    j += 1;
+                }
+            }
+            TOK_EQ | TOK_LT | TOK_GT | TOK_AND | TOK_OR if depth == 1 => return false,
+            _ => {}
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Skip one string atom and return the next byte index.
 fn skip_string_atom(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
@@ -6128,6 +6332,9 @@ fn skip_string_atom(bytes: &[u8], mut i: usize) -> usize {
             }
             i
         }
+        // A parenthesised string group is one atom: `(A$)="X"` has to land the caller on the
+        // `=`, not inside the group.
+        b'(' => paren_group_end(bytes, i).unwrap_or(i),
         // Built-in string function tokens are followed by a
         // parenthesised argument list. Skip balanced parens.
         TOK_CHR | TOK_STR | TOK_LEFT | TOK_RIGHT | TOK_MID => {
@@ -6222,6 +6429,7 @@ fn peek_is_string_atom_at(bytes: &[u8], start: usize) -> bool {
     // string-typed function tokens.
     match bytes[i] {
         b'"' | TOK_CHR | TOK_STR | TOK_LEFT | TOK_RIGHT | TOK_MID => return true,
+        b'(' => return paren_group_is_string(bytes, i),
         TOK_TSB_PREFIX => {
             return bytes
                 .get(i + 1)
@@ -6442,6 +6650,8 @@ struct Cursor<'a> {
     /// Base names that REM hints have declared as integer. `var_name`
     /// consults this to rewrite Float-kind vars whose base matches.
     int_hint_vars: &'a std::collections::HashSet<String>,
+    /// Whether bare extended keyword spellings are accepted as keywords.
+    tsb_ascii: bool,
 }
 
 impl<'a> Cursor<'a> {
@@ -6454,6 +6664,7 @@ impl<'a> Cursor<'a> {
             line,
             lenient_syntax: false,
             int_hint_vars: EMPTY.get_or_init(std::collections::HashSet::new),
+            tsb_ascii: true,
         }
     }
     fn peek(&self) -> Option<u8> {
@@ -6503,71 +6714,83 @@ impl<'a> Cursor<'a> {
         }
         self.bytes[start..].to_vec()
     }
+    /// Byte at `pos + <run of spaces>`, plus the length of that run.
+    fn peek_past_spaces(&self, from: usize) -> (usize, Option<u8>) {
+        let mut n = 0usize;
+        while self.bytes.get(from + n) == Some(&b' ') {
+            n += 1;
+        }
+        (n, self.bytes.get(from + n).copied())
+    }
+
+    /// Scan a numeric literal the way the ROM's FIN (`$BCF3`) does.
     fn take_number(&mut self) -> f64 {
-        let start = self.pos;
+        // Digits are collected into `buf` with the interior spaces squeezed out, so
+        // `f64::from_str` gets a clean literal.
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(b) = self.peek() {
             if b.is_ascii_digit() || b == b'.' {
+                buf.push(b);
                 self.pos += 1;
+            } else if b == b' ' {
+                // A space only belongs to the number when more of the number follows it.
+                let (spaces, next) = self.peek_past_spaces(self.pos);
+                match next {
+                    Some(c) if c.is_ascii_digit() || c == b'.' => {
+                        buf.push(c);
+                        self.pos += spaces + 1;
+                    }
+                    _ => break,
+                }
             } else {
                 break;
             }
         }
-        // Optional scientific exponent: `E[+-]?digits` (case-insensitive).
-        // Only consume the `E` when the exponent looks well-formed, else
-        // leave it for the parser to handle as a separate token (matters
-        // for stuck-together statements like `100E=...`). Tokenized
-        // sources may carry the sign as TOK_PLUS/TOK_MINUS, so accept
-        // both raw ASCII and tokenized forms.
-        if matches!(self.peek(), Some(b'E') | Some(b'e')) {
-            let exp_start = self.pos;
-            self.pos += 1;
-            // Splice over a token-form sign by stitching the literal
-            // character back into the string we hand to f64::parse.
-            let mut sign_char: Option<u8> = None;
-            match self.peek() {
-                Some(b'+') | Some(b'-') => {
-                    self.pos += 1;
+        let mantissa_len = buf.len();
+        let (pre_e, e_byte) = self.peek_past_spaces(self.pos);
+        if matches!(e_byte, Some(b'E') | Some(b'e')) {
+            self.pos += pre_e + 1;
+            buf.push(b'E');
+            let (pre_sign, sign) = self.peek_past_spaces(self.pos);
+            match sign {
+                Some(b'+') | Some(TOK_PLUS) => {
+                    buf.push(b'+');
+                    self.pos += pre_sign + 1;
                 }
-                Some(TOK_PLUS) => {
-                    sign_char = Some(b'+');
-                    self.pos += 1;
-                }
-                Some(TOK_MINUS) => {
-                    sign_char = Some(b'-');
-                    self.pos += 1;
+                Some(b'-') | Some(TOK_MINUS) => {
+                    buf.push(b'-');
+                    self.pos += pre_sign + 1;
                 }
                 _ => {}
             }
-            if matches!(self.peek(), Some(b) if b.is_ascii_digit()) {
+            let (pre_d, first) = self.peek_past_spaces(self.pos);
+            if first.is_some_and(|b| b.is_ascii_digit()) {
+                buf.push(first.unwrap());
+                self.pos += pre_d + 1;
                 while let Some(b) = self.peek() {
                     if b.is_ascii_digit() {
+                        buf.push(b);
                         self.pos += 1;
+                    } else if b == b' ' {
+                        let (spaces, next) = self.peek_past_spaces(self.pos);
+                        match next {
+                            Some(c) if c.is_ascii_digit() => {
+                                buf.push(c);
+                                self.pos += spaces + 1;
+                            }
+                            _ => break,
+                        }
                     } else {
                         break;
                     }
                 }
-                if let Some(s) = sign_char {
-                    let mut buf = self.bytes[start..self.pos].to_vec();
-                    // Replace the tokenised sign byte with its literal
-                    // form so std::f64::from_str sees `2.5E-3` instead
-                    // of `2.5E\xAB3`. The byte position to overwrite
-                    // is `start + (exp_start - start) + 1` (the byte
-                    // immediately after the `E`).
-                    let sign_idx = (exp_start - start) + 1;
-                    buf[sign_idx] = s;
-                    return std::str::from_utf8(&buf)
-                        .expect("ASCII")
-                        .parse()
-                        .unwrap_or(0.0);
-                }
             } else {
-                // Exponent never materialised — back off so the `E` stays
-                // available as the next token.
-                self.pos = exp_start;
+                // No digits: exponent 0, i.e. the mantissa unchanged.
+                buf.truncate(mantissa_len);
             }
         }
         // Tokenized BASIC stores numbers as ASCII so parse always succeeds.
-        std::str::from_utf8(&self.bytes[start..self.pos])
+        std::str::from_utf8(&buf)
             .expect("ASCII")
             .parse()
             .unwrap_or(0.0)
@@ -6625,6 +6848,68 @@ mod tests {
         assert!(skipped[0].whole_conditional);
     }
 
+    fn data_items(body: &[u8]) -> Vec<crate::ast::DataValue> {
+        match line_body(10, body).unwrap().remove(0) {
+            Statement::Data(v) => v,
+            other => panic!("not a DATA statement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_keeps_trailing_spaces_in_unquoted_items() {
+        use crate::ast::DataValue;
+        let items = data_items(&[TOK_DATA, b'a', b'b', b' ', b',', b'x']);
+        assert_eq!(
+            items,
+            vec![
+                DataValue::String(b"ab ".to_vec()),
+                DataValue::String(b"x".to_vec())
+            ]
+        );
+        let two = data_items(&[TOK_DATA, b'a', b' ', b' ', b',', b'y']);
+        assert_eq!(two[0], DataValue::String(b"a  ".to_vec()));
+    }
+
+    /// A separator implies another item: `DATA x,` holds two, the second empty.
+    #[test]
+    fn data_trailing_comma_yields_an_empty_final_item() {
+        use crate::ast::DataValue;
+        let items = data_items(&[TOK_DATA, b'x', b',']);
+        assert_eq!(
+            items,
+            vec![
+                DataValue::String(b"x".to_vec()),
+                DataValue::String(Vec::new())
+            ]
+        );
+    }
+
+    #[test]
+    fn data_numeric_items_keep_their_source_spelling() {
+        use crate::ast::DataValue;
+        // Canonical spellings stay numeric (the compact binary pools depend on it).
+        assert_eq!(
+            data_items(&[TOK_DATA, b'4', b'2']),
+            vec![DataValue::Float(42.0)]
+        );
+        assert_eq!(
+            data_items(&[TOK_DATA, TOK_MINUS, b'7']),
+            vec![DataValue::Float(-7.0)]
+        );
+        // Non-canonical ones are kept as text: 1E3 must not READ back as "1000", 007 as "7", or
+        // .5 as "0.5".
+        for spelling in [&b"1E3"[..], b"007", b"1.50", b".5"] {
+            let mut body = vec![TOK_DATA];
+            body.extend_from_slice(spelling);
+            assert_eq!(
+                data_items(&body),
+                vec![DataValue::String(spelling.to_vec())],
+                "spelling {:?} should round-trip verbatim",
+                String::from_utf8_lossy(spelling)
+            );
+        }
+    }
+
     #[test]
     fn trailing_bare_goto_is_accepted_as_empty_statement() {
         let stmts = line_body(3250, &[TOK_PRINT, b'"', b'X', b'"', b':', TOK_GOTO]).unwrap();
@@ -6637,7 +6922,11 @@ mod tests {
         // `GOSUB 500DEFGFX` — the tokeniser turns the leading `DEF` of
         // the label into a token byte; v2 reads the 500 and ignores the
         // rest, so it must not be parsed as a `DEF` statement.
-        let stmts = line_body(10, &[TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X']).unwrap();
+        let stmts = line_body(
+            10,
+            &[TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X'],
+        )
+        .unwrap();
         assert!(matches!(stmts.as_slice(), [Statement::GoSub(500)]));
     }
 
@@ -6648,8 +6937,8 @@ mod tests {
         let stmts = line_body(
             10,
             &[
-                TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X', b':', TOK_PRINT, b'"', b'X',
-                b'"',
+                TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X', b':', TOK_PRINT, b'"',
+                b'X', b'"',
             ],
         )
         .unwrap();
@@ -6662,9 +6951,13 @@ mod tests {
     fn gosub_drops_trailing_text_to_end_of_line() {
         // v2 ignores everything after the line number, even when it would
         // tokenise to a valid statement; only `GOSUB 10000` survives.
-        let stmts =
-            line_body(10, &[TOK_GOSUB, b'1', b'0', b'0', b'0', b'0', TOK_PRINT, b'"', b'X', b'"'])
-                .unwrap();
+        let stmts = line_body(
+            10,
+            &[
+                TOK_GOSUB, b'1', b'0', b'0', b'0', b'0', TOK_PRINT, b'"', b'X', b'"',
+            ],
+        )
+        .unwrap();
         assert!(matches!(stmts.as_slice(), [Statement::GoSub(10000)]));
     }
 
@@ -6673,7 +6966,8 @@ mod tests {
         let stmts = line_body(
             10,
             &[
-                TOK_IF, b'1', b' ', TOK_THEN, TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F', b'X',
+                TOK_IF, b'1', b' ', TOK_THEN, TOK_GOSUB, b'5', b'0', b'0', TOK_DEF, b'G', b'F',
+                b'X',
             ],
         )
         .unwrap();
@@ -7079,7 +7373,7 @@ mod tests {
 
     #[test]
     fn tsb_runtime_batch_ascii_aliases_parse() {
-        let stmts = line_body(
+        let stmts = line_body_tsb(
             10,
             b"MUSIC 4,\"CDE\":PLAY ON:BFLASH 2,0,6:FLASH OFF:FETCH \"\",8,A$:KEY 1,\"RUN\":DISPLAY:COPY 1024,2048,40:SCRSV 49152,0:SCRLD 49152,1:MEM CLR 4096,16,0:MEMCLR 4096,8:MEMSAVE 1024,2048,40:MEMLOAD 2048,1024,40:MEMREAD 1024,3072,40:MEMDEF 1,2,3:DESIGN 832,1,2,3",
         )
@@ -7109,7 +7403,7 @@ mod tests {
         assert!(matches!(stmts[15], Statement::MemDef { .. }));
         assert!(matches!(stmts[16], Statement::Design { .. }));
 
-        let stmts = line_body(
+        let stmts = line_body_tsb(
             20,
             &[
                 TOK_TSB_PREFIX,
@@ -7151,7 +7445,7 @@ mod tests {
 
     #[test]
     fn tsb_gap_statement_forms_parse() {
-        let stmts = line_body(
+        let stmts = line_body_tsb(
             10,
             b"VOL ON:VOL OFF:SCRSV DEF 49152,1:SCRSV:SCRSV RESTORE:SCRLD DEF 49152,0:SCRLD:SCRLD RESTORE:AT(A$,B$):INSERT \"abcdefghi\",1,2,3,4,5:LIN:INST(\"HELLO\",\"EL\"):PLACE(\"EL\",\"HELLO\")",
         )
@@ -7395,7 +7689,7 @@ mod tests {
 
     #[test]
     fn tsbneo_compatibility_batch_parse() {
-        let stmts = line_body(
+        let stmts = line_body_tsb(
             10,
             b"MOVE 0,0,10,2,5,5:UPW 0,0,10,2:KEYGET A$:DISK \"I0\":PAGE:TRACE",
         )
@@ -7407,7 +7701,7 @@ mod tests {
         assert!(matches!(stmts[4], Statement::Rem(_)));
         assert!(matches!(stmts[5], Statement::Rem(_)));
 
-        let stmts = line_body(
+        let stmts = line_body_tsb(
             20,
             &[
                 TOK_LOAD, b'"', b'D', b'A', b'T', b'A', b'"', b',', b'8', b' ', b'U', b'S', b'E',
@@ -7425,7 +7719,7 @@ mod tests {
 
         let mut print_line = vec![TOK_PRINT, b' '];
         print_line.extend_from_slice(b"LIN(),SOUND(),GRAPHICS(),DISPLAY(),PLACE(\"EL\",\"HELLO\")");
-        let stmts = line_body(30, &print_line).unwrap();
+        let stmts = line_body_tsb(30, &print_line).unwrap();
         let Statement::Print(print) = &stmts[0] else {
             panic!("expected PRINT");
         };
@@ -7520,5 +7814,87 @@ mod tests {
             }
             other => panic!("expected FOR statement, got {other:?}"),
         }
+    }
+
+    /// `PRINT <expr>` where `<expr>` is spelled out in raw tokens.
+    fn print_expr(body: &[u8]) -> Expr {
+        let mut bytes = vec![TOK_PRINT];
+        bytes.extend_from_slice(body);
+        let stmts = line_body(10, &bytes).unwrap();
+        match &stmts[0] {
+            Statement::Print(p) => match &p.items[0] {
+                crate::ast::PrintItem::Expr(e) => e.clone(),
+                other => panic!("expected a numeric print item, got {other:?}"),
+            },
+            other => panic!("expected PRINT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_minus_after_caret_takes_the_whole_power_chain() {
+        // 2 ^ - 1 ^ 3
+        let e = print_expr(&[b'2', TOK_POW, TOK_MINUS, b'1', TOK_POW, b'3']);
+        let Expr::Bin(BinOp::Pow, base, exp) = &e else {
+            panic!("expected a Pow at the root, got {e:?}");
+        };
+        assert!(matches!(base.as_ref(), Expr::Number(n) if *n == 2.0));
+        let Expr::Neg(inner) = exp.as_ref() else {
+            panic!("expected the exponent to be negated, got {exp:?}");
+        };
+        assert!(
+            matches!(inner.as_ref(), Expr::Bin(BinOp::Pow, b, x)
+                if matches!(b.as_ref(), Expr::Number(n) if *n == 1.0)
+                    && matches!(x.as_ref(), Expr::Number(n) if *n == 3.0)),
+            "the negation must cover the whole 1^3 chain, got {inner:?}"
+        );
+    }
+
+    /// Without a sign the operator stays left-associative: `2^3^2` is `(2^3)^2 = 64` on a real
+    /// C64, not `2^9`.
+    #[test]
+    fn bare_caret_is_still_left_associative() {
+        let e = print_expr(&[b'2', TOK_POW, b'3', TOK_POW, b'2']);
+        let Expr::Bin(BinOp::Pow, base, exp) = &e else {
+            panic!("expected a Pow at the root, got {e:?}");
+        };
+        assert!(
+            matches!(base.as_ref(), Expr::Bin(BinOp::Pow, _, _)),
+            "left-associative: the nesting belongs on the base, got {base:?}"
+        );
+        assert!(matches!(exp.as_ref(), Expr::Number(n) if *n == 2.0));
+    }
+
+    #[test]
+    fn unary_plus_after_caret_parses_without_widening_the_operand() {
+        let e = print_expr(&[b'2', TOK_POW, TOK_PLUS, b'2']);
+        assert!(
+            matches!(&e, Expr::Bin(BinOp::Pow, b, x)
+                if matches!(b.as_ref(), Expr::Number(n) if *n == 2.0)
+                    && matches!(x.as_ref(), Expr::Number(n) if *n == 2.0)),
+            "expected 2^2, got {e:?}"
+        );
+        let chain = print_expr(&[b'2', TOK_POW, TOK_PLUS, b'1', TOK_POW, b'3']);
+        let Expr::Bin(BinOp::Pow, base, exp) = &chain else {
+            panic!("expected a Pow at the root, got {chain:?}");
+        };
+        assert!(
+            matches!(base.as_ref(), Expr::Bin(BinOp::Pow, _, _)),
+            "plus must leave `^` left-associative: expected (2^1)^3, got {chain:?}"
+        );
+        assert!(matches!(exp.as_ref(), Expr::Number(n) if *n == 3.0));
+    }
+
+    #[test]
+    fn unary_minus_after_caret_stops_at_a_lower_precedence_operator() {
+        // 2 ^ - 1 * 3
+        let e = print_expr(&[b'2', TOK_POW, TOK_MINUS, b'1', TOK_MUL, b'3']);
+        let Expr::Bin(BinOp::Mul, l, r) = &e else {
+            panic!("expected Mul at the root (the ^ binds tighter), got {e:?}");
+        };
+        assert!(
+            matches!(l.as_ref(), Expr::Bin(BinOp::Pow, _, _)),
+            "left of the multiply must be the whole 2^-1, got {l:?}"
+        );
+        assert!(matches!(r.as_ref(), Expr::Number(n) if *n == 3.0));
     }
 }

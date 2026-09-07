@@ -1,13 +1,13 @@
 ABC
-ABC
+A         B         C
  1  2  3 
- 1  2  3 
+ 1         2         3 
 X= 5 
-X
-Y
-AB
+     X
+          Y
+A   B
 XY
-ABCD
+AB        CD
  1.5 
 -1.5 
  .5 

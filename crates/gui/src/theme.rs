@@ -231,12 +231,12 @@ pub fn visuals(flavor: Flavor) -> Visuals {
     v.warn_fg_color = p.peach;
     v.error_fg_color = p.red;
     v.window_fill = p.base;
-    v.window_stroke = Stroke::new(1.0, p.surface1);
+    v.window_stroke = Stroke::new(1.0_f32, p.surface1);
     v.panel_fill = p.base;
     v.window_corner_radius = CornerRadius::same(8);
     v.menu_corner_radius = CornerRadius::same(6);
     v.selection.bg_fill = with_alpha(p.blue, 90);
-    v.selection.stroke = Stroke::new(1.0, p.blue);
+    v.selection.stroke = Stroke::new(1.0_f32, p.blue);
 
     let widgets = &mut v.widgets;
     widgets.noninteractive = make_widget(p.mantle, p.surface1, p.subtext1, 1.0, 4);
@@ -259,7 +259,7 @@ fn make_widget(
         bg_fill,
         weak_bg_fill: bg_fill,
         bg_stroke: Stroke::new(border_width, border),
-        fg_stroke: Stroke::new(1.0, text),
+        fg_stroke: Stroke::new(1.0_f32, text),
         corner_radius: CornerRadius::same(radius),
         expansion: 0.0,
     }

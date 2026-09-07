@@ -14,6 +14,42 @@ pub const TOKEN_MIN: u8 = 0x80;
 /// Prefix byte used by the extended keyword table.
 pub const TSB_PREFIX: u8 = 0x64;
 
+/// Source dialect controlling extended keyword recognition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// Decide per program.
+    #[default]
+    Auto,
+    /// BASIC V2 treats extension names as variables.
+    BasicV2,
+    /// Extended BASIC: ASCII extension names are keywords everywhere.
+    Tsb,
+}
+
+impl Dialect {
+    /// Parse a `--dialect=` value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Dialect::Auto),
+            "basic2" | "basicv2" | "v2" | "basic-v2" => Ok(Dialect::BasicV2),
+            "tsb" | "simons" | "ext" => Ok(Dialect::Tsb),
+            other => Err(format!(
+                "unknown dialect '{other}': expected auto, basic2 or tsb"
+            )),
+        }
+    }
+}
+
+/// Is `word` (upper-case ASCII, no `$64` prefix) the spelling of an extended keyword?
+pub fn is_tsb_keyword_name(word: &[u8]) -> bool {
+    // `tsb_keyword` only yields the canonical spelling, so the accepted alternates have to be
+    // listed here or `COLOUR`/`CENTRE` would slip through ungated.
+    if matches!(word, b"COLOUR" | b"CENTRE") {
+        return true;
+    }
+    (0x01u8..=0x7F).any(|id| tsb_keyword(id).is_some_and(|k| k.as_bytes() == word))
+}
+
 /// Textual form of every byte in $80..=$FF.
 const TOKENS: [&str; 128] = [
     "END", "FOR", "NEXT", "DATA", // 80..83
