@@ -49,6 +49,10 @@ pub const CODE_ORIGIN: u16 = 0x080D;
 /// parallel arrays).
 const AUTO_DIM_BOUND: u16 = 10;
 
+/// Size of `__USE_BUF` for a `USE` control string built at run time.
+/// TSB raises ?STRING TOO LONG past this.
+const USE_DYN_BUF_LEN: u8 = 88;
+
 /// Extra BSS, in bytes, `grow_static_arrays_for_clr` may spend across the whole module widening
 /// static arrays to the auto-`DIM` bound a `CLR` restores.
 const CLR_REDIM_GROWTH_BUDGET: u32 = 1024;
@@ -337,7 +341,7 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_source_types(
 ) -> Result<(String, ZpPressure), CodegenError> {
     emit_with_profile_at_opts_diag_and_data_rescue(
         module, profile, origin, safe_sys_calls, hints, poisoned_fns,
-        source_integer_vars, false,
+        source_integer_vars, false, false,
     )
 }
 
@@ -351,6 +355,8 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_data_rescue(
     poisoned_fns: &HashMap<FnName, u8>,
     source_integer_vars: SourceIntegerVars,
     compact_data_metadata: bool,
+    // TSB dialect: boot like TSB, not a stock C64.
+    tsb_target: bool,
 ) -> Result<(String, ZpPressure), CodegenError> {
     let analysis = CodegenAnalysis::from_module(module);
     let orphan_for_next = crate::for_next_runtime::analyze(module);
@@ -370,6 +376,7 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_data_rescue(
         cg.bounded_accumulators = bounded_accumulators.clone();
         cg.code_origin = origin;
         cg.safe_sys_calls = safe_sys_calls;
+        cg.tsb_target = tsb_target;
         cg.forced_byte_bases = hints.byte_vars.clone();
         cg.forced_zp_bases = hints.zp_vars.clone();
         cg.poisoned_fns = poisoned_fns.clone();
@@ -540,6 +547,8 @@ struct Codegen {
     er_el_as_user_var: bool,
     /// `RESUME` (Same/Next) needs the runtime line-table walker.
     used_tsb_goto_line: bool,
+    /// True once the shared `GOTO <expr>` line search has been emitted.
+    cgoto_dispatch_emitted: bool,
     /// Track whether `CHR$(...)` was used in any PRINT/LET-string
     /// context, to emit the shared `__CHR_HEAP` slot.
     used_chr_heap: bool,
@@ -834,6 +843,7 @@ struct Codegen {
     /// True iff `TI` (the system jiffy counter) was read anywhere —
     /// pulls in the `__READ_TI` helper plus the byte slots and FAC
     /// stash it needs.
+    used_hardcopy: bool,
     used_read_ti: bool,
     /// True iff `TI$` was read anywhere — pulls in the
     /// `__READ_TI_STR` helper, the binary divide-by-60 routine,
@@ -1015,9 +1025,22 @@ struct Codegen {
     /// `INSERT box$, …` with a non-literal box pattern — emits the
     /// `__INSERT_BOX_PARSE` helper + `__INSERT_BOX_BUF`/`__INSERT_BOX_TMP`.
     used_insert_box_runtime: bool,
+    /// Need the TSB ?BAD MODE (error 32) printer. ROM messages stop at 30.
+    used_tsb_bad_mode: bool,
     /// `USE "…###…", v` formatted-PRINT field — emits the
-    /// `__USE_FIELD` helper + `__USE_FIELD_WIDTH` ZP/data slots.
-    used_use_field: bool,
+    /// mask buffer, field descriptors, and
+    /// __USE_LOAD / __USE_DESC / __USE_FLD / __USE_SHOW.
+    used_use_format: bool,
+    /// `USE` with a string-expression control string. Adds the runtime mask scanner.
+    used_use_dyn: bool,
+    /// `RESET <expr>` needs the runtime DATA-line table and its search.
+    used_reset_find: bool,
+    /// Both sides of a string compare rebuild the same slot. Pulls in __STR_SNAP.
+    used_str_snap: bool,
+    /// TSB dialect: boot charset and colours match TSB, not a stock C64.
+    tsb_target: bool,
+    /// Longest `USE` control string in the module. Size of __USE_BUF.
+    use_buf_len: u8,
     /// `MOB SET …,speed` writes or `MMOB`/`RLOCMOB` glide reads —
     /// emits `__MOB_SPEED` (8-byte per-sprite delay table) and the
     /// `__MMOB_GLIDE` helper.
@@ -1709,6 +1732,7 @@ impl Codegen {
             used_rom_error_hook: false,
             er_el_as_user_var: false,
             used_tsb_goto_line: false,
+            cgoto_dispatch_emitted: false,
             used_chr_heap: false,
             used_chr_new: false,
             used_concat: false,
@@ -1808,6 +1832,7 @@ impl Codegen {
             used_mul16: false,
             used_div16: false,
             used_smul_tmp: false,
+            used_hardcopy: false,
             used_read_ti: false,
             used_read_ti_str: false,
             used_stop: false,
@@ -1878,7 +1903,13 @@ impl Codegen {
             used_str_insert: false,
             used_inst: false,
             used_insert_box_runtime: false,
-            used_use_field: false,
+            used_tsb_bad_mode: false,
+            used_use_format: false,
+            used_use_dyn: false,
+            used_reset_find: false,
+            used_str_snap: false,
+            tsb_target: false,
+            use_buf_len: 0,
             used_mmob_glide: false,
             shared_strings: HashSet::new(),
             bss_str_vars: HashMap::new(),
@@ -3195,6 +3226,9 @@ impl Codegen {
             | Stmt::Cmob { .. }
             | Stmt::Bckgnds { .. }
             | Stmt::Nrm
+            | Stmt::HardCopy
+            | Stmt::Cold
+            | Stmt::Retrace
             | Stmt::MemModeOn
             | Stmt::Cset { .. }
             | Stmt::Pause { .. }
@@ -3217,6 +3251,9 @@ impl Codegen {
             Stmt::Print { items, .. } | Stmt::PrintFile { items, .. } | Stmt::Cmd { items, .. } => {
                 items.iter().any(|p| matches!(p, PrintPiece::StrExpr(_)))
             }
+            // USE goes through $FB/$FC and CHROUT.
+            Stmt::UseFormat { .. } => true,
+            Stmt::UseFormatDyn { .. } => true,
             // OPEN/CLOSE/LOAD/etc. invoke KERNAL routines; safest to
             // invalidate.
             Stmt::Open { .. }
@@ -3485,17 +3522,19 @@ impl Codegen {
             writeln!(self.code, "    JSR __TSB_IRQ_INSTALL").unwrap();
             writeln!(self.code).unwrap();
         }
-        // `nrm` boot path sets $D018 = $17 (lowercase chars
-        // at $1800 within VIC bank 0), so extended BASIC programs that draw
-        // letters expect lowercase glyphs. Stock BASIC v2 programs,
-        // however, expect the KERNAL default $15 — uppercase +
-        // graphics — because PETSCII codes $C0-$DF render there as
-        // box-drawing/corner shapes.
-        // Pick the charset that matches what the source likely
-        // expects: any extended feature in use → lowercase ($17);
-        // otherwise leave KERNAL's $15 in place by not writing at
-        // all.
-        if scan_module_uses_tsb_neo_features(module) {
+        // TSB's default disk device is 8. Seed it when the program reads or writes the cell.
+        if scan_module_touches_tsb_device(module) {
+            writeln!(self.code, "    LDA #$08").unwrap();
+            writeln!(
+                self.code,
+                "    STA ${:02X}",
+                crate::runtime::TSB_DEFAULT_DEVICE
+            )
+            .unwrap();
+        }
+        // TSB boots $D018=$17 (lower/upper). Direct-IR callers have no dialect
+        // flag, so the feature scan still covers them.
+        if self.tsb_target || scan_module_uses_tsb_neo_features(module) {
             writeln!(self.code, "    LDA #$17").unwrap();
             writeln!(self.code, "    STA $D018").unwrap();
         }
@@ -3504,7 +3543,7 @@ impl Codegen {
         // KERNAL defaults (light-blue text on blue background) and
         // forcing $0286=0 makes their first PRINT come out invisible
         // black-on-black or unreadable.
-        if scan_module_uses_tsb_neo_features(module) {
+        if self.tsb_target || scan_module_uses_tsb_neo_features(module) {
             writeln!(self.code, "    LDA #$0B").unwrap();
             writeln!(self.code, "    STA $D020").unwrap();
             writeln!(self.code, "    LDA #$0C").unwrap();
@@ -3770,12 +3809,10 @@ impl Codegen {
         // `__FOR_TOP_*` label is just an unreachable jump target,
         // which is fine. Discard the frames silently.
         self.for_stack.clear();
-        if !self.structured_loop_stack.is_empty() {
-            return Err(CodegenError::UnmatchedEndLoop { line: 0 });
-        }
-        if !self.do_stack.is_empty() {
-            return Err(CodegenError::DoneWithoutDo { line: 0 });
-        }
+        // Unclosed LOOP/REPEAT/DO is inert in TSB, same as an unmatched FOR in v2.
+        // A mismatched END LOOP or UNTIL is still an error, with the real line number.
+        self.structured_loop_stack.clear();
+        self.do_stack.clear();
 
         // Safety fall-through: cleanly back to BASIC. Skipped if the last
         // emitted opcode was already an RTS (END / RETURN), so we don't
@@ -8614,6 +8651,90 @@ impl Codegen {
             writeln!(self.code, "    LDA #$01").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
+        if self.used_hardcopy {
+            // `HRDCPY`: dump the 40x25 TEXT screen to IEC device 4.
+            // Per row: CR, CHR$(15), tab-to-col-21, then 40 (char, RVS-OFF) pairs.
+            // Reads screen RAM directly. No error path: TSB keeps going if no printer.
+            // Row pointer is $FB/$FC: `(abs),Y` is not a 6502 mode.
+            let screen = "$0400";
+            writeln!(self.code, "__HRDCPY:").unwrap();
+            writeln!(self.code, "    LDA #$65").unwrap();
+            writeln!(self.code, "    LDX #$04").unwrap();
+            writeln!(self.code, "    LDY #$FF").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::SETLFS).unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::SETNAM).unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::KERNAL_OPEN).unwrap();
+            writeln!(self.code, "    LDX #$65").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHKOUT).unwrap();
+            writeln!(self.code, "    LDA #$91").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+            // Row pointer starts at the screen base and advances 40 per row.
+            writeln!(self.code, "    LDA #<{screen}").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    LDA #>{screen}").unwrap();
+            writeln!(self.code, "    STA $FC").unwrap();
+            writeln!(self.code, "    LDA #$19").unwrap();
+            writeln!(self.code, "    STA __HC_ROW").unwrap();
+            writeln!(self.code, "__HC_ROW_LOOP:").unwrap();
+            for b in [0x0Du8, 0x0F, 0x10, 0x32, 0x31] {
+                writeln!(self.code, "    LDA #${b:02X}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+            }
+            // TSB emits CHR$(17) in text mode, not after HIRES. $D011 bit 5 is BMM.
+            writeln!(self.code, "    LDA $D011").unwrap();
+            writeln!(self.code, "    AND #$20").unwrap();
+            writeln!(self.code, "    BNE __HC_NOCS").unwrap();
+            writeln!(self.code, "    LDA #$11").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+            writeln!(self.code, "__HC_NOCS:").unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "__HC_COL_LOOP:").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    STY __HC_COL").unwrap();
+            writeln!(self.code, "    JSR __HC_SCR2PET").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+            writeln!(self.code, "    LDA #$92").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+            writeln!(self.code, "    LDY __HC_COL").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    CPY #$28").unwrap();
+            writeln!(self.code, "    BCC __HC_COL_LOOP").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    LDA $FB").unwrap();
+            writeln!(self.code, "    ADC #$28").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    LDA $FC").unwrap();
+            writeln!(self.code, "    ADC #$00").unwrap();
+            writeln!(self.code, "    STA $FC").unwrap();
+            writeln!(self.code, "    DEC __HC_ROW").unwrap();
+            writeln!(self.code, "    BNE __HC_ROW_LOOP").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
+            writeln!(self.code, "    LDA #$65").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::KERNAL_CLOSE).unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            // Screen code to PETSCII: 0-31 +64, 32-63 same, 64-95 +128, 96-127 +64.
+            // Drop bit 7 (reverse). Caller already emits RVS-OFF after each cell.
+            writeln!(self.code, "__HC_SCR2PET:").unwrap();
+            writeln!(self.code, "    AND #$7F").unwrap();
+            writeln!(self.code, "    CMP #$20").unwrap();
+            writeln!(self.code, "    BCS __HC_B1").unwrap();
+            writeln!(self.code, "    ORA #$40").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__HC_B1:").unwrap();
+            writeln!(self.code, "    CMP #$40").unwrap();
+            writeln!(self.code, "    BCC __HC_DONE").unwrap();
+            writeln!(self.code, "    CMP #$60").unwrap();
+            writeln!(self.code, "    BCS __HC_B3").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC #$80").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__HC_B3:").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC #$40").unwrap();
+            writeln!(self.code, "__HC_DONE:").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
         if self.used_read_ti {
             // FAC = TI = $A0*65536 + $A1*256 + $A2, computed
             // incrementally so we never need a 24-bit integer→FAC
@@ -9147,19 +9268,7 @@ impl Codegen {
             // label, or to BASIC_ERROR with ?UNDEFINED STATEMENT
             // if no line matches (covers RESUME NEXT past EOF).
             writeln!(self.code, "__TSB_GOTO_LINE:").unwrap();
-            for &line in &self.line_numbers.clone() {
-                let lo = (line & 0xFF) as u8;
-                let hi = (line >> 8) as u8;
-                let next = format!("__TSB_GOTO_NEXT_{line}");
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                writeln!(self.code, "    CMP #${lo:02X}").unwrap();
-                writeln!(self.code, "    BNE {next}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                writeln!(self.code, "    CMP #${hi:02X}").unwrap();
-                writeln!(self.code, "    BNE {next}").unwrap();
-                writeln!(self.code, "    JMP L{line}").unwrap();
-                writeln!(self.code, "{next}:").unwrap();
-            }
+            self.emit_line_number_search("TSBGL", "__TSB_GOTO_FAIL");
             writeln!(self.code, "    LDX #${:02X}", rt::ERR_UNDEF_STATEMENT).unwrap();
             if self.used_rom_error_hook {
 
@@ -10230,18 +10339,222 @@ impl Codegen {
             writeln!(self.code, "    BNE __IBP_LOOP").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
-        if self.used_use_field {
-            // `USE`-formatted-PRINT field helper. Input:
-            // FAC = the value, __USE_FIELD_WIDTH = the field width
-            // (number of `#` chars; 0 = print as-is, no padding).
-            // FOUT ($BDDD) converts FAC to ASCII at $0100..; the
-            // first byte is a sign indicator (' ' for positive, '-'
-            // for negative). We skip the leading space, count the
-            // remaining digits, left-pad with spaces to `width`, then
-            // print the digits. Pointer goes through $FB/$FC, saved
-            // around the body so the DATA pointer (also $FB/$FC) is
-            // preserved across the call.
-            writeln!(self.code, "__USE_FIELD:").unwrap();
+        if self.used_insert_box_runtime {
+            // TSB `INSERT` box: width/height 0 is ?BAD MODE, else clamp each up to 2,
+            // then col+W must be <= 40 and row+H <= 25.
+            writeln!(self.code, "__INSERT_BOX_BOUNDS:").unwrap();
+            writeln!(self.code, "    LDA __TSB_RECT_W").unwrap();
+            writeln!(self.code, "    BEQ __IBB_BAD").unwrap();
+            writeln!(self.code, "    CMP #$02").unwrap();
+            writeln!(self.code, "    BCS __IBB_W_OK").unwrap();
+            writeln!(self.code, "    LDA #$02").unwrap();
+            writeln!(self.code, "__IBB_W_OK:").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __TSB_RECT_COL").unwrap();
+            writeln!(self.code, "    BCS __IBB_BAD").unwrap();
+            writeln!(self.code, "    CMP #$29").unwrap();
+            writeln!(self.code, "    BCS __IBB_BAD").unwrap();
+            writeln!(self.code, "    LDA __TSB_RECT_H").unwrap();
+            writeln!(self.code, "    BEQ __IBB_BAD").unwrap();
+            writeln!(self.code, "    CMP #$02").unwrap();
+            writeln!(self.code, "    BCS __IBB_H_OK").unwrap();
+            writeln!(self.code, "    LDA #$02").unwrap();
+            writeln!(self.code, "__IBB_H_OK:").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __TSB_RECT_ROW").unwrap();
+            writeln!(self.code, "    BCS __IBB_BAD").unwrap();
+            writeln!(self.code, "    CMP #$1A").unwrap();
+            writeln!(self.code, "    BCS __IBB_BAD").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__IBB_BAD:").unwrap();
+            writeln!(self.code, "    JMP __TSB_BAD_MODE").unwrap();
+        }
+        if self.used_tsb_bad_mode {
+            // TSB ?BAD MODE, error 32. ROM messages stop at 30, so print our own
+            // and re-enter the ROM error tail at $A46C (skips the ROM's " ERROR").
+            // Message is CR "?BAD MODE  ERROR" with two spaces before ERROR.
+            writeln!(self.code, "__TSB_BAD_MODE:").unwrap();
+            if self.used_on_error {
+                // Handler installed and not already in one: pass 32 through __TSB_ERROR.
+                // Otherwise print here. __TSB_ERROR's default arm would index past ROM messages.
+                writeln!(self.code, "    LDA __TSB_IN_HANDLER").unwrap();
+                writeln!(self.code, "    BNE __TSB_BAD_MODE_PRINT").unwrap();
+                writeln!(self.code, "    LDA __TSB_ON_ERR_LINE").unwrap();
+                writeln!(self.code, "    ORA __TSB_ON_ERR_LINE+1").unwrap();
+                writeln!(self.code, "    BEQ __TSB_BAD_MODE_PRINT").unwrap();
+                writeln!(self.code, "    LDX #$20").unwrap();
+                writeln!(self.code, "    JMP __TSB_ERROR").unwrap();
+            }
+            writeln!(self.code, "__TSB_BAD_MODE_PRINT:").unwrap();
+            if self.used_tsb_irq {
+                writeln!(self.code, "    JSR __TSB_IRQ_UNINSTALL").unwrap();
+            }
+            writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA $13").unwrap();
+            writeln!(self.code, "    LDA #<__BAD_MODE_MSG").unwrap();
+            writeln!(self.code, "    LDY #>__BAD_MODE_MSG").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::STROUT).unwrap();
+            writeln!(self.code, "    JMP ${:04X}", rt::BASIC_ERROR_TAIL).unwrap();
+            writeln!(self.code, "__BAD_MODE_MSG:").unwrap();
+            writeln!(
+                self.code,
+                "    .byte $0D,$3F,$42,$41,$44,$20,$4D,$4F,$44,$45,$20,$20,$45,$52,$52,$4F,$52,$00"
+            )
+            .unwrap();
+        }
+        if self.used_str_snap {
+            // Copy the length-prefixed string at A/Y into __STRCMP_SNAP and return that pointer.
+            // Saves $FB/$FC. Length is clamped to 7: TI$ is 6 bytes, GET is 1.
+            writeln!(self.code, "__STR_SNAP:").unwrap();
+            writeln!(self.code, "    STA __SNAP_PTR").unwrap();
+            writeln!(self.code, "    STY __SNAP_PTR+1").unwrap();
+            writeln!(self.code, "    LDA $FB").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+            writeln!(self.code, "    LDA $FC").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+            writeln!(self.code, "    LDA __SNAP_PTR").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    LDA __SNAP_PTR+1").unwrap();
+            writeln!(self.code, "    STA $FC").unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    CMP #$08").unwrap();
+            writeln!(self.code, "    BCC __SS_LEN").unwrap();
+            writeln!(self.code, "    LDA #$07").unwrap();
+            writeln!(self.code, "__SS_LEN:").unwrap();
+            writeln!(self.code, "    STA __STRCMP_SNAP").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    BEQ __SS_DONE").unwrap();
+            writeln!(self.code, "__SS_COPY:").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    STA __STRCMP_SNAP,Y").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BNE __SS_COPY").unwrap();
+            writeln!(self.code, "__SS_DONE:").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    STA $FC").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    LDA #<__STRCMP_SNAP").unwrap();
+            writeln!(self.code, "    LDY #>__STRCMP_SNAP").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_reset_find {
+            // `RESET <expr>`: DATA pointer to the first item on a line >= LINNUM.
+            // Past the last DATA line, land on __DATA_END so the next READ is ?OUT OF DATA.
+            // Parallel byte tables so X can index them (up to 255 DATA lines).
+            let lines: Vec<u16> = self.data_line_offsets.iter().map(|(l, _)| *l).collect();
+            writeln!(self.code, "__RESET_FIND:").unwrap();
+            writeln!(self.code, "    LDX #$00").unwrap();
+            writeln!(self.code, "__RF_LOOP:").unwrap();
+            writeln!(self.code, "    CPX #${:02X}", lines.len().min(255) as u8).unwrap();
+            writeln!(self.code, "    BEQ __RF_END").unwrap();
+            // 16-bit `table[X] >= LINNUM`, high byte first.
+            writeln!(self.code, "    LDA __RESET_HI,X").unwrap();
+            writeln!(self.code, "    CMP ${:02X}", rt::LINNUM_HI).unwrap();
+            writeln!(self.code, "    BCC __RF_NEXT").unwrap();
+            writeln!(self.code, "    BNE __RF_HIT").unwrap();
+            writeln!(self.code, "    LDA __RESET_LO,X").unwrap();
+            writeln!(self.code, "    CMP ${:02X}", rt::LINNUM_LO).unwrap();
+            writeln!(self.code, "    BCC __RF_NEXT").unwrap();
+            writeln!(self.code, "__RF_HIT:").unwrap();
+            writeln!(self.code, "    LDA __RESET_PLO,X").unwrap();
+            writeln!(self.code, "    STA {}", self.data_cur_lo()).unwrap();
+            writeln!(self.code, "    LDA __RESET_PHI,X").unwrap();
+            writeln!(self.code, "    STA {}", self.data_cur_hi()).unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__RF_NEXT:").unwrap();
+            writeln!(self.code, "    INX").unwrap();
+            writeln!(self.code, "    JMP __RF_LOOP").unwrap();
+            writeln!(self.code, "__RF_END:").unwrap();
+            writeln!(self.code, "    LDA #<__DATA_END").unwrap();
+            writeln!(self.code, "    STA {}", self.data_cur_lo()).unwrap();
+            writeln!(self.code, "    LDA #>__DATA_END").unwrap();
+            writeln!(self.code, "    STA {}", self.data_cur_hi()).unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__RESET_LO:").unwrap();
+            for line in lines.iter().take(255) {
+                writeln!(self.code, "    .byte ${:02X}", (line & 0xFF) as u8).unwrap();
+            }
+            writeln!(self.code, "__RESET_HI:").unwrap();
+            for line in lines.iter().take(255) {
+                writeln!(self.code, "    .byte ${:02X}", (line >> 8) as u8).unwrap();
+            }
+            writeln!(self.code, "__RESET_PLO:").unwrap();
+            for line in lines.iter().take(255) {
+                writeln!(self.code, "    .byte <__DATA_LINE_{line}").unwrap();
+            }
+            writeln!(self.code, "__RESET_PHI:").unwrap();
+            for line in lines.iter().take(255) {
+                writeln!(self.code, "    .byte >__DATA_LINE_{line}").unwrap();
+            }
+        }
+        if self.used_use_format {
+            // TSB `USE`: copy the control string into __USE_BUF, overwrite each field
+            // in place, then print the buffer. Overflow leaves the mask chars.
+            // A rounding carry can walk left into the surrounding text.
+            // Every helper saves $FB/$FC (the DATA pointer).
+
+            // __USE_LOAD: A/Y = pooled mask (length byte first), X = length.
+            writeln!(self.code, "__USE_LOAD:").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+            writeln!(self.code, "    LDA $FB").unwrap();
+            writeln!(self.code, "    STA __UF_SAVE").unwrap();
+            writeln!(self.code, "    LDA $FC").unwrap();
+            writeln!(self.code, "    STA __UF_SAVE+1").unwrap();
+            writeln!(self.code, "    STY $FC").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    TXA").unwrap();
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    BEQ __UL_DONE").unwrap();
+            writeln!(self.code, "__UL_LOOP:").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    STA __USE_BUF-1,Y").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    BNE __UL_LOOP").unwrap();
+            writeln!(self.code, "__UL_DONE:").unwrap();
+            writeln!(self.code, "    JMP __UF_RESTORE").unwrap();
+
+            // __USE_DESC: A/Y = pooled 8-byte field descriptor.
+            writeln!(self.code, "__USE_DESC:").unwrap();
+            writeln!(self.code, "    LDX $FB").unwrap();
+            writeln!(self.code, "    STX __UF_SAVE").unwrap();
+            writeln!(self.code, "    LDX $FC").unwrap();
+            writeln!(self.code, "    STX __UF_SAVE+1").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    STY $FC").unwrap();
+            writeln!(self.code, "    LDY #$08").unwrap();
+            writeln!(self.code, "__UD_LOOP:").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    STA __UF_DESC-1,Y").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    BNE __UD_LOOP").unwrap();
+            writeln!(self.code, "__UF_RESTORE:").unwrap();
+            writeln!(self.code, "    LDA __UF_SAVE").unwrap();
+            writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    LDA __UF_SAVE+1").unwrap();
+            writeln!(self.code, "    STA $FC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+
+            // __USE_SHOW: X = length.
+            writeln!(self.code, "__USE_SHOW:").unwrap();
+            writeln!(self.code, "    CPX #$00").unwrap();
+            writeln!(self.code, "    BEQ __US_DONE").unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "__US_LOOP:").unwrap();
+            writeln!(self.code, "    LDA __USE_BUF,Y").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BNE __US_LOOP").unwrap();
+            writeln!(self.code, "__US_DONE:").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+
+            // __USE_FLD: FAC = the value, __UF_DESC = the field.
+            writeln!(self.code, "__USE_FLD:").unwrap();
             writeln!(self.code, "    LDA $FB").unwrap();
             writeln!(self.code, "    PHA").unwrap();
             writeln!(self.code, "    LDA $FC").unwrap();
@@ -10249,46 +10562,527 @@ impl Codegen {
             writeln!(self.code, "    JSR ${:04X}", rt::FOUT).unwrap();
             writeln!(self.code, "    STA $FB").unwrap();
             writeln!(self.code, "    STY $FC").unwrap();
+            // FOUT leads with ' ' or '-'; note the sign and step past it.
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __UF_NEG").unwrap();
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA ($FB),Y").unwrap();
-            writeln!(self.code, "    CMP #$20").unwrap();
-            writeln!(self.code, "    BNE __UF_HAVE_OFF").unwrap();
+            writeln!(self.code, "    CMP #$2D").unwrap();
+            writeln!(self.code, "    BNE __UF_NOTNEG").unwrap();
+            writeln!(self.code, "    INC __UF_NEG").unwrap();
             writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "__UF_HAVE_OFF:").unwrap();
-            writeln!(self.code, "    STY __USE_FIELD_OFF").unwrap();
-            writeln!(self.code, "    LDX #$00").unwrap();
-            writeln!(self.code, "__UF_COUNT:").unwrap();
+            writeln!(self.code, "    JMP __UF_S0SET").unwrap();
+            writeln!(self.code, "__UF_NOTNEG:").unwrap();
+            writeln!(self.code, "    CMP #$20").unwrap();
+            writeln!(self.code, "    BNE __UF_S0SET").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "__UF_S0SET:").unwrap();
+            writeln!(self.code, "    STY __UF_S0").unwrap();
+            // Find the decimal point and whether FOUT chose E notation.
+            writeln!(self.code, "    LDA #$FF").unwrap();
+            writeln!(self.code, "    STA __UF_DOT").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __UF_HASE").unwrap();
+            writeln!(self.code, "__UF_SCAN:").unwrap();
             writeln!(self.code, "    LDA ($FB),Y").unwrap();
-            writeln!(self.code, "    BEQ __UF_HAVE_LEN").unwrap();
+            writeln!(self.code, "    BEQ __UF_SCANEND").unwrap();
+            writeln!(self.code, "    CMP #$2E").unwrap();
+            writeln!(self.code, "    BNE __UF_NOTDOT").unwrap();
+            writeln!(self.code, "    LDX __UF_DOT").unwrap();
+            writeln!(self.code, "    CPX #$FF").unwrap();
+            writeln!(self.code, "    BNE __UF_SCANNEXT").unwrap();
+            writeln!(self.code, "    STY __UF_DOT").unwrap();
+            writeln!(self.code, "    JMP __UF_SCANNEXT").unwrap();
+            writeln!(self.code, "__UF_NOTDOT:").unwrap();
+            writeln!(self.code, "    CMP #$45").unwrap();
+            writeln!(self.code, "    BNE __UF_SCANNEXT").unwrap();
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __UF_HASE").unwrap();
+            writeln!(self.code, "__UF_SCANNEXT:").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    JMP __UF_SCAN").unwrap();
+            writeln!(self.code, "__UF_SCANEND:").unwrap();
+            writeln!(self.code, "    STY __UF_END").unwrap();
+            // Integer digits = the run before the '.', or the whole string.
+            // An E-notation value with no '.' has none we can use at all.
+            writeln!(self.code, "    LDA __UF_DOT").unwrap();
+            writeln!(self.code, "    CMP #$FF").unwrap();
+            writeln!(self.code, "    BNE __UF_HAVEDOT").unwrap();
+            writeln!(self.code, "    LDA __UF_HASE").unwrap();
+            writeln!(self.code, "    BNE __UF_OVERJ").unwrap();
+            writeln!(self.code, "    LDA __UF_END").unwrap();
+            writeln!(self.code, "    JMP __UF_ILENSET").unwrap();
+            writeln!(self.code, "__UF_OVERJ:").unwrap();
+            writeln!(self.code, "    JMP __UF_OVER").unwrap();
+            writeln!(self.code, "__UF_HAVEDOT:").unwrap();
+            writeln!(self.code, "    LDA __UF_DOT").unwrap();
+            writeln!(self.code, "__UF_ILENSET:").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC __UF_S0").unwrap();
+            writeln!(self.code, "    STA __UF_ILEN").unwrap();
+            // A fraction field cannot render an E-notation value at all.
+            writeln!(self.code, "    LDA __UF_DESC+2").unwrap();
+            writeln!(self.code, "    BEQ __UF_FITS").unwrap();
+            writeln!(self.code, "    LDA __UF_HASE").unwrap();
+            writeln!(self.code, "    BNE __UF_OVERJ").unwrap();
+            writeln!(self.code, "__UF_FITS:").unwrap();
+            writeln!(self.code, "    LDA __UF_ILEN").unwrap();
+            writeln!(self.code, "    CMP __UF_DESC+1").unwrap();
+            writeln!(self.code, "    BEQ __UF_ROUNDQ").unwrap();
+            writeln!(self.code, "    BCS __UF_OVERJ").unwrap();
+            // Does the fraction round up?
+            writeln!(self.code, "__UF_ROUNDQ:").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __UF_CARRY").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+2").unwrap();
+            writeln!(self.code, "    BEQ __UF_ESCQ").unwrap();
+            writeln!(self.code, "    LDA __UF_DOT").unwrap();
+            writeln!(self.code, "    CMP #$FF").unwrap();
+            writeln!(self.code, "    BEQ __UF_ESCQ").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC #$01").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __UF_DESC+2").unwrap();
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    CPY __UF_END").unwrap();
+            writeln!(self.code, "    BCS __UF_ESCQ").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    CMP #$35").unwrap();
+            writeln!(self.code, "    BCC __UF_ESCQ").unwrap();
+            writeln!(self.code, "    CMP #$3A").unwrap();
+            writeln!(self.code, "    BCS __UF_ESCQ").unwrap();
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __UF_CARRY").unwrap();
+            // Carry leaves the integer field only when it is full of 9s.
+            // Offset 0 has nothing to the left, so TSB echoes the mask instead.
+            writeln!(self.code, "__UF_ESCQ:").unwrap();
+            writeln!(self.code, "    LDA __UF_CARRY").unwrap();
+            writeln!(self.code, "    BEQ __UF_WRITE").unwrap();
+            writeln!(self.code, "    LDA __UF_ILEN").unwrap();
+            writeln!(self.code, "    CMP __UF_DESC+1").unwrap();
+            writeln!(self.code, "    BNE __UF_WRITE").unwrap();
+            writeln!(self.code, "    LDX __UF_ILEN").unwrap();
+            writeln!(self.code, "    BEQ __UF_ESCAPE").unwrap();
+            writeln!(self.code, "    LDY __UF_S0").unwrap();
+            writeln!(self.code, "__UF_NINE:").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    CMP #$39").unwrap();
+            writeln!(self.code, "    BNE __UF_WRITE").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BNE __UF_NINE").unwrap();
+            writeln!(self.code, "__UF_ESCAPE:").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+7").unwrap();
+            writeln!(self.code, "    BEQ __UF_OVERJ").unwrap();
+            // Value fits: write it.
+            writeln!(self.code, "__UF_WRITE:").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+5").unwrap();
+            writeln!(self.code, "    BEQ __UF_NOSIGN").unwrap();
+            writeln!(self.code, "    LDX __UF_DESC+6").unwrap();
+            writeln!(self.code, "    CMP #$01").unwrap();
+            writeln!(self.code, "    BNE __UF_SGNMINUS").unwrap();
+            writeln!(self.code, "    LDA #$2B").unwrap();
+            writeln!(self.code, "    LDY __UF_NEG").unwrap();
+            writeln!(self.code, "    BEQ __UF_SGNPUT").unwrap();
+            writeln!(self.code, "    LDA #$2D").unwrap();
+            writeln!(self.code, "    JMP __UF_SGNPUT").unwrap();
+            writeln!(self.code, "__UF_SGNMINUS:").unwrap();
+            writeln!(self.code, "    LDA #$20").unwrap();
+            writeln!(self.code, "    LDY __UF_NEG").unwrap();
+            writeln!(self.code, "    BEQ __UF_SGNPUT").unwrap();
+            writeln!(self.code, "    LDA #$2D").unwrap();
+            writeln!(self.code, "__UF_SGNPUT:").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "__UF_NOSIGN:").unwrap();
+            // Integer positions: fill them, then lay the digits in from the
+            // right so the value is right-justified.
+            writeln!(self.code, "    LDA __UF_DESC+1").unwrap();
+            writeln!(self.code, "    BEQ __UF_FRAC").unwrap();
+            writeln!(self.code, "    STA __UF_CNT").unwrap();
+            writeln!(self.code, "    LDX __UF_DESC+0").unwrap();
+            writeln!(self.code, "__UF_PADL:").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+4").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    INX").unwrap();
+            writeln!(self.code, "    DEC __UF_CNT").unwrap();
+            writeln!(self.code, "    BNE __UF_PADL").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+0").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __UF_DESC+1").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC #$01").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    LDA __UF_ILEN").unwrap();
+            writeln!(self.code, "    BNE __UF_HAVEDIG").unwrap();
+            // No integer digits: TSB writes a single 0.
+            writeln!(self.code, "    LDA #$30").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    JMP __UF_FRAC").unwrap();
+            writeln!(self.code, "__UF_HAVEDIG:").unwrap();
+            writeln!(self.code, "    STA __UF_CNT").unwrap();
+            writeln!(self.code, "    LDA __UF_S0").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __UF_ILEN").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC #$01").unwrap();
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "__UF_CPI:").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    DEC __UF_CNT").unwrap();
+            writeln!(self.code, "    BNE __UF_CPI").unwrap();
+            // Fraction positions, zero-filled past the end of the value.
+            writeln!(self.code, "__UF_FRAC:").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+2").unwrap();
+            writeln!(self.code, "    BEQ __UF_CARRYAPPLY").unwrap();
+            writeln!(self.code, "    STA __UF_CNT").unwrap();
+            writeln!(self.code, "    LDX __UF_DESC+3").unwrap();
+            writeln!(self.code, "    LDY __UF_DOT").unwrap();
+            writeln!(self.code, "    CPY #$FF").unwrap();
+            writeln!(self.code, "    BEQ __UF_FRZEROALL").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    JMP __UF_FRL").unwrap();
+            writeln!(self.code, "__UF_FRZEROALL:").unwrap();
+            writeln!(self.code, "    LDY __UF_END").unwrap();
+            writeln!(self.code, "__UF_FRL:").unwrap();
+            writeln!(self.code, "    CPY __UF_END").unwrap();
+            writeln!(self.code, "    BCS __UF_FRZERO").unwrap();
+            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    CMP #$30").unwrap();
+            writeln!(self.code, "    BCC __UF_FRZERO").unwrap();
+            writeln!(self.code, "    CMP #$3A").unwrap();
+            writeln!(self.code, "    BCC __UF_FRPUT").unwrap();
+            writeln!(self.code, "__UF_FRZERO:").unwrap();
+            writeln!(self.code, "    LDA #$30").unwrap();
+            writeln!(self.code, "__UF_FRPUT:").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
             writeln!(self.code, "    INY").unwrap();
             writeln!(self.code, "    INX").unwrap();
-            writeln!(self.code, "    JMP __UF_COUNT").unwrap();
-            writeln!(self.code, "__UF_HAVE_LEN:").unwrap();
-            writeln!(self.code, "    STX __USE_FIELD_LEN").unwrap();
-            writeln!(self.code, "    LDA __USE_FIELD_WIDTH").unwrap();
-            writeln!(self.code, "    SEC").unwrap();
-            writeln!(self.code, "    SBC __USE_FIELD_LEN").unwrap();
-            writeln!(self.code, "    BCC __UF_PRINT").unwrap();
-            writeln!(self.code, "    BEQ __UF_PRINT").unwrap();
-            writeln!(self.code, "    TAX").unwrap();
-            writeln!(self.code, "__UF_PAD:").unwrap();
-            writeln!(self.code, "    LDA #$20").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
-            writeln!(self.code, "    DEX").unwrap();
-            writeln!(self.code, "    BNE __UF_PAD").unwrap();
-            writeln!(self.code, "__UF_PRINT:").unwrap();
-            writeln!(self.code, "    LDY __USE_FIELD_OFF").unwrap();
-            writeln!(self.code, "__UF_OUT:").unwrap();
-            writeln!(self.code, "    LDA ($FB),Y").unwrap();
+            writeln!(self.code, "    DEC __UF_CNT").unwrap();
+            writeln!(self.code, "    BNE __UF_FRL").unwrap();
+            // Rounding carry: walk left through the buffer, keyed by the byte:
+            // blank ($20) becomes '1' and stops, below $30 is skipped, '9' becomes
+            // '0' and continues, anything else is incremented and stops.
+            // A blank pad takes the carry as a leading 1; `*` / `.` / sign are skipped.
+            // Stop at offset 0.
+            writeln!(self.code, "__UF_CARRYAPPLY:").unwrap();
+            writeln!(self.code, "    LDA __UF_CARRY").unwrap();
             writeln!(self.code, "    BEQ __UF_DONE").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
-            writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    JMP __UF_OUT").unwrap();
+            // Start at the last position the value was written into.
+            writeln!(self.code, "    LDA __UF_DESC+2").unwrap();
+            writeln!(self.code, "    BEQ __UF_CA_FROMINT").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+3").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __UF_DESC+2").unwrap();
+            writeln!(self.code, "    JMP __UF_CA_START").unwrap();
+            writeln!(self.code, "__UF_CA_FROMINT:").unwrap();
+            writeln!(self.code, "    LDA __UF_DESC+0").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC __UF_DESC+1").unwrap();
+            writeln!(self.code, "__UF_CA_START:").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC #$01").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "__UF_CW:").unwrap();
+            writeln!(self.code, "    LDA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    CMP #$20").unwrap();
+            writeln!(self.code, "    BNE __UF_CW_NOTBLANK").unwrap();
+            writeln!(self.code, "    LDA #$31").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    JMP __UF_DONE").unwrap();
+            writeln!(self.code, "__UF_CW_NOTBLANK:").unwrap();
+            writeln!(self.code, "    CMP #$30").unwrap();
+            writeln!(self.code, "    BCC __UF_CW_NEXT").unwrap();
+            writeln!(self.code, "    CMP #$39").unwrap();
+            writeln!(self.code, "    BNE __UF_CW_INC").unwrap();
+            writeln!(self.code, "    LDA #$30").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    JMP __UF_CW_NEXT").unwrap();
+            writeln!(self.code, "__UF_CW_INC:").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC #$01").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    JMP __UF_DONE").unwrap();
+            writeln!(self.code, "__UF_CW_NEXT:").unwrap();
+            writeln!(self.code, "    CPX #$00").unwrap();
+            writeln!(self.code, "    BEQ __UF_DONE").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    JMP __UF_CW").unwrap();
+            // Set __UF_ECHO. A multi-field run stops at the first echo, so later
+            // fields in that run do not consume a value.
             writeln!(self.code, "__UF_DONE:").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __UF_ECHO").unwrap();
+            writeln!(self.code, "    JMP __UF_EXIT").unwrap();
+            writeln!(self.code, "__UF_OVER:").unwrap();
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __UF_ECHO").unwrap();
+            writeln!(self.code, "__UF_EXIT:").unwrap();
             writeln!(self.code, "    PLA").unwrap();
             writeln!(self.code, "    STA $FC").unwrap();
             writeln!(self.code, "    PLA").unwrap();
             writeln!(self.code, "    STA $FB").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_use_dyn {
+            // TSB `USE` with a control string built at run time.
+            // __USE_LOADV copies it, __USE_FIND builds the same 8-byte descriptor
+            // the pooled path uses, then __USE_FLD formats. __USE_SRC is a pristine
+            // copy: __USE_BUF is overwritten field by field, so the scanner cannot
+            // reread it.
+
+            // __USE_LOADV: A/Y = length-prefixed string. Copy into both buffers,
+            // dropping every `!` (same as parse_use_mask). Length is the image
+            // after deletions. Empty is ?SYNTAX, over-long is ?STRING TOO LONG.
+            writeln!(self.code, "__USE_LOADV:").unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    STY ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    LDA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    BEQ __ULV_EMPTY").unwrap();
+            writeln!(self.code, "    STA __RS_N").unwrap();
+            writeln!(self.code, "    LDX #$00").unwrap();
+            writeln!(self.code, "__ULV_COPY:").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    LDA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    CMP #$21").unwrap();
+            writeln!(self.code, "    BEQ __ULV_NEXT").unwrap();
+            writeln!(self.code, "    CPX #${:02X}", USE_DYN_BUF_LEN).unwrap();
+            writeln!(self.code, "    BCS __ULV_LONG").unwrap();
+            writeln!(self.code, "    STA __USE_BUF,X").unwrap();
+            writeln!(self.code, "    STA __USE_SRC,X").unwrap();
+            writeln!(self.code, "    INX").unwrap();
+            writeln!(self.code, "__ULV_NEXT:").unwrap();
+            writeln!(self.code, "    CPY __RS_N").unwrap();
+            writeln!(self.code, "    BNE __ULV_COPY").unwrap();
+            writeln!(self.code, "    STX __UF_LEN").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__ULV_EMPTY:").unwrap();
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_SYNTAX).unwrap();
+            self.emit_jmp_basic_error();
+            writeln!(self.code, "__ULV_LONG:").unwrap();
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_STRING_TOO_LONG).unwrap();
+            self.emit_jmp_basic_error();
+
+            // __USE_FIND: A = wanted field index, or $FF for none. Walks __USE_SRC,
+            // counts fields in __UF_NF, and fills __UF_DESC for the wanted one.
+            // A field is a run of `# * . , + -` with at least one `#` or `*`.
+            // Sign is first or last char only, at most one `.`/`,`, pad is `*` if present.
+            writeln!(self.code, "__USE_FIND:").unwrap();
+            writeln!(self.code, "    STA __RS_WANT").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __RS_OK").unwrap();
+            writeln!(self.code, "    STA __UF_NF").unwrap();
+            writeln!(self.code, "    STA __RS_I").unwrap();
+            writeln!(self.code, "__RS_LOOP:").unwrap();
+            writeln!(self.code, "    LDX __RS_I").unwrap();
+            writeln!(self.code, "    CPX __UF_LEN").unwrap();
+            writeln!(self.code, "    BCS __RS_DONE").unwrap();
+            writeln!(self.code, "    LDA __USE_SRC,X").unwrap();
+            writeln!(self.code, "    JSR __RS_ISFLD").unwrap();
+            writeln!(self.code, "    BCS __RS_RUN").unwrap();
+            writeln!(self.code, "    INC __RS_I").unwrap();
+            writeln!(self.code, "    JMP __RS_LOOP").unwrap();
+            writeln!(self.code, "__RS_DONE:").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            // Walk to the end of the run. Note digit positions and any `*`.
+            writeln!(self.code, "__RS_RUN:").unwrap();
+            writeln!(self.code, "    STX __RS_RS").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __RS_HASD").unwrap();
+            writeln!(self.code, "    STA __RS_PAD").unwrap();
+            writeln!(self.code, "__RS_RUNL:").unwrap();
+            writeln!(self.code, "    CPX __UF_LEN").unwrap();
+            writeln!(self.code, "    BCS __RS_RUNE").unwrap();
+            writeln!(self.code, "    LDA __USE_SRC,X").unwrap();
+            writeln!(self.code, "    JSR __RS_ISFLD").unwrap();
+            writeln!(self.code, "    BCC __RS_RUNE").unwrap();
+            writeln!(self.code, "    CMP #$23").unwrap();
+            writeln!(self.code, "    BEQ __RS_ISD").unwrap();
+            writeln!(self.code, "    CMP #$2A").unwrap();
+            writeln!(self.code, "    BNE __RS_RUNN").unwrap();
+            writeln!(self.code, "    STA __RS_PAD").unwrap();
+            writeln!(self.code, "__RS_ISD:").unwrap();
+            writeln!(self.code, "    INC __RS_HASD").unwrap();
+            writeln!(self.code, "__RS_RUNN:").unwrap();
+            writeln!(self.code, "    INX").unwrap();
+            writeln!(self.code, "    JMP __RS_RUNL").unwrap();
+            writeln!(self.code, "__RS_RUNE:").unwrap();
+            writeln!(self.code, "    STX __RS_RE").unwrap();
+            writeln!(self.code, "    STX __RS_I").unwrap();
+            writeln!(self.code, "    LDA __RS_HASD").unwrap();
+            writeln!(self.code, "    BNE __RS_FIELD").unwrap();
+            writeln!(self.code, "    JMP __RS_LOOP").unwrap();
+            // The run is a field. Leading sign wins; a `+`/`-` left in the body is ?SYNTAX.
+            writeln!(self.code, "__RS_FIELD:").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __RS_SGN").unwrap();
+            writeln!(self.code, "    LDA __RS_RS").unwrap();
+            writeln!(self.code, "    STA __RS_BS").unwrap();
+            writeln!(self.code, "    STA __RS_SGNAT").unwrap();
+            writeln!(self.code, "    LDA __RS_RE").unwrap();
+            writeln!(self.code, "    STA __RS_BE").unwrap();
+            writeln!(self.code, "    LDX __RS_RS").unwrap();
+            writeln!(self.code, "    LDA __USE_SRC,X").unwrap();
+            writeln!(self.code, "    JSR __RS_ISSGN").unwrap();
+            writeln!(self.code, "    BCC __RS_TRAIL").unwrap();
+            writeln!(self.code, "    JSR __RS_SETSGN").unwrap();
+            writeln!(self.code, "    INC __RS_BS").unwrap();
+            writeln!(self.code, "    JMP __RS_SEP").unwrap();
+            writeln!(self.code, "__RS_TRAIL:").unwrap();
+            writeln!(self.code, "    LDX __RS_RE").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    LDA __USE_SRC,X").unwrap();
+            writeln!(self.code, "    JSR __RS_ISSGN").unwrap();
+            writeln!(self.code, "    BCC __RS_SEP").unwrap();
+            writeln!(self.code, "    STX __RS_SGNAT").unwrap();
+            writeln!(self.code, "    JSR __RS_SETSGN").unwrap();
+            writeln!(self.code, "    DEC __RS_BE").unwrap();
+            writeln!(self.code, "__RS_SEP:").unwrap();
+            writeln!(self.code, "    LDA #$FF").unwrap();
+            writeln!(self.code, "    STA __RS_SEPAT").unwrap();
+            writeln!(self.code, "    LDX __RS_BS").unwrap();
+            writeln!(self.code, "__RS_SEPL:").unwrap();
+            writeln!(self.code, "    CPX __RS_BE").unwrap();
+            writeln!(self.code, "    BCS __RS_COUNT").unwrap();
+            writeln!(self.code, "    LDA __USE_SRC,X").unwrap();
+            writeln!(self.code, "    JSR __RS_ISSGN").unwrap();
+            writeln!(self.code, "    BCS __RS_BAD").unwrap();
+            writeln!(self.code, "    CMP #$2E").unwrap();
+            writeln!(self.code, "    BEQ __RS_SEPHIT").unwrap();
+            writeln!(self.code, "    CMP #$2C").unwrap();
+            writeln!(self.code, "    BNE __RS_SEPN").unwrap();
+            writeln!(self.code, "__RS_SEPHIT:").unwrap();
+            writeln!(self.code, "    LDA __RS_SEPAT").unwrap();
+            writeln!(self.code, "    CMP #$FF").unwrap();
+            writeln!(self.code, "    BNE __RS_BAD").unwrap();
+            writeln!(self.code, "    STX __RS_SEPAT").unwrap();
+            writeln!(self.code, "__RS_SEPN:").unwrap();
+            writeln!(self.code, "    INX").unwrap();
+            writeln!(self.code, "    JMP __RS_SEPL").unwrap();
+            // Unparseable control string: ?SYNTAX ERROR, same as the literal path.
+            writeln!(self.code, "__RS_BAD:").unwrap();
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_SYNTAX).unwrap();
+            self.emit_jmp_basic_error();
+            // Validate every field. Skip descriptor math for fields nobody asked for.
+            writeln!(self.code, "__RS_COUNT:").unwrap();
+            writeln!(self.code, "    LDA __UF_NF").unwrap();
+            writeln!(self.code, "    CMP __RS_WANT").unwrap();
+            writeln!(self.code, "    BEQ __RS_BUILD").unwrap();
+            writeln!(self.code, "    INC __UF_NF").unwrap();
+            writeln!(self.code, "    JMP __RS_LOOP").unwrap();
+            // Eight descriptor bytes, same order as the pooled blobs:
+            // digits, int_digits, dec_digits, dec_at, pad, sign, sign_at, start.
+            writeln!(self.code, "__RS_BUILD:").unwrap();
+            writeln!(self.code, "    LDA __RS_BS").unwrap();
+            writeln!(self.code, "    STA __UF_DESC").unwrap();
+            writeln!(self.code, "    LDA __RS_SEPAT").unwrap();
+            writeln!(self.code, "    CMP #$FF").unwrap();
+            writeln!(self.code, "    BNE __RS_HASSEP").unwrap();
+            // No separator: every body byte is an integer digit. dec_at is the body start.
+            writeln!(self.code, "    LDA __RS_BE").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC __RS_BS").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+1").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+2").unwrap();
+            writeln!(self.code, "    LDA __RS_BS").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+3").unwrap();
+            writeln!(self.code, "    JMP __RS_TAIL").unwrap();
+            writeln!(self.code, "__RS_HASSEP:").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC __RS_BS").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+1").unwrap();
+            writeln!(self.code, "    LDA __RS_BE").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC __RS_SEPAT").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC #$01").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+2").unwrap();
+            writeln!(self.code, "    LDA __RS_SEPAT").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    ADC #$01").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+3").unwrap();
+            writeln!(self.code, "__RS_TAIL:").unwrap();
+            writeln!(self.code, "    LDA __RS_PAD").unwrap();
+            writeln!(self.code, "    BNE __RS_PADSET").unwrap();
+            writeln!(self.code, "    LDA #$20").unwrap();
+            writeln!(self.code, "__RS_PADSET:").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+4").unwrap();
+            writeln!(self.code, "    LDA __RS_SGN").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+5").unwrap();
+            writeln!(self.code, "    LDA __RS_SGNAT").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+6").unwrap();
+            writeln!(self.code, "    LDA __RS_RS").unwrap();
+            writeln!(self.code, "    STA __UF_DESC+7").unwrap();
+            writeln!(self.code, "    INC __RS_OK").unwrap();
+            writeln!(self.code, "    INC __UF_NF").unwrap();
+            writeln!(self.code, "    JMP __RS_LOOP").unwrap();
+
+            // Carry set when A is one of `# * . , + -`. `$2A..$2E` covers four of them.
+            writeln!(self.code, "__RS_ISFLD:").unwrap();
+            writeln!(self.code, "    CMP #$23").unwrap();
+            writeln!(self.code, "    BEQ __RS_IFYES").unwrap();
+            writeln!(self.code, "    CMP #$2A").unwrap();
+            writeln!(self.code, "    BCC __RS_IFNO").unwrap();
+            writeln!(self.code, "    CMP #$2F").unwrap();
+            writeln!(self.code, "    BCS __RS_IFNO").unwrap();
+            writeln!(self.code, "__RS_IFYES:").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__RS_IFNO:").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+
+            // Carry set when A is `+` or `-`. Leaves A alone for __RS_SETSGN.
+            writeln!(self.code, "__RS_ISSGN:").unwrap();
+            writeln!(self.code, "    CMP #$2B").unwrap();
+            writeln!(self.code, "    BEQ __RS_IFYES").unwrap();
+            writeln!(self.code, "    CMP #$2D").unwrap();
+            writeln!(self.code, "    BEQ __RS_IFYES").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+
+            // A = the sign byte. 1 for `+`, 2 for `-`, matching the pooled descriptors.
+            writeln!(self.code, "__RS_SETSGN:").unwrap();
+            writeln!(self.code, "    CMP #$2B").unwrap();
+            writeln!(self.code, "    BNE __RS_SGNMINUS").unwrap();
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __RS_SGN").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__RS_SGNMINUS:").unwrap();
+            writeln!(self.code, "    LDA #$02").unwrap();
+            writeln!(self.code, "    STA __RS_SGN").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+
+            // __USE_RTSCAN: count fields without wanting any. $FF is never a real index.
+            writeln!(self.code, "__USE_RTSCAN:").unwrap();
+            writeln!(self.code, "    LDA #$FF").unwrap();
+            writeln!(self.code, "    JMP __USE_FIND").unwrap();
+
+            // __USE_DESC_RT: A = value index. Carry clear: descriptor loaded.
+            // Carry set: no field left. Does not raise: TSB prints what it formatted,
+            // then ?BAD MODE after the flush. The extra value is never evaluated.
+            writeln!(self.code, "__USE_DESC_RT:").unwrap();
+            writeln!(self.code, "    JSR __USE_FIND").unwrap();
+            writeln!(self.code, "    LDA __RS_OK").unwrap();
+            writeln!(self.code, "    BNE __RS_DOK").unwrap();
+            writeln!(self.code, "    INC __UF_OVERRUN").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__RS_DOK:").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+
+            // __USE_COUNT_CHK: A = number of values. Too few is ?BAD MODE here,
+            // because a field with no value prints nothing at all.
+            writeln!(self.code, "__USE_COUNT_CHK:").unwrap();
+            writeln!(self.code, "    CMP __UF_NF").unwrap();
+            writeln!(self.code, "    BCS __RS_COK").unwrap();
+            writeln!(self.code, "    JMP __TSB_BAD_MODE").unwrap();
+            writeln!(self.code, "__RS_COK:").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_mmob_glide {
@@ -11514,14 +12308,19 @@ impl Codegen {
             };
             writeln!(self.code, "; --- DATA pool ({layout_note}) ---").unwrap();
             writeln!(self.code, "__DATA:").unwrap();
-            let mut next_label = 0;
+            // Offset -> DATA lines that start there. data_line_offsets follows
+            // module.lines, which is not always sorted by offset.
+            let mut labels_at: HashMap<usize, Vec<u16>> = HashMap::new();
+            for (line_no, off) in &self.data_line_offsets {
+                labels_at.entry(*off).or_default().push(*line_no);
+            }
+            let mut emitted: HashSet<u16> = HashSet::new();
             for (i, v) in self.data_values.iter().enumerate() {
-                while next_label < self.data_line_offsets.len()
-                    && self.data_line_offsets[next_label].1 == i
-                {
-                    let line_no = self.data_line_offsets[next_label].0;
-                    writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
-                    next_label += 1;
+                if let Some(lines) = labels_at.get(&i) {
+                    for line_no in lines {
+                        writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
+                        emitted.insert(*line_no);
+                    }
                 }
                 // Anchors for the `__DATA_BAD` range that covers this entry ; emitted only when a numeric READ exists to consult the table.
                 if self.used_read_num && self.compact_data_bad.is_none() {
@@ -11545,6 +12344,13 @@ impl Codegen {
                 let last_idx = self.data_values.len() - 1;
                 if self.data_bad.iter().any(|(_, last, _)| *last == last_idx) {
                     writeln!(self.code, "__DBAD_E{last_idx}:").unwrap();
+                }
+            }
+            // Label any DATA line the walk missed, at the end of the pool.
+            // RESET tables name every entry, and a READ from here is ?OUT OF DATA.
+            for (line_no, _) in &self.data_line_offsets {
+                if emitted.insert(*line_no) {
+                    writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
                 }
             }
             // End-of-pool marker: `__DATA_CHK`'s ?OUT OF DATA bound, and the layout marker every later pass keys off.
@@ -11898,16 +12704,51 @@ impl Codegen {
             writeln!(self.code, "__INSERT_BOX_TMP:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
-        if self.used_use_field {
-            // Field width (# count) for the current __USE_FIELD call,
-            // plus offset+len scratch used while skipping FOUT's sign
-            // byte and measuring the digit run.
-            writeln!(self.code, "__USE_FIELD_WIDTH:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__USE_FIELD_OFF:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__USE_FIELD_LEN:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
+        if self.used_str_snap {
+            writeln!(self.code, "__SNAP_PTR:").unwrap();
+            writeln!(self.code, "    .byte $00,$00").unwrap();
+            writeln!(self.code, "__STRCMP_SNAP:").unwrap();
+            writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
+        }
+        if self.used_use_format {
+            // TSB `USE` workspace. __UF_DESC is the eight-byte field
+            // descriptor the codegen copies in before each field:
+            //   +0 first integer digit offset   +4 fill byte
+            //   +1 integer digit count          +5 sign kind (0/1/2)
+            //   +2 fraction digit count         +6 sign offset
+            //   +3 first fraction digit offset  +7 field start offset
+            writeln!(self.code, "__UF_DESC:").unwrap();
+            writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
+            for slot in [
+                "__UF_NEG", "__UF_S0", "__UF_DOT", "__UF_HASE", "__UF_END", "__UF_ILEN",
+                "__UF_CARRY", "__UF_CNT", "__UF_ECHO",
+            ] {
+                writeln!(self.code, "{slot}:").unwrap();
+                writeln!(self.code, "    .byte $00").unwrap();
+            }
+            writeln!(self.code, "__UF_SAVE:").unwrap();
+            writeln!(self.code, "    .byte $00,$00").unwrap();
+            // The mask image the fields overwrite and __USE_SHOW prints.
+            writeln!(self.code, "__USE_BUF:").unwrap();
+            for _ in 0..self.use_buf_len {
+                writeln!(self.code, "    .byte $00").unwrap();
+            }
+        }
+        if self.used_use_dyn {
+            // Runtime scanner workspace. __USE_SRC is the pristine control image:
+            // __USE_BUF is overwritten as digits go in.
+            writeln!(self.code, "__USE_SRC:").unwrap();
+            for _ in 0..USE_DYN_BUF_LEN {
+                writeln!(self.code, "    .byte $00").unwrap();
+            }
+            for slot in [
+                "__UF_NF", "__UF_LEN", "__RS_I", "__RS_N", "__RS_RS", "__RS_RE", "__RS_BS",
+                "__RS_BE", "__RS_SEPAT", "__RS_SGN", "__RS_SGNAT", "__RS_PAD", "__RS_HASD",
+                "__RS_WANT", "__RS_OK", "__UF_OVERRUN",
+            ] {
+                writeln!(self.code, "{slot}:").unwrap();
+                writeln!(self.code, "    .byte $00").unwrap();
+            }
         }
         if self.used_mmob_glide {
             // Per-sprite glide delay. MOB SET and inline MMOB/RLOCMOB
@@ -12032,6 +12873,13 @@ impl Codegen {
             writeln!(self.code, "__TI_MID:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__TI_LO:").unwrap();
+            writeln!(self.code, "    .byte $00").unwrap();
+        }
+        if self.used_hardcopy {
+            // Row pointer is $FB/$FC. Only the two counters live here.
+            writeln!(self.code, "__HC_ROW:").unwrap();
+            writeln!(self.code, "    .byte $00").unwrap();
+            writeln!(self.code, "__HC_COL:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
         if self.used_read_ti {
@@ -13876,6 +14724,24 @@ impl Codegen {
                 color3,
             } => self.emit_bckgnds(color0, color1, color2, color3)?,
             Stmt::Nrm => self.emit_nrm(),
+            Stmt::HardCopy => self.emit_hardcopy(),
+            Stmt::Cold => self.emit_cold(),
+            Stmt::Retrace => self.emit_retrace(),
+            Stmt::UseFormat {
+                at,
+                mask,
+                fields,
+                values,
+                newline,
+                bad_mode,
+            } => self.emit_use_format(at, mask, fields, values, *newline, *bad_mode)?,
+            Stmt::UseFormatDyn {
+                at,
+                ctrl,
+                values,
+                newline,
+                bad_mode,
+            } => self.emit_use_format_dyn(at, ctrl, values, *newline, *bad_mode)?,
             Stmt::MemModeOn => self.emit_mem_mode_on(),
             Stmt::Cset { mode } => self.emit_cset(mode)?,
             Stmt::Pause { message, ticks } => self.emit_pause(message.as_ref(), ticks)?,
@@ -13974,26 +14840,50 @@ impl Codegen {
                     writeln!(self.code, "    JSR __DATA_INIT").unwrap();
                 }
             }
-            Stmt::Reset { line } => {
-                // Point the DATA pointer at the `__DATA_LINE_<n>:`
-                // label dropped by the pool emitter for this line.
-                // If the named line never produced a DATA item the
-                // label doesn't exist — fall back to RESTORE so
-                // the pointer at least lands at the pool start
-                // (mirroring behaviour for an "empty"
-                // RESET target: the read pointer just sits at
-                // whatever happened to be next).
-                if self.data_line_offsets.iter().any(|(l, _)| *l == *line) {
-                    writeln!(self.code, "    LDA #<__DATA_LINE_{line}").unwrap();
-                    writeln!(self.code, "    STA {}", self.data_cur_lo()).unwrap();
-                    writeln!(self.code, "    LDA #>__DATA_LINE_{line}").unwrap();
-                    writeln!(self.code, "    STA {}", self.data_cur_hi()).unwrap();
-                } else if !self.data_values.is_empty() {
-                    writeln!(self.code, "    JSR __DATA_INIT").unwrap();
+            Stmt::Reset { target } => {
+                // TSB RESET is RESTORE to a line: first DATA item on a program line
+                // >= the argument, not an exact match. Past the last DATA line,
+                // point at __DATA_END so the next READ is ?OUT OF DATA.
+                let resolve = |line: u16| -> Option<u16> {
+                    self.data_line_offsets
+                        .iter()
+                        .map(|(l, _)| *l)
+                        .filter(|l| *l >= line)
+                        .min()
+                };
+                if let Some(line) = as_u16_literal(target) {
+                    match resolve(line) {
+                        Some(l) => {
+                            writeln!(self.code, "    LDA #<__DATA_LINE_{l}").unwrap();
+                            writeln!(self.code, "    STA {}", self.data_cur_lo()).unwrap();
+                            writeln!(self.code, "    LDA #>__DATA_LINE_{l}").unwrap();
+                            writeln!(self.code, "    STA {}", self.data_cur_hi()).unwrap();
+                        }
+                        None if !self.data_values.is_empty() => {
+                            writeln!(self.code, "    LDA #<__DATA_END").unwrap();
+                            writeln!(self.code, "    STA {}", self.data_cur_lo()).unwrap();
+                            writeln!(self.code, "    LDA #>__DATA_END").unwrap();
+                            writeln!(self.code, "    STA {}", self.data_cur_hi()).unwrap();
+                        }
+                        None => {}
+                    }
+                } else if self.data_values.is_empty() {
+                    // No DATA: evaluate the argument anyway, then READ raises ?OUT OF DATA.
+                    self.emit_expr_to_fac(target)?;
+                    self.emit_facword_rom();
+                    self.invalidate_fac_cache();
+                } else {
+                    // Runtime argument. Goes through ROM GETADR, which raises
+                    // ?ILLEGAL QUANTITY outside 0..65535 and truncates a fraction.
+                    self.emit_expr_to_fac(target)?;
+                    self.emit_facword_rom();
+                    writeln!(self.code, "    JSR __RESET_FIND").unwrap();
+                    self.used_reset_find = true;
+                    self.invalidate_fac_cache();
                 }
             }
-            Stmt::Get { var, indices } => self.emit_get(var, indices)?,
             Stmt::KeyGet { var } => self.emit_keyget(var)?,
+            Stmt::Get { var, indices } => self.emit_get(var, indices)?,
             Stmt::Fetch {
                 control,
                 max_len,
@@ -14913,9 +15803,14 @@ impl Codegen {
         keys: &StrExpr,
         target: Option<crate::ast::OnKeyAction>,
     ) -> Result<(), CodegenError> {
+        // TSB has no `ON KEY <str> GOTO n`. The handler is the rest of the line
+        // after the key string, which is not implemented. The GOTO form we accept
+        // is not a TSB form.
         let Some(action) = target else {
             return Err(CodegenError::Unsupported(
-                "ON KEY without GOTO/GOSUB target",
+                "ON KEY: the handler is the rest of the line after the key string, \
+                 which is not implemented yet -- note that the `ON KEY <str> GOTO n` \
+                 form this compiler does accept is not a form real TSB has",
             ));
         };
         let key_label = match keys {
@@ -15143,6 +16038,10 @@ impl Codegen {
     fn emit_keyget(&mut self, var: &VarName) -> Result<(), CodegenError> {
         let wait = format!("__KEYGET_WAIT_{}", self.fresh_id());
         let label = self.intern_var(var.clone());
+        // TSB flushes the keyboard buffer before waiting ($C6 = 0).
+        // INPUT does not flush; do not share a rule.
+        writeln!(self.code, "    LDA #$00").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::KBD_BUF_NDX).unwrap();
         writeln!(self.code, "{wait}:").unwrap();
         writeln!(self.code, "    JSR ${:04X}", rt::GETIN).unwrap();
         writeln!(self.code, "    BEQ {wait}").unwrap();
@@ -15398,6 +16297,12 @@ impl Codegen {
             (bottom.clone(), right.clone(), one.clone(), one.clone()),
         ];
 
+        // Bounds first: the colour fill below already writes.
+        self.emit_tsb_rect_dims(row, col, width, height)?;
+        writeln!(self.code, "    JSR __INSERT_BOX_BOUNDS").unwrap();
+        self.used_insert_box_runtime = true;
+        self.used_tsb_bad_mode = true;
+
         // Fill colours over the whole box first; the char writes then
         // only need to touch screen RAM.
         self.emit_tsb_screen_rect(
@@ -15410,15 +16315,7 @@ impl Codegen {
             Some(color),
         )?;
 
-        // A non-9-byte literal pattern can never work — flag it now
-        // rather than at runtime.
-        if let StrExpr::Literal(b) = pattern {
-            if b.len() != 9 {
-                return Err(CodegenError::Unsupported(
-                    "INSERT box pattern must contain exactly 9 characters",
-                ));
-            }
-        }
+        // Length is checked at run time by __INSERT_BOX_PARSE (?ILLEGAL QUANTITY).
         // Always go through `__INSERT_BOX_PARSE`: it validates length
         // and applies PETSCII-to-screen conversion plus $C7 reverse state.
         self.emit_strexpr_pointer_to_ay(pattern)?;
@@ -16269,8 +17166,15 @@ impl Codegen {
         // CSE: if we just computed this exact address and nothing has
         // clobbered ARRAY_ADDR_LO/HI in the meantime, skip the whole
         // emission. Caller still ends up reading/writing via $FD/$FE.
+        // Only reuse when the subscripts read the same element again.
+        // `A(TI)` and `A(PEEK($D012))` match structurally but not at run time.
         if let Some((cached_name, cached_idx)) = &self.last_array_addr {
-            if cached_name == name && cached_idx.as_slice() == indices {
+            if cached_name == name
+                && cached_idx.as_slice() == indices
+                && indices
+                    .iter()
+                    .all(crate::passes::expr_reads_are_repeatable)
+            {
                 writeln!(
                     self.code,
                     "    ; reuse ARRAY_ADDR for {}({})",
@@ -17698,20 +18602,6 @@ impl Codegen {
                     writeln!(self.code, "    TAX").unwrap();
                     writeln!(self.code, "    CLC").unwrap();
                     writeln!(self.code, "    JSR ${:04X}", rt::PLOT).unwrap();
-                    self.invalidate_fac_cache();
-                }
-                PrintPiece::UseField { width, value } => {
-                    // Right-justified, space-padded numeric field from
-                    // a `USE "...###...", val` placeholder. Eval
-                    // the value to FAC, stash the width, jump to the
-                    // helper. Width 0 = "print as-is" (no padding,
-                    // strip the FOUT leading space — happens when a
-                    // var has no matching `#`-run).
-                    self.emit_expr_to_fac(value)?;
-                    writeln!(self.code, "    LDA #${:02X}", *width).unwrap();
-                    writeln!(self.code, "    STA __USE_FIELD_WIDTH").unwrap();
-                    writeln!(self.code, "    JSR __USE_FIELD").unwrap();
-                    self.used_use_field = true;
                     self.invalidate_fac_cache();
                 }
             }
@@ -20038,6 +20928,42 @@ impl Codegen {
         Ok(())
     }
 
+    /// Shared line-number search: read LINNUM and tail-jump to `L<n>:`,
+    /// or fall through to `fail_label` (emitted here) if none matches.
+    /// Groups lines by high byte so each run tests HI once. Clobbers A and X.
+    fn emit_line_number_search(&mut self, tag: &str, fail_label: &str) {
+        writeln!(self.code, "    LDX ${:02X}", rt::LINNUM_HI).unwrap();
+        writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+        let lines = self.line_numbers.clone();
+        let mut i = 0usize;
+        let mut group = 0usize;
+        while i < lines.len() {
+            let hi = (lines[i] >> 8) as u8;
+            let mut j = i;
+            while j < lines.len() && (lines[j] >> 8) as u8 == hi {
+                j += 1;
+            }
+            // Branch over the run body rather than past it, so every branch
+            // here stays in short range no matter how long the run is.
+            writeln!(self.code, "    CPX #${hi:02X}").unwrap();
+            writeln!(self.code, "    BEQ __{tag}_B{group}").unwrap();
+            writeln!(self.code, "    JMP __{tag}_G{}", group + 1).unwrap();
+            writeln!(self.code, "__{tag}_B{group}:").unwrap();
+            for (k, &line) in lines[i..j].iter().enumerate() {
+                writeln!(self.code, "    CMP #${:02X}", (line & 0xFF) as u8).unwrap();
+                writeln!(self.code, "    BNE __{tag}_N{group}_{k}").unwrap();
+                writeln!(self.code, "    JMP L{line}").unwrap();
+                writeln!(self.code, "__{tag}_N{group}_{k}:").unwrap();
+            }
+            // High byte matched but no line in the run did: no line can match.
+            writeln!(self.code, "    JMP {fail_label}").unwrap();
+            writeln!(self.code, "__{tag}_G{}:", group + 1).unwrap();
+            i = j;
+            group += 1;
+        }
+        writeln!(self.code, "{fail_label}:").unwrap();
+    }
+
     fn emit_computed_goto(&mut self, target: &Expr) -> Result<(), CodegenError> {
         // Literal target: collapse to a direct JMP (or an
         // ?UNDEFINED STATEMENT trap if the line doesn't exist).
@@ -20058,19 +20984,16 @@ impl Codegen {
             self.emit_expr_to_fac(target)?;
             self.emit_facword_rom();
         }
-        for line in self.line_numbers.clone() {
-            let lo = (line & 0xFF) as u8;
-            let hi = (line >> 8) as u8;
-            let next = format!("__CGOTO_NEXT_{}", self.fresh_id());
-            writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-            writeln!(self.code, "    CMP #${lo:02X}").unwrap();
-            writeln!(self.code, "    BNE {next}").unwrap();
-            writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-            writeln!(self.code, "    CMP #${hi:02X}").unwrap();
-            writeln!(self.code, "    BNE {next}").unwrap();
-            writeln!(self.code, "    JMP L{line}").unwrap();
-            writeln!(self.code, "{next}:").unwrap();
+        // Emit the line search once. Later `GOTO <expr>` sites jump into it.
+        // It only reads LINNUM and tail-jumps to `L<n>:`. CURLIN stays on the
+        // jumping line, so ?UNDEFINED STATEMENT names that line.
+        if self.cgoto_dispatch_emitted {
+            writeln!(self.code, "    JMP __CGOTO_DISPATCH").unwrap();
+            return Ok(());
         }
+        self.cgoto_dispatch_emitted = true;
+        writeln!(self.code, "__CGOTO_DISPATCH:").unwrap();
+        self.emit_line_number_search("CGOTO", "__CGOTO_FAIL");
         writeln!(self.code, "    LDX #${:02X}", rt::ERR_UNDEF_STATEMENT).unwrap();
         self.emit_jmp_basic_error();
         Ok(())
@@ -21480,10 +22403,9 @@ impl Codegen {
             writeln!(self.code, "    LDX #<{slot_label}").unwrap();
             writeln!(self.code, "    LDY #>{slot_label}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
-            // After MOVMF, FAC still holds STEP — its sign byte is at
-            // FAC_SIGN. Stash a single byte so NEXT can branch without
-            // re-loading the slot.
-            writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
+            // FAC still holds STEP after MOVMF. Stash ROM SGN ($BC2B), not FAC_SIGN:
+            // `$66` cannot tell +0.0 from a positive step, so STEP 0 would never end.
+            writeln!(self.code, "    JSR ${:04X}", rt::SIGN).unwrap();
             writeln!(self.code, "    STA {sign_label}").unwrap();
             self.used_dyn_step = true;
             StepLoc::Dynamic {
@@ -22440,7 +23362,22 @@ impl Codegen {
             "__FOR_CONT_{}",
             frame.exit_label.trim_start_matches("__FOR_EXIT_")
         );
-        let step_is_zero = matches!(step_const_value, Some(v) if v == 0.0);
+        // Use the pooled MFLPT, not the folded f64. `STEP 1E-40` is nonzero as f64
+        // and all-zero MFLPT, so the f64 test would treat it as STEP>0.
+        let step_mflpt = step_const_value.map(round_to_mflpt);
+        let step_is_zero = matches!(step_mflpt, Some(v) if v == 0.0);
+        // A dynamic STEP can be zero: ROM exits iff counter == end, the opposite
+        // of the BEQ-cont below. Handle that in a separate tail.
+        let dyn_zero_label = match (&frame.step_loc, step_const_value) {
+            (StepLoc::Dynamic { sign_label, .. }, None) => {
+                let id = self.fresh_id();
+                let l = format!("__FOR_DYN_ZS_{id}");
+                writeln!(self.code, "    LDA {sign_label}").unwrap();
+                writeln!(self.code, "    BEQ {l}").unwrap();
+                Some(l)
+            }
+            _ => None,
+        };
         writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
         if step_is_zero {
             writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
@@ -22450,7 +23387,7 @@ impl Codegen {
         }
         writeln!(self.code, "    BEQ {cont_label}").unwrap();
         writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-        match (step_const_value, &frame.step_loc) {
+        match (step_mflpt, &frame.step_loc) {
             (Some(v), _) if v > 0.0 => {
                 writeln!(self.code, "    BPL {}", frame.exit_label).unwrap();
             }
@@ -22479,6 +23416,13 @@ impl Codegen {
         }
         writeln!(self.code, "{cont_label}:").unwrap();
         writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
+        // Dynamic STEP 0: ROM exits iff FCOMP(counter, limit) is equal.
+        if let Some(l) = dyn_zero_label {
+            writeln!(self.code, "{l}:").unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
+            writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
+            writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
+        }
         writeln!(self.code, "{}:", frame.exit_label).unwrap();
     }
 
@@ -22706,8 +23650,19 @@ impl Codegen {
                     self.used_read_ti = true;
                 } else if v.kind == VarKind::Float && v.base == "ST" {
                     // KERNAL status byte at $90 — last file-I/O result.
-                    writeln!(self.code, "    LDY ${:02X}", rt::ST).unwrap();
-                    writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
+                    // ROM floats ST as a signed byte ($80 is -128, $FF is -1).
+                    // Sign-extend and go through GIVAYF. Use READST, not a peek
+                    // at $90: RS-232 returns $0297 and clears it.
+                    let id = self.fresh_id();
+                    let pos = format!("__ST_POS_{id}");
+                    writeln!(self.code, "    JSR ${:04X}", rt::READST).unwrap();
+                    writeln!(self.code, "    TAY").unwrap();
+                    writeln!(self.code, "    LDA #$00").unwrap();
+                    writeln!(self.code, "    CPY #$80").unwrap();
+                    writeln!(self.code, "    BCC {pos}").unwrap();
+                    writeln!(self.code, "    LDA #$FF").unwrap();
+                    writeln!(self.code, "{pos}:").unwrap();
+                    writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
                 } else if v.kind == VarKind::Float && v.base == "ER" && !self.er_el_as_user_var {
                     // ERR pseudo-variable: error code from the most
                     // recent error caught by ON ERROR. The slot is
@@ -23289,6 +24244,14 @@ impl Codegen {
         rhs: &StrExpr,
     ) -> Result<(), CodegenError> {
         self.emit_strexpr_pointer_to_ay(lhs)?;
+        // `TI$` and GET rebuild one shared slot. Snapshot the left side when
+        // both operands read that kind of storage, or the right side overwrites it.
+        if !crate::passes::str_reads_are_repeatable(lhs)
+            && !crate::passes::str_reads_are_repeatable(rhs)
+        {
+            writeln!(self.code, "    JSR __STR_SNAP").unwrap();
+            self.used_str_snap = true;
+        }
         writeln!(self.code, "    PHA").unwrap();
         writeln!(self.code, "    TYA").unwrap();
         writeln!(self.code, "    PHA").unwrap();
@@ -25552,6 +26515,217 @@ impl Codegen {
         self.emit_poke_literal_addr(0xD023, color2)?;
         self.emit_poke_literal_addr(0xD024, color3)?;
         Ok(())
+    }
+
+    /// TSB `USE`: copy the control string into a buffer, overwrite each field
+    /// in place, then print the buffer. Overflow leaves the mask; a rounding
+    /// carry can walk left into the surrounding text.
+    fn emit_use_format(
+        &mut self,
+        at: &Option<(Expr, Expr)>,
+        mask: &[u8],
+        fields: &[crate::ast::UseFieldDesc],
+        values: &[Expr],
+        newline: bool,
+        bad_mode: crate::ast::UseBadMode,
+    ) -> Result<(), CodegenError> {
+        use crate::ast::UseSign;
+        if let Some((row, col)) = at {
+            self.emit_byte_expr_to_a(row)?;
+            writeln!(self.code, "    PHA").unwrap();
+            self.emit_byte_expr_to_a(col)?;
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::PLOT).unwrap();
+            self.invalidate_fac_cache();
+        }
+        let len = mask.len() as u8;
+        self.use_buf_len = self.use_buf_len.max(len);
+        self.used_use_format = true;
+        let mask_label = self.intern_string(mask.to_vec());
+        writeln!(self.code, "    LDA #<{mask_label}").unwrap();
+        writeln!(self.code, "    LDY #>{mask_label}").unwrap();
+        writeln!(self.code, "    LDX #${len:02X}").unwrap();
+        writeln!(self.code, "    JSR __USE_LOAD").unwrap();
+        self.invalidate_fac_cache();
+        // Walk fields run by run. An overflow echoes and TSB skips the rest of
+        // that run (later fields do not take a value). A field with no value
+        // left is ?BAD MODE and prints nothing.
+        let mut vi = 0usize;
+        let mut fi = 0usize;
+        while fi < fields.len() {
+            let run_end = fields[fi].run_end;
+            let n = fields[fi..]
+                .iter()
+                .take_while(|f| f.run_end == run_end)
+                .count();
+            let id = self.fresh_id();
+            let run_done = format!("__USE_RUN_{id}");
+            let mut chained = false;
+            for k in 0..n {
+                let field = &fields[fi + k];
+                let Some(value) = values.get(vi) else {
+                    self.used_tsb_bad_mode = true;
+                    writeln!(self.code, "    JMP __TSB_BAD_MODE").unwrap();
+                    break;
+                };
+                vi += 1;
+                // Eight constant bytes, pooled like any other literal.
+                let desc = vec![
+                    field.digits,
+                    field.int_digits,
+                    field.dec_digits,
+                    field.dec_at,
+                    field.pad,
+                    match field.sign {
+                        None => 0,
+                        Some(UseSign::Plus) => 1,
+                        Some(UseSign::Minus) => 2,
+                    },
+                    field.sign_at,
+                    field.start,
+                ];
+                let desc_label = self.intern_string(desc);
+                writeln!(self.code, "    LDA #<{desc_label}").unwrap();
+                writeln!(self.code, "    LDY #>{desc_label}").unwrap();
+                writeln!(self.code, "    JSR __USE_DESC").unwrap();
+                self.emit_expr_to_fac(value)?;
+                writeln!(self.code, "    JSR __USE_FLD").unwrap();
+                self.invalidate_fac_cache();
+                if k + 1 < n {
+                    writeln!(self.code, "    LDA __UF_ECHO").unwrap();
+                    writeln!(self.code, "    BNE {run_done}").unwrap();
+                    chained = true;
+                }
+            }
+            if chained {
+                writeln!(self.code, "{run_done}:").unwrap();
+            }
+            fi += n;
+        }
+        writeln!(self.code, "    LDX #${len:02X}").unwrap();
+        writeln!(self.code, "    JSR __USE_SHOW").unwrap();
+        self.invalidate_fac_cache();
+        // Extra values: flush the buffer with no trailing CR, then ?BAD MODE.
+        // The error message already starts with CR.
+        if bad_mode == crate::ast::UseBadMode::After {
+            self.used_tsb_bad_mode = true;
+            writeln!(self.code, "    JMP __TSB_BAD_MODE").unwrap();
+            self.invalidate_fac_cache();
+            self.invalidate_array_addr_cache();
+            return Ok(());
+        }
+        if newline {
+            writeln!(self.code, "    LDA #$0D").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+        }
+        self.invalidate_array_addr_cache();
+        Ok(())
+    }
+
+    /// `USE <string expression>, v...`: same as the literal form, mask at run time.
+    /// The scanner matches `parse_use_mask`.
+    fn emit_use_format_dyn(
+        &mut self,
+        at: &Option<(Expr, Expr)>,
+        ctrl: &StrExpr,
+        values: &[Expr],
+        newline: bool,
+        bad_mode: crate::ast::UseBadMode,
+    ) -> Result<(), CodegenError> {
+        // Too few values: TSB prints nothing, not even AT(). Just raise.
+        if bad_mode == crate::ast::UseBadMode::Before {
+            self.used_tsb_bad_mode = true;
+            writeln!(self.code, "    JMP __TSB_BAD_MODE").unwrap();
+            self.invalidate_fac_cache();
+            self.invalidate_array_addr_cache();
+            return Ok(());
+        }
+        if let Some((row, col)) = at {
+            self.emit_byte_expr_to_a(row)?;
+            writeln!(self.code, "    PHA").unwrap();
+            self.emit_byte_expr_to_a(col)?;
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::PLOT).unwrap();
+            self.invalidate_fac_cache();
+        }
+        self.used_use_format = true;
+        self.used_use_dyn = true;
+        // Buffer must hold any control string the program can build.
+        self.use_buf_len = self.use_buf_len.max(USE_DYN_BUF_LEN);
+        self.emit_strexpr_pointer_to_ay(ctrl)?;
+        writeln!(self.code, "    JSR __USE_LOADV").unwrap();
+        writeln!(self.code, "    JSR __USE_RTSCAN").unwrap();
+        // A trailing comma is an extra value the mask cannot reach.
+        writeln!(
+            self.code,
+            "    LDA #${:02X}",
+            u8::from(bad_mode == crate::ast::UseBadMode::After)
+        )
+        .unwrap();
+        writeln!(self.code, "    STA __UF_OVERRUN").unwrap();
+        self.invalidate_fac_cache();
+        for (i, value) in values.iter().enumerate() {
+            let id = self.fresh_id();
+            let skip = format!("__USE_SKIP_{id}");
+            writeln!(self.code, "    LDA #${:02X}", (i & 0xFF) as u8).unwrap();
+            writeln!(self.code, "    JSR __USE_DESC_RT").unwrap();
+            // Carry set: no field left for this value, so do not evaluate it.
+            writeln!(self.code, "    BCS {skip}").unwrap();
+            self.emit_expr_to_fac(value)?;
+            writeln!(self.code, "    JSR __USE_FLD").unwrap();
+            writeln!(self.code, "{skip}:").unwrap();
+            self.invalidate_fac_cache();
+        }
+        // Too few values: raise before the flush. Too many: print, then raise.
+        writeln!(self.code, "    LDA #${:02X}", (values.len() & 0xFF) as u8).unwrap();
+        writeln!(self.code, "    JSR __USE_COUNT_CHK").unwrap();
+        writeln!(self.code, "    LDX __UF_LEN").unwrap();
+        writeln!(self.code, "    JSR __USE_SHOW").unwrap();
+        self.invalidate_fac_cache();
+        self.used_tsb_bad_mode = true;
+        let id = self.fresh_id();
+        let ok = format!("__USE_OK_{id}");
+        writeln!(self.code, "    LDA __UF_OVERRUN").unwrap();
+        writeln!(self.code, "    BEQ {ok}").unwrap();
+        writeln!(self.code, "    JMP __TSB_BAD_MODE").unwrap();
+        writeln!(self.code, "{ok}:").unwrap();
+        if newline {
+            writeln!(self.code, "    LDA #$0D").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+        }
+        self.invalidate_array_addr_cache();
+        Ok(())
+    }
+
+    /// TSB `COLD`: full machine reset. Force $01=$37 so $FFFC is the KERNAL ROM.
+    fn emit_cold(&mut self) {
+        writeln!(self.code, "    SEI").unwrap();
+        writeln!(self.code, "    LDA #$37").unwrap();
+        writeln!(self.code, "    STA $01").unwrap();
+        writeln!(self.code, "    JMP ($FFFC)").unwrap();
+    }
+
+    /// TSB `RETRACE`: print the 12-byte build stamp, no extra CR.
+    fn emit_retrace(&mut self) {
+        for b in [
+            0x41u8, 0x44, 0x32, 0x33, 0x0D, 0x32, 0x2E, 0x36, 0x30, 0x32, 0x32, 0x38,
+        ] {
+            writeln!(self.code, "    LDA #${b:02X}").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
+        }
+        self.invalidate_fac_cache();
+    }
+
+    fn emit_hardcopy(&mut self) {
+        self.used_hardcopy = true;
+        writeln!(self.code, "    JSR __HRDCPY").unwrap();
+        self.invalidate_fac_cache();
     }
 
     fn emit_nrm(&mut self) {
@@ -28517,12 +29691,92 @@ fn scan_module_references_irq_workspace(module: &ir::Module) -> bool {
     module.lines.iter().any(|l| stmts_have(&l.stmts, &in_range))
 }
 
+/// True when the program reads or writes TSB's default-device cell
+/// (`USE <n>` / `USE` as an expression).
+fn scan_module_touches_tsb_device(module: &ir::Module) -> bool {
+    let is_dev = |e: &Expr| {
+        matches!(e, Expr::Number(n)
+            if *n == f64::from(crate::runtime::TSB_DEFAULT_DEVICE))
+    };
+    struct Find<F: Fn(&Expr) -> bool> {
+        found: bool,
+        is_dev: F,
+    }
+    impl<F: Fn(&Expr) -> bool> crate::visit::Visitor for Find<F> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Peek(addr) = e
+                && (self.is_dev)(addr)
+            {
+                self.found = true;
+                return;
+            }
+            crate::visit::walk_expr(self, e);
+        }
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            if self.found {
+                return;
+            }
+            if let Stmt::Poke { addr, .. } = stmt
+                && (self.is_dev)(addr)
+            {
+                self.found = true;
+                return;
+            }
+            crate::visit::walk_stmt(self, line, stmt);
+        }
+    }
+    let mut f = Find {
+        found: false,
+        is_dev,
+    };
+    crate::visit::walk_module(&mut f, module);
+    f.found
+}
+
 /// True iff any statement in the program is a extension-specific
 /// construct (MEM/MOB/HIRES/MUSIC/FLASH/CSET/COLOR/ON-KEY/etc.).
 /// Used by the prologue to decide which `$D018` default the user
 /// expects: programs using extended statements get lowercase chars,
 /// while stock BASIC v2 keeps the KERNAL uppercase/graphics default.
+/// True if the program uses a TSB-only function (NRM, LIN, JOY, and so on).
+fn scan_module_uses_tsb_neo_exprs(module: &ir::Module) -> bool {
+    struct Find(bool);
+    impl crate::visit::Visitor for Find {
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.0 {
+                return;
+            }
+            if matches!(
+                e,
+                Expr::Nrm(_)
+                    | Expr::Lin
+                    | Expr::Joy(_)
+                    | Expr::Pot(_)
+                    | Expr::At(_, _)
+                    | Expr::Test(_, _)
+                    | Expr::Check { .. }
+                    | Expr::Inst { .. }
+                    | Expr::Inkey
+                    | Expr::MemPeek(_)
+            ) {
+                self.0 = true;
+                return;
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut f = Find(false);
+    crate::visit::walk_module(&mut f, module);
+    f.0
+}
+
 fn scan_module_uses_tsb_neo_features(module: &ir::Module) -> bool {
+    if scan_module_uses_tsb_neo_exprs(module) {
+        return true;
+    }
     scan_module_for_stmt(module, |s| {
         matches!(
             s,
@@ -28536,6 +29790,9 @@ fn scan_module_uses_tsb_neo_features(module: &ir::Module) -> bool {
                 | Stmt::Wave { .. }
                 | Stmt::Hires { .. }
                 | Stmt::Nrm
+                | Stmt::HardCopy
+                | Stmt::Cold
+                | Stmt::Retrace
                 | Stmt::Cset { .. }
                 | Stmt::Color { .. }
                 | Stmt::HiCol
@@ -28556,6 +29813,8 @@ fn scan_module_uses_tsb_neo_features(module: &ir::Module) -> bool {
                 | Stmt::KeyGet { .. }
                 | Stmt::DisplayKeys
                 | Stmt::Reset { .. }
+                | Stmt::UseFormat { .. }
+                | Stmt::UseFormatDyn { .. }
                 | Stmt::Text { .. }
                 | Stmt::Draw { .. }
                 | Stmt::Line { .. }
@@ -30251,7 +31510,8 @@ fn stmt_cannot_error(s: &Stmt) -> bool {
             | Stmt::End
             | Stmt::Data(_)
             | Stmt::Restore
-            | Stmt::Reset { .. }
+            // RESET goes through GETADR (?ILLEGAL QUANTITY outside 0..65535),
+            // so CURLIN must stay on this line.
             | Stmt::DefFn { .. }
     )
 }
@@ -37326,7 +38586,7 @@ __LOOP:
         // No FAC dance, no per-line CMP table, no undef-line trap
         // (the target is statically valid).
         assert!(
-            !asm.contains("__CGOTO_NEXT_"),
+            !asm.contains("__CGOTO_DISPATCH"),
             "no dispatch chain for literal target:\n{asm}"
         );
     }

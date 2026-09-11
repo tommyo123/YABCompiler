@@ -3515,7 +3515,9 @@ fn helper_shape(items: &[Item], label_idx: usize, zp: &ZpEquates) -> Option<Help
     }
 }
 
-/// Every label mentioned by an operand or a `.word`, with a count.
+/// Every label mentioned by an instruction operand or a directive, with a count.
+///
+/// Directives include split `.byte <__FOO` / `.byte >__FOO` pointer tables.
 fn label_ref_counts(items: &[Item]) -> std::collections::HashMap<String, usize> {
     let mut refs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for it in items {
@@ -3527,11 +3529,9 @@ fn label_ref_counts(items: &[Item]) -> std::collections::HashMap<String, usize> 
                     }
                 }
             }
-            Item::Directive(raw) => {
-                if let Some(rest) = raw.trim_start().strip_prefix(".word") {
-                    for label in extract_labels_from_operand(rest) {
-                        *refs.entry(label).or_insert(0) += 1;
-                    }
+            Item::Directive(raw) | Item::Origin(raw) => {
+                for label in directive_operand_labels(raw) {
+                    *refs.entry(label).or_insert(0) += 1;
                 }
             }
             _ => {}
@@ -5546,6 +5546,18 @@ fn extract_labels_from_operand(op: &str) -> Vec<String> {
     out
 }
 
+/// Labels named on a directive or origin line.
+///
+/// Strips the comment and the leading `.mnemonic` first, then scans the rest.
+fn directive_operand_labels(raw: &str) -> Vec<String> {
+    let body = raw.split(';').next().unwrap_or(raw).trim();
+    let operands = match body.strip_prefix('.') {
+        Some(rest) => rest.split_once(char::is_whitespace).map_or("", |(_, o)| o),
+        None => body,
+    };
+    extract_labels_from_operand(operands)
+}
+
 /// PH106 — factor `LDA #$00 ; LDY #imm ; JSR $B391` into a helper.
 ///
 /// This is the dominant int-byte-to-FAC pattern: integer constants
@@ -7519,12 +7531,9 @@ fn ph303_drop_unreferenced_trampolines(items: &mut Vec<Item>) -> bool {
                     }
                 }
             }
-            Item::Directive(raw) => {
-                // `.word __FOO` references the target as data.
-                if let Some(rest) = raw.trim_start().strip_prefix(".word") {
-                    for label in extract_labels_from_operand(rest) {
-                        *refs.entry(label).or_insert(0) += 1;
-                    }
+            Item::Directive(raw) | Item::Origin(raw) => {
+                for label in directive_operand_labels(raw) {
+                    *refs.entry(label).or_insert(0) += 1;
                 }
             }
             Item::Label(name) => {
@@ -7556,9 +7565,8 @@ fn ph303_drop_unreferenced_trampolines(items: &mut Vec<Item>) -> bool {
                         to_remove.push(j);
                     }
                     // Stacked label — pure alias with no body of
-                    // its own. Always safe to drop; the next item
-                    // is reached the same way it would have been
-                    // before.
+                    // its own. The next item is reached the same
+                    // way it would have been before.
                     Item::Label(_) => {
                         to_remove.push(i);
                     }
@@ -11967,6 +11975,69 @@ mod tests {
         }
         let got = run_default(&input);
         assert!(!got.contains("__SEQ_"));
+    }
+
+    /// A label named only from a split `.byte <label` / `.byte >label` pointer
+    /// table must survive, even when stacked in front of another label.
+    #[test]
+    fn ph303_keeps_a_label_named_only_by_a_split_byte_pointer_table() {
+        let input = concat!(
+            "    RTS\n",
+            "__TAB_LO:\n",
+            "    .byte <__DAT\n",
+            "__TAB_HI:\n",
+            "    .byte >__DAT\n",
+            "__DAT:\n",
+            "__NEXT:\n",
+            "    .byte $01\n",
+        );
+        for profile in [Profile::Default, Profile::Size] {
+            let got = run(input, profile);
+            assert!(
+                got.contains("__DAT:"),
+                "a .byte <label reference pins its target ({profile:?}):\n{got}"
+            );
+        }
+    }
+
+    /// An unnamed stacked label is dropped.
+    #[test]
+    fn ph303_still_drops_a_stacked_label_nothing_names() {
+        let input = concat!(
+            "    RTS\n",
+            "__TAB_LO:\n",
+            "    .byte <__DAT\n",
+            "__ORPHAN:\n",
+            "__DAT:\n",
+            "    .byte $01\n",
+        );
+        let got = run(input, Profile::Size);
+        assert!(
+            got.contains("__DAT:"),
+            "the named target still survives:\n{got}"
+        );
+        assert!(
+            !got.contains("__ORPHAN:"),
+            "a stacked label nothing names is still dropped:\n{got}"
+        );
+    }
+
+    /// A word in a comment, or the directive's own mnemonic, is not a
+    /// label reference.
+    #[test]
+    fn a_comment_word_is_not_a_label_reference() {
+        assert_eq!(
+            directive_operand_labels("    .byte $01  ; touches __DAT here"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            directive_operand_labels("    .byte <__DAT"),
+            vec!["__DAT".to_string()]
+        );
+        assert_eq!(
+            directive_operand_labels("    .word __A, __B"),
+            vec!["__A".to_string(), "__B".to_string()]
+        );
     }
 
     #[test]

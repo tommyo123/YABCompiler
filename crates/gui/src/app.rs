@@ -26,6 +26,50 @@ pub enum ProfileChoice {
     Size,
 }
 
+/// Keyword set for ASCII source. Same idea as `ProfileChoice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialectChoice {
+    #[default]
+    Auto,
+    BasicV2,
+    Tsb,
+}
+
+impl DialectChoice {
+    pub fn as_dialect(self) -> yabcompiler_core::Dialect {
+        match self {
+            Self::Auto => yabcompiler_core::Dialect::Auto,
+            Self::BasicV2 => yabcompiler_core::Dialect::BasicV2,
+            Self::Tsb => yabcompiler_core::Dialect::Tsb,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::BasicV2 => "BASIC V2",
+            Self::Tsb => "TSB",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                "Decide per program. A tokenized .prg is unambiguous; ASCII source is read as \
+                 BASIC V2 unless it uses an extension keyword where only a statement can go."
+            }
+            Self::BasicV2 => {
+                "Stock Commodore BASIC V2. Extension spellings like LINE, MAP and TEST are \
+                 ordinary variable names, exactly as on an unexpanded C64."
+            }
+            Self::Tsb => {
+                "Tuned Simons' BASIC. Extension spellings are keywords everywhere, even where a \
+                 BASIC V2 program would have meant a variable."
+            }
+        }
+    }
+}
+
 impl ProfileChoice {
     pub fn as_profile(self) -> Profile {
         match self {
@@ -69,6 +113,7 @@ pub struct YabApp {
 
     // Compile options
     profile: ProfileChoice,
+    dialect: DialectChoice,
     extraram: bool,
     force_extraram_off: bool,
     auto_reserve: bool,
@@ -108,6 +153,7 @@ impl Default for YabApp {
             asm_path: PathBuf::new(),
             write_asm: false,
             profile: ProfileChoice::default(),
+            dialect: DialectChoice::default(),
             extraram: false,
             force_extraram_off: false,
             auto_reserve: true,
@@ -390,6 +436,8 @@ impl YabApp {
                     ui.add_space(12.0);
                     self.profile_section(ui);
                     ui.add_space(12.0);
+                    self.dialect_section(ui);
+                    ui.add_space(12.0);
                     self.memory_section(ui);
                     ui.add_space(12.0);
                     self.reserved_section(ui);
@@ -515,6 +563,33 @@ impl YabApp {
         });
         ui.label(
             RichText::new(self.profile.description())
+                .color(theme_subtle_color(ui))
+                .small(),
+        );
+    }
+
+    /// Dialect picker for ASCII `.bas` input.
+    fn dialect_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("BASIC extension");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for choice in [
+                DialectChoice::Auto,
+                DialectChoice::Tsb,
+                DialectChoice::BasicV2,
+            ] {
+                let selected = self.dialect == choice;
+                if ui
+                    .add(egui::Button::selectable(selected, choice.label()))
+                    .on_hover_text(choice.description())
+                    .clicked()
+                {
+                    self.dialect = choice;
+                }
+            }
+        });
+        ui.label(
+            RichText::new(self.dialect.description())
                 .color(theme_subtle_color(ui))
                 .small(),
         );
@@ -819,7 +894,7 @@ impl YabApp {
     }
 
     fn run_list(&mut self) {
-        match pipeline::list_program(&self.input_path) {
+        match pipeline::list_program(&self.input_path, self.dialect.as_dialect()) {
             Ok(text) => {
                 self.log = text;
                 self.output_view = OutputView::Log;
@@ -833,7 +908,7 @@ impl YabApp {
     }
 
     fn run_dump(&mut self) {
-        match pipeline::dump_program(&self.input_path) {
+        match pipeline::dump_program(&self.input_path, self.dialect.as_dialect()) {
             Ok(text) => {
                 self.log = text;
                 self.output_view = OutputView::Log;
@@ -864,7 +939,7 @@ impl YabApp {
         let Some(target) = dialog.save_file() else {
             return;
         };
-        match pipeline::export_as_bas(&self.input_path, &target) {
+        match pipeline::export_as_bas(&self.input_path, &target, self.dialect.as_dialect()) {
             Ok(bytes_written) => {
                 let summary = format!(
                     "exported BASIC source: {} ({bytes_written} bytes)",
@@ -898,7 +973,7 @@ impl YabApp {
         let Some(target) = dialog.save_file() else {
             return;
         };
-        match pipeline::export_as_prg(&self.input_path, &target) {
+        match pipeline::export_as_prg(&self.input_path, &target, self.dialect.as_dialect()) {
             Ok(bytes_written) => {
                 let summary = format!(
                     "exported tokenised .prg: {} ({bytes_written} bytes)",
@@ -923,6 +998,7 @@ impl YabApp {
         let request = BuildRequest {
             input_path: &self.input_path,
             profile: self.profile.as_profile(),
+            dialect: self.dialect.as_dialect(),
             extraram: self.extraram,
             force_extraram_off: self.force_extraram_off,
             auto_reserve: self.auto_reserve,

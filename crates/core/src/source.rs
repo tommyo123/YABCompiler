@@ -805,6 +805,20 @@ pub fn tokenize_program_with(source: &str, dialect: Dialect) -> Result<Vec<u8>, 
     tokenize_program_at_with(source, LOAD_ADDR_C64, dialect)
 }
 
+/// Which dialect `Dialect::Auto` actually picks for this ASCII source.
+pub fn resolved_dialect(source: &str, dialect: Dialect) -> Dialect {
+    match dialect {
+        Dialect::Auto => {
+            if tsb_statement_evidence(source) {
+                Dialect::Tsb
+            } else {
+                Dialect::BasicV2
+            }
+        }
+        explicit => explicit,
+    }
+}
+
 /// Same as [`tokenize_program`] but with an explicit load address.
 /// Exposed for tests and for future targets (C128/PET) that don't
 /// share the C64 default.
@@ -821,6 +835,11 @@ fn tsb_table_for(
         Dialect::Tsb => (KEYWORDS_TSB.to_vec(), Vec::new()),
         Dialect::BasicV2 => (Vec::new(), Vec::new()),
         Dialect::Auto => {
+            // ASCII source has no `$64` prefix. Need TSB statement evidence
+            // before turning the extension table on.
+            if !tsb_statement_evidence(source) {
+                return (Vec::new(), Vec::new());
+            }
             let names = tsb_words_used_as_variables(source);
             if names.is_empty() {
                 return (KEYWORDS_TSB.to_vec(), Vec::new());
@@ -830,6 +849,123 @@ fn tsb_table_for(
             (live, demoted)
         }
     }
+}
+
+/// True if a TSB keyword is used as a statement, as `ELSE`, or as a function.
+/// Assignments like `MEM = 5` do not count.
+fn tsb_statement_evidence(source: &str) -> bool {
+    for raw_line in source.lines() {
+        let bytes = raw_line.as_bytes();
+        let mut i = 0usize;
+        let mut in_string = false;
+        let mut in_data = false;
+        // Skip the line number, then the first thing on the line is a statement.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let mut at_stmt_start = true;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_string {
+                if c == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' {
+                in_string = true;
+                at_stmt_start = false;
+                i += 1;
+                continue;
+            }
+            if in_data {
+                if c == b':' {
+                    in_data = false;
+                    at_stmt_start = true;
+                }
+                i += 1;
+                continue;
+            }
+            if match_keyword(&[("REM", 0x8Fu8)], bytes, i).is_some() {
+                break;
+            }
+            if match_keyword(&[("DATA", 0x83u8)], bytes, i).is_some() {
+                in_data = true;
+                at_stmt_start = false;
+                i += 4;
+                continue;
+            }
+            if c == b':' {
+                at_stmt_start = true;
+                i += 1;
+                continue;
+            }
+            if c.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if let Some((kw_len, _)) = match_keyword(KEYWORDS_TSB, bytes, i) {
+                // `ELSE` is TSB-only, so it counts even after THEN.
+                if kw_len == 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"ELSE") {
+                    return true;
+                }
+                // `MOD(10,3)` and `DIV(25,4)` are TSB functions, even in an
+                // expression.
+                let mut k = i + kw_len;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if !at_stmt_start && bytes.get(k) == Some(&b'(') {
+                    return true;
+                }
+            }
+            if at_stmt_start {
+                if let Some((kw_len, _)) = match_keyword(KEYWORDS_TSB, bytes, i) {
+                    // `NAME = ...` or `NAME(i) = ...` at statement start is a
+                    // variable assignment, not an extension statement.
+                    let mut j = i + kw_len;
+                    // `DIR%=1` and `MAP$="x"` are the variables DI% and MA$,
+                    // not TSB statements.
+                    if matches!(bytes.get(j), Some(b'%') | Some(b'$')) {
+                        j += 1;
+                    }
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'(') {
+                        let mut depth = 0usize;
+                        while j < bytes.len() {
+                            match bytes[j] {
+                                b'(' => depth += 1,
+                                b')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        j += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                    }
+                    if bytes.get(j) != Some(&b'=') {
+                        return true;
+                    }
+                }
+            }
+            at_stmt_start = false;
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Find extended keyword spellings used as variables outside strings, REM and DATA.
@@ -884,7 +1020,37 @@ fn tsb_words_used_as_variables(source: &str) -> std::collections::HashSet<&'stat
                 while bytes.get(j) == Some(&b' ') {
                     j += 1;
                 }
-                if bytes.get(j) == Some(&b'=') {
+                // Skip a subscript list so `MAP(1) = 7` demotes MAP the same
+                // way `MAP = 7` does.
+                if bytes.get(j) == Some(&b'(') {
+                    let mut depth = 0usize;
+                    while j < bytes.len() {
+                        match bytes[j] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    j += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    while bytes.get(j) == Some(&b' ') {
+                        j += 1;
+                    }
+                }
+                // `DIM NAME(...)` is a variable use too.
+                let after_dim = i >= 4
+                    && bytes[..i]
+                        .iter()
+                        .rposition(|b| !b.is_ascii_whitespace())
+                        .is_some_and(|e| {
+                            e >= 2 && bytes[e - 2..=e].eq_ignore_ascii_case(b"DIM")
+                        });
+                if bytes.get(j) == Some(&b'=') || after_dim {
                     let kw = KEYWORDS_TSB
                         .iter()
                         .find(|(k, _)| {

@@ -275,6 +275,27 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
                 rewrite_vars_in_print_item(item, map);
             }
         }
+        Statement::UseFormat { at, values, .. } => {
+            if let Some((r, c)) = at {
+                rewrite_vars_in_expr(r, map);
+                rewrite_vars_in_expr(c, map);
+            }
+            for value in values {
+                rewrite_vars_in_expr(value, map);
+            }
+        }
+        Statement::UseFormatDyn {
+            at, ctrl, values, ..
+        } => {
+            if let Some((r, c)) = at {
+                rewrite_vars_in_expr(r, map);
+                rewrite_vars_in_expr(c, map);
+            }
+            rewrite_vars_in_str_expr(ctrl, map);
+            for value in values {
+                rewrite_vars_in_expr(value, map);
+            }
+        }
         Statement::Let { name, value } => {
             map_var(map, name);
             rewrite_vars_in_expr(value, map);
@@ -329,6 +350,7 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
             }
         }
         Statement::ComputedGoto { target, .. } => rewrite_vars_in_expr(target, map),
+        Statement::Reset { target } => rewrite_vars_in_expr(target, map),
         Statement::Rcomp {
             then_branch,
             else_branch,
@@ -821,6 +843,9 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
         | Statement::HiCol
         | Statement::Hires { .. }
         | Statement::Nrm
+        | Statement::HardCopy
+        | Statement::Cold
+        | Statement::Retrace
         | Statement::MemModeOn
         | Statement::Disable
         | Statement::Resume { .. }
@@ -848,7 +873,6 @@ fn rewrite_vars_in_stmt(stmt: &mut ast::Statement, map: &HashMap<VarName, VarNam
         | Statement::Run(_)
         | Statement::Clr
         | Statement::Restore
-        | Statement::Reset { .. }
         | Statement::Data(_)
         | Statement::DesignRow(_) => {}
         Statement::Open {
@@ -995,7 +1019,6 @@ fn rewrite_vars_in_print_item(item: &mut ast::PrintItem, map: &HashMap<VarName, 
             rewrite_vars_in_expr(r, map);
             rewrite_vars_in_expr(c, map);
         }
-        PrintItem::UseField { value, .. } => rewrite_vars_in_expr(value, map),
         PrintItem::String(_) | PrintItem::Semi | PrintItem::Comma => {}
     }
 }
@@ -2453,8 +2476,10 @@ impl ir::Pass for IntForBodyAnalysis {
             }
         }
 
-        struct MutableFloatCounters<'a>(&'a HashSet<VarName>);
-        impl crate::visit::MutVisitor for MutableFloatCounters<'_> {
+        // Any FOR counter written outside its header, of any kind. Codegen
+        // exits on equality, so jumping past the limit wraps.
+        struct MutableCounters<'a>(&'a HashSet<VarName>);
+        impl crate::visit::MutVisitor for MutableCounters<'_> {
             fn visit_stmt_mut(&mut self, line: u16, stmt: &mut Stmt) {
                 if let Stmt::For {
                     var,
@@ -2463,7 +2488,7 @@ impl ir::Pass for IntForBodyAnalysis {
                     ..
                 } = stmt
                 {
-                    if var.kind == VarKind::Float && self.0.contains(var) {
+                    if self.0.contains(var) {
                         *body_int_safe = false;
                         *body_reads_loop_var = true;
                     }
@@ -2472,7 +2497,7 @@ impl ir::Pass for IntForBodyAnalysis {
             }
         }
         crate::visit::MutVisitor::visit_module_mut(
-            &mut MutableFloatCounters(&counter_writes),
+            &mut MutableCounters(&counter_writes),
             module,
         );
         Ok(())
@@ -2693,7 +2718,12 @@ fn match_poke_fill_triplet(
         return None;
     }
 
-    if !expr_is_pure(value) || expr_contains_memory_read(value) {
+    // Fusing N stores into one memset evaluates `value` once, so it must be
+    // side-effect free and read the same every iteration (not `TI`).
+    if !expr_is_pure(value)
+        || !expr_reads_are_repeatable(value)
+        || expr_contains_memory_read(value)
+    {
         return None;
     }
     // Start/end can't read the loop variable either (the BASIC v2
@@ -2826,16 +2856,95 @@ impl ir::Pass for LoopInvariantCodeMotion {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        // Hoisted LETs sit at the FOR. A jump into the body from outside
+        // skips them, so collect branch sources for `try_hoist_loop`.
+        let entries = licm_collect_entry_edges(module);
+        let opaque_entry = licm_has_opaque_entry(module);
         let pairs = collect_for_next_pairs(module);
         // Process pairs in reverse so insertions in earlier lines
         // (or earlier statements on the same line) don't shift the
         // indices of as-yet-unprocessed pairs.
         let mut next_id: usize = 0;
         for ((fli, fsi), (nli, nsi)) in pairs.iter().rev() {
-            try_hoist_loop(module, *fli, *fsi, *nli, *nsi, &mut next_id);
+            if opaque_entry {
+                break;
+            }
+            try_hoist_loop(module, *fli, *fsi, *nli, *nsi, &mut next_id, &entries);
         }
         Ok(())
     }
+}
+
+/// Every branch in the module as `(source line index, target line number)`.
+/// A jump from inside a loop body is fine: the hoisted temp ran with the FOR.
+/// Only an edge from outside the body can skip it.
+fn licm_collect_entry_edges(module: &ir::Module) -> Vec<(usize, u16)> {
+    let mut out = Vec::new();
+    for (li, line) in module.lines.iter().enumerate() {
+        let mut targets: HashSet<u16> = HashSet::new();
+        for stmt in &line.stmts {
+            collect_goto_targets(stmt, &mut targets);
+            licm_collect_gosub_targets(stmt, &mut targets);
+            // ON ERROR is entered from wherever the trap fired. Record it as
+            // an edge from `usize::MAX`, i.e. from outside every loop.
+            if let Stmt::OnError {
+                target: Some(t), ..
+            } = stmt
+            {
+                out.push((usize::MAX, *t));
+            }
+        }
+        for t in targets {
+            out.push((li, t));
+        }
+    }
+    out
+}
+
+/// GOSUB targets that `collect_goto_targets` skips. A GOSUB into the body
+/// skips the hoisted LET the same way a GOTO would.
+fn licm_collect_gosub_targets(stmt: &Stmt, targets: &mut HashSet<u16>) {
+    match stmt {
+        Stmt::GoSub { target, .. } => {
+            targets.insert(*target);
+        }
+        Stmt::OnBranch {
+            kind: OnBranchKind::GoSub,
+            targets: branch_targets,
+            ..
+        } => {
+            targets.extend(branch_targets.iter().copied());
+        }
+        Stmt::If {
+            then: ThenIr::Stmts(inner),
+            ..
+        } => {
+            for s in inner {
+                licm_collect_gosub_targets(s, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True if a transfer can land inside a loop body at an unknown line.
+/// `ComputedGoto` can reach any line; `RESUME` returns to the trapped line.
+/// `RUN` restarts at line 1; `ON ERROR GOTO` is a known entry edge.
+fn licm_has_opaque_entry(module: &ir::Module) -> bool {
+    fn stmt_is_opaque(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::ComputedGoto { .. } | Stmt::Resume { .. } => true,
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => inner.iter().any(stmt_is_opaque),
+            _ => false,
+        }
+    }
+    module
+        .lines
+        .iter()
+        .any(|l| l.stmts.iter().any(stmt_is_opaque))
 }
 
 /// Try to hoist invariant subexpressions out of the FOR at
@@ -2847,7 +2956,22 @@ fn try_hoist_loop(
     nli: usize,
     nsi: usize,
     next_id: &mut usize,
+    entries: &[(usize, u16)],
 ) {
+    // Skip the hoist if a jump can enter the body without passing the FOR.
+    // The FOR line itself is safe: hoisted LETs sit at the FOR statement.
+    if fli < nli {
+        let body_lines: HashSet<u16> = module.lines[fli + 1..=nli]
+            .iter()
+            .map(|l| l.number)
+            .collect();
+        let entered_from_outside = entries
+            .iter()
+            .any(|(src, tgt)| body_lines.contains(tgt) && (*src < fli || *src > nli));
+        if entered_from_outside {
+            return;
+        }
+    }
     // Pull the loop variable out of the FOR header. Sanity check
     // that we still see a FOR there (a previous pass could have
     // mutated the IR).
@@ -2970,7 +3094,9 @@ fn licm_stmt_safe(stmt: &Stmt, blocked: &mut HashSet<VarName>) -> bool {
         // by collect_for_next_pairs.
         Stmt::For { .. } | Stmt::Next { .. } => false,
         // REM/Data/Restore are no-ops at runtime for LICM purposes.
-        Stmt::Rem(_) | Stmt::Data(_) | Stmt::Restore | Stmt::Reset { .. } => true,
+        // RESET is only as safe as its numeric expression.
+        Stmt::Rem(_) | Stmt::Data(_) | Stmt::Restore => true,
+        Stmt::Reset { target } => !licm_expr_has_unsafe(target),
         // Everything else: be conservative. GOSUB/USR/FN can call
         // arbitrary code; INPUT/READ write vars unpredictably;
         // OnError/Resume/Run/Clr alter control flow; graphics and
@@ -3030,8 +3156,25 @@ fn licm_expr_has_unsafe(e: &Expr) -> bool {
                 Expr::Func1(crate::ast::Func1::Rnd, _) => {
                     self.unsafe_seen = true;
                 }
+                // TI/ST/ER/EL: the runtime writes them, not the program.
+                // Hoisting `TI > N` out of a wait loop freezes the clock.
+                Expr::Var(v) if var_is_volatile(v) => {
+                    self.unsafe_seen = true;
+                }
                 _ => crate::visit::walk_expr(self, e),
             }
+        }
+
+        // `TI$` is a `StrExpr::Var`, so the `Expr::Var` arm above never sees it.
+        fn visit_str_expr(&mut self, s: &StrExpr) {
+            if self.unsafe_seen {
+                return;
+            }
+            if !str_reads_are_repeatable(s) {
+                self.unsafe_seen = true;
+                return;
+            }
+            crate::visit::walk_str_expr(self, s);
         }
     }
     let mut d = Det { unsafe_seen: false };
@@ -3092,33 +3235,56 @@ fn licm_collect_candidates(
     blocked: &HashSet<VarName>,
     out: &mut Vec<Expr>,
 ) {
+    // FOR always runs the body at least once, so the top is safe to hoist.
+    // After a branch-away, only hoist expressions that cannot trap.
+    let mut speculative = false;
     licm_walk_body(module, fli, fsi, nli, nsi, |stmt| {
-        licm_collect_in_stmt(stmt, blocked, out);
+        licm_collect_in_stmt(stmt, blocked, out, speculative);
+        if licm_stmt_can_branch_away(stmt) {
+            speculative = true;
+        }
         true
     });
 }
 
-fn licm_collect_in_stmt(stmt: &Stmt, blocked: &HashSet<VarName>, out: &mut Vec<Expr>) {
+/// True if this body statement can skip the rest of the body.
+/// `licm_stmt_safe` already refused a bare `GOTO`, so this is `IF ... THEN <line>`.
+fn licm_stmt_can_branch_away(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::If {
+            then: ThenIr::Goto(_),
+            ..
+        }
+    )
+}
+
+fn licm_collect_in_stmt(
+    stmt: &Stmt,
+    blocked: &HashSet<VarName>,
+    out: &mut Vec<Expr>,
+    speculative: bool,
+) {
     match stmt {
-        Stmt::Let { value, .. } => licm_collect_in_expr(value, blocked, out),
+        Stmt::Let { value, .. } => licm_collect_in_expr(value, blocked, out, speculative),
         Stmt::ArrayLet { indices, value, .. } => {
             for e in indices {
-                licm_collect_in_expr(e, blocked, out);
+                licm_collect_in_expr(e, blocked, out, speculative);
             }
-            licm_collect_in_expr(value, blocked, out);
+            licm_collect_in_expr(value, blocked, out, speculative);
         }
         Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
-            licm_collect_in_expr(addr, blocked, out);
-            licm_collect_in_expr(value, blocked, out);
+            licm_collect_in_expr(addr, blocked, out, speculative);
+            licm_collect_in_expr(value, blocked, out, speculative);
         }
         Stmt::PokeFill {
             dst_start,
             dst_end,
             value,
         } => {
-            licm_collect_in_expr(dst_start, blocked, out);
-            licm_collect_in_expr(dst_end, blocked, out);
-            licm_collect_in_expr(value, blocked, out);
+            licm_collect_in_expr(dst_start, blocked, out, speculative);
+            licm_collect_in_expr(dst_end, blocked, out, speculative);
+            licm_collect_in_expr(value, blocked, out, speculative);
         }
         Stmt::Print { items, .. } => {
             for p in items {
@@ -3127,15 +3293,16 @@ fn licm_collect_in_stmt(stmt: &Stmt, blocked: &HashSet<VarName>, out: &mut Vec<E
                 | PrintPiece::TabTo(e)
                 | PrintPiece::Spc(e) = p
                 {
-                    licm_collect_in_expr(e, blocked, out);
+                    licm_collect_in_expr(e, blocked, out, speculative);
                 }
             }
         }
         Stmt::If { cond, then } => {
-            licm_collect_in_expr(cond, blocked, out);
+            // The condition runs whenever the IF is reached. The THEN body does not.
+            licm_collect_in_expr(cond, blocked, out, speculative);
             if let ThenIr::Stmts(inner) = then {
                 for s in inner {
-                    licm_collect_in_stmt(s, blocked, out);
+                    licm_collect_in_stmt(s, blocked, out, true);
                 }
             }
         }
@@ -3143,8 +3310,16 @@ fn licm_collect_in_stmt(stmt: &Stmt, blocked: &HashSet<VarName>, out: &mut Vec<E
     }
 }
 
-fn licm_collect_in_expr(e: &Expr, blocked: &HashSet<VarName>, out: &mut Vec<Expr>) {
-    if licm_expr_invariant(e, blocked) && licm_expr_worth_hoisting(e) {
+fn licm_collect_in_expr(
+    e: &Expr,
+    blocked: &HashSet<VarName>,
+    out: &mut Vec<Expr>,
+    speculative: bool,
+) {
+    if licm_expr_invariant(e, blocked)
+        && licm_expr_worth_hoisting(e)
+        && (!speculative || expr_cannot_trap(e))
+    {
         // Maximal: don't descend. Dedupe so identical sub-expressions
         // share one temp.
         if !out.iter().any(|x| x == e) {
@@ -3155,21 +3330,21 @@ fn licm_collect_in_expr(e: &Expr, blocked: &HashSet<VarName>, out: &mut Vec<Expr
     // Descend into children to find smaller invariant candidates.
     match e {
         Expr::Neg(inner) | Expr::Not(inner) => {
-            licm_collect_in_expr(inner, blocked, out);
+            licm_collect_in_expr(inner, blocked, out, speculative);
         }
         Expr::Bin(_, l, r) => {
-            licm_collect_in_expr(l, blocked, out);
-            licm_collect_in_expr(r, blocked, out);
+            licm_collect_in_expr(l, blocked, out, speculative);
+            licm_collect_in_expr(r, blocked, out, speculative);
         }
         Expr::Func1(_, arg) => {
-            licm_collect_in_expr(arg, blocked, out);
+            licm_collect_in_expr(arg, blocked, out, speculative);
         }
         Expr::Peek(addr) | Expr::MemPeek(addr) => {
-            licm_collect_in_expr(addr, blocked, out);
+            licm_collect_in_expr(addr, blocked, out, speculative);
         }
         Expr::ArrayRef(_, idx) => {
             for e in idx {
-                licm_collect_in_expr(e, blocked, out);
+                licm_collect_in_expr(e, blocked, out, speculative);
             }
         }
         _ => {}
@@ -3265,22 +3440,65 @@ fn licm_expr_worth_hoisting(e: &Expr) -> bool {
 /// kinded and every op preserves int (which `licm_binop_safe`
 /// guarantees), the result is integer; else float.
 fn licm_infer_kind(e: &Expr) -> VarKind {
-    fn all_int_leaves(e: &Expr) -> bool {
+    // Integer leaves are not enough: `A% * B%` can exceed i16, and an Integer
+    // temp would raise ?ILLEGAL QUANTITY. Bound the value instead.
+    const MIN: f64 = -32768.0;
+    const MAX: f64 = 32767.0;
+
+    /// Conservative value range, or `None` if not provably integral.
+    fn range(e: &Expr) -> Option<(f64, f64)> {
         match e {
-            Expr::Number(n) => {
-                n.is_finite() && n.fract() == 0.0 && (-32768.0..=32767.0).contains(n)
+            Expr::Number(n) if n.is_finite() && n.fract() == 0.0 && (MIN..=MAX).contains(n) => {
+                Some((*n, *n))
             }
-            Expr::Var(v) => v.kind == VarKind::Integer,
-            Expr::Neg(inner) | Expr::Not(inner) => all_int_leaves(inner),
-            Expr::Bin(_, l, r) => all_int_leaves(l) && all_int_leaves(r),
-            Expr::Func1(_, arg) => all_int_leaves(arg),
-            _ => false,
+            Expr::Var(v) if v.kind == VarKind::Integer && !var_is_volatile(v) => Some((MIN, MAX)),
+            Expr::Neg(inner) => range(inner).map(|(lo, hi)| (-hi, -lo)),
+            // BASIC NOT is bitwise i16 complement: -(x+1), always in range.
+            Expr::Not(inner) => range(inner).map(|_| (MIN, MAX)),
+            Expr::Bin(op, l, r) => {
+                let (a, b) = range(l)?;
+                let (c, d) = range(r)?;
+                match op {
+                    // FCOMP yields 0 or -1.
+                    BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge => Some((-1.0, 0.0)),
+                    // AYINT-ed operands, bitwise result: always an i16.
+                    BinOp::And | BinOp::Or | BinOp::Xor => Some((MIN, MAX)),
+                    BinOp::Add => Some((a + c, b + d)),
+                    BinOp::Sub => Some((a - d, b - c)),
+                    BinOp::Mul => {
+                        let p = [a * c, a * d, b * c, b * d];
+                        Some((
+                            p.iter().copied().fold(f64::INFINITY, f64::min),
+                            p.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Func1(f, arg) => {
+                let (lo, hi) = range(arg)?;
+                match f {
+                    // ABS(-32768) is 32768, one past i16.
+                    crate::ast::Func1::Abs => {
+                        Some((0.0, lo.abs().max(hi.abs())))
+                    }
+                    crate::ast::Func1::Int => Some((lo, hi)),
+                    crate::ast::Func1::Sgn => Some((-1.0, 1.0)),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
-    if all_int_leaves(e) {
-        VarKind::Integer
-    } else {
-        VarKind::Float
+
+    match range(e) {
+        Some((lo, hi)) if lo >= MIN && hi <= MAX => VarKind::Integer,
+        _ => VarKind::Float,
     }
 }
 
@@ -3802,6 +4020,7 @@ fn stmt_reads_var(stmt: &Stmt, var: &VarName) -> bool {
         Stmt::DoIf { cond } | Stmt::Until { cond } => expr_reads_var(cond, var),
         Stmt::ExitLoop { cond } => cond.as_ref().map_or(false, |e| expr_reads_var(e, var)),
         Stmt::ComputedGoto { target } => expr_reads_var(target, var),
+        Stmt::Reset { target } => expr_reads_var(target, var),
         Stmt::Rcomp { then, else_then } => {
             then_ir_reads_var(then, var)
                 || else_then
@@ -5412,6 +5631,7 @@ fn stmt_is_int_safe_with(
         Stmt::DoIf { cond } | Stmt::Until { cond } => expr_is_int_safe(cond, loop_var),
         Stmt::ExitLoop { cond } => cond.as_ref().map_or(true, |c| expr_is_int_safe(c, loop_var)),
         Stmt::ComputedGoto { target } => expr_is_int_safe(target, loop_var),
+        Stmt::Reset { target } => expr_is_int_safe(target, loop_var),
         Stmt::Rcomp { then, else_then } => {
             (match then {
                 ThenIr::Goto(_) => true,
@@ -5429,6 +5649,19 @@ fn stmt_is_int_safe_with(
             PrintPiece::StrExpr(s) => str_is_int_safe(s, loop_var),
             _ => true,
         }),
+        Stmt::UseFormat { at, values, .. } => {
+            at.iter().all(|(r, c)| {
+                expr_is_int_safe(r, loop_var) && expr_is_int_safe(c, loop_var)
+            }) && values.iter().all(|e| expr_is_int_safe(e, loop_var))
+        }
+        Stmt::UseFormatDyn {
+            at, ctrl, values, ..
+        } => {
+            at.iter().all(|(r, c)| {
+                expr_is_int_safe(r, loop_var) && expr_is_int_safe(c, loop_var)
+            }) && str_is_int_safe(ctrl, loop_var)
+                && values.iter().all(|e| expr_is_int_safe(e, loop_var))
+        }
         Stmt::Poke { addr, value } => {
             expr_is_int_safe(addr, loop_var) && expr_is_int_safe(value, loop_var)
         }
@@ -5809,7 +6042,7 @@ fn stmt_is_int_safe_with(
                 && expr_is_int_safe(color3, loop_var)
         }
         Stmt::Cset { mode } => expr_is_int_safe(mode, loop_var),
-        Stmt::Nrm | Stmt::MemModeOn => true,
+        Stmt::Nrm | Stmt::HardCopy | Stmt::MemModeOn | Stmt::Cold | Stmt::Retrace => true,
         Stmt::Pause { ticks, .. } => expr_is_int_safe(ticks, loop_var),
         Stmt::Sys {
             addr,
@@ -5933,7 +6166,7 @@ fn stmt_is_int_safe_with(
         // in sync at the time of the jump.
         | Stmt::Run(_)
         | Stmt::Data(_)
-        | Stmt::Restore | Stmt::Reset { .. }
+        | Stmt::Restore
         | Stmt::Dim(_)
         | Stmt::DefFn { .. } => true,
         // CLR wipes the loop variable along with everything else, so
@@ -8206,6 +8439,27 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_ob
                 local_const_print_piece(item, env);
             }
         }
+        Stmt::UseFormat { at, values, .. } => {
+            if let Some((r, c)) = at {
+                local_const_expr(r, env);
+                local_const_expr(c, env);
+            }
+            for value in values {
+                local_const_expr(value, env);
+            }
+        }
+        Stmt::UseFormatDyn {
+            at, ctrl, values, ..
+        } => {
+            if let Some((r, c)) = at {
+                local_const_expr(r, env);
+                local_const_expr(c, env);
+            }
+            local_const_str(ctrl, env);
+            for value in values {
+                local_const_expr(value, env);
+            }
+        }
         Stmt::Load {
             filename,
             device,
@@ -8250,6 +8504,7 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_ob
             }
         }
         Stmt::ComputedGoto { target } => local_const_expr(target, env),
+        Stmt::Reset { target } => local_const_expr(target, env),
         Stmt::OnKey { keys, .. } => local_const_str(keys, env),
         Stmt::Fetch {
             control,
@@ -8300,6 +8555,9 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_ob
         | Stmt::OnError { .. }
         | Stmt::ErrorRaise { .. }
         | Stmt::Nrm
+        | Stmt::HardCopy
+        | Stmt::Cold
+        | Stmt::Retrace
         | Stmt::MemModeOn
         | Stmt::Rem(_)
         | Stmt::LineMark(_)
@@ -8309,7 +8567,6 @@ fn local_rewrite_stmt_exprs(stmt: &mut Stmt, env: &HashMap<VarName, f64>, fre_ob
         | Stmt::Clr
         | Stmt::Data(_)
         | Stmt::Restore
-        | Stmt::Reset { .. }
         | Stmt::Get { .. }
         | Stmt::KeyGet { .. }
         | Stmt::DisplayKeys => {}
@@ -8443,6 +8700,9 @@ fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
         | Stmt::Cmob { .. }
         | Stmt::Bckgnds { .. }
         | Stmt::Nrm
+        | Stmt::HardCopy
+        | Stmt::Cold
+        | Stmt::Retrace
         | Stmt::MemModeOn
         | Stmt::Cset { .. }
         | Stmt::Pause { .. } => {
@@ -8466,6 +8726,8 @@ fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
         | Stmt::Close { .. }
         | Stmt::Disk { .. }
         | Stmt::Print { .. }
+        | Stmt::UseFormat { .. }
+        | Stmt::UseFormatDyn { .. }
         | Stmt::PrintFile { .. }
         | Stmt::Cmd { .. }
         | Stmt::Load { .. }
@@ -8475,14 +8737,14 @@ fn local_update_env(stmt: &Stmt, env: &mut HashMap<VarName, f64>) {
         | Stmt::Restore
         | Stmt::Reset { .. }
         | Stmt::DefFn { .. } => {}
+        // TSB `LOOP`, `REPEAT`, and `DO` are back-edge targets. Facts from
+        // before the loop are only valid on the first iteration, so clear them.
+        Stmt::Do | Stmt::Repeat | Stmt::Loop => env.clear(),
         Stmt::DoIf { .. }
-        | Stmt::Do
         | Stmt::DoNull
         | Stmt::Done
         | Stmt::Else
-        | Stmt::Repeat
         | Stmt::Until { .. }
-        | Stmt::Loop
         | Stmt::EndLoop
         | Stmt::ExitLoop { .. }
         | Stmt::Disable => {}
@@ -8637,7 +8899,6 @@ fn local_const_print_piece(piece: &mut PrintPiece, env: &HashMap<VarName, f64>) 
             local_const_expr(r, env);
             local_const_expr(c, env);
         }
-        PrintPiece::UseField { value, .. } => local_const_expr(value, env),
         PrintPiece::LiteralString(_) | PrintPiece::Tab => {}
     }
 }
@@ -8866,6 +9127,9 @@ fn local_note_effects(stmt: &Stmt, effects: &mut LocalEffects) {
         | Stmt::Cmob { .. }
         | Stmt::Bckgnds { .. }
         | Stmt::Nrm
+        | Stmt::HardCopy
+        | Stmt::Cold
+        | Stmt::Retrace
         | Stmt::MemModeOn
         | Stmt::Cset { .. }
         | Stmt::Pause { .. }
@@ -8875,6 +9139,8 @@ fn local_note_effects(stmt: &Stmt, effects: &mut LocalEffects) {
         | Stmt::Close { .. }
         | Stmt::Disk { .. }
         | Stmt::Print { .. }
+        | Stmt::UseFormat { .. }
+        | Stmt::UseFormatDyn { .. }
         | Stmt::PrintFile { .. }
         | Stmt::Cmd { .. }
         | Stmt::Load { .. }
@@ -9353,10 +9619,14 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     // Bounds for hand-rolled counters, from their loop-exit tests.
     let mut guarded = guarded_counter_bounds(module);
     let mut bounded_families = HashSet::new();
+    let mut counted: HashSet<VarName> = HashSet::new();
+    // Unproved accumulators are unsafe only on cycles that are not FOR/NEXT.
+    let uncounted_cycle = module_has_uncounted_cycle(module);
     for (var, range) in bounded_accumulator_ranges(module) {
         // Both are independent whole-program bounds.
         if var.kind == VarKind::Float && range.fits_i16() {
             bounded_families.insert(split_family_base(&var).to_owned());
+            counted.insert(var.clone());
             guarded.entry(var).or_insert(range);
         }
     }
@@ -9390,7 +9660,15 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
         }
         if to_drop.is_empty() {
 
-            to_drop = int_range_escapees(&defs, &candidates, &for_counters, &guarded);
+            to_drop =
+                int_range_escapees(
+                    &defs,
+                    &candidates,
+                    &for_counters,
+                    &guarded,
+                    &counted,
+                    uncounted_cycle,
+                );
             if to_drop.is_empty() {
                 break;
             }
@@ -9818,6 +10096,7 @@ impl<'a> UseClassifier<'a> {
                 }
             }
             Stmt::ComputedGoto { target } => self.walk_expr(target, UseRole::Addr),
+            Stmt::Reset { target } => self.walk_expr(target, UseRole::Addr),
             Stmt::OnBranch { value, .. } => self.walk_expr(value, UseRole::Cond),
             Stmt::Sys {
                 addr,
@@ -10091,6 +10370,55 @@ fn split_family_base(var: &VarName) -> &str {
         .map_or(var.base.as_str(), |(base, _)| base)
 }
 
+/// True if the program has a cycle that is not a `FOR`/`NEXT` pair.
+/// Those can run forever, so an unproved accumulator is not safe to promote.
+/// Orphan NEXT, oversized CFG, or a NEXT that misses its header: true.
+fn module_has_uncounted_cycle(module: &ir::Module) -> bool {
+    let orphans = crate::for_next_runtime::analyze(module);
+    if orphans.needs_runtime_stack() {
+        return true;
+    }
+    let cfg = crate::cfg::Cfg::build_with(module, &orphans);
+    if cfg.nodes.len() > REGION_NODE_LIMIT {
+        return true;
+    }
+    let mut stack: Vec<(VarName, usize)> = Vec::new();
+    let mut back_edges: HashSet<(usize, usize)> = HashSet::new();
+    for (id, node) in cfg.nodes.iter().enumerate() {
+        match cfg.stmt_at(id, module) {
+            Stmt::For { var, .. } => {
+                if node.stmt.path.len() != 1 || node.successors.as_slice() != [id + 1] {
+                    return true;
+                }
+                stack.push((var.clone(), id));
+            }
+            Stmt::Next { vars } => {
+                if node.stmt.path.len() != 1 || vars.len() != 1 {
+                    return true;
+                }
+                let Some((var, header)) = stack.pop() else {
+                    return true;
+                };
+                if vars[0].as_ref().is_some_and(|v| v != &var)
+                    || !node.successors.contains(&(header + 1))
+                {
+                    return true;
+                }
+                back_edges.insert((id, header + 1));
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return true;
+    }
+    cfg.nodes.iter().enumerate().any(|(id, node)| {
+        node.successors
+            .iter()
+            .any(|&to| to <= id && !back_edges.contains(&(id, to)))
+    })
+}
+
 fn bounded_accumulator_ranges(module: &ir::Module) -> HashMap<VarName, PromRange> {
     fn prove(module: &ir::Module) -> Option<HashMap<VarName, PromRange>> {
         struct Safe(bool);
@@ -10281,6 +10609,11 @@ fn int_range_escapees(
     candidates: &HashSet<VarName>,
     for_counters: &HashSet<VarName>,
     guarded: &HashMap<VarName, PromRange>,
+    // `guarded` entries whose bound came from execution count, not a loop-exit
+    // test. Only the count proof bounds the value at the store.
+    counted: &HashSet<VarName>,
+    // True when a cycle is not a FOR/NEXT pair, so an accumulator can run forever.
+    uncounted_cycle: bool,
 ) -> Vec<VarName> {
     let mut ranges: HashMap<VarName, PromRange> = HashMap::new();
     let mut unstable: HashSet<VarName> = HashSet::new();
@@ -10325,14 +10658,30 @@ fn int_range_escapees(
             break;
         }
     }
+    // A def that mentions itself. Needs a proven bound before promotion.
+    let accumulator = |v: &VarName| {
+        defs.get(v)
+            .is_some_and(|values| values.iter().any(|e| expr_reads_var(e, v)))
+    };
     let mut out: Vec<VarName> = candidates
         .iter()
         .filter(|v| {
 
+            // Range still widening after the last fixpoint round. Check this
+            // first so an accumulator that never settled is still dropped.
+            if unstable.contains(*v) {
+                return true;
+            }
+            if uncounted_cycle && accumulator(v) {
+                // A loop-exit test bounds the value at the test, not the store.
+                // Keep only if the execution-count proof or the fixpoint covers it.
+                return !(counted.contains(*v)
+                    || ranges.get(*v).is_some_and(|r| r.fits_i16()));
+            }
             if let Some(b) = guarded.get(*v) {
                 return !b.fits_i16();
             }
-            unstable.contains(*v) || ranges.get(*v).is_some_and(|r| !r.fits_i16())
+            ranges.get(*v).is_some_and(|r| !r.fits_i16())
         })
         .cloned()
         .collect();
@@ -11046,6 +11395,7 @@ impl<'a> VarKindPromoter<'a> {
                 }
             }
             Stmt::ComputedGoto { target } => self.rewrite_expr(target),
+            Stmt::Reset { target } => self.rewrite_expr(target),
             Stmt::For {
                 var,
                 start,
@@ -11523,7 +11873,20 @@ impl<'a> VarKindPromoter<'a> {
                     }
                 }
             }
-            _ => {}
+            other => {
+                // Rewrite reads in every remaining statement via the generic
+                // walk, so a promoted var is not left reading the old Float slot.
+                struct Reads<'p, 'a>(&'p VarKindPromoter<'a>);
+                impl crate::visit::MutVisitor for Reads<'_, '_> {
+                    fn visit_expr_mut(&mut self, e: &mut Expr) {
+                        self.0.rewrite_expr(e);
+                    }
+                    fn visit_str_expr_mut(&mut self, s: &mut StrExpr) {
+                        self.0.rewrite_str(s);
+                    }
+                }
+                crate::visit::walk_stmt_mut(&mut Reads(self), 0, other);
+            }
         }
     }
 
@@ -11641,7 +12004,6 @@ impl<'a> VarKindPromoter<'a> {
                 self.rewrite_expr(r);
                 self.rewrite_expr(c);
             }
-            PrintPiece::UseField { value, .. } => self.rewrite_expr(value),
             PrintPiece::LiteralString(_) | PrintPiece::Tab => {}
         }
     }
@@ -12091,9 +12453,70 @@ fn str_store_cannot_trap(var: &VarName) -> bool {
     !(var.kind == VarKind::String && var.base == "TI")
 }
 
+/// Runtime-written pseudo-variables: `TI`/`TI$`, `ST`, `ER`/`EL`. Name test, not kind.
+/// Distinct from [`expr_is_pure`]: reading `TI` has no side effect, it just
+/// does not give the same answer twice.
+pub(crate) fn var_is_volatile(v: &VarName) -> bool {
+    matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL")
+}
+
+/// True if evaluating `e` again later yields the same value. Whitelist: unknown
+/// forms are refused (`PEEK`, `POS`, `FRE`, `RND`, `USR`, `FN`, I/O, strings).
+/// `ArrayRef` covers subscripts only; element stability is the caller's problem.
+pub(crate) fn expr_reads_are_repeatable(e: &Expr) -> bool {
+    match e {
+        Expr::Number(n) => n.is_finite(),
+        Expr::Var(v) => !var_is_volatile(v),
+        Expr::ArrayRef(name, idx) => {
+            !var_is_volatile(name) && idx.iter().all(expr_reads_are_repeatable)
+        }
+        Expr::Neg(inner) | Expr::Not(inner) => expr_reads_are_repeatable(inner),
+        Expr::Bin(_, l, r) => expr_reads_are_repeatable(l) && expr_reads_are_repeatable(r),
+        // RND advances the seed. Other one-arg functions are pure in the argument.
+        Expr::Func1(crate::ast::Func1::Rnd, _) => false,
+        Expr::Func1(_, arg) => expr_reads_are_repeatable(arg),
+        _ => false,
+    }
+}
+
+/// String side of [`expr_reads_are_repeatable`]: would evaluating `s` again
+/// later yield the same characters? `TI$` is a `StrExpr::Var`, so the numeric
+/// predicate never sees it. Value only: callers that care about allocation ask [`str_is_pure`].
+pub(crate) fn str_reads_are_repeatable(s: &StrExpr) -> bool {
+    match s {
+        StrExpr::Literal(_) => true,
+        StrExpr::Var(v) => !var_is_volatile(v),
+        StrExpr::ArrayRef(name, idx) => {
+            !var_is_volatile(name) && idx.iter().all(expr_reads_are_repeatable)
+        }
+        // GET advances the keyboard buffer, so the next read is a different key.
+        StrExpr::GetKey => false,
+        StrExpr::Chr(e) | StrExpr::HexFmt(e) | StrExpr::BinFmt(e) | StrExpr::Str(e) => {
+            expr_reads_are_repeatable(e)
+        }
+        StrExpr::Concat(a, b) => str_reads_are_repeatable(a) && str_reads_are_repeatable(b),
+        StrExpr::Left(s, n) | StrExpr::Right(s, n) | StrExpr::Dup(s, n) => {
+            str_reads_are_repeatable(s) && expr_reads_are_repeatable(n)
+        }
+        StrExpr::Mid(s, from, len) => {
+            str_reads_are_repeatable(s)
+                && expr_reads_are_repeatable(from)
+                && len.as_deref().is_none_or(expr_reads_are_repeatable)
+        }
+        StrExpr::Insert(a, b, n) => {
+            str_reads_are_repeatable(a)
+                && str_reads_are_repeatable(b)
+                && expr_reads_are_repeatable(n)
+        }
+    }
+}
+
 pub(crate) fn expr_is_pure(e: &Expr) -> bool {
     match e {
         Expr::Number(n) => n.is_finite(),
+        // READST for RS-232 returns $0297 and clears it, so a discarded `X=ST`
+        // is a discarded side effect. A discarded `TI` read is not.
+        Expr::Var(v) if v.kind == VarKind::Float && v.base == "ST" => false,
         Expr::Var(_) => true,
         Expr::String(_) => true,
         Expr::Neg(inner) | Expr::Not(inner) => expr_is_pure(inner),
@@ -12236,6 +12659,10 @@ fn str_is_pure(s: &StrExpr) -> bool {
 /// effects (advancing the keyboard buffer, possibly raising ?BAD
 /// SUBSCRIPT) are observable regardless of FRE.
 fn str_is_pure_for_dead_store(s: &StrExpr, fre_observable: bool) -> bool {
+    // Volatile string reads (`TI$`) move FRE even if the store is unused.
+    if fre_observable && !str_reads_are_repeatable(s) {
+        return false;
+    }
     if str_is_pure(s) {
         return true;
     }
@@ -12397,6 +12824,98 @@ mod tests {
             Box::new(a),
             Box::new(Expr::Number(3.0))
         )));
+    }
+
+    /// `str_reads_are_repeatable` refuses `TI$`, including nested string ops.
+    #[test]
+    fn a_volatile_string_read_is_not_repeatable() {
+        let ti = VarName {
+            base: "TI".to_string(),
+            kind: VarKind::String,
+        };
+        let a = VarName {
+            base: "A".to_string(),
+            kind: VarKind::String,
+        };
+
+        // Name test: string-typed TI is volatile, ordinary A$ is not.
+        assert!(var_is_volatile(&ti));
+        assert!(!var_is_volatile(&a));
+
+        assert!(!str_reads_are_repeatable(&StrExpr::Var(ti.clone())));
+        assert!(str_reads_are_repeatable(&StrExpr::Var(a.clone())));
+        assert!(str_reads_are_repeatable(&StrExpr::Literal(b"HI".to_vec())));
+
+        // GET advances the keyboard buffer, so the next read is a different key.
+        assert!(!str_reads_are_repeatable(&StrExpr::GetKey));
+
+        // Nested uses of `TI$` are still not repeatable.
+        for nested in [
+            StrExpr::Left(
+                Box::new(StrExpr::Var(ti.clone())),
+                Box::new(Expr::Number(2.0)),
+            ),
+            StrExpr::Concat(
+                Box::new(StrExpr::Literal(b"T=".to_vec())),
+                Box::new(StrExpr::Var(ti.clone())),
+            ),
+            StrExpr::Mid(
+                Box::new(StrExpr::Var(ti.clone())),
+                Box::new(Expr::Number(3.0)),
+                Some(Box::new(Expr::Number(2.0))),
+            ),
+        ] {
+            assert!(
+                !str_reads_are_repeatable(&nested),
+                "a volatile read stays volatile inside {nested:?}"
+            );
+        }
+
+        // The same shapes on an ordinary string variable are repeatable.
+        assert!(str_reads_are_repeatable(&StrExpr::Left(
+            Box::new(StrExpr::Var(a.clone())),
+            Box::new(Expr::Number(2.0))
+        )));
+        assert!(str_reads_are_repeatable(&StrExpr::Concat(
+            Box::new(StrExpr::Literal(b"T=".to_vec())),
+            Box::new(StrExpr::Var(a.clone()))
+        )));
+
+        // A numeric argument can be volatile too.
+        let ti_num = VarName {
+            base: "TI".to_string(),
+            kind: VarKind::Float,
+        };
+        assert!(!str_reads_are_repeatable(&StrExpr::Str(Box::new(
+            Expr::Var(ti_num)
+        ))));
+        assert!(str_reads_are_repeatable(&StrExpr::Str(Box::new(
+            Expr::Number(1.0)
+        ))));
+    }
+
+    /// LICM must refuse a `TI$` read, even if it starts hoisting other strings.
+    #[test]
+    fn licm_refuses_a_volatile_string_read_whatever_the_blanket_does() {
+        let ti = VarName {
+            base: "TI".to_string(),
+            kind: VarKind::String,
+        };
+        for e in [
+            Expr::Len(Box::new(StrExpr::Var(ti.clone()))),
+            Expr::Asc(Box::new(StrExpr::Var(ti.clone()))),
+            Expr::Val(Box::new(StrExpr::Var(ti.clone()))),
+            Expr::StrCompare(
+                crate::ast::BinOp::Eq,
+                StrExpr::Var(ti.clone()),
+                StrExpr::Literal(b"000000".to_vec()),
+            ),
+        ] {
+            assert!(
+                licm_expr_has_unsafe(&e),
+                "a read of TI$ must never be hoistable: {e:?}"
+            );
+        }
     }
 
     fn fvar(base: &str) -> VarName {
@@ -14001,7 +14520,6 @@ mod tests {
                 print(PrintPiece::StrExpr(str_call)),
                 print(PrintPiece::PositionAt(call.clone(), Expr::Number(0.0))),
                 print(PrintPiece::PositionAt(Expr::Number(0.0), call.clone())),
-                print(PrintPiece::UseField { width: 3, value: call.clone() }),
                 Stmt::If { cond: call.clone(), then: ThenIr::Goto(10) },
                 Stmt::IfElse { cond: call.clone(), then: ThenIr::Goto(10), else_then: ThenIr::Goto(20) },
                 Stmt::ComputedGoto { target: call.clone() },
@@ -15168,7 +15686,6 @@ fn collect_print_piece_reads(piece: &PrintPiece, reads: &mut HashSet<VarName>) {
             collect_expr_reads(a, reads);
             collect_expr_reads(b, reads);
         }
-        PrintPiece::UseField { value, .. } => collect_expr_reads(value, reads),
         PrintPiece::StrExpr(s) => collect_str_expr_reads(s, reads),
         PrintPiece::LiteralString(_) | PrintPiece::Tab => {}
     }
@@ -15568,6 +16085,7 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
             }
         }
         ComputedGoto { target } => v.visit_expr_mut(target),
+        Reset { target } => v.visit_expr_mut(target),
         Poke { addr, value } | Dpoke { addr, value } => {
             v.visit_expr_mut(addr);
             v.visit_expr_mut(value);
@@ -15598,7 +16116,6 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
                         v.visit_expr_mut(a);
                         v.visit_expr_mut(b);
                     }
-                    PrintPiece::UseField { value, .. } => v.visit_expr_mut(value),
                     PrintPiece::StrExpr(s) => v.visit_str_expr_mut(s),
                     _ => {}
                 }
@@ -15618,7 +16135,6 @@ fn walk_stmt_exprs_mut<V: crate::visit::MutVisitor>(stmt: &mut Stmt, v: &mut V) 
                         v.visit_expr_mut(a);
                         v.visit_expr_mut(b);
                     }
-                    PrintPiece::UseField { value, .. } => v.visit_expr_mut(value),
                     PrintPiece::StrExpr(s) => v.visit_str_expr_mut(s),
                     _ => {}
                 }

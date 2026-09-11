@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use yabcompiler_core::{
     BasicHintDialect, CompileOptions, Dialect, Profile, compile, config, is_basic_source_path,
-    parse_reserved_ranges, parse_start_address, prg, tokenize_program_with,
+    parse_reserved_ranges, parse_start_address, prg, resolved_dialect, tokenize_program_with,
 };
 
 /// Output stream for command-line help.
@@ -112,6 +112,14 @@ fn load_prg_bytes(path: &str, dialect: Dialect) -> Result<Vec<u8>, String> {
     if is_basic_source_path(Path::new(path)) {
         let source = String::from_utf8(bytes)
             .map_err(|e| format!("{path} is not valid UTF-8 source: {e}"))?;
+        // Auto dialect is otherwise silent: list prints the same text either way.
+        if matches!(dialect, Dialect::Auto) {
+            let picked = match resolved_dialect(&source, dialect) {
+                Dialect::Tsb => "tsb (extended keywords found in statement position)",
+                _ => "basic2",
+            };
+            eprintln!("  dialect: auto -> {picked}");
+        }
         tokenize_program_with(&source, dialect).map_err(|e| format!("tokenize {path}: {e}"))
     } else {
         Ok(bytes)

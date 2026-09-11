@@ -673,6 +673,29 @@ pub enum Statement {
     },
     /// `NRM` — restore normal text screen mode.
     Nrm,
+    /// `HRDCPY`: dump the 40x25 text screen to IEC device 4.
+    HardCopy,
+    /// `COLD`: reset the machine to a BASIC READY prompt.
+    Cold,
+    /// `RETRACE`: print a 12-byte build stamp.
+    Retrace,
+    /// `USE [AT(r,c)] "<mask>"[, v...][;]`: format values into a mask buffer and print it.
+    UseFormat {
+        at: Option<(Expr, Expr)>,
+        mask: Vec<u8>,
+        fields: Vec<UseFieldDesc>,
+        values: Vec<Expr>,
+        newline: bool,
+        bad_mode: UseBadMode,
+    },
+    /// `USE` with a control string that is not a literal.
+    UseFormatDyn {
+        at: Option<(Expr, Expr)>,
+        ctrl: StrExpr,
+        values: Vec<Expr>,
+        newline: bool,
+        bad_mode: UseBadMode,
+    },
     /// bare `MEM` — switch to MEM mode: copy char ROM
     /// $D000-$DFFF to $E000-$EFFF, switch VIC bank to 3, set
     /// $D018 so screen reads from $CC00 and chars from $E000,
@@ -804,7 +827,8 @@ pub enum Statement {
     /// `RESET <line>` — set the DATA pointer to the stream
     /// starting at the named BASIC line.
     Reset {
-        line: u16,
+        /// Line-number expression (`RESET X`, `RESET 5*4`).
+        target: Expr,
     },
     /// `GET var` — read one keystroke (PETSCII code) into the numeric
     /// variable. Non-blocking; sets the variable to 0 if no key.
@@ -1116,13 +1140,49 @@ pub enum PrintItem {
     /// item in PRINT/CENTER it positions the cursor; in numeric
     /// context it reads a screen byte.
     PositionAt(Expr, Expr),
-    /// `USE`-formatted-PRINT field — a `#`-run of `width`
-    /// chars in the control string takes the next numeric var and
-    /// prints it right-justified, space-padded, in that width.
-    /// Emitted by the `USE [AT(r,c)] "...###...", v` parser; the
-    /// surrounding literal chunks of the control string ride
-    /// alongside as `StrExpr(Literal(_))` items.
-    UseField { width: u8, value: Expr },
+}
+
+/// How a `USE` reports `?BAD MODE`, if it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseBadMode {
+    /// Value count matches the mask. Print and return.
+    None,
+    /// A field has no value. Raise before printing.
+    Before,
+    /// Extra values. Print the buffer without a trailing CR, then raise.
+    After,
+}
+
+/// One `USE` field. Offsets are into the mask buffer filled at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UseFieldDesc {
+    /// First byte of this field.
+    pub start: u8,
+    /// First integer digit position.
+    pub digits: u8,
+    /// Integer digit count before the separator.
+    pub int_digits: u8,
+    /// First fraction digit. Unused when `dec_digits` is 0.
+    pub dec_at: u8,
+    /// Fraction digit count after the separator.
+    pub dec_digits: u8,
+    /// Fill for unused integer slots: space, or `*` if the field has one.
+    pub pad: u8,
+    /// Sign slot, if the field has one.
+    pub sign: Option<UseSign>,
+    /// Offset of the sign character. Unused when `sign` is None.
+    pub sign_at: u8,
+    /// One past the last byte of the run this field sits in.
+    pub run_end: u8,
+}
+
+/// Sign slot in a `USE` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseSign {
+    /// `+` when >= 0, `-` when negative.
+    Plus,
+    /// `-` when negative, space otherwise.
+    Minus,
 }
 
 #[derive(Debug, Clone)]

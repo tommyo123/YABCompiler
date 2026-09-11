@@ -824,6 +824,19 @@ fn compile_pipeline(
         .custom_start_address
         .map(u32::from)
         .unwrap_or(CODE_ORIGIN);
+    // PROC is gone after lowering, so the TSB boot palette has to be decided here.
+    let uses_proc = ast.lines.iter().any(|l| {
+        l.statements.iter().any(|s| {
+            matches!(
+                s,
+                crate::ast::Statement::ProcDef(_)
+                    | crate::ast::Statement::ProcCall(_)
+                    | crate::ast::Statement::ProcTailCall(_)
+                    | crate::ast::Statement::EndProc
+            )
+        })
+    });
+    let tsb_target = !matches!(options.dialect, Dialect::BasicV2) && uses_proc;
     let (asm, zp_pressure) = codegen::emit_with_profile_at_opts_diag_and_data_rescue(
         &module,
         options.profile,
@@ -833,6 +846,7 @@ fn compile_pipeline(
         &poisoned_fns,
         source_integer_vars,
         matches!(rescue, LayoutRescue::Compact | LayoutRescue::DataFirst),
+        tsb_target,
     )
     .map_err(CompileError::Codegen)?;
     // Run asm-level peephole passes before extraram rewrites so liveness analysis sees raw ROM calls.

@@ -88,6 +88,12 @@ pub const KERNAL_SAVE: u16 = 0xFFD8;
 /// timeout, etc. Read via the BASIC `ST` system variable.
 pub const ST: u8 = 0x90;
 
+/// Default disk device for `USE <n>` / `PRINT USE` (`$BE`).
+pub const TSB_DEFAULT_DEVICE: u8 = 0xBE;
+
+/// KERNAL READST. For RS-232 this returns `$0297` and clears it; `$90` does not.
+pub const READST: u16 = 0xFFB7;
+
 // ---------- BASIC: console / strings ----------
 /// Print null-terminated PETSCII string at `.A` (lo) `.Y` (hi).
 pub const STROUT: u16 = 0xAB1E;
@@ -176,6 +182,9 @@ pub const PRINT_FAC: u16 = FOUT;
 pub const FAC_EXP: u8 = 0x61;
 /// FAC1 sign byte. Bit 7 = 1 means negative; toggle with `EOR #$FF`.
 pub const FAC_SIGN: u8 = 0x66;
+
+/// `SIGN`: SGN(FAC) in .A as `$01` / `$00` / `$FF`. Leaves FAC alone.
+pub const SIGN: u16 = 0xBC2B;
 
 // ---------- Numeric one-arg functions (FAC → FAC) ----------
 //
@@ -275,6 +284,9 @@ pub const BASIC_WARM_START: u16 = 0xE37B;
 /// routine takes care of stack cleanup, so callers don't need to
 /// unwind nested JSRs themselves.
 pub const BASIC_ERROR: u16 = 0xA437;
+
+/// ROM error tail: prints " IN <line>" and READY, skipping the ROM " ERROR" text.
+pub const BASIC_ERROR_TAIL: u16 = 0xA46C;
 /// BASIC IERROR vector and its standard ROM target. `BASIC_ERROR`
 /// eventually jumps through this vector; extension-style `ON ERROR` can
 /// install a compiled dispatcher here to catch ROM/FAC-raised errors.

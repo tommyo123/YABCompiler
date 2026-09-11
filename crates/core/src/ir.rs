@@ -585,6 +585,25 @@ pub enum Stmt {
         color3: Expr,
     },
     Nrm,
+    /// `HRDCPY`: dump the 40x25 text screen to IEC device 4.
+    HardCopy,
+    Cold,
+    Retrace,
+    UseFormat {
+        at: Option<(Expr, Expr)>,
+        mask: Vec<u8>,
+        fields: Vec<crate::ast::UseFieldDesc>,
+        values: Vec<Expr>,
+        newline: bool,
+        bad_mode: crate::ast::UseBadMode,
+    },
+    UseFormatDyn {
+        at: Option<(Expr, Expr)>,
+        ctrl: StrExpr,
+        values: Vec<Expr>,
+        newline: bool,
+        bad_mode: crate::ast::UseBadMode,
+    },
     MemModeOn,
     Cset {
         mode: Expr,
@@ -659,7 +678,7 @@ pub enum Stmt {
     Read(Vec<ReadTarget>),
     Restore,
     Reset {
-        line: u16,
+        target: Expr,
     },
     Get {
         var: VarName,
@@ -773,13 +792,6 @@ pub enum PrintPiece {
     /// CENTER. Lowers to a KERNAL PLOT call (`CLC; LDX row; LDY col;
     /// JSR $FFF0`).
     PositionAt(Expr, Expr),
-    /// `USE`-formatted-PRINT field — width-char `#`-run from
-    /// the control string, consumes one numeric value. Codegen runs
-    /// `JSR __USE_FIELD` after stashing the width.
-    UseField {
-        width: u8,
-        value: Expr,
-    },
 }
 
 /// IR mirror of `ast::StrExpr` — separate type so `Chr(Expr)` refers to
@@ -923,10 +935,6 @@ fn lower_stmt(
                     ast::PrintItem::PositionAt(r, c) => {
                         items.push(PrintPiece::PositionAt(lower_expr(r), lower_expr(c)))
                     }
-                    ast::PrintItem::UseField { width, value } => items.push(PrintPiece::UseField {
-                        width: *width,
-                        value: lower_expr(value),
-                    }),
                 }
             }
             Stmt::Print {
@@ -1474,6 +1482,37 @@ fn lower_stmt(
             color3: lower_expr(color3),
         },
         ast::Statement::Nrm => Stmt::Nrm,
+        ast::Statement::HardCopy => Stmt::HardCopy,
+        ast::Statement::Cold => Stmt::Cold,
+        ast::Statement::Retrace => Stmt::Retrace,
+        ast::Statement::UseFormat {
+            at,
+            mask,
+            fields,
+            values,
+            newline,
+            bad_mode,
+        } => Stmt::UseFormat {
+            at: at.as_ref().map(|(r, c)| (lower_expr(r), lower_expr(c))),
+            mask: mask.clone(),
+            fields: fields.clone(),
+            values: values.iter().map(lower_expr).collect(),
+            newline: *newline,
+            bad_mode: *bad_mode,
+        },
+        ast::Statement::UseFormatDyn {
+            at,
+            ctrl,
+            values,
+            newline,
+            bad_mode,
+        } => Stmt::UseFormatDyn {
+            at: at.as_ref().map(|(r, c)| (lower_expr(r), lower_expr(c))),
+            ctrl: lower_str(ctrl),
+            values: values.iter().map(lower_expr).collect(),
+            newline: *newline,
+            bad_mode: *bad_mode,
+        },
         ast::Statement::MemModeOn => Stmt::MemModeOn,
         ast::Statement::Cset { mode } => Stmt::Cset {
             mode: lower_expr(mode),
@@ -1539,10 +1578,6 @@ fn lower_stmt(
                     ast::PrintItem::PositionAt(r, c) => {
                         items.push(PrintPiece::PositionAt(lower_expr(r), lower_expr(c)))
                     }
-                    ast::PrintItem::UseField { width, value } => items.push(PrintPiece::UseField {
-                        width: *width,
-                        value: lower_expr(value),
-                    }),
                 }
             }
             Stmt::PrintFile {
@@ -1615,10 +1650,6 @@ fn lower_stmt(
                     ast::PrintItem::PositionAt(r, c) => {
                         items.push(PrintPiece::PositionAt(lower_expr(r), lower_expr(c)))
                     }
-                    ast::PrintItem::UseField { width, value } => items.push(PrintPiece::UseField {
-                        width: *width,
-                        value: lower_expr(value),
-                    }),
                 }
             }
             Stmt::Cmd {
@@ -1641,7 +1672,9 @@ fn lower_stmt(
                 .collect(),
         ),
         ast::Statement::Restore => Stmt::Restore,
-        ast::Statement::Reset { line } => Stmt::Reset { line: *line },
+        ast::Statement::Reset { target } => Stmt::Reset {
+            target: lower_expr(target),
+        },
         ast::Statement::Get { var, indices } => Stmt::Get {
             var: var.clone(),
             indices: indices.iter().map(lower_expr).collect(),

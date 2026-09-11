@@ -381,6 +381,29 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
             }
             out.writes.insert(EffectRegion::IoState);
         }
+        Stmt::UseFormat { at, values, .. } => {
+            if let Some((r, c)) = at {
+                summarize_expr(r, &mut out);
+                summarize_expr(c, &mut out);
+            }
+            for value in values {
+                summarize_expr(value, &mut out);
+            }
+            out.writes.insert(EffectRegion::IoState);
+        }
+        Stmt::UseFormatDyn {
+            at, ctrl, values, ..
+        } => {
+            if let Some((r, c)) = at {
+                summarize_expr(r, &mut out);
+                summarize_expr(c, &mut out);
+            }
+            summarize_str(ctrl, &mut out);
+            for value in values {
+                summarize_expr(value, &mut out);
+            }
+            out.writes.insert(EffectRegion::IoState);
+        }
         Stmt::Let { var, value } => {
             summarize_expr(value, &mut out);
             out.write_scalar(var);
@@ -1038,7 +1061,7 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
             out.writes.insert(EffectRegion::SysMemKnown(0xD016));
             out.writes.insert(EffectRegion::IoState);
         }
-        Stmt::Nrm | Stmt::MemModeOn => {
+        Stmt::Nrm | Stmt::HardCopy | Stmt::MemModeOn | Stmt::Cold | Stmt::Retrace => {
             out.writes.insert(EffectRegion::SysMemKnown(0xDD00));
             out.writes.insert(EffectRegion::SysMemKnown(0xD011));
             out.writes.insert(EffectRegion::SysMemKnown(0xD016));
@@ -1095,7 +1118,11 @@ fn summarize_stmt_effect(stmt: &Stmt) -> EffectSummary {
                 summarize_read_target_write(target, &mut out);
             }
         }
-        Stmt::Restore | Stmt::Reset { .. } => {
+        Stmt::Restore => {
+            out.writes.insert(EffectRegion::DataPtr);
+        }
+        Stmt::Reset { target } => {
+            summarize_expr(target, &mut out);
             out.writes.insert(EffectRegion::DataPtr);
         }
         Stmt::Input { targets, .. } => {
@@ -1362,7 +1389,6 @@ fn summarize_print_piece(piece: &PrintPiece, out: &mut EffectSummary) {
             summarize_expr(r, out);
             summarize_expr(c, out);
         }
-        PrintPiece::UseField { value, .. } => summarize_expr(value, out),
         PrintPiece::LiteralString(_) | PrintPiece::Tab => {}
     }
 }
@@ -1856,9 +1882,6 @@ fn collect_stmt_induction_facts(
                     PrintPiece::PositionAt(r, c) => {
                         collect_array_index_facts_expr(r, loop_id, node, loop_var, out);
                         collect_array_index_facts_expr(c, loop_id, node, loop_var, out);
-                    }
-                    PrintPiece::UseField { value, .. } => {
-                        collect_array_index_facts_expr(value, loop_id, node, loop_var, out);
                     }
                     PrintPiece::LiteralString(_) | PrintPiece::Tab => {}
                 }

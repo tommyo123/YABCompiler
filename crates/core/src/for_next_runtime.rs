@@ -1348,6 +1348,61 @@ fn cross_reached_nexts(
             }
         }
     }
+    // The loop above only sees a `NEXT` on the branch target line. A branch
+    // that lands elsewhere can still fall through into one, so walk forward
+    // and check the first `NEXT` on each path.
+    if !has_unmodelled_control_flow(module) {
+        let line_index: HashMap<u16, usize> = module
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.number, i))
+            .collect();
+        let succ = fallthrough_successors(module);
+        let marks = for_next_line_marks(module);
+        let innermost_by_stmt = innermost_open_by_stmt(module);
+        let mut memo: HashMap<usize, Vec<StmtId>> = HashMap::new();
+        for edge in collect_edges_with_source(module) {
+            // GOSUB pushes a FNDFOR marker, so the callee's `NEXT`s cannot
+            // see the caller's frames. `nexts_behind_gosub_marker` owns that.
+            if edge.gosub {
+                continue;
+            }
+            // Only a branch taken from inside a loop body can leave a frame.
+            let Some(open) = innermost_by_stmt.get(&edge.src) else {
+                continue;
+            };
+            // `?UNDEF'D STATEMENT`: control never arrives.
+            let Some(&target_idx) = line_index.get(&edge.target) else {
+                continue;
+            };
+            // A `NEXT` on the target line is already handled above.
+            if matches!(marks[target_idx], LineMark::Next(_)) {
+                continue;
+            }
+            for n in first_nexts_from(&succ, &marks, &mut memo, target_idx) {
+                // `NEXT V` finds its own frame. Only a bare `NEXT` takes the top.
+                if !is_bare_next(&n) {
+                    continue;
+                }
+                let Some(&partner) = next_partner_for.get(&n) else {
+                    continue;
+                };
+                // It closes the frame the branch left open, so the static
+                // binding is right.
+                if partner == open {
+                    continue;
+                }
+                if header_reruns_on_line_entry(&n, partner) {
+                    continue;
+                }
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+
     // `bodies` is a HashMap; sort so the output doesn't depend on its
     // iteration order.
     out.sort_by(|a, b| {
@@ -1355,6 +1410,199 @@ fn cross_reached_nexts(
             .cmp(&b.line_idx)
             .then_with(|| a.path.cmp(&b.path))
     });
+    out
+}
+
+/// First `FOR` or `NEXT` on a line, for the forward walk in [`first_nexts_from`].
+enum LineMark {
+    /// A `NEXT` appears before any `FOR`.
+    Next(StmtId),
+    /// A `FOR` appears first. The walk stops: a later bare `NEXT` takes that frame.
+    OpensFor,
+    /// Nothing that moves the FOR stack.
+    Plain,
+}
+
+/// The first `FOR` or `NEXT` on each line, in statement order.
+fn for_next_line_marks(module: &Module) -> Vec<LineMark> {
+    let mut marks: Vec<LineMark> = module.lines.iter().map(|_| LineMark::Plain).collect();
+    for id in collect_all(module, |s| {
+        matches!(s, Stmt::For { .. } | Stmt::Next { .. })
+    }) {
+        if !matches!(marks[id.line_idx], LineMark::Plain) {
+            continue;
+        }
+        let is_next = matches!(stmt_at(module, &id), Some(Stmt::Next { .. }));
+        let slot = id.line_idx;
+        marks[slot] = if is_next {
+            LineMark::Next(id)
+        } else {
+            LineMark::OpensFor
+        };
+    }
+    marks
+}
+
+/// Static `GOTO` / `ON..GOTO` / `IF..THEN <line>` edges plus fall-through.
+/// `GOSUB` is omitted: see the note at the call site.
+fn fallthrough_successors(module: &Module) -> Vec<Vec<usize>> {
+    let index: HashMap<u16, usize> = module
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.number, i))
+        .collect();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); module.lines.len()];
+    for edge in collect_edges_with_source(module) {
+        if edge.gosub {
+            continue;
+        }
+        let Some(&t) = index.get(&edge.target) else {
+            continue;
+        };
+        let f = edge.src.line_idx;
+        if !succ[f].contains(&t) {
+            succ[f].push(t);
+        }
+    }
+    for (i, line) in module.lines.iter().enumerate() {
+        let terminates = line.stmts.iter().any(|s| {
+            matches!(
+                s,
+                Stmt::Goto { .. }
+                    | Stmt::Return
+                    | Stmt::End
+                    | Stmt::Stop
+                    | Stmt::RaiseError(_)
+                    | Stmt::Run(_)
+                    | Stmt::ComputedGoto { .. }
+            )
+        });
+        if !terminates && i + 1 < module.lines.len() && !succ[i].contains(&(i + 1)) {
+            succ[i].push(i + 1);
+        }
+    }
+    succ
+}
+
+/// Innermost `FOR` open at each branch statement, not per line.
+///
+/// `FOR J=1 TO 5:IF J=2 THEN 35` is inside J. `ON-(X)GOTO 7:FOR I=...` is not.
+fn innermost_open_by_stmt(module: &Module) -> HashMap<StmtId, StmtId> {
+    fn record(stmt: &Stmt, here: &StmtId, stack: &[StmtId], out: &mut HashMap<StmtId, StmtId>) {
+        let Some(top) = stack.last() else {
+            return;
+        };
+        if matches!(
+            stmt,
+            Stmt::Goto { .. }
+                | Stmt::OnBranch { .. }
+                | Stmt::If { .. }
+                | Stmt::IfElse { .. }
+                | Stmt::Rcomp { .. }
+        ) {
+            out.insert(here.clone(), top.clone());
+        }
+        match stmt {
+            Stmt::If { then, .. } => record_then(then, here, stack, out),
+            Stmt::IfElse {
+                then, else_then, ..
+            } => {
+                record_then(then, here, stack, out);
+                record_then(else_then, here, stack, out);
+            }
+            Stmt::Rcomp { then, else_then } => {
+                record_then(then, here, stack, out);
+                if let Some(et) = else_then {
+                    record_then(et, here, stack, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn record_then(
+        then: &ThenIr,
+        parent: &StmtId,
+        stack: &[StmtId],
+        out: &mut HashMap<StmtId, StmtId>,
+    ) {
+        if let ThenIr::Stmts(stmts) = then {
+            for (idx, inner) in stmts.iter().enumerate() {
+                let mut path = parent.path.clone();
+                path.push(idx);
+                let id = StmtId {
+                    line_no: parent.line_no,
+                    line_idx: parent.line_idx,
+                    path,
+                };
+                record(inner, &id, stack, out);
+            }
+        }
+    }
+    let mut out: HashMap<StmtId, StmtId> = HashMap::new();
+    let mut stack: Vec<StmtId> = Vec::new();
+    for (line_idx, line) in module.lines.iter().enumerate() {
+        for (top_idx, stmt) in line.stmts.iter().enumerate() {
+            let here = StmtId {
+                line_no: line.number,
+                line_idx,
+                path: vec![top_idx],
+            };
+            record(stmt, &here, &stack, &mut out);
+            match stmt {
+                Stmt::For { .. } => stack.push(here),
+                Stmt::Next { vars } => {
+                    for _ in vars {
+                        stack.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The `NEXT`s ordinary forward execution can run into from `start` without
+/// opening a `FOR` first. The visited set is the termination guard: every line
+/// index is pushed at most once, so a `GOTO` cycle simply stops.
+fn first_nexts_from(
+    succ: &[Vec<usize>],
+    marks: &[LineMark],
+    memo: &mut HashMap<usize, Vec<StmtId>>,
+    start: usize,
+) -> Vec<StmtId> {
+    if let Some(hit) = memo.get(&start) {
+        return hit.clone();
+    }
+    let mut seen: HashSet<usize> = HashSet::new();
+    seen.insert(start);
+    let mut work = vec![start];
+    let mut out: Vec<StmtId> = Vec::new();
+    while let Some(i) = work.pop() {
+        match &marks[i] {
+            LineMark::Next(id) => {
+                if !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+            LineMark::OpensFor => {}
+            LineMark::Plain => {
+                for &n in &succ[i] {
+                    if seen.insert(n) {
+                        work.push(n);
+                    }
+                }
+            }
+        }
+    }
+    // `seen` is a HashSet, so fix the order before anyone can observe it.
+    out.sort_by(|a, b| {
+        a.line_idx
+            .cmp(&b.line_idx)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    memo.insert(start, out.clone());
     out
 }
 

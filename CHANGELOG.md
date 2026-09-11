@@ -5,6 +5,12 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-11
+
+- Integer promotion keeps every read of a promoted variable, and it leaves unbounded accumulators as floats.
+- Spaces inside `<>` / `<=` and a type sigil on an extension name (`DIR%=1`) parse as on the ROM. `TI` and `ST` stay read-only.
+- TSB `USE`, `RESET`, `RCOMP`, `HRDCPY`, `COLD`, `RETRACE` and `INSERT` compile and run. `TRACE`, `DUMP`, `MAP` and `OUT` warn and raise at run time instead of doing nothing. The GUI has a dialect picker for `.bas` files.
+
 ## [1.0.0] - 2026-09-07
 
 - Extensive bug fixes across BASIC parsing, numeric and string operations, loops, subroutines and memory handling.
@@ -225,6 +231,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[1.0.1]: https://github.com/tommyo123/YABCompiler/releases/tag/v1.0.1
 [1.0.0]: https://github.com/tommyo123/YABCompiler/releases/tag/v1.0.0
 [0.9.11]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.11
 [0.9.10]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.10

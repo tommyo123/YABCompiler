@@ -25,7 +25,7 @@ use crate::ast::{
     BinOp, DeferredFnBody, DimSpec, Expr, FnName, Func1, Line, MemTransferOp, OnBranchKind,
     PrintItem, PrintStmt,
     ProcName, Program, ResumeTarget, ScreenRectOp, ScreenScrollOp, SkippedStatement, Statement,
-    StrExpr, SyntaxTrap, SysParamRef, ThenBranch, VarKind, VarName,
+    StrExpr, SyntaxTrap, SysParamRef, ThenBranch, UseBadMode, VarKind, VarName,
 };
 use crate::prg;
 use crate::runtime::ERR_SYNTAX as BASIC_ERR_SYNTAX;
@@ -494,7 +494,7 @@ fn program_uses_tsb_tokens(prg: &prg::Program) -> bool {
         .any(|line| body_uses_tsb_tokens(&line.body))
 }
 
-fn body_uses_tsb_tokens(body: &[u8]) -> bool {
+pub(crate) fn body_uses_tsb_tokens(body: &[u8]) -> bool {
     let mut i = 0usize;
     while i < body.len() {
         match body[i] {
@@ -543,6 +543,8 @@ pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Pr
     let mut skipped = Vec::new();
     let mut traps = Vec::new();
     let mut deferred_fn_bodies = Vec::new();
+    // Names defined by PROC. A bare identifier is a call only if it is in this set.
+    let proc_names = collect_proc_names(prg);
     for raw in &prg.lines {
         lines.push(Line {
             number: raw.number,
@@ -551,6 +553,7 @@ pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Pr
                 &raw.body,
                 &opts,
                 tsb_ascii,
+                &proc_names,
                 &mut skipped,
                 &mut traps,
                 &mut deferred_fn_bodies,
@@ -562,6 +565,19 @@ pub fn program_with_options(prg: &prg::Program, opts: ParseOptions) -> Result<Pr
         skipped,
         traps,
         deferred_fn_bodies,
+    })
+}
+
+/// PROC names on this one test line. The real parser scans the whole program.
+#[cfg(test)]
+fn line_procs(body: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+    collect_proc_names(&prg::Program {
+        load_address: 0x0801,
+        lines: vec![prg::Line {
+            next_ptr: 0,
+            number: 0,
+            body: body.to_vec(),
+        }],
     })
 }
 
@@ -578,6 +594,7 @@ fn line_body_traps(line_no: u16, body: &[u8]) -> Result<Vec<SyntaxTrap>, ParseEr
         body,
         &ParseOptions::default(),
         body_uses_tsb_tokens(body),
+        &line_procs(body),
         &mut Vec::new(),
         &mut traps,
         &mut Vec::new(),
@@ -613,6 +630,7 @@ fn line_body_with_options(
         body,
         opts,
         tsb_ascii,
+        &line_procs(body),
         skipped,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -624,6 +642,7 @@ fn line_body_inner(
     body: &[u8],
     opts: &ParseOptions,
     tsb_ascii: bool,
+    proc_names: &std::collections::HashSet<Vec<u8>>,
     skipped: &mut Vec<SkippedStatement>,
     traps: &mut Vec<SyntaxTrap>,
     deferred_fn_bodies: &mut Vec<DeferredFnBody>,
@@ -632,6 +651,7 @@ fn line_body_inner(
     p.lenient_syntax = opts.lenient_syntax;
     p.int_hint_vars = &opts.int_hint_vars;
     p.tsb_ascii = tsb_ascii;
+    p.proc_names = proc_names;
     p.sys_register_args = opts.sys_register_args;
     let mut out = Vec::new();
     loop {
@@ -1406,10 +1426,22 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             if consume_ascii_stmt_word(p, b"PAGE")
                 || consume_ascii_stmt_word(p, b"DELAY")
                 || consume_ascii_stmt_word(p, b"OPTION")
-                || consume_ascii_stmt_word(p, b"TRACE")
-                || consume_ascii_stmt_word(p, b"RETRACE")
+                // TRACE and RETRACE are handled below, not swallowed here.
             {
                 return Ok(tsb_noop_statement(p));
+            }
+            // RETRACE before TRACE: the shorter word must not eat the longer.
+            if consume_ascii_stmt_word(p, b"RETRACE") {
+                return Ok(Statement::Retrace);
+            }
+            if consume_ascii_stmt_word(p, b"COLD") {
+                return Ok(Statement::Cold);
+            }
+            if consume_ascii_stmt_word(p, b"TRACE") {
+                return Ok(tsb_unreproducible_statement(
+                    p,
+                    "TRACE (it displays the interpreter's current line before every statement)",
+                ));
             }
             if consume_ascii_stmt_word(p, b"KEYGET") || consume_ascii_two_word(p, b"KEY", b"GET") {
                 return tsb_keyget_statement(p);
@@ -1668,8 +1700,9 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             }
             if consume_ascii_stmt_word(p, b"RESET") {
                 p.skip_spaces();
-                let line = line_number(p)?;
-                return Ok(Statement::Reset { line });
+                return Ok(Statement::Reset {
+                    target: expression(p)?,
+                });
             }
             // CHAR followed by `(` is a v2 array reference, not the
             // `CHAR x, y` glyph-POKE statement. Skip the statement
@@ -1713,7 +1746,7 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 // code keeps running and the user sees a missing
                 // operation but no compile error.
                 const NOOP_OK: &[&str] = &[
-                    "DIR", "DUMP", "MAP", "COLD", "OUT", "HRDCPY", "MERGE", "RENUMBER",
+                    "DIR", "HRDCPY", "MERGE", "RENUMBER",
                 ];
                 if NOOP_OK.contains(&name) {
                     let mut bytes = Vec::new();
@@ -1725,6 +1758,15 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                         p.advance(1);
                     }
                     return Ok(Statement::Rem(bytes));
+                }
+                // TSB statements we cannot reproduce: runtime trap plus a warning.
+                if let Some(what) = match name {
+                    "DUMP" => Some("DUMP (it prints the interpreter's live variable table)"),
+                    "MAP" => Some("MAP (it is a TSB extension the program loads from disk at run time)"),
+                    "OUT" => Some("OUT (it prints a BASIC error message text)"),
+                    _ => None,
+                } {
+                    return Ok(tsb_unreproducible_statement(p, what));
                 }
                 return Err(ParseError::Unsupported { line: p.line, name });
             }
@@ -1917,11 +1959,31 @@ fn tsb_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         TSB_ELSE => Ok(Statement::Else),
         TSB_DIV => Ok(cls_statement()),
         TSB_D_BANG => tsb_d_bang_statement(p),
-        TSB_DELAY | TSB_PAGE | TSB_OPTION | TSB_TRACE | TSB_RETRACE => Ok(tsb_noop_statement(p)),
+        TSB_DELAY | TSB_PAGE | TSB_OPTION => Ok(tsb_noop_statement(p)),
+        // RETRACE is a fixed 12-byte build stamp. TRACE cannot be reproduced.
+        TSB_RETRACE => Ok(Statement::Retrace),
+        TSB_TRACE => Ok(tsb_unreproducible_statement(
+            p,
+            "TRACE (it displays the interpreter's current line before every statement)",
+        )),
+        TSB_DUMP => Ok(tsb_unreproducible_statement(
+            p,
+            "DUMP (it prints the interpreter's live variable table)",
+        )),
+        TSB_MAP => Ok(tsb_unreproducible_statement(
+            p,
+            "MAP (it is a TSB extension the program loads from disk at run time)",
+        )),
+        TSB_OUT => Ok(tsb_unreproducible_statement(
+            p,
+            "OUT (it prints a BASIC error message text)",
+        )),
         TSB_SOUND => tsb_sound_statement(p),
         TSB_BFLASH => tsb_flash_statement(p, true),
         TSB_MUSIC => tsb_music_statement(p),
         TSB_FLASH => tsb_flash_statement(p, false),
+        // Bare OFF is TSB's spelling of FLASH OFF, not DISABLE.
+        TSB_OFF => tsb_off_statement(p),
         TSB_PLAY => tsb_play_statement(p),
         TSB_FETCH => tsb_fetch_statement(p),
         TSB_DESIGN => tsb_design_statement(p),
@@ -1937,8 +1999,9 @@ fn tsb_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         TSB_USE => tsb_use_statement(p),
         TSB_RESET => {
             p.skip_spaces();
-            let line = line_number(p)?;
-            Ok(Statement::Reset { line })
+            Ok(Statement::Reset {
+                target: expression(p)?,
+            })
         }
         TSB_SCRSV => tsb_scr_statement(p, true),
         TSB_SCRLD => tsb_scr_statement(p, false),
@@ -1954,6 +2017,8 @@ fn tsb_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         TSB_CMOB => tsb_cmob_statement(p),
         TSB_BCKGNDS => tsb_bckgnds_statement(p),
         TSB_NRM => Ok(Statement::Nrm),
+        // Hardcopy I/O, not a no-op.
+        TSB_HRDCPY => Ok(Statement::HardCopy),
         TSB_CSET => Ok(Statement::Cset {
             mode: expression(p)?,
         }),
@@ -1972,7 +2037,8 @@ fn tsb_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         // we can't actually honour (no disk I/O, no live BASIC
         // editor) but flags the missing operation visually as a
         // skipped REM in the asm.
-        TSB_MAP | TSB_DIR | TSB_DUMP | TSB_COLD | TSB_OUT => Ok(tsb_noop_statement(p)),
+        TSB_DIR => Ok(tsb_noop_statement(p)),
+        TSB_COLD => Ok(Statement::Cold),
         // `GRAPHICS` loads HSG support for the interpreter. Compiled
         // programs handle `\` HSG commands directly, so it is a no-op.
         TSB_GRAPHICS => Ok(tsb_noop_statement(p)),
@@ -2029,8 +2095,29 @@ fn unsupported_tsb_expr(line: u16, token: u8) -> Result<Expr, ParseError> {
 }
 
 fn tsb_noop_statement(p: &mut Cursor<'_>) -> Statement {
-    let _ = p.take_until_statement_end();
+    // Skip to the next `:` or `;`, but not one that sits inside a string.
+    let mut in_string = false;
+    while let Some(c) = p.peek() {
+        if c == b'"' {
+            in_string = !in_string;
+        } else if (c == b':' || c == b';') && !in_string {
+            break;
+        }
+        p.advance(1);
+    }
     Statement::Rem(Vec::new())
+}
+
+/// TSB statement we cannot reproduce. Swallow the rest of the line and
+/// raise ?SYNTAX ERROR at run time, with a compile-time warning.
+fn tsb_unreproducible_statement(p: &mut Cursor<'_>, what: &'static str) -> Statement {
+    let err = ParseError::UnsupportedFeature {
+        line: p.line,
+        what,
+    };
+    p.note_trap(BASIC_ERR_SYNTAX, &err);
+    tsb_noop_statement(p);
+    Statement::RaiseError(BASIC_ERR_SYNTAX)
 }
 
 /// `\<cmd>[,args]` — High-Speed-Graphics shorthand. Drawing commands
@@ -2179,6 +2266,12 @@ fn tsb_key_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     if p.peek() == Some(TOK_GET) {
         p.advance(1);
         return tsb_keyget_statement(p);
+    }
+    // KEY ON / KEY OFF only gate TSB's editor macros, which we do not have.
+    // ON KEY traps are unrelated and still fire. Lower to a no-op.
+    if p.peek() == Some(TOK_ON) || peek_tsb(p, TSB_OFF) {
+        let _ = p.take_until_statement_end();
+        return Ok(Statement::Rem(Vec::new()));
     }
     let index = expression(p)?;
     // `KEY <n>, "..."` is F-key binding. If there's no comma, the
@@ -2415,6 +2508,18 @@ fn make_flash_stmt(
             color2,
         }
     }
+}
+
+/// Bare `OFF`: TSB's standalone spelling of `FLASH OFF`.
+/// An operand is a syntax error, same as on TSB.
+fn tsb_off_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
+    if !at_statement_tail(p) {
+        return Err(ParseError::ExpectedKeyword {
+            line: p.line,
+            what: "end of statement after OFF",
+        });
+    }
+    Ok(make_flash_stmt(false, Some(false), None, None, None))
 }
 
 fn tsb_fetch_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
@@ -2751,142 +2856,224 @@ fn tsb_disk_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     })
 }
 
-/// `USE [AT(r,c)] "ctrl$", var1, var2, … [;]` — formatted
-/// PRINT. The control string holds literal bytes plus `#`-runs that
-/// each consume the next numeric var, formatting it right-justified
-/// (space-padded) in the run's width. Lowered into a regular `Print`
-/// statement: each non-`#` chunk of the control string becomes a
-/// `StrExpr(Literal)` item, each `#`-run becomes a `UseField`. An
-/// optional leading `AT(r,c)` becomes a `PositionAt` item. A trailing
-/// `;` suppresses the newline.
-///
-/// Forms we don't recognise (`USE n`, `USE #n,...`, or non-literal
-/// control strings) fall back to a no-op. Without a trailing `;`, we
-/// still emit a bare CR so the cursor reverse flag resets.
+/// Characters TSB treats as part of a `USE` field.
+/// `!` is not one: it is stripped from the image before the scan.
+fn use_field_char(c: u8) -> bool {
+    matches!(c, b'#' | b'*' | b'.' | b',' | b'+' | b'-')
+}
+
+/// Split a `USE` control string into the printed image and the fields on it.
+/// A run of field chars is one or more fields: `[sign] digits [sep digits] [sign]`.
+/// A trailing sign or a second separator ends the current field and starts the next.
+fn parse_use_mask(ctrl: &[u8]) -> (Vec<u8>, Vec<crate::ast::UseFieldDesc>) {
+    use crate::ast::{UseFieldDesc, UseSign};
+    let mask: Vec<u8> = ctrl.iter().copied().filter(|c| *c != b'!').collect();
+    let mut fields: Vec<UseFieldDesc> = Vec::new();
+    let is_sign = |c: u8| matches!(c, b'+' | b'-');
+    let is_digit = |c: u8| matches!(c, b'#' | b'*');
+    let is_sep = |c: u8| matches!(c, b'.' | b',');
+    let sign_of = |c: u8| {
+        if c == b'+' {
+            UseSign::Plus
+        } else {
+            UseSign::Minus
+        }
+    };
+
+    let mut i = 0usize;
+    while i < mask.len() {
+        if !use_field_char(mask[i]) {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < mask.len() && use_field_char(mask[i]) {
+            i += 1;
+        }
+        let run_end = i;
+
+        let mut k = run_start;
+        while k < run_end {
+            let field_start = k;
+            let mut sign = None;
+            let mut sign_at = field_start;
+            if is_sign(mask[k]) {
+                sign = Some(sign_of(mask[k]));
+                sign_at = k;
+                k += 1;
+            }
+            let body_start = k;
+            let mut sep_at: Option<usize> = None;
+            let mut pad = b' ';
+            let body_end;
+            loop {
+                if k >= run_end {
+                    body_end = k;
+                    break;
+                }
+                let c = mask[k];
+                if is_digit(c) {
+                    if c == b'*' {
+                        pad = b'*';
+                    }
+                    k += 1;
+                } else if is_sep(c) && sep_at.is_none() {
+                    sep_at = Some(k);
+                    k += 1;
+                } else if is_sign(c) {
+                    // Trailing sign: belongs to this field and ends it.
+                    sign = Some(sign_of(c));
+                    sign_at = k;
+                    body_end = k;
+                    k += 1;
+                    break;
+                } else {
+                    // Second separator: end this field, start the next with an empty integer part.
+                    body_end = k;
+                    break;
+                }
+            }
+            let int_digits = sep_at.unwrap_or(body_end) - body_start;
+            let (dec_at, dec_digits) = match sep_at {
+                Some(s) => (s + 1, body_end.saturating_sub(s + 1)),
+                None => (body_start, 0),
+            };
+            // Offsets are u8, so a mask longer than 255 bytes cannot be described.
+            if body_end > 255 || run_end > 255 {
+                break;
+            }
+            fields.push(UseFieldDesc {
+                start: field_start as u8,
+                digits: body_start as u8,
+                int_digits: int_digits as u8,
+                dec_at: dec_at as u8,
+                dec_digits: dec_digits as u8,
+                pad,
+                sign,
+                sign_at: sign_at as u8,
+                run_end: run_end as u8,
+            });
+            if k == field_start {
+                // Stop if this field consumed nothing.
+                break;
+            }
+        }
+    }
+    (mask, fields)
+}
+
+/// `USE [AT(r,c)] <control>[, v...][;]`: TSB formatted print.
+/// A literal mask is scanned here; any other string expression is scanned at run time.
+/// `USE #n` is file output (unreproducible). A leading ASCII digit is device select.
 fn tsb_use_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     p.skip_spaces();
 
-    // Optional `AT(r,c)` prefix.
-    let mut items: Vec<PrintItem> = Vec::new();
+    let mut at = None;
     if matches!(p.peek(), Some(TOK_TSB_PREFIX))
         && p.peek_at(1).map(normalize_tsb_token) == Some(TSB_AT)
     {
-        p.advance(2); // skip $64 $28 (= `AT(`)
+        p.advance(2); // `AT(`
         let row = expression(p)?;
         expect_comma(p, "',' in USE AT")?;
         let col = expression(p)?;
         expect_rparen(p, "')' after USE AT")?;
-        items.push(PrintItem::PositionAt(row, col));
+        at = Some((row, col));
         p.skip_spaces();
     }
 
-    // The control string must be a literal for our formatted-PRINT
-    // path. Anything else (`USE n`, `USE #n,…`, runtime ctrl) falls
-    // back to the no-op-with-conditional-CR behaviour.
-    if p.peek() != Some(b'"') {
-        return tsb_use_fallback(p);
+    if p.peek() == Some(b'#') {
+        return Ok(tsb_unreproducible_statement(
+            p,
+            "USE #n (formatted output to a logical file)",
+        ));
     }
-    p.advance(1);
-    let mut ctrl: Vec<u8> = Vec::new();
-    while let Some(c) = p.peek() {
-        if c == b'"' {
-            p.advance(1);
-            break;
-        }
-        ctrl.push(c);
-        p.advance(1);
+    if at.is_none() && matches!(p.peek(), Some(c) if c.is_ascii_digit()) {
+        return tsb_use_device(p);
+    }
+    // Bare `USE` is a syntax error on TSB.
+    if matches!(p.peek(), None | Some(b':')) {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
     }
 
-    // Variables follow, each after a comma.
-    let mut vars: Vec<Expr> = Vec::new();
+    let ctrl = string_expression(p)?;
+
+    // Values are taken one per field. Extra args after the last field are parsed and dropped.
+    // A trailing comma with nothing after it is a legal extra value.
+    let mut values: Vec<Expr> = Vec::new();
+    let mut trailing_comma = false;
     loop {
         p.skip_spaces();
         if p.peek() != Some(TOK_COMMA) {
             break;
         }
         p.advance(1);
-        vars.push(expression(p)?);
+        p.skip_spaces();
+        if matches!(p.peek(), None | Some(b':') | Some(b';')) {
+            trailing_comma = true;
+            break;
+        }
+        values.push(expression(p)?);
     }
-
-    // Optional trailing `;` suppresses the newline.
     p.skip_spaces();
     let trailing_semicolon = p.peek() == Some(b';');
     if trailing_semicolon {
         p.advance(1);
     }
+    let newline = !trailing_semicolon;
 
-    // Walk the control string, emitting literal chunks and field
-    // items. `#`-runs each consume the next var.
-    let mut var_iter = vars.into_iter();
-    let mut literal: Vec<u8> = Vec::new();
-    let mut i = 0;
-    while i < ctrl.len() {
-        if ctrl[i] == b'#' {
-            if !literal.is_empty() {
-                items.push(PrintItem::StrExpr(StrExpr::Literal(std::mem::take(
-                    &mut literal,
-                ))));
-            }
-            let start = i;
-            while i < ctrl.len() && ctrl[i] == b'#' {
-                i += 1;
-            }
-            let width = (i - start).min(255) as u8;
-            // If there are fewer vars than `#` runs, treat remaining
-            // runs as literal `#`s instead of failing at compile time.
-            match var_iter.next() {
-                Some(value) => items.push(PrintItem::UseField { width, value }),
-                None => {
-                    for _ in 0..(i - start) {
-                        literal.push(b'#');
-                    }
-                }
-            }
+    let StrExpr::Literal(text) = &ctrl else {
+        return Ok(Statement::UseFormatDyn {
+            at,
+            ctrl,
+            values,
+            newline,
+            bad_mode: if trailing_comma {
+                UseBadMode::After
+            } else {
+                UseBadMode::None
+            },
+        });
+    };
+    // `!` deletes that position. Empty-image and length checks use the result, not the source.
+    let image: Vec<u8> = text.iter().copied().filter(|c| *c != b'!').collect();
+    if image.is_empty() {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
+    }
+    let (mask, fields) = parse_use_mask(text);
+    // Trailing comma still needed by a field: ?SYNTAX. Extra values: print, then ?BAD MODE.
+    if trailing_comma && values.len() < fields.len() {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
+    }
+    let extra = values.len() > fields.len() || trailing_comma;
+    values.truncate(fields.len());
+
+    Ok(Statement::UseFormat {
+        at,
+        mask,
+        fields,
+        values,
+        newline,
+        bad_mode: if extra {
+            UseBadMode::After
         } else {
-            literal.push(ctrl[i]);
-            i += 1;
-        }
-    }
-    if !literal.is_empty() {
-        items.push(PrintItem::StrExpr(StrExpr::Literal(literal)));
-    }
-    // Any unused vars get printed verbatim after the control string —
-    // matches BASIC's behaviour where extra args run off the field
-    // list without consuming format chars.
-    for value in var_iter {
-        items.push(PrintItem::UseField { width: 0, value });
-    }
-
-    Ok(Statement::Print(PrintStmt {
-        items,
-        trailing_newline: !trailing_semicolon,
-    }))
+            UseBadMode::None
+        },
+    })
 }
 
-/// Fallback for `USE` forms we don't model — swallow the rest of the
-/// statement (respecting string literals so a `:` inside `"..."` isn't
-/// the separator) and emit a bare CR when there is no trailing `;`.
-fn tsb_use_fallback(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
-    let mut bytes = Vec::new();
-    let mut in_string = false;
-    while let Some(c) = p.peek() {
-        if c == b'"' {
-            in_string = !in_string;
-        } else if c == b':' && !in_string {
-            break;
-        }
-        bytes.push(c);
-        p.advance(1);
+/// Device-select form of `USE`. Stores the device in TSB's default-disk cell at $BE.
+/// Prints nothing.
+fn tsb_use_device(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
+    let device = expression(p)?;
+    p.skip_spaces();
+    // Trailing `;` or `,` is a syntax error.
+    if matches!(p.peek(), Some(b';') | Some(b',')) {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
     }
-    let trailing_semicolon = bytes.last() == Some(&b';');
-    if trailing_semicolon {
-        Ok(Statement::Rem(bytes))
-    } else {
-        Ok(Statement::Print(PrintStmt {
-            items: Vec::new(),
-            trailing_newline: true,
-        }))
-    }
+    Ok(Statement::Poke {
+        addr: Expr::Number(f64::from(crate::runtime::TSB_DEFAULT_DEVICE)),
+        value: device,
+    })
 }
 
 /// Parse a comma-separated variable list for `LOCAL`/`GLOBAL`.
@@ -3449,7 +3636,6 @@ fn consume_ascii_unsupported_tsb_statement(p: &mut Cursor<'_>) -> Option<&'stati
         (b"LIN", "LIN"),
         (b"GRAPHICS", "GRAPHICS"),
         (b"ARC", "ARC"),
-        (b"COLD", "COLD"),
         (b"HRDCPY", "HRDCPY"),
         (b"MERGE", "MERGE"),
         (b"RENUMBER", "RENUMBER"),
@@ -4156,14 +4342,27 @@ fn tsb_exit_statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     Ok(Statement::ExitLoop { cond })
 }
 
+/// `RCOMP [rest of line]`: re-run the last `IF` truth value.
+/// Whatever can follow `THEN` can follow `RCOMP`. A `THEN` after RCOMP is a
+/// run-time ?SYNTAX ERROR, raised only if the branch is taken.
 fn rcomp_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     p.skip_spaces();
-    if p.peek() == Some(TOK_THEN) {
+    let has_then = if p.peek() == Some(TOK_THEN) {
         p.advance(1);
-    } else if !consume_ascii_then(p) && p.peek() != Some(TOK_GOTO) {
-        return Err(ParseError::ExpectedKeyword {
+        true
+    } else {
+        consume_ascii_then(p)
+    };
+    if has_then {
+        let err = ParseError::UnsupportedFeature {
             line: p.line,
-            what: "THEN or GOTO after RCOMP",
+            what: "THEN after RCOMP (TSB raises ?SYNTAX ERROR when the branch is taken)",
+        };
+        p.note_trap(BASIC_ERR_SYNTAX, &err);
+        tsb_noop_statement(p);
+        return Ok(Statement::Rcomp {
+            then_branch: ThenBranch::Stmts(vec![Statement::RaiseError(BASIC_ERR_SYNTAX)]),
+            else_branch: None,
         });
     }
     let (then_branch, else_branch) = then_else_tail(p)?;
@@ -4197,31 +4396,108 @@ fn proc_name(p: &mut Cursor<'_>) -> Result<ProcName, ParseError> {
 }
 
 /// Is the statement at the cursor a bare `EXEC`-less procedure call?
+/// Yes if the name matches a defined PROC. An `=` before the statement ends
+/// makes it an assignment instead. Names may contain embedded tokens and spaces.
 fn bare_identifier_statement(p: &Cursor<'_>) -> bool {
-    let mut i = p.pos;
-    if i >= p.bytes.len() || !p.bytes[i].is_ascii_alphabetic() {
+    if p.pos >= p.bytes.len() || !p.bytes[p.pos].is_ascii_alphabetic() {
         return false;
     }
-    while i < p.bytes.len() && p.bytes[i].is_ascii_alphanumeric() {
-        i += 1;
-    }
-    if i < p.bytes.len() && matches!(p.bytes[i], b'$' | b'%') {
-        i += 1;
-    }
-    while i < p.bytes.len() && p.bytes[i] == b' ' {
-        i += 1;
-    }
-    match p.bytes.get(i).copied() {
-        None | Some(b':' | b';') => true,
+    let Some(name) = statement_name_slice(p.bytes, p.pos) else {
+        return false;
+    };
+    p.proc_names.contains(&name)
+}
 
-        Some(TOK_TSB_PREFIX) => p
-            .bytes
-            .get(i + 1)
-            .copied()
-            .map(normalize_tsb_token)
-            .is_some_and(|t| t == TSB_ELSE),
-        _ => false,
+/// Bytes `proc_name` would take as the name of a bare statement at `start`.
+/// Stops at `:`, `;`, or TSB `ELSE`, trailing spaces trimmed.
+/// `None` if an `=` appears first: that is an assignment, not a name.
+fn statement_name_slice(bytes: &[u8], start: usize) -> Option<Vec<u8>> {
+    let mut i = start;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            // Tokenized `=` (`TOK_EQ`) and a raw `=` byte.
+            TOK_EQ | b'=' => return None,
+            b':' | b';' => break,
+            TOK_TSB_PREFIX => {
+                // `ELSE` closes the statement the way `:` does.
+                if bytes
+                    .get(i + 1)
+                    .copied()
+                    .map(normalize_tsb_token)
+                    .is_some_and(|t| t == TSB_ELSE)
+                {
+                    break;
+                }
+                // Skip the sub-token so its value is not read as `=`.
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    let mut name = bytes[start..i].to_vec();
+    while name.last() == Some(&b' ') {
+        name.pop();
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+/// Every `PROC` name in the program, extracted the same way `proc_name` does.
+/// An EXEC-less call is recognised only when this set contains that name.
+fn collect_proc_names(prg: &prg::Program) -> std::collections::HashSet<Vec<u8>> {
+    let mut out = std::collections::HashSet::new();
+    for line in &prg.lines {
+        let body = &line.body;
+        let mut i = 0usize;
+        let mut in_string = false;
+        while i < body.len() {
+            let b = body[i];
+            if in_string {
+                if b == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            if b == TOK_REM {
+                break;
+            }
+            if b == TOK_TSB_PREFIX
+                && body
+                    .get(i + 1)
+                    .copied()
+                    .map(normalize_tsb_token)
+                    .is_some_and(|t| t == TSB_PROC)
+            {
+                let mut j = i + 2;
+                while j < body.len() && body[j] == b' ' {
+                    j += 1;
+                }
+                if let Some(name) = statement_name_slice(body, j) {
+                    out.insert(name);
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 fn consume_ascii_word(p: &mut Cursor<'_>, word: &[u8]) -> bool {
@@ -4622,6 +4898,10 @@ fn let_assign(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         return Ok(Statement::LetStr { var: name, value });
     }
     let value = expression(p)?;
+    // `TI` and `ST` are read-only. `TI$=` is the clock-set form and already returned above.
+    if is_read_only_pseudo_var(&name) {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
+    }
     Ok(Statement::Let { name, value })
 }
 
@@ -5297,6 +5577,12 @@ fn consume_ascii_then(p: &mut Cursor<'_>) -> bool {
     false
 }
 
+/// `TI` and `ST` (float only) are read-only. `TI%` and `ST%` are ordinary variables.
+/// `TI$` is how a program sets the clock and is not checked here.
+fn is_read_only_pseudo_var(v: &VarName) -> bool {
+    v.kind == VarKind::Float && matches!(v.base.as_str(), "TI" | "ST")
+}
+
 fn for_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     let var = var_name(p)?;
 
@@ -5328,6 +5614,10 @@ fn for_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     } else {
         Expr::Number(1.0)
     };
+    // The counter is written each iteration, so a read-only name is refused here too.
+    if is_read_only_pseudo_var(&var) {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
+    }
     Ok(Statement::For {
         var,
         start,
@@ -5450,7 +5740,15 @@ fn data_item_from_number(raw: &[u8], n: f64) -> crate::ast::DataValue {
 }
 
 fn read_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
-    Ok(Statement::Read(parse_read_target_list(p)?))
+    let targets = parse_read_target_list(p)?;
+    // READ writes its targets, so a read-only name is refused here too.
+    if targets.iter().any(|t| match t {
+        crate::ast::ReadTarget::Scalar(v) => is_read_only_pseudo_var(v),
+        crate::ast::ReadTarget::Array { name, .. } => is_read_only_pseudo_var(name),
+    }) {
+        return Ok(Statement::RaiseError(BASIC_ERR_SYNTAX));
+    }
+    Ok(Statement::Read(targets))
 }
 
 fn input_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
@@ -6246,9 +6544,14 @@ fn parse_prefixed_int_literal(
     if p.peek() == Some(prefix) {
         p.advance(1);
     }
+    // TSB takes at most 4 hex digits after `$` (8 after `%`). The rest is ordinary text.
+    let max_digits = if radix == 16 { 4 } else { 8 };
     let mut value: u32 = 0;
     let mut digits = 0;
     while let Some(b) = p.peek() {
+        if digits == max_digits {
+            break;
+        }
         let digit = match radix {
             16 => match b {
                 b'0'..=b'9' => Some((b - b'0') as u32),
@@ -6349,14 +6652,10 @@ fn tsb_expr_atom(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             let arg = paren_str_expr(p)?;
             Ok(Expr::Nrm(Box::new(arg)))
         }
-        // `USE` as expression returns the current default
-        // drive number. Compiled programs can't really track a
-        // mutable "current drive" state (we don't implement
-        // `USE n` as a runtime statement), so hardcode the
-        // canonical 8 — every `I=USE` reader gets a plausible
-        // value and the program's `LOAD` paths still target the
-        // canonical drive.
-        TSB_USE => Ok(Expr::Number(8.0)),
+        // `USE` as an expression reads TSB's default disk device from $BE.
+        TSB_USE => Ok(Expr::Peek(Box::new(Expr::Number(f64::from(
+            crate::runtime::TSB_DEFAULT_DEVICE,
+        ))))),
         TSB_AT => tsb_at_expr(p),
         TSB_TEST => tsb_test_expr(p),
         TSB_CHECK => tsb_check_expr(p),
@@ -6373,6 +6672,8 @@ fn tsb_expr_atom(p: &mut Cursor<'_>) -> Result<Expr, ParseError> {
                 kind: VarKind::Float,
             }))
         }
+        // `KEY` is not an expression in TSB. Treat it as a syntax error.
+        TSB_KEY => Err(ParseError::ExpectedExpr { line: p.line }),
         other => unsupported_tsb_expr(p.line, other),
     }
 }
@@ -6850,6 +7151,8 @@ fn parse_compare_mask(p: &mut Cursor<'_>) -> Result<u8, ParseError> {
     let mut mask = 0u8;
     loop {
 
+        // CHRGET skips spaces, so `1< >2` is a two-character operator.
+        p.skip_spaces();
         let bit = match p.peek() {
             Some(TOK_GT) => 1,
             Some(TOK_EQ) => 2,
@@ -7021,6 +7324,9 @@ struct Cursor<'a> {
     int_hint_vars: &'a std::collections::HashSet<String>,
     /// Whether bare extended keyword spellings are accepted as keywords.
     tsb_ascii: bool,
+    /// Names defined by `PROC`, as `proc_name` would extract them.
+    /// A bare identifier is a call only if it is in this set.
+    proc_names: &'a std::collections::HashSet<Vec<u8>>,
     /// See [`ParseOptions::sys_register_args`].
     sys_register_args: bool,
     /// Statements this line lowered to a runtime BASIC error, for the caller to warn about.
@@ -7042,6 +7348,11 @@ impl<'a> Cursor<'a> {
             lenient_syntax: false,
             int_hint_vars: EMPTY.get_or_init(std::collections::HashSet::new),
             tsb_ascii: true,
+            proc_names: {
+                static NO_PROCS: std::sync::OnceLock<std::collections::HashSet<Vec<u8>>> =
+                    std::sync::OnceLock::new();
+                NO_PROCS.get_or_init(std::collections::HashSet::new)
+            },
             sys_register_args: false,
             traps: Vec::new(),
             deferred_fn_bodies: Vec::new(),
@@ -8153,11 +8464,175 @@ mod tests {
         assert!(matches!(exprs[3], Expr::Inkey));
     }
 
+    /// Field layout of `USE` control strings.
+    #[test]
+    fn use_mask_fields_match_the_interpreter() {
+        use crate::ast::UseSign;
+        let f = |mask: &str| {
+            let (image, fields) = parse_use_mask(mask.as_bytes());
+            (String::from_utf8(image).unwrap(), fields)
+        };
+
+        // A plain run of `#`.
+        let (image, fields) = f("[###]");
+        assert_eq!(image, "[###]");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].start, 1);
+        assert_eq!(fields[0].digits, 1);
+        assert_eq!(fields[0].int_digits, 3);
+        assert_eq!(fields[0].dec_digits, 0);
+        assert_eq!(fields[0].pad, b' ');
+        assert_eq!(fields[0].sign, None);
+
+        // `.` is the separator, and the digits after it are fraction places.
+        let (image, fields) = f("[##.##]");
+        assert_eq!(image, "[##.##]");
+        assert_eq!(fields[0].int_digits, 2);
+        assert_eq!(fields[0].dec_digits, 2);
+        assert_eq!(fields[0].dec_at, 4);
+
+        // `,` is a decimal comma, not a thousands separator.
+        let (_, fields) = f("[###,###]");
+        assert_eq!(fields[0].int_digits, 3);
+        assert_eq!(fields[0].dec_digits, 3);
+
+        // A trailing separator stays in the image; the field has no fraction digits.
+        let (image, fields) = f("[##.]");
+        assert_eq!(image, "[##.]");
+        assert_eq!(fields[0].int_digits, 2);
+        assert_eq!(fields[0].dec_digits, 0);
+
+        // A leading sign is a sign position, not a literal.
+        let (_, fields) = f("[+##.#]");
+        assert_eq!(fields[0].sign, Some(UseSign::Plus));
+        assert_eq!(fields[0].sign_at, 1);
+        assert_eq!(fields[0].digits, 2);
+        assert_eq!(fields[0].int_digits, 2);
+        assert_eq!(fields[0].dec_digits, 1);
+
+        // A trailing one too, and it may be `-`.
+        let (_, fields) = f("[###-]");
+        assert_eq!(fields[0].sign, Some(UseSign::Minus));
+        assert_eq!(fields[0].sign_at, 4);
+        assert_eq!(fields[0].digits, 1);
+        assert_eq!(fields[0].int_digits, 3);
+
+        // `!` is stripped from the image and does not add width.
+        let (image, fields) = f("[!###]");
+        assert_eq!(image, "[###]");
+        assert_eq!(fields[0].start, 1);
+        assert_eq!(fields[0].int_digits, 3);
+
+        // `*` is a digit and also sets the fill byte, wherever it sits.
+        for mask in ["[*###]", "[###*]"] {
+            let (_, fields) = f(mask);
+            assert_eq!(fields[0].int_digits, 4, "{mask}");
+            assert_eq!(fields[0].pad, b'*', "{mask}");
+        }
+
+        // A run with no digit positions is still a field and still takes a value.
+        let (image, fields) = f("[-.-]");
+        assert_eq!(image, "[-.-]");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].int_digits, 0, "no digit positions to fill");
+
+        // Text between fields stays put, and each field takes one value.
+        let (image, fields) = f("A#B#C");
+        assert_eq!(image, "A#B#C");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].start, 1);
+        assert_eq!(fields[1].start, 3);
+
+        // A second separator, or a sign after digits, ends the field and starts another.
+        let (image, fields) = f("[#.#,#]");
+        assert_eq!(image, "[#.#,#]");
+        assert_eq!(fields.len(), 2, "a second separator opens a field");
+        assert_eq!(fields[0].int_digits, 1);
+        assert_eq!(fields[1].int_digits, 0, "and that field has no integer part");
+
+        let (image, fields) = f("[##+##]");
+        assert_eq!(image, "[##+##]");
+        assert_eq!(fields.len(), 2, "a sign after digits closes its field");
+        assert_eq!(fields[0].int_digits, 2);
+        assert_eq!(fields[0].sign, Some(UseSign::Plus));
+        assert_eq!(fields[1].int_digits, 2);
+        assert_eq!(fields[1].sign, None);
+
+        // Fields in one run share `run_end`, so overflow in the first skips the rest.
+        assert_eq!(fields[0].run_end, fields[1].run_end);
+    }
+
+    /// Only float `TI` and `ST` are read-only. Integer and string spellings are not.
+    #[test]
+    fn only_the_float_spelling_of_ti_and_st_is_read_only() {
+        let eq5 = |base: &[u8]| {
+            let mut v = base.to_vec();
+            v.push(TOK_EQ);
+            v.push(b'5');
+            v
+        };
+
+        // `TI%` and `ST%` are ordinary integer variables.
+        for base in [&b"TI%"[..], b"ST%"] {
+            assert!(
+                matches!(line_body(10, &eq5(base)).unwrap()[0], Statement::Let { .. }),
+                "{} is an ordinary variable",
+                String::from_utf8_lossy(base)
+            );
+        }
+
+        // The float spelling is not.
+        for base in [&b"TI"[..], b"ST"] {
+            assert!(
+                matches!(
+                    line_body(10, &eq5(base)).unwrap()[0],
+                    Statement::RaiseError(BASIC_ERR_SYNTAX)
+                ),
+                "{} must raise",
+                String::from_utf8_lossy(base)
+            );
+        }
+
+        // TI$ sets the clock.
+        let ti_str = [b'T', b'I', b'$', TOK_EQ, 0x22, b'0', 0x22];
+        assert!(matches!(
+            line_body(10, &ti_str).unwrap()[0],
+            Statement::LetStr { .. }
+        ));
+
+        // FOR writes the counter, so float `TI` is refused there too.
+        let for_ti = [TOK_FOR, b'T', b'I', TOK_EQ, b'1', TOK_TO, b'3'];
+        assert!(matches!(
+            line_body(10, &for_ti).unwrap()[0],
+            Statement::RaiseError(BASIC_ERR_SYNTAX)
+        ));
+        let for_ti_int = [TOK_FOR, b'T', b'I', b'%', TOK_EQ, b'1', TOK_TO, b'3'];
+        assert!(
+            matches!(
+                line_body(10, &for_ti_int).unwrap()[0],
+                Statement::For { .. }
+            ),
+            "the integer spelling is a perfectly good loop counter"
+        );
+
+        // Same for READ.
+        let read_ti = [TOK_READ, b'T', b'I'];
+        assert!(matches!(
+            line_body(20, &read_ti).unwrap()[0],
+            Statement::RaiseError(BASIC_ERR_SYNTAX)
+        ));
+        let read_ti_int = [TOK_READ, b'T', b'I', b'%'];
+        assert!(matches!(
+            line_body(20, &read_ti_int).unwrap()[0],
+            Statement::Read(_)
+        ));
+    }
+
     #[test]
     fn tsbneo_compatibility_batch_parse() {
         let stmts = line_body_tsb(
             10,
-            b"MOVE 0,0,10,2,5,5:UPW 0,0,10,2:KEYGET A$:DISK \"I0\":PAGE:TRACE",
+            b"MOVE 0,0,10,2,5,5:UPW 0,0,10,2:KEYGET A$:DISK \"I0\":PAGE",
         )
         .unwrap();
         assert!(matches!(stmts[0], Statement::ScreenMove { .. }));
@@ -8165,7 +8640,24 @@ mod tests {
         assert!(matches!(stmts[2], Statement::KeyGet { .. }));
         assert!(matches!(stmts[3], Statement::Disk { .. }));
         assert!(matches!(stmts[4], Statement::Rem(_)));
-        assert!(matches!(stmts[5], Statement::Rem(_)));
+
+        // TRACE, DUMP, and MAP cannot be reproduced, so they raise at run time.
+        // RETRACE is a fixed 12-byte stamp. COLD is a real statement.
+        for src in [&b"TRACE ON"[..], b"DUMP", b"MAP 2,0,\"A\",1"] {
+            assert!(
+                matches!(line_body_tsb(10, src).unwrap()[0], Statement::RaiseError(_)),
+                "{:?} must compile to a runtime trap",
+                String::from_utf8_lossy(src)
+            );
+        }
+        assert!(matches!(
+            line_body_tsb(10, b"RETRACE").unwrap()[0],
+            Statement::Retrace
+        ));
+        assert!(matches!(
+            line_body_tsb(10, b"COLD").unwrap()[0],
+            Statement::Cold
+        ));
 
         let stmts = line_body_tsb(
             20,
@@ -8248,13 +8740,29 @@ mod tests {
         ));
     }
 
+    /// `EXEC` may be omitted when the same line also defines the PROC.
     #[test]
     fn tsb_proc_exec_can_be_omitted() {
-        let stmts = line_body(10, b"WORK").unwrap();
+        let mut body = b"WORK:".to_vec();
+        body.extend_from_slice(&[TOK_TSB_PREFIX, TSB_PROC, b' ']);
+        body.extend_from_slice(b"WORK");
+        let stmts = line_body(10, &body).unwrap();
         match &stmts[0] {
             Statement::ProcCall(name) => assert_eq!(name.0.as_slice(), b"WORK"),
             other => panic!("unexpected parse result: {other:?}"),
         }
+        assert!(
+            matches!(&stmts[1], Statement::ProcDef(n) if n.0.as_slice() == b"WORK"),
+            "{stmts:?}"
+        );
+    }
+
+    /// A bare name with no matching `PROC` is a syntax trap, not a call.
+    #[test]
+    fn a_bare_name_with_no_proc_is_not_a_call() {
+        let traps = line_body_traps(10, b"WORK").unwrap();
+        assert_eq!(traps.len(), 1, "{traps:?}");
+        assert_eq!(traps[0].code, BASIC_ERR_SYNTAX);
     }
 
     /// Regression: `FOR Z=10 TO 0 STEP +.2` (TankAttack line 510).

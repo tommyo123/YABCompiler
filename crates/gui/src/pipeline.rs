@@ -10,7 +10,7 @@ use std::path::Path;
 
 use yabcompiler_core::{
     CompileOptions, Diagnostics, Program, compile_with_options, is_basic_source_path,
-    parse_reserved_ranges, parse_start_address, tokenize_program,
+    parse_reserved_ranges, parse_start_address, tokenize_program_with,
 };
 
 pub use yabcompiler_core::Profile;
@@ -33,6 +33,8 @@ pub struct BuildArtifact {
 pub struct BuildRequest<'a> {
     pub input_path: &'a Path,
     pub profile: Profile,
+    /// Keyword set used when reading ASCII source.
+    pub dialect: yabcompiler_core::Dialect,
     pub extraram: bool,
     pub force_extraram_off: bool,
     pub auto_reserve: bool,
@@ -66,6 +68,7 @@ impl BuildRequest<'_> {
     fn options(&self) -> Result<CompileOptions, String> {
         let mut options = CompileOptions {
             profile: self.profile,
+            dialect: self.dialect,
             extraram: self.extraram,
             force_extraram_off: self.force_extraram_off,
             auto_reserve: self.auto_reserve,
@@ -100,31 +103,32 @@ pub fn read_input(path: &Path) -> Result<Vec<u8>, String> {
 /// rest is returned unchanged. Used by every UI action that needs a
 /// .prg shape (list, dump, build) so each action accepts either
 /// extension transparently.
-pub fn load_prg_bytes(path: &Path) -> Result<Vec<u8>, String> {
+pub fn load_prg_bytes(path: &Path, dialect: yabcompiler_core::Dialect) -> Result<Vec<u8>, String> {
     let bytes = read_input(path)?;
     if !is_basic_source_path(path) {
         return Ok(bytes);
     }
     let source = String::from_utf8(bytes)
         .map_err(|e| format!("{} is not valid UTF-8 source: {e}", path.display()))?;
-    tokenize_program(&source).map_err(|e| format!("tokenize {}: {e}", path.display()))
+    tokenize_program_with(&source, dialect)
+        .map_err(|e| format!("tokenize {}: {e}", path.display()))
 }
 
-pub fn list_program(path: &Path) -> Result<String, String> {
-    let bytes = load_prg_bytes(path)?;
+pub fn list_program(path: &Path, dialect: yabcompiler_core::Dialect) -> Result<String, String> {
+    let bytes = load_prg_bytes(path, dialect)?;
     let program = Program::parse(&bytes).map_err(|e| format!("prg parse: {e}"))?;
     Ok(program.detokenize())
 }
 
-pub fn dump_program(path: &Path) -> Result<String, String> {
-    let bytes = load_prg_bytes(path)?;
+pub fn dump_program(path: &Path, dialect: yabcompiler_core::Dialect) -> Result<String, String> {
+    let bytes = load_prg_bytes(path, dialect)?;
     let program = Program::parse(&bytes).map_err(|e| format!("prg parse: {e}"))?;
     Ok(program.dump())
 }
 
 pub fn build(request: &BuildRequest<'_>) -> Result<BuildArtifact, BuildError> {
     request.validate().map_err(|m| BuildError::short(m))?;
-    let bytes = load_prg_bytes(request.input_path).map_err(BuildError::short)?;
+    let bytes = load_prg_bytes(request.input_path, request.dialect).map_err(BuildError::short)?;
     let options = request.options().map_err(BuildError::short)?;
     let compiled = compile_with_options(&bytes, options).map_err(|e| {
         let asm = e.generated_asm().map(str::to_owned);
@@ -203,8 +207,8 @@ pub fn default_export_path(input: &Path, ext: &str) -> std::path::PathBuf {
 /// tokenizer first to canonicalise (case-fold, normalize PETSCII
 /// escapes) before being detokenised back, so the output reads
 /// like the LIST a real C64 would print.
-pub fn export_as_bas(input: &Path, target: &Path) -> Result<usize, String> {
-    let bytes = load_prg_bytes(input)?;
+pub fn export_as_bas(input: &Path, target: &Path, dialect: yabcompiler_core::Dialect) -> Result<usize, String> {
+    let bytes = load_prg_bytes(input, dialect)?;
     let program = Program::parse(&bytes).map_err(|e| format!("prg parse: {e}"))?;
     let text = program.detokenize();
     std::fs::write(target, text.as_bytes())
@@ -216,8 +220,8 @@ pub fn export_as_bas(input: &Path, target: &Path) -> Result<usize, String> {
 /// tokenised .prg file to `target`. For `.prg` input we still go
 /// through `Program::parse` so a malformed file fails loudly rather
 /// than being silently re-saved.
-pub fn export_as_prg(input: &Path, target: &Path) -> Result<usize, String> {
-    let bytes = load_prg_bytes(input)?;
+pub fn export_as_prg(input: &Path, target: &Path, dialect: yabcompiler_core::Dialect) -> Result<usize, String> {
+    let bytes = load_prg_bytes(input, dialect)?;
     Program::parse(&bytes).map_err(|e| format!("prg parse: {e}"))?;
     std::fs::write(target, &bytes).map_err(|e| format!("write {}: {e}", target.display()))?;
     Ok(bytes.len())

@@ -4,7 +4,8 @@
 mod common;
 
 use yabcompiler_core::{
-    CompileOptions, Dialect, Profile, compile_with_options, tokenize_program, tokenize_program_with,
+    CompileOptions, Dialect, Profile, compile_with_options, resolved_dialect, tokenize_program,
+    tokenize_program_with,
 };
 
 fn asm_dialect(src: &str, dialect: Dialect) -> String {
@@ -218,7 +219,7 @@ fn runtime_computed_goto_turns_both_caches_off() {
                301 PRINT 1/Q\n";
     let a = asm_dialect(src, Dialect::Tsb);
     assert!(
-        a.contains("__CGOTO_NEXT_"),
+        a.contains("__CGOTO_DISPATCH"),
         "target really is runtime:\n{a}"
     );
     assert!(
@@ -241,7 +242,7 @@ fn literal_computed_goto_is_just_a_branch_target() {
         Dialect::Tsb,
     );
     assert!(
-        !a.contains("__CGOTO_NEXT_"),
+        !a.contains("__CGOTO_DISPATCH"),
         "a literal target must not build a table:\n{a}"
     );
     assert!(
@@ -558,5 +559,518 @@ fn a_single_line_loop_gets_no_loop_head_stamp() {
         after_for_top(&a, 0).first().map(String::as_str),
         Some("LDA #$0A"),
         "nothing between the head and the back edge writes $39:\n{a}"
+    );
+}
+
+    /// `RESET` restores to the first DATA line at or after its argument.
+    /// The argument may be any expression, not only a literal.
+    #[test]
+    fn reset_targets_the_first_data_line_at_or_after_its_argument() {
+        // DATA on 10 and 20 only; line 15 exists but carries none.
+        let src = |arg: &str| {
+            format!(
+                "10 DATA 1,2,3\n15 REM\n20 DATA 4,5,6\n\
+                 30 READ B\n40 {arg}\n50 READ B\n60 PRINT B\n70 END\n"
+            )
+        };
+
+        // `RESET 20` and `RESET 15` both land on line 20's DATA.
+        for arg in ["RESET 20", "RESET 15"] {
+            let asm = asm_dialect(&src(arg), Dialect::Tsb);
+            assert!(
+                asm.contains("LDA #<__DATA_LINE_20"),
+                "{arg} must point at line 20's DATA:\n{asm}"
+            );
+            assert!(
+                !asm.contains("LDA #<__DATA_LINE_10"),
+                "{arg} must not target line 10 -- that is the wrong DATA:
+{asm}"
+            );
+        }
+
+        // Past the last DATA line, the pointer is __DATA_END, so the next
+        // READ raises ?OUT OF DATA.
+        let asm = asm_dialect(&src("RESET 65000"), Dialect::Tsb);
+        assert!(asm.contains("#<__DATA_END"), "past the end:\n{asm}");
+
+        // A non-literal argument builds the runtime table and search.
+        // PEEK keeps the argument out of const-prop; `X=20:RESET X` would fold.
+        let asm = asm_dialect(&src("RESET 20+PEEK(198)"), Dialect::Tsb);
+        assert!(asm.contains("JSR __RESET_FIND"), "runtime search:\n{asm}");
+        assert!(asm.contains("__RESET_LO:"), "line table:\n{asm}");
+        // Two parallel byte tables, so X can index them and the search
+        // covers 255 DATA lines rather than the 127 a `.word` table allows.
+        assert!(asm.contains("__RESET_PLO:"), "pointer table lo:\n{asm}");
+        assert!(asm.contains("__RESET_PHI:"), "pointer table hi:\n{asm}");
+        assert!(
+            asm.contains(".byte <__DATA_LINE_20"),
+            "the pointer table names the DATA-line labels:\n{asm}"
+        );
+        // GETADR, not the int island: `RESET -1` must raise ?ILLEGAL QUANTITY.
+        assert!(
+            asm.contains("JSR $B7F7"),
+            "argument goes through GETADR:\n{asm}"
+        );
+    }
+
+/// TSB boot colours and charset follow live extension use, not a statement
+/// whitelist and not the dialect flag alone.
+#[test]
+fn the_boot_prologue_follows_the_dialect_not_the_statement_whitelist() {
+    // `USE` is TSB, so this program gets the TSB prologue.
+    let tsb = asm_dialect("10 USE \"[###]\",5\n", Dialect::Tsb);
+    assert!(
+        tsb.contains("LDA #$17") && tsb.contains("STA $D018"),
+        "a TSB program gets TSB's charset:\n{tsb}"
+    );
+    assert!(
+        tsb.contains("STA $D020"),
+        "and TSB's boot colours:\n{tsb}"
+    );
+
+    // A TSB function counts too, even with no TSB statement.
+    let expr_only = asm_dialect("10 A$=\"F\"
+20 PRINT NRM(A$)
+", Dialect::Tsb);
+    assert!(
+        expr_only.contains("STA $D018"),
+        "a TSB function is TSB evidence too:
+{expr_only}"
+    );
+
+    // No TSB construct keeps the KERNAL defaults, even with dialect TSB.
+    let plain = asm_dialect("10 PRINT 5\n", Dialect::Tsb);
+    assert!(
+        !plain.contains("STA $D018") && !plain.contains("STA $D020"),
+        "no extension token means no TSB prologue, whatever the flag says:\n{plain}"
+    );
+
+    // A token on a dead line does not decide the boot prologue.
+    let dead = asm_dialect("10 PRINT 5\n20 END\n30 USE \"[###]\",5\n", Dialect::Tsb);
+    assert!(
+        !dead.contains("L30:"),
+        "the line really is eliminated, or this proves nothing:\n{dead}"
+    );
+    assert!(
+        !dead.contains("STA $D018"),
+        "a token on a dead line must not decide the boot prologue:\n{dead}"
+    );
+}
+
+/// `TI$` is rebuilt in one shared slot, so a compare of two reads snapshots
+/// the left one before the right one overwrites it.
+#[test]
+fn a_compare_of_two_volatile_string_reads_snapshots_the_left_one() {
+    let both = asm("10 IF TI$<>TI$ THEN PRINT \"NE\"\n");
+    assert!(
+        both.contains("JSR __STR_SNAP"),
+        "two rebuild-in-place reads need the left one copied aside:\n{both}"
+    );
+
+    // An ordinary string compare needs no snapshot.
+    let ordinary = asm("10 A$=\"X\":B$=\"Y\"\n20 IF A$<>B$ THEN PRINT \"NE\"\n");
+    assert!(
+        !ordinary.contains("JSR __STR_SNAP"),
+        "an ordinary compare needs no snapshot:\n{ordinary}"
+    );
+
+    // A copy is already stable: `T$=TI$` cannot be overwritten by the next read.
+    let copied = asm("10 T$=TI$\n20 IF T$<>TI$ THEN PRINT \"NE\"\n");
+    assert!(
+        !copied.contains("JSR __STR_SNAP"),
+        "a copy is stable storage already:\n{copied}"
+    );
+}
+
+/// TSB `USE <n>` stores the device in $BE. An expression `USE` reads that cell.
+/// Only a leading digit takes the device path, so `USE D` is not a select.
+#[test]
+fn use_selects_a_device_in_the_cell_tsb_uses() {
+    let set = asm_dialect("10 USE 0+9\n20 PRINT USE\n", Dialect::Tsb);
+    assert!(
+        set.contains("STA $BE"),
+        "the device is stored where TSB stores it:\n{set}"
+    );
+    assert!(
+        set.contains("LDA #$08"),
+        "and the cell starts at TSB's boot value:\n{set}"
+    );
+
+    // No USE means no write to $BE. On a stock C64 that cell is the tape buffer.
+    let plain = asm_dialect("10 PRINT 5\n", Dialect::Tsb);
+    assert!(
+        !plain.contains("STA $BE"),
+        "no USE means no write to $BE:\n{plain}"
+    );
+
+    // Only a leading digit takes the device path, so `USE D` is a control string.
+    let named = asm_dialect("10 D=9\n20 USE D\n", Dialect::Tsb);
+    assert!(
+        !named.contains("STA $BE"),
+        "USE D is not a device select:\n{named}"
+    );
+}
+
+/// A `USE` control string may be any string expression. A literal still uses
+/// the compile-time path. A runtime scan keeps a pristine copy of the mask.
+#[test]
+fn a_use_control_string_may_be_a_string_expression() {
+    let dynamic = asm_dialect("10 F$=\"[###]\"\n20 USE F$,12\n", Dialect::Tsb);
+    assert!(
+        dynamic.contains("JSR __USE_LOADV") && dynamic.contains("JSR __USE_FIND"),
+        "a variable control string is scanned at run time:\n{dynamic}"
+    );
+
+    // The literal form must not drag the scanner in with it.
+    let literal = asm_dialect("10 USE \"[###]\",12\n", Dialect::Tsb);
+    assert!(
+        literal.contains("JSR __USE_DESC"),
+        "a literal keeps the pooled descriptor:\n{literal}"
+    );
+    assert!(
+        !literal.contains("__USE_LOADV"),
+        "and pays nothing for the runtime scanner:\n{literal}"
+    );
+
+    // The scanner reads a pristine copy: after field 1, `###` has become `123`.
+    let two = asm_dialect("10 F$=\"[###][###]\"\n20 USE F$,1,2\n", Dialect::Tsb);
+    assert!(
+        two.contains("STA __USE_SRC,X"),
+        "the control image is kept twice:\n{two}"
+    );
+}
+
+/// Int-promotion must rename every read of a promoted variable, including
+/// those inside `USE`.
+#[test]
+fn int_promotion_renames_reads_in_every_statement() {
+    let looped = asm_dialect("10 FOR I=1 TO 3\n20 USE \"[###]\",I\n30 NEXT\n", Dialect::Tsb);
+    assert!(
+        !looped.contains("LDA #<V_I"),
+        "the USE value reads the live counter, not the stale float slot:\n{looped}"
+    );
+
+    // Same read outside a loop: promotion comes from the write, not a FOR header.
+    let plain = asm_dialect("10 N=7\n20 USE \"[###]\",N\n", Dialect::Tsb);
+    assert!(
+        !plain.contains("LDA #<V_N"),
+        "a promoted scalar reads its integer slot too:\n{plain}"
+    );
+}
+
+/// `RCOMP` guards the rest of the line using the last `IF` result. A bare
+/// statement list is allowed, not only `THEN` or `GOTO`.
+#[test]
+fn rcomp_guards_a_bare_statement_list() {
+    for src in [
+        // a bare statement
+        "10 A=1\n20 IF A=1 THEN PRINT\"T\"\n30 RCOMP PRINT\"R\"\n",
+        // several statements: the whole rest of the line is one guarded block
+        "10 A=1\n20 IF A=1 THEN PRINT\"T\"\n30 RCOMP PRINT\"A\":PRINT\"B\"\n40 PRINT\"C\"\n",
+        // an assignment
+        "10 A=1\n20 IF A=1 THEN PRINT\"T\"\n30 RCOMP B=2:C=3\n",
+        // a colon straight after the token
+        "10 A=1\n20 IF A=1 THEN PRINT\"T\"\n30 RCOMP:PRINT\"R\"\n",
+        // GOTO
+        "10 IF 1=1 THEN PRINT\"T\"\n20 RCOMP GOTO 40\n40 END\n",
+    ] {
+        let asm = asm_dialect(src, Dialect::Tsb);
+        assert!(
+            asm.contains("__LAST_IF"),
+            "RCOMP compiles and tests the remembered IF result for {src:?}:\n{asm}"
+        );
+    }
+}
+
+/// `THEN` after `RCOMP` is a run-time ?SYNTAX ERROR, raised only if the
+/// branch is taken. The program still compiles.
+#[test]
+fn then_after_rcomp_raises_only_when_the_branch_is_taken() {
+    let src = "10 A=1\n20 IF A=1 THEN PRINT\"T\"\n30 RCOMP THEN PRINT\"R\"\n";
+    let prg = tokenize_program_with(src, Dialect::Tsb).expect("tokenizes");
+    let opts = CompileOptions {
+        profile: Profile::Default,
+        dialect: Dialect::Tsb,
+        ..CompileOptions::default()
+    };
+    let out = compile_with_options(&prg, opts).expect("compiles rather than refusing the program");
+    assert!(
+        out.diagnostics
+            .syntax_traps
+            .iter()
+            .any(|t| t.detail.contains("THEN after RCOMP")),
+        "the trap is reported: {:?}",
+        out.diagnostics.syntax_traps
+    );
+    assert!(
+        out.asm.contains("__LAST_IF"),
+        "and it is still guarded by the remembered IF result:\n{}",
+        out.asm
+    );
+}
+
+/// `INSERT` checks the box before it writes. Out of range raises ?BAD MODE.
+/// A pattern that is not nine characters is a run-time ?ILLEGAL QUANTITY.
+#[test]
+fn insert_checks_its_box_before_it_writes_anything() {
+    let asm = asm_dialect("10 R$=\"ABCDEFGHI\"\n20 INSERT R$,2,3,10,5,1\n", Dialect::Tsb);
+    let guard = asm
+        .find("JSR __INSERT_BOX_BOUNDS")
+        .expect("the guard is emitted");
+    let fill = asm.find("__TSB_RECT_FILL").expect("the rects are emitted");
+    assert!(
+        guard < fill,
+        "the guard runs before the first write, colour fill included:\n{asm}"
+    );
+    assert!(
+        asm.contains("__TSB_BAD_MODE"),
+        "and an out-of-range box raises TSB's own error:\n{asm}"
+    );
+
+    let short = tokenize_program_with("10 R$=\"ABC\"\n20 INSERT R$,2,3,10,5,1\n", Dialect::Tsb)
+        .expect("tokenizes");
+    let opts = CompileOptions {
+        profile: Profile::Default,
+        dialect: Dialect::Tsb,
+        ..CompileOptions::default()
+    };
+    assert!(
+        compile_with_options(&short, opts).is_ok(),
+        "a non-nine-character pattern must not refuse the program"
+    );
+}
+
+/// TSB error 32 is not in the ROM message table, so the message is printed
+/// here and control re-enters the ROM error tail at $A46C.
+#[test]
+fn bad_mode_prints_tsbs_own_message() {
+    let asm = asm_dialect("10 R$=\"ABCDEFGHI\"\n20 INSERT R$,2,3,10,5,1\n", Dialect::Tsb);
+    assert!(
+        asm.contains("$0D,$3F,$42,$41,$44,$20,$4D,$4F,$44,$45,$20,$20,$45,$52,$52,$4F,$52,$00"),
+        "the measured message bytes are emitted verbatim:\n{asm}"
+    );
+    assert!(
+        asm.contains("JMP $A46C"),
+        "and it re-enters the ROM error tail rather than the message table:\n{asm}"
+    );
+
+    // A program with no ?BAD MODE path must not pay for the printer.
+    let plain = asm_dialect("10 PRINT 5\n", Dialect::Tsb);
+    assert!(
+        !plain.contains("__TSB_BAD_MODE"),
+        "the printer is only emitted where it is reachable:\n{plain}"
+    );
+}
+
+/// An accumulator with no proven bound stays a float. A later `IF r>32767`
+/// guard does not bound the store on the previous line.
+#[test]
+fn an_unbounded_accumulator_stays_a_float() {
+    // No bound exists: the interpreter counts up in floating point forever.
+    let loop_only = asm("10 r=r+1000\n20 goto 10\n");
+    assert!(
+        !loop_only.contains("VI_R"),
+        "an accumulator with no proven bound must not become an integer:\n{loop_only}"
+    );
+
+    // Every read is an integer context, but the store overshoots the later guard.
+    let reported = asm(
+        "10 a%=1524\n110 r=peek(56324)+r+a%\n120 if r>32767 then r=r-32767\n\
+         130 p%=r and 7\n140 goto 110\n",
+    );
+    assert!(
+        !reported.contains("VI_R"),
+        "a guard bounds the read, not the store, so R stays a float:\n{reported}"
+    );
+
+    // A variable whose definitions do not mention it can still promote.
+    let plain = asm("10 for i=1 to 10\n20 k=i+1\n30 poke 1024,k\n40 next\n");
+    assert!(
+        plain.contains("VI_K") || plain.contains("VI_I"),
+        "ordinary bounded variables still promote:\n{plain}"
+    );
+}
+
+/// A second separator or a mid-run sign starts a new field in the same run.
+/// With one value, `[##+##]` reaches field two and raises ?BAD MODE.
+#[test]
+fn a_use_run_can_hold_more_than_one_field() {
+    for src in [
+        "10 USE \"[#,###,###]\",1\n",
+        "10 USE \"[#,###.##]\",1.5\n",
+        "10 USE \"[##+##]\",12\n",
+        "10 USE \"[#.#,#]\",1.5\n",
+        "10 USE \"[++##]\",1\n",
+    ] {
+        let prg = tokenize_program_with(src, Dialect::Tsb).expect("tokenizes");
+        let opts = CompileOptions {
+            profile: Profile::Default,
+            dialect: Dialect::Tsb,
+            ..CompileOptions::default()
+        };
+        let out = compile_with_options(&prg, opts).expect("compiles");
+        assert!(
+            out.diagnostics.syntax_traps.is_empty(),
+            "a mask TSB accepts must not be trapped: {src:?} {:?}",
+            out.diagnostics.syntax_traps
+        );
+        assert!(
+            out.asm.contains("__TSB_BAD_MODE"),
+            "and the second field has no value, so it reaches ?BAD MODE:\n{}",
+            out.asm
+        );
+    }
+}
+
+/// Too few values: print nothing, then ?BAD MODE. Too many: print first, then
+/// raise. The raise sits at the field; an echo branch jumps past it.
+#[test]
+fn bad_mode_prints_before_or_after_by_which_side_ran_out() {
+    // The peephole may fold `JMP __TSB_BAD_MODE` into a fallthrough, so look
+    // at the program body, everything before the helper block.
+    let body = |src: &str| {
+        let a = asm_dialect(src, Dialect::Tsb);
+        let cut = a
+            .find("; --- helper subroutines ---")
+            .unwrap_or(a.len());
+        (a[..cut].to_string(), a)
+    };
+
+    // Too few: the buffer is never flushed at all.
+    let (few, few_all) = body("10 USE \"[###]\"
+");
+    assert!(
+        few_all.contains("__BAD_MODE_MSG"),
+        "it raises TSB own error:
+{few_all}"
+    );
+    assert!(
+        !few.contains("JSR __USE_SHOW"),
+        "and prints nothing before it:
+{few}"
+    );
+
+    // Too many: flush first, without the statement's own carriage return.
+    let (many, many_all) = body("10 USE \"[###]\",1,2
+");
+    let show = many.find("JSR __USE_SHOW").expect("prints");
+    assert!(
+        many_all.contains("__BAD_MODE_MSG"),
+        "and then raises:
+{many_all}"
+    );
+    assert!(
+        !many[show..].contains("LDA #$0D"),
+        "no trailing carriage return between the flush and the error:
+{}",
+        &many[show..]
+    );
+
+    // A run cut into two fields stops at the first echo, so the second field
+    // raise is jumped over rather than reached.
+    let (echo, _) = body("10 USE \"[#,###,###]\",1
+");
+    assert!(
+        echo.contains("LDA __UF_ECHO"),
+        "the echo is tested between the fields of one run:
+{echo}"
+    );
+}
+
+/// `!` deletes a position, so `USE "!"` is empty and raises ?SYNTAX ERROR.
+/// A trailing comma is a value: reached it is ?SYNTAX, unreached it is ?BAD MODE.
+#[test]
+fn a_control_string_that_is_all_bangs_is_empty() {
+    for src in ["10 USE \"!\"\n", "10 USE \"!!\"\n", "10 USE \"!\",1\n"] {
+        let asm = asm_dialect(src, Dialect::Tsb);
+        assert!(
+            asm.contains("__ILLEGAL") || asm.contains("JMP $A437") || asm.contains("__TSB_ERROR"),
+            "an all-bang control string raises: {src:?}\n{asm}"
+        );
+        assert!(
+            !asm.contains("JSR __USE_SHOW"),
+            "and prints nothing: {src:?}\n{asm}"
+        );
+    }
+
+    // Reached: ?SYNTAX, and no ?BAD MODE anywhere.
+    let reached = asm_dialect("10 USE \"[###]\",\n", Dialect::Tsb);
+    assert!(
+        !reached.contains("__TSB_BAD_MODE"),
+        "a trailing comma the mask reaches is ?SYNTAX, not ?BAD MODE:\n{reached}"
+    );
+    // Not reached: the statement prints, then ?BAD MODE.
+    let spare = asm_dialect("10 USE \"###\",1,\n", Dialect::Tsb);
+    assert!(
+        spare.contains("__TSB_BAD_MODE") && spare.contains("JSR __USE_SHOW"),
+        "a trailing comma past the last field prints first:\n{spare}"
+    );
+}
+
+/// Spaces may sit between the two characters of a relational operator, as in
+/// `1< >2`. CHRGET skips them, so the statement must compile.
+#[test]
+fn a_relational_operator_may_be_split_by_spaces() {
+    for (src, expect) in [
+        ("10 PRINT 1<>2\n", "matched already"),
+        ("10 PRINT 1< >2\n", "the reported shape"),
+        ("10 PRINT 1 < > 2\n", "spaces on both sides too"),
+        ("10 PRINT 1> <2\n", "the reversed spelling"),
+        ("10 PRINT 1< =2\n", "and <= as well"),
+    ] {
+        let prg = tokenize_program(src).expect("tokenizes");
+        let out = compile_with_options(&prg, CompileOptions::default())
+            .unwrap_or_else(|e| panic!("{expect}: {src:?} must compile: {e}"));
+        // Compiling is not enough: a refusal is a recorded trap plus a jump
+        // to the ROM error routine.
+        assert!(
+            out.diagnostics.syntax_traps.is_empty(),
+            "{expect}: {src:?} must not be trapped: {:?}",
+            out.diagnostics.syntax_traps
+        );
+        assert!(
+            !out.asm.contains("JMP $A437"),
+            "{expect}: {src:?} must not reduce to a jump to the ROM error routine:\n{}",
+            out.asm
+        );
+    }
+}
+
+/// A type sigil binds tighter than an extension keyword. `DIR%=1` is DI%,
+/// and `MAP$="x"` is MA$. Neither is TSB evidence for `Dialect::Auto`.
+#[test]
+fn a_type_sigil_keeps_an_extension_keyword_a_variable() {
+    // A sigilled assignment is not extension evidence.
+    let src = "10 OX%=10:DIR%=1\n20 IF DIR%<0 THEN DIR%=0-DIR%\n30 PRINT DIR%\n";
+    let picked = resolved_dialect(src, Dialect::Auto);
+    assert_eq!(
+        picked,
+        Dialect::BasicV2,
+        "a sigilled assignment is not extension evidence"
+    );
+    let prg = tokenize_program_with(src, Dialect::Auto).expect("tokenizes");
+    assert!(
+        compile_with_options(&prg, CompileOptions::default()).is_ok(),
+        "and the program compiles"
+    );
+
+    // The string sigil behaves the same way.
+    assert_eq!(
+        resolved_dialect("10 MAP$=\"X\"\n20 PRINT MAP$\n", Dialect::Auto),
+        Dialect::BasicV2,
+        "so does a string sigil"
+    );
+
+    // A bare extension keyword in statement position is still TSB evidence.
+    assert_eq!(
+        resolved_dialect("10 PRINT\"X\"\n20 DIR\n", Dialect::Auto),
+        Dialect::Tsb,
+        "a bare DIR in statement position is still TSB"
+    );
+    // An assignment with no sigil is a variable too.
+    assert_eq!(
+        resolved_dialect("10 MEM=5\n20 PRINT MEM\n", Dialect::Auto),
+        Dialect::BasicV2,
+        "an unsigilled assignment was already a variable"
     );
 }

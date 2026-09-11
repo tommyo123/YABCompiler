@@ -109,6 +109,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
             }
         }
         ComputedGoto { target } => v.visit_expr(target),
+        Reset { target } => v.visit_expr(target),
         Rcomp { then, else_then } => {
             if let ThenIr::Stmts(inner) = then {
                 for s in inner {
@@ -646,6 +647,27 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
                 v.visit_print_piece(it);
             }
         }
+        UseFormat { at, values, .. } => {
+            if let Some((r, c)) = at {
+                v.visit_expr(r);
+                v.visit_expr(c);
+            }
+            for e in values {
+                v.visit_expr(e);
+            }
+        }
+        UseFormatDyn {
+            at, ctrl, values, ..
+        } => {
+            if let Some((r, c)) = at {
+                v.visit_expr(r);
+                v.visit_expr(c);
+            }
+            v.visit_str_expr(ctrl);
+            for e in values {
+                v.visit_expr(e);
+            }
+        }
         Load {
             filename,
             device,
@@ -729,6 +751,9 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
         | Resume { .. }
         | OnError { .. }
         | Nrm
+        | HardCopy
+        | Cold
+        | Retrace
         | MemModeOn
         | Rem(_)
         | LineMark(_)
@@ -742,8 +767,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(v: &mut V, line_no: u16, stmt: &Stmt) {
         | KeyGet { .. }
         | DisplayKeys
         | SwapStr { .. }
-        | Restore
-        | Reset { .. } => {}
+        | Restore => {}
 
         Get { indices, .. } => {
             for e in indices {
@@ -872,7 +896,6 @@ pub fn walk_print_piece<V: Visitor + ?Sized>(v: &mut V, p: &PrintPiece) {
             v.visit_expr(r);
             v.visit_expr(c);
         }
-        UseField { value, .. } => v.visit_expr(value),
         LiteralString(_) | Tab => {}
     }
 }
@@ -966,6 +989,7 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
             }
         }
         ComputedGoto { target } => v.visit_expr_mut(target),
+        Reset { target } => v.visit_expr_mut(target),
         Rcomp { then, else_then } => {
             if let ThenIr::Stmts(inner) = then {
                 for s in inner.iter_mut() {
@@ -1502,6 +1526,27 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
                 v.visit_print_piece_mut(it);
             }
         }
+        UseFormat { at, values, .. } => {
+            if let Some((r, c)) = at {
+                v.visit_expr_mut(r);
+                v.visit_expr_mut(c);
+            }
+            for e in values.iter_mut() {
+                v.visit_expr_mut(e);
+            }
+        }
+        UseFormatDyn {
+            at, ctrl, values, ..
+        } => {
+            if let Some((r, c)) = at {
+                v.visit_expr_mut(r);
+                v.visit_expr_mut(c);
+            }
+            v.visit_str_expr_mut(ctrl);
+            for e in values.iter_mut() {
+                v.visit_expr_mut(e);
+            }
+        }
         Load {
             filename,
             device,
@@ -1584,6 +1629,9 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
         | Resume { .. }
         | OnError { .. }
         | Nrm
+        | HardCopy
+        | Cold
+        | Retrace
         | MemModeOn
         | Rem(_)
         | LineMark(_)
@@ -1597,8 +1645,7 @@ pub fn walk_stmt_mut<V: MutVisitor + ?Sized>(v: &mut V, line_no: u16, stmt: &mut
         | KeyGet { .. }
         | DisplayKeys
         | SwapStr { .. }
-        | Restore
-        | Reset { .. } => {}
+        | Restore => {}
         Get { indices, .. } => {
             for e in indices {
                 v.visit_expr_mut(e);
@@ -1724,7 +1771,6 @@ pub fn walk_print_piece_mut<V: MutVisitor + ?Sized>(v: &mut V, p: &mut PrintPiec
             v.visit_expr_mut(r);
             v.visit_expr_mut(c);
         }
-        UseField { value, .. } => v.visit_expr_mut(value),
         LiteralString(_) | Tab => {}
     }
 }

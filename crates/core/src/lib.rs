@@ -36,7 +36,7 @@ pub use compile::{
 };
 pub use prg::Program;
 pub use source::{
-    TokenizeError, is_basic_source_path, tokenize_program, tokenize_program_at_with,
-    tokenize_program_with,
+    TokenizeError, is_basic_source_path, resolved_dialect, tokenize_program,
+    tokenize_program_at_with, tokenize_program_with,
 };
 pub use tokens::Dialect;

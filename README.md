@@ -68,15 +68,18 @@ programs. The default profile balances both.
 
 GUI: launch `yabcompiler-gui`, pick a `.bas` or `.prg` as the input,
 press Compile. The menu bar holds the same actions plus theme and
-about. The settings panel is on the left, the output and generated
-assembly on the right.
+about. The settings panel is on the left, including a dialect picker
+that matches `--dialect` for ASCII `.bas` files. The output and
+generated assembly are on the right.
 
 ## Features
 
 * BASIC V2 compatible, plus a useful subset of Simons' BASIC and Tuned
   Simons' BASIC commands (see below).
 * Type inference promotes integer-only variables to byte or word
-  storage where it is safe to do so.
+  storage where it is safe to do so. `FRE()` reports this compiler's
+  heap, not the interpreter's number, because a compiled program has
+  no BASIC variable table.
 * Optimizations for loops, array access and shared instruction sequences.
   Trailing zero data can be initialized at startup to reduce file size.
 * Optional extra RAM mode banks BASIC ROM out and uses
@@ -104,9 +107,15 @@ TSB is a modern take on Simons' BASIC. It adds commands for hires
 graphics, sprites, sound and structured programming (PROC, LOOP,
 REPEAT and so on) on top of Commodore BASIC V2. YABCompiler tokenizes
 and compiles the subset of these commands that makes sense in a
-compiled program. Some runtime routines were ported from TSB so a
-compiled program behaves the same way it does under the interpreter,
-and the compiler is tested against real TSB programs.
+compiled program. That includes formatted `USE` (literal or string
+expression), `USE` as a disk device select, `RESET` with an expression,
+`RCOMP`, `HRDCPY`, `COLD` and `RETRACE`. `TRACE`, `DUMP`, `MAP` and
+`OUT` cannot be reproduced: they warn at compile time and raise
+`?SYNTAX ERROR` if they run.
+
+Some runtime routines were ported from TSB so a compiled program
+behaves the same way it does under the interpreter, and the compiler is
+tested against real TSB programs.
 
 Thanks to godot64 for TSB.
 

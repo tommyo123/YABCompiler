@@ -79,6 +79,10 @@ const ROM_CALLS: &[RomCall] = &[
         label: "GIVAYF",
     },
     RomCall {
+        addr: 0xBC2B,
+        label: "SIGN",
+    },
+    RomCall {
         addr: 0xBBA2,
         label: "MOVFM",
     },
@@ -187,6 +191,11 @@ const ROM_CALLS: &[RomCall] = &[
     RomCall {
         addr: 0xA437,
         label: "BASIC_ERROR",
+    },
+    // $A46C prints " IN <line>" and READY. Used after a custom error message.
+    RomCall {
+        addr: 0xA46C,
+        label: "BASIC_ERROR_TAIL",
     },
     // Math functions that live above $BFFF in the C64 ROM. Their
     // entry points are outside the BASIC-ROM-bank-out window
@@ -805,7 +814,7 @@ fn emit_preamble(
         };
         let _ = writeln!(s, "__JT_{}:", call.label);
 
-        if ceiling.is_some() && matches!(call.addr, 0xA437 | 0xE37B) {
+        if ceiling.is_some() && matches!(call.addr, 0xA437 | 0xA46C | 0xE37B) {
             let _ = writeln!(s, "    JSR {MEMSIZ_RESTORE}");
         }
         let _ = writeln!(s, "    INC $01");
