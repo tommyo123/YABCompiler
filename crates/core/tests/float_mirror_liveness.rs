@@ -183,7 +183,7 @@ fn actual_float_shadow_readers_restore_mirrors_after_the_probe() {
                 "test did not create a shadow: {asm}"
             );
 
-            if !tail.starts_with("80 Z=M") || profile == Profile::Speed {
+            if !tail.starts_with("80 Z=M") {
                 assert!(asm.contains("V_M:"), "live float slot was omitted: {asm}");
             }
             assert_eq!(

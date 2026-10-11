@@ -16,16 +16,24 @@ fn asm_of(src: &str, profile: Profile) -> String {
 
 const PROFILES: [Profile; 3] = [Profile::Default, Profile::Speed, Profile::Size];
 
-/// The skip branch exists, tests the length byte, and lands past the last target store.
 #[test]
 fn empty_line_branches_around_every_store() {
     for profile in PROFILES {
         let asm = asm_of("10 INPUT A$,B$\n20 PRINT A$;B$\n", profile);
         let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+        let helper_ret = lines
+            .iter()
+            .position(|l| *l == "__INPUT_LINE:")
+            .and_then(|at| lines[at..].iter().position(|l| *l == "RTS").map(|r| at + r))
+            .unwrap_or_else(|| panic!("{profile:?}: no __INPUT_LINE helper:\n{asm}"));
+        assert_eq!(
+            lines[helper_ret - 1], "LDA __INPUT_BUF",
+            "{profile:?}: __INPUT_LINE must return with the length byte loaded:\n{asm}"
+        );
         let test_at = lines
             .iter()
-            .position(|l| *l == "LDA __INPUT_BUF")
-            .unwrap_or_else(|| panic!("{profile:?}: no empty-line test on the INPUT length byte:\n{asm}"));
+            .position(|l| *l == "JSR __INPUT_LINE")
+            .unwrap_or_else(|| panic!("{profile:?}: no INPUT line read:\n{asm}"));
         let join = lines
             .iter()
             .position(|l| l.starts_with("__IN_EMPTY_") && l.ends_with(':'))

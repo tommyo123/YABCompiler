@@ -72,7 +72,11 @@ fn the_successful_get_paths_do_not_touch_curlin() {
         );
         // and the good paths are still there
         assert!(
-            lines[start..err].iter().filter(|l| l.contains("$B3A2")).count() >= 2,
+            lines[start..err]
+                .iter()
+                .filter(|l| l.contains("$B3A2") || l.contains("__BYTEFAC"))
+                .count()
+                >= 2,
             "{profile:?}: the BYTEFAC conversions are gone:\n{asm}"
         );
     }

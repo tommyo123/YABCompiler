@@ -236,6 +236,47 @@ pub fn run_prg_to_end(prg: &[u8], max_instructions: u64) -> Result<RunToEnd, Str
     })
 }
 
+/// Run tokenized BASIC with the bundled ROMs until READY or the instruction limit.
+pub fn run_basic_to_end(prg: &[u8], max_instructions: u64) -> Result<RunToEnd, String> {
+    const STUB: u16 = 0xC000;
+    let mut sys = System::new();
+    let (start, end) = sys.mem.load_prg(prg)?;
+    if start != 0x0801 {
+        return Err(format!("a BASIC program loads at $0801, not ${start:04X}"));
+    }
+    // VARTAB, ARYTAB and STREND just past the program text (`end` is its last byte).
+    let vartab = end.wrapping_add(1);
+    for zp in [0x2Dusize, 0x2F, 0x31] {
+        sys.mem.ram[zp] = vartab as u8;
+        sys.mem.ram[zp + 1] = (vartab >> 8) as u8;
+    }
+    // MEMBOT $0800 and MEMTOP $A000, where the KERNAL leaves them for INITBA.
+    sys.mem.ram[0x0281..0x0285].copy_from_slice(&[0x00, 0x08, 0x00, 0xA0]);
+    // JSR INITBA / JSR RUNC / JMP NEWSTT.
+    let stub = [0x20, 0xBF, 0xE3, 0x20, 0x59, 0xA6, 0x4C, 0xAE, 0xA7];
+    sys.mem.ram[STUB as usize..STUB as usize + stub.len()].copy_from_slice(&stub);
+    sys.stop_key_down = false;
+    sys.start_at(STUB);
+
+    let mut instructions = 0u64;
+    while instructions < max_instructions {
+        instructions += 1;
+        if !sys.step() {
+            break;
+        }
+    }
+    Ok(RunToEnd {
+        output: sys.output.clone(),
+        screen: sys.screen_bytes(),
+        clean_exit: sys.ready_reached && sys.error_code.is_none(),
+        instructions,
+        error_code: sys.error_code,
+        error_line: sys.error_line,
+        error_output: sys.error_output.clone(),
+        ready_reached: sys.ready_reached,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +493,30 @@ mod tests {
             Some("?RETURN WITHOUT GOSUB  ERROR IN 20")
         );
         assert!(!r.error_output.is_empty());
+    }
+
+    #[test]
+    fn a_direct_mode_curlin_names_no_line() {
+        let r = run_prg_to_end(&raise_error_prg(11, 0xFF40), 200_000).unwrap();
+        assert_eq!(r.error_code, Some(11));
+        assert_eq!(r.error_line, None);
+        assert_eq!(r.error_banner().as_deref(), Some("?SYNTAX  ERROR"));
+    }
+
+    #[test]
+    fn getin_takes_waiting_keys() {
+        let mut prg = vec![0x00, 0xC0];
+        prg.extend_from_slice(&[
+            0xA9, 0x41, 0x8D, 0x77, 0x02, // LDA #'A'; STA $0277
+            0xA9, 0x42, 0x8D, 0x78, 0x02, // LDA #'B'; STA $0278
+            0xA9, 0x02, 0x85, 0xC6, // LDA #2; STA $C6
+            0x20, 0xE4, 0xFF, 0x20, 0xD2, 0xFF, // JSR $FFE4; JSR $FFD2
+            0x20, 0xE4, 0xFF, 0x20, 0xD2, 0xFF, // JSR $FFE4; JSR $FFD2
+            0x20, 0xE4, 0xFF, 0x18, 0x69, 0x30, // JSR $FFE4; CLC; ADC #'0'
+            0x20, 0xD2, 0xFF, 0x60, // JSR $FFD2; RTS
+        ]);
+        let r = run_prg_to_end(&prg, 10_000).unwrap();
+        assert_eq!(r.output, b"AB0".to_vec());
     }
 
     #[test]

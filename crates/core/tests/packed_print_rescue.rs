@@ -1,11 +1,10 @@
-//! Packing is admitted only after the existing layout ladder fails.
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
 
 fn source() -> String {
     let mut s = String::new();
     for i in 0..24 {
         let letter = char::from(b'A' + i);
-        s.push_str(&format!("{} PRINT \"{}AB{letter}\";\n", 10 + u32::from(i) * 10, letter.to_string().repeat(177)));
+        s.push_str(&format!("{} PRINT \"{}AB{letter}\";\n", 10 + u32::from(i) * 10, (0..177).map(|k| if k % 8 == 7 { '.' } else { letter }).collect::<String>()));
     }
     s.push_str("500 A$=\"UNCHANGED\":PRINT LEN(A$);A$:END\n");
     s
@@ -23,13 +22,15 @@ fn tight_reservation_rescues_print_pool_through_complete_layout() {
     for (profile, extraram) in [Profile::Default, Profile::Speed, Profile::Size]
         .into_iter().flat_map(|p| [(p, false), (p, true)]) {
         let ordinary = compile_with_options(&input, CompileOptions { profile, force_extraram_off: true, ..Default::default() }).unwrap();
-        assert!(!ordinary.asm.contains("__CP_"));
+        assert_eq!(ordinary.asm.contains("__CP_"), profile == Profile::Size, "{profile:?}");
         let packed = compile_with_options(&input, CompileOptions {
             profile, extraram, force_extraram_off: !extraram, auto_reserve: false,
             reserved_ranges: vec![(0x1000, 0xcfff)], ..Default::default()
         }).unwrap();
         assert!(packed.asm.contains("__CP_PACKED:"), "fixture must require the packing retry");
-        assert!(packed.prg_bytes.len() < ordinary.prg_bytes.len());
+        if profile != Profile::Size {
+            assert!(packed.prg_bytes.len() < ordinary.prg_bytes.len());
+        }
         assert_eq!(run(&packed.prg_bytes), run(&ordinary.prg_bytes));
     }
 }

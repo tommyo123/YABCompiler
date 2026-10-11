@@ -142,17 +142,21 @@ fn a_u8_proven_selector_skips_the_range_check() {
         "10 x=1\n20 on x goto 30,40\n30 print \"a\":end\n40 print \"b\":end\n",
         "10 x=peek(1024) and 3\n20 on x goto 30,40\n30 print \"a\":end\n40 print \"b\":end\n",
     ] {
-        let c = build(src, Profile::Default);
-        assert!(
-            c.asm.contains("__FAC_BYTE_OK"),
-            "a u8-proven selector must use the no-check helper:\n{src}\n{}",
-            c.asm
-        );
-        assert!(
-            !c.asm.contains("__FAC_BYTE:"),
-            "…and must not pull in the checking helper:\n{src}\n{}",
-            c.asm
-        );
+        for profile in [Profile::Default, Profile::Size] {
+            let c = build(src, profile);
+            assert!(
+                c.asm.contains("__FAC_BYTE_OK"),
+                "a u8-proven selector must use the no-check helper:\n{src}\n{}",
+                c.asm
+            );
+            if profile == Profile::Size {
+                assert!(
+                    !c.asm.contains("__FAC_BYTE:"),
+                    "The checking helper must be absent.\n{src}\n{}",
+                    c.asm
+                );
+            }
+        }
     }
 }
 #[test]

@@ -4546,7 +4546,7 @@ fn print_stmt(p: &mut Cursor<'_>) -> Result<PrintStmt, ParseError> {
                 items.push(PrintItem::Comma);
                 trailing_newline = false;
             }
-            Some(TOK_CHR) => {
+            Some(TOK_CHR) if chr_print_item_stands_alone(p) => {
                 p.advance(1);
                 let arg = paren_expr(p)?;
                 items.push(PrintItem::CharOut(arg));
@@ -5645,7 +5645,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 let start = p.pos;
                 p.advance(1);
                 p.skip_spaces();
-                let n = p.take_number();
+                let n = p.take_number_plain();
                 p.skip_spaces();
                 // If the byte after the number isn't a separator,
                 // BASIC v2 treats the whole thing as a string DATA
@@ -5674,7 +5674,7 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                     || (b == b'.' && p.peek_at(1).is_some_and(|c| c.is_ascii_digit())) =>
             {
                 let start = p.pos;
-                let n = p.take_number();
+                let n = p.take_number_plain();
                 p.skip_spaces();
                 if !matches!(p.peek(), None | Some(TOK_COMMA) | Some(b':')) {
                     // E.T's `DATA ...,3X3 SPRITES,...` — the digit
@@ -7063,10 +7063,40 @@ fn peek_is_string_compare(p: &Cursor<'_>) -> bool {
     matches!(p.bytes[i], b'=' | b'<' | b'>' | TOK_EQ | TOK_LT | TOK_GT)
 }
 
-/// Used by `print_stmt` to detect the `+` <string-atom> shape that
-/// comes from `PRINT TAB(14)+"X"+A$(I)`. BASIC v2's PRINT loop runs
-/// FRMEVL after TAB/SPC, and FRMEVL silently swallows unary `+`
-/// before a string atom — the program then concats normally.
+/// Recognize CHR$ PRINT items that must be evaluated on their own.
+fn chr_print_item_stands_alone(p: &Cursor<'_>) -> bool {
+    let bytes = p.bytes;
+    let mut i = p.pos + 1;
+    while bytes.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'(') {
+        return true;
+    }
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    while let Some(&b) = bytes.get(i) {
+        i += 1;
+        match b {
+            b'"' => in_quote = !in_quote,
+            _ if in_quote => {}
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            b':' | 0 => return true,
+            _ => {}
+        }
+    }
+    while bytes.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    !matches!(bytes.get(i), Some(&(TOK_PLUS | TOK_GT | TOK_EQ | TOK_LT)))
+}
+
 fn peek_string_atom_after_plus(p: &Cursor<'_>) -> bool {
     debug_assert_eq!(p.peek(), Some(TOK_PLUS));
     peek_is_string_atom_at(p.bytes, p.pos + 1, p.tsb_ascii)
@@ -7437,8 +7467,22 @@ impl<'a> Cursor<'a> {
         (n, self.bytes.get(from + n).copied())
     }
 
-    /// Scan a numeric literal the way the ROM's FIN (`$BCF3`) does.
+    /// Parse an expression literal with its exact FAC rounding state.
     fn take_number(&mut self) -> f64 {
+        let buf = self.take_number_text();
+        crate::romfloat::fin(&buf)
+            .map(|f| f.to_f64())
+            .unwrap_or_else(|| parse_number_text(&buf))
+    }
+
+    /// Parse the plain numeric value for DATA encoding.
+    fn take_number_plain(&mut self) -> f64 {
+        let buf = self.take_number_text();
+        parse_number_text(&buf)
+    }
+
+    /// Collect literal text without interior spaces.
+    fn take_number_text(&mut self) -> Vec<u8> {
         // Digits are collected into `buf` with the interior spaces squeezed out, so
         // `f64::from_str` gets a clean literal.
         let mut buf: Vec<u8> = Vec::new();
@@ -7504,12 +7548,16 @@ impl<'a> Cursor<'a> {
                 buf.truncate(mantissa_len);
             }
         }
-        // Tokenized BASIC stores numbers as ASCII so parse always succeeds.
-        std::str::from_utf8(&buf)
-            .expect("ASCII")
-            .parse()
-            .unwrap_or(0.0)
+        buf
     }
+}
+
+/// Parse a plain numeric value when the text is valid.
+fn parse_number_text(buf: &[u8]) -> f64 {
+    std::str::from_utf8(buf)
+        .expect("ASCII")
+        .parse()
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

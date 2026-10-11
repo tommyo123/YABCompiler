@@ -61,6 +61,8 @@ pub struct System {
     pub error_line: Option<u16>,
     /// Whether execution has reached BASIC's READY prompt.
     pub ready_reached: bool,
+    /// STOP key state. Compiled loops default to pressed.
+    pub stop_key_down: bool,
 }
 
 impl System {
@@ -162,6 +164,7 @@ impl System {
             error_code: None,
             error_line: None,
             ready_reached: false,
+            stop_key_down: true,
         }
     }
 
@@ -217,7 +220,8 @@ impl System {
         if basic_rom && pc == BASIC_ERROR && self.error_code.is_none() {
             self.error_code = Some(self.cpu.regs.x);
             let curlin = (self.mem.ram[0x39] as u16) | ((self.mem.ram[0x3A] as u16) << 8);
-            self.error_line = (curlin != 0xFFFF).then_some(curlin);
+            // A $FF high byte means direct mode and has no error line.
+            self.error_line = (curlin >> 8 != 0xFF).then_some(curlin);
         }
 
         if basic_rom && pc == BASIC_READY {
@@ -238,6 +242,37 @@ impl System {
                 // Real CHROUT returns carry clear on success; KERNAL
                 // callers (e.g. $E10C) do `BCS error` afterwards, so a
                 // stale carry would send them into the error handler.
+                self.cpu.set_flag(crate::cpu::FLAG_C, false);
+                self.rts();
+                return true;
+            }
+            FFE1 if !self.stop_key_down => {
+                // Return Z clear when STOP is not pressed.
+                self.cpu.regs.a = 0x7F;
+                self.cpu.set_flag(crate::cpu::FLAG_Z, false);
+                self.cpu.set_flag(crate::cpu::FLAG_C, false);
+                self.rts();
+                return true;
+            }
+            FFE4 if self.mem.ram[0x99] == 0 && self.mem.ram[0xC6] != 0 => {
+                // Take the first keyboard byte, shift the buffer and update its count.
+                let count = self.mem.ram[0xC6];
+                let key = self.mem.ram[0x0277];
+                let mut x: u8 = 0;
+                loop {
+                    let src = 0x0278 + usize::from(x);
+                    self.mem.ram[src - 1] = self.mem.ram[src];
+                    x = x.wrapping_add(1);
+                    if x == count {
+                        break;
+                    }
+                }
+                self.mem.ram[0xC6] = count - 1;
+                self.cpu.regs.a = key;
+                self.cpu.regs.x = x;
+                self.cpu.regs.y = key;
+                self.cpu.set_flag(crate::cpu::FLAG_Z, key == 0);
+                self.cpu.set_flag(crate::cpu::FLAG_N, key & 0x80 != 0);
                 self.cpu.set_flag(crate::cpu::FLAG_C, false);
                 self.rts();
                 return true;

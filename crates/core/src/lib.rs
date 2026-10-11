@@ -7,10 +7,12 @@ pub mod cfg;
 pub mod codegen;
 pub mod compile;
 pub mod config;
+pub mod crunch;
 pub mod dataflow;
 pub mod expr_type;
 pub mod extraram;
 pub mod for_next_runtime;
+pub mod gosub_depth;
 pub mod image_reach;
 pub mod ir;
 pub mod opt_model;
@@ -23,6 +25,7 @@ pub mod petscii;
 mod compact_data_bad;
 pub mod prg;
 pub mod rem_hints;
+pub mod romfloat;
 pub mod runtime;
 pub mod source;
 pub mod sys_params;
@@ -30,10 +33,11 @@ pub mod tokens;
 pub mod visit;
 
 pub use compile::{
-    BasicHintDialect, CompileError, CompileOptions, Compiled, Diagnostics, ExtraRamDecision,
+    AutoMode, BasicHintDialect, CompileError, CompileOptions, Compiled, Diagnostics, ExtraRamDecision,
     Profile, ReservedOvershoot, compile_with_options, lower_and_optimize, parse_reserved_ranges,
     parse_start_address, reserved_tail_overshoots, verify_addressing_modes_for_test,
 };
+pub use crunch::{CrunchError, SelfExtracting, self_extracting_prg};
 pub use prg::Program;
 pub use source::{
     TokenizeError, is_basic_source_path, resolved_dialect, tokenize_program,

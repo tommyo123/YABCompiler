@@ -230,7 +230,6 @@ fn a_sys_parks_the_cursor_in_absolute_bss() {
 #[test]
 fn the_bss_cursor_is_never_an_indirect_base() {
     for src in [
-        // BinaryI16 ; the layout with indirect reads.
         "10 sys 49152\n20 read a: print a\n30 data 9,8\n",
         // AsciiTagged ; indirect read plus indirect length re-read.
         "10 sys 49152\n20 read a$: print a$\n30 data hello\n",

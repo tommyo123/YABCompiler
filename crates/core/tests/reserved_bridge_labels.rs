@@ -1,27 +1,25 @@
 use yabcompiler_core::{CompileOptions, Compiled, compile_with_options, tokenize_program};
 
+fn line_text(c: char) -> String {
+    (0..30).map(|k| if k % 2 == 0 { c } else { '.' }).collect()
+}
+
 /// Eight distinct PRINTs: enough string-pool entries that a reserved byte can be dropped
 /// anywhere inside the pool.
-const SRC: &str = "\
-10 PRINT \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"
-20 PRINT \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"
-30 PRINT \"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\"
-40 PRINT \"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\"
-50 PRINT \"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEE\"
-60 PRINT \"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"
-70 PRINT \"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\"
-80 PRINT \"HHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\"
-";
-
-fn expected_text() -> String {
-    ["A", "B", "C", "D", "E", "F", "G", "H"]
-        .iter()
-        .map(|c| format!("{}\n", c.repeat(30)))
+fn src() -> String {
+    "ABCDEFGH"
+        .chars()
+        .enumerate()
+        .map(|(i, c)| format!("{} PRINT \"{}\"\n", 10 * (i + 1), line_text(c)))
         .collect()
 }
 
+fn expected_text() -> String {
+    "ABCDEFGH".chars().map(|c| format!("{}\n", line_text(c))).collect()
+}
+
 fn compile_reserved(reserved: Vec<(u16, u16)>) -> Compiled {
-    let prg = tokenize_program(SRC).expect("tokenizes");
+    let prg = tokenize_program(&src()).expect("tokenizes");
     let mut options = CompileOptions::default();
     options.reserved_ranges = reserved;
     compile_with_options(&prg, options).expect("compiles")

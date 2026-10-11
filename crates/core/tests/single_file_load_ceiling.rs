@@ -87,7 +87,7 @@ fn must_refuse() -> Vec<(&'static str, String, CompileOptions, u32)> {
             "big DATA at $C000 — the overrun is stored bytes",
             big_data(),
             options_at(Some(0xC000), Profile::Default),
-            0xEF11 - (IO_LO - 1),
+            0xEF09 - (IO_LO - 1),
         ),
     ]
 }

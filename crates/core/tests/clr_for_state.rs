@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -453,7 +451,7 @@ fn for_limit_and_counter_slots_sit_inside_the_vars_anchors() {
     }
 }
 #[test]
-fn the_wipe_is_still_one_memzero_over_the_label_difference() {
+fn the_wipe_covers_the_variable_block_exactly() {
     const SRC: &str = "10 N=3.5\n20 FOR I=1 TO N STEP 0.5\n30 S=S+I\n40 NEXT\n50 CLR\n60 PRINT S;I\n";
     for profile in PROFILES {
         for extraram in [false, true] {
@@ -463,16 +461,19 @@ fn the_wipe_is_still_one_memzero_over_the_label_difference() {
                 .nth(1)
                 .unwrap_or_else(|| panic!("__STATE_RESET emitted:\n{asm}"));
             let body = reset.split("\n    RTS").next().unwrap();
-            assert!(
-                body.contains("LDA #<(__VARS_END-__VARS_START)"),
-                "count is still the live label difference \
-                 ({profile:?}, extraram={extraram}):\n{body}"
-            );
+            let open = asm.find("\n__VARS_START:\n").expect("__VARS_START defined");
+            let close = asm.find("\n__VARS_END:\n").expect("__VARS_END defined");
+            let bytes: usize = asm[open..close].lines().map(data_bytes).sum();
             assert_eq!(
-                body.matches("LDA #<__VARS_START").count(),
-                1,
-                "exactly one bulk wipe ({profile:?}, extraram={extraram}):\n{body}"
+                common::zeroed_offsets(body, "__VARS_START"),
+                (0..bytes).collect(),
+                "({profile:?}, extraram={extraram}):\n{body}"
             );
         }
     }
+}
+
+fn data_bytes(line: &str) -> usize {
+    let t = line.split(';').next().unwrap().trim();
+    t.strip_prefix(".byte").map_or(0, |rest| rest.split(',').count())
 }

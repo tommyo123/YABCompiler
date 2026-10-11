@@ -50,7 +50,7 @@ fn reachable(cfg: &Cfg, start: usize) -> Vec<usize> {
 }
 
 const DODGEM_SHAPE: &str = "\
-10 bg=53280
+10 bg=53280:if a$=\"x\" then bg=0
 20 goto 1000
 40 if a$=\"y\" then run
 1000 :
@@ -80,7 +80,7 @@ fn the_store_read_only_past_an_empty_line_target_survives() {
     let c = compiled(DODGEM_SHAPE);
     assert!(
         c.asm.contains("V_BG"),
-        "the fold is defeated by the RUN, so BG must be a real variable"
+        "the untaken second assignment keeps BG a real variable"
     );
     assert!(
         c.asm.contains("LDX #<V_BG"),

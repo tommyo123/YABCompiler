@@ -1,5 +1,3 @@
-
-
 use yabcompiler_core::{CompileOptions, Compiled, Profile, compile_with_options, tokenize_program};
 
 fn compile(src: &str) -> Compiled {
@@ -94,7 +92,7 @@ fn hello_does_not_grow() {
         "no anchor, no fill, no marker left behind:\n{}",
         c.asm
     );
-    assert_eq!(c.prg_bytes.len(), 56);
+    assert_eq!(c.prg_bytes.len(), 48);
     assert_eq!(run(&c), "HELLO\n");
 }
 

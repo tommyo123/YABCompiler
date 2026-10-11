@@ -75,6 +75,10 @@ const ROM_CALLS: &[RomCall] = &[
         label: "PRINT_GAP",
     },
     RomCall {
+        addr: 0xAB47,
+        label: "OUTDO",
+    },
+    RomCall {
         addr: 0xB391,
         label: "GIVAYF",
     },
@@ -83,12 +87,28 @@ const ROM_CALLS: &[RomCall] = &[
         label: "SIGN",
     },
     RomCall {
+        addr: 0xAF84,
+        label: "GETTIM",
+    },
+    RomCall {
+        addr: 0xBC4F,
+        label: "FLOATB",
+    },
+    RomCall {
+        addr: 0xBE68,
+        label: "FOUTIM",
+    },
+    RomCall {
         addr: 0xBBA2,
         label: "MOVFM",
     },
     RomCall {
         addr: 0xBBD4,
         label: "MOVMF",
+    },
+    RomCall {
+        addr: 0xBC1B,
+        label: "ROUND",
     },
     RomCall {
         addr: 0xB867,
@@ -262,8 +282,7 @@ pub(crate) fn has_bss_tail_fill(asm: &str) -> bool {
     asm.contains(BSS_FILL_OPEN)
 }
 
-/// Drop the BSS zero-fill loop and its `__BSS_START:` / `__BSS_END:` brackets, returning the
-/// asm to its "zeros are stored in the image" form.
+/// Replace the zero fill with explicit clearing code.
 pub(crate) fn strip_bss_tail_fill(asm: &str) -> String {
     if !asm.contains(BSS_FILL_OPEN) {
         return asm.to_string();
@@ -277,6 +296,14 @@ pub(crate) fn strip_bss_tail_fill(asm: &str) -> String {
             continue;
         }
         if inside {
+            if let Some(kept) = trimmed.strip_prefix(crate::codegen::IF_NO_FILL_PREFIX.trim_end()) {
+                let kept = kept.trim();
+                if !kept.ends_with(':') {
+                    out.push_str("    ");
+                }
+                out.push_str(kept);
+                out.push('\n');
+            }
             inside = trimmed != BSS_FILL_CLOSE;
             continue;
         }
@@ -389,6 +416,21 @@ pub fn inject_with_reserved(
     asm: &str,
     reserved: &[(u16, u16)],
     program_touches_memsiz: bool,
+) -> String {
+    inject_with_heap_floor(
+        asm,
+        reserved,
+        program_touches_memsiz,
+        crate::compile::MIN_STRING_HEAP,
+    )
+}
+
+/// Raise MEMSIZ when the remaining heap is below the required floor.
+pub(crate) fn inject_with_heap_floor(
+    asm: &str,
+    reserved: &[(u16, u16)],
+    program_touches_memsiz: bool,
+    heap_floor: u32,
 ) -> String {
 
     let asm = &strip_bss_tail_fill(asm);
@@ -539,6 +581,7 @@ pub fn inject_with_reserved(
         has_ierror,
         has_sys_strings,
         &tramps,
+        heap_floor,
     ));
     out.push_str("; --- extraram: hoisted data sections ---\n");
     for b in &data_blocks {
@@ -590,8 +633,7 @@ fn debug_assert_data_anchors_hoisted(asm: &str) {
         assert!(
             asm[start..end].contains(".byte"),
             "extraram: `__VARS_START`..`__VARS_END` encloses no data — \
-             __STATE_RESET would memzero 0 bytes and CLR/RUN would clear \
-             nothing:\n{}",
+             CLR/RUN would clear nothing:\n{}",
             &asm[start..end]
         );
     }
@@ -774,6 +816,7 @@ fn emit_preamble(
     has_ierror: bool,
     has_sys_strings: bool,
     tramps: &SysTrampolines,
+    heap_floor: u32,
 ) -> String {
     let mut s = String::new();
     s.push_str("; --- extraram: bank BASIC ROM out, route ROM calls through low JT ---\n");
@@ -820,6 +863,10 @@ fn emit_preamble(
         let _ = writeln!(s, "    INC $01");
         let _ = writeln!(s, "    JSR ${:04X}", call.addr);
         let _ = writeln!(s, "    DEC $01");
+        if call.addr == crate::runtime::FCOMP {
+            // Preserve FCOMP flags across the memory bank change.
+            let _ = writeln!(s, "    TAX");
+        }
         let _ = writeln!(s, "    RTS");
     }
     s.push_str("__EXRAM_ENTRY:\n");
@@ -857,11 +904,8 @@ fn emit_preamble(
 
         s.push_str("    SBC #>__HEAP_BOTTOM\n");
         s.push_str("    BCC __EXRAM_MEMSIZ_RAISE\n");
-        let _ = writeln!(
-            s,
-            "    CMP #${:02X}",
-            (crate::compile::MIN_STRING_HEAP >> 8) as u8
-        );
+        // Round required room up to whole pages.
+        let _ = writeln!(s, "    CMP #${:02X}", heap_floor.div_ceil(0x100).min(0xFF));
         s.push_str("    BCC __EXRAM_MEMSIZ_RAISE\n");
         let _ = writeln!(s, "    JMP {MEMSIZ_RESTORE}");
         s.push_str("__EXRAM_MEMSIZ_RAISE:\n");

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn yabc() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_yabcompiler"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_yabcompiler"));
+    cmd.current_dir(env!("CARGO_MANIFEST_DIR"));
+    cmd
 }
 
 fn run(args: &[&str]) -> Output {
@@ -67,7 +69,9 @@ fn compile_without_an_output_path_is_a_usage_error() {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join("yabc_cli_surface");
+    let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-tmp/cli_surface")
+        .join(std::process::id().to_string());
     std::fs::create_dir_all(&d).expect("scratch dir");
     d.join(name)
 }

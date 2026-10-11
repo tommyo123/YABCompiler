@@ -190,7 +190,9 @@ mod tests {
                 ..Options::default()
             },
         );
-        assert!(before.contains("STA FU_0") && before.contains("STA FU_1"));
-        assert!(after.contains("STA FU_0") && !after.contains("STA FU_1"));
+        for out in [&before, &after] {
+            assert_eq!(out.matches("STA FU_0").count(), 1, "{out}");
+            assert!(!out.contains("STA FU_1"), "{out}");
+        }
     }
 }

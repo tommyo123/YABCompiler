@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use yabcompiler_core::{
-    BasicHintDialect, CompileOptions, Dialect, Profile, compile, config, is_basic_source_path,
+    AutoMode, BasicHintDialect, CompileOptions, Dialect, Profile, compile, config, is_basic_source_path,
     parse_reserved_ranges, parse_start_address, prg, resolved_dialect, tokenize_program_with,
 };
 
@@ -67,6 +67,13 @@ fn usage_to(program: &str, to: UsageTo) {
     usage_line!(to, "    --start-address=<a>   Load at <a> with no SYS stub. Start with `SYS <decimal>`."
     );
     usage_line!(to, "                          Example: --start-address=$C000  (run with: SYS 49152)");
+    usage_line!(to, "    --data-relocate=<m>   auto | on | off   (default auto)");
+    usage_line!(to, "                          Move DATA to RAM at $D000 when the program starts.");
+    usage_line!(to, "");
+    usage_line!(to, "Output");
+    usage_line!(to, "    --compress=<m>        auto | on | off   (default auto)");
+    usage_line!(to, "                          Write a compressed .prg with its decoder.");
+    usage_line!(to, "                          Auto compresses files that reach past $CFFF.");
     usage_line!(to, "");
     usage_line!(to, "Input is either a .bas source file or a tokenized .prg. The compiler");
     usage_line!(to, "auto-detects extraram and reserved ranges by default. Use the flags above");
@@ -242,6 +249,23 @@ fn run_compile(args: &[String]) -> ExitCode {
                 options.extraram = true;
                 i += 1;
             }
+            "--compress" => {
+                options.compress = AutoMode::On;
+                i += 1;
+            }
+            arg if arg.starts_with("--compress=") || arg.starts_with("--data-relocate=") => {
+                let (name, value) = arg.split_once('=').unwrap_or((arg, ""));
+                let Some(mode) = AutoMode::parse(value) else {
+                    eprintln!("{name} needs auto, on or off. Got '{value}'.");
+                    return ExitCode::from(2);
+                };
+                if name == "--compress" {
+                    options.compress = mode;
+                } else {
+                    options.data_relocate = mode;
+                }
+                i += 1;
+            }
             "--force-extraram-off" => {
                 options.force_extraram_off = true;
                 i += 1;
@@ -383,6 +407,12 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
         );
     }
     eprintln!("  extraram: {}", d.extraram);
+    if d.data_relocated > 0 {
+        eprintln!("  DATA {} bytes moved to $D000 at start", d.data_relocated);
+    }
+    if let Some(plain) = d.compressed_from {
+        eprintln!("  Compressed from {} to {} bytes", plain, compiled.prg_bytes.len());
+    }
     if let Some((before, after)) = d.size_profile_heap_improvement {
         let layout = if d.compact_heap_layout { "compact " } else { "" };
         eprintln!(

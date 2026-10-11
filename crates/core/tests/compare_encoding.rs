@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -70,27 +68,26 @@ fn assert_no(a: &str, needle: &str) {
     assert!(!a.contains(needle), "expected no {needle:?} in\n{a}");
 }
 
-/// A float comparison used as a *value* is the only thing that reaches `emit_compare`.
 #[test]
 fn fac_compare_materialises_the_boolean_without_a_jmp() {
     for op in ["<", "<=", "=", ">=", ">", "<>"] {
         let src = format!("10 a=peek(1024)/3:b=peek(1025)/7\n20 c=(a{op}b):print c\n");
         let a = asm(&src);
-        assert_seq(&a, &["LDA #$FF", "BIT $61"]);
+        assert_seq(&a, &["TAX", "LDA #$FF", "CPX"]);
         assert_no(&a, "JMP __CMP_D");
         assert_no(&a, "LDA $61");
         assert_no(&a, "LDA $66");
+        assert_no(&a, "__FSUB");
     }
 }
 #[test]
-fn fac_compare_ordering_arms_probe_exponent_then_sign() {
+fn fac_compare_runs_fcomp_not_a_subtraction() {
     let lt = asm("10 a=peek(1024)/3:b=peek(1025)/7\n20 c=(a<b):print c\n");
-    assert_seq(&lt, &["LDA #$FF", "BIT $61", "BEQ", "BIT $66", "BMI"]);
-    assert!(lt.contains("__CMP_F_"), "`<` needs a false arm:\n{lt}");
-
-    let le = asm("10 a=peek(1024)/3:b=peek(1025)/7\n20 c=(a<=b):print c\n");
-    assert_seq(&le, &["LDA #$FF", "BIT $61", "BEQ", "BIT $66", "BMI"]);
-    assert_no(&le, "__CMP_F_");
+    assert!(
+        lt.contains("__FCMP") || lt.contains("JSR $BC5B"),
+        "`<` should call FCOMP:\n{lt}"
+    );
+    assert_no(&lt, "JSR $B850");
 }
 
 /// 1 / 0 for every operator, against the ROM's own float compare.
@@ -120,10 +117,12 @@ fn int16_compare_fast_path_still_fires() {
         );
         let a = asm(&src);
         assert!(
-            count_seq(&a, &["SEC", "LDA VI_X", "SBC VI_Y"])
+            count_seq(&a, &["LDA VI_X", "CMP VI_Y"])
+                + count_seq(&a, &["LDA VI_Y", "CMP VI_X"])
+                + count_seq(&a, &["SEC", "LDA VI_X", "SBC VI_Y"])
                 + count_seq(&a, &["SEC", "LDA VI_Y", "SBC VI_X"])
                 > 0,
-            "`{op}` left the inline SBC chain:\n{a}"
+            "`{op}` left the inline compare chain:\n{a}"
         );
         assert_no(&a, "__BOOL_TO_FAC");
     }
@@ -140,9 +139,8 @@ fn int16_gt_and_le_transpose_the_sbc_operands() {
     assert_seq(
         &gt,
         &[
-            "SEC",
             "LDA VI_Y",
-            "SBC VI_X",
+            "CMP VI_X",
             "LDA VI_Y+1",
             "SBC VI_X+1",
             "BVC",
@@ -161,9 +159,8 @@ fn int16_gt_and_le_transpose_the_sbc_operands() {
     assert_seq(
         &le,
         &[
-            "SEC",
             "LDA VI_Y",
-            "SBC VI_X",
+            "CMP VI_X",
             "LDA VI_Y+1",
             "SBC VI_X+1",
             "BVC",
@@ -186,9 +183,8 @@ fn int16_lt_and_ge_are_a_single_branch() {
         assert_seq(
             &a,
             &[
-                "SEC",
                 "LDA VI_X",
-                "SBC VI_Y",
+                "CMP VI_Y",
                 "LDA VI_X+1",
                 "SBC VI_Y+1",
                 "BVC",
@@ -202,30 +198,55 @@ fn int16_lt_and_ge_are_a_single_branch() {
     }
 }
 #[test]
-fn int16_equality_skips_the_sign_fixup() {
-    for (op, want) in [("=", "BNE"), ("<>", "BEQ")] {
+fn int16_equality_compares_byte_by_byte() {
+    for (op, tail) in [("=", ["BNE", "LDA VI_X+1", "CMP VI_Y+1", "BNE"]), ("<>", ["BNE", "LDA VI_X+1", "CMP VI_Y+1", "BEQ"])] {
         let a = asm(&format!(
             "10 for k=1 to 2:read x%,y%\n\
              20 if x%{op}y% then print \"t\"\n\
              30 next k\n\
              40 data 1000,-31768,-5,-6\n"
         ));
-        assert_seq(
-            &a,
-            &[
-                "SEC",
-                "LDA VI_X",
-                "SBC VI_Y",
-                "STA __FOR_DIFF_LO",
-                "LDA VI_X+1",
-                "SBC VI_Y+1",
-                "ORA __FOR_DIFF_LO",
-                want,
-            ],
-        );
+        let mut seq = vec!["LDA VI_X", "CMP VI_Y"];
+        seq.extend(tail);
+        assert_seq(&a, &seq);
+        assert_no(&a, "__FOR_DIFF_LO");
         assert_no(&a, "__IF_NV_");
         assert_no(&a, "EOR #$80");
     }
+}
+
+const INT16_EQUALITY: &str = "\
+5 poke 828,1:poke 829,44:poke 830,251:poke 831,255:poke 832,0
+10 a%=peek(828)*256+peek(829):b%=300:c%=peek(830)-256:d%=peek(829):e%=peek(831)-256:f%=peek(831):g%=peek(832)
+20 if a%=b% then print \"1\";
+30 if a%<>b% then print \"x\";
+40 if a%=301 then print \"x\";
+50 if a%<>301 then print \"2\";
+60 if c%=-5 then print \"3\";
+70 if c%<>-5 then print \"x\";
+80 for i%=0 to 3:if i%=2 then print \"4\";
+90 next
+100 if d%=44 then print \"5\";
+110 if 44=d% then print \"6\";
+120 if e%=-1 then print \"7\";
+130 if e%=255 then print \"x\";
+140 if f%=-1 then print \"x\";
+150 if f%=255 then print \"8\";
+160 if e%=f% then print \"x\";
+170 if e%<>f% then print \"9\";
+180 if c%=e% then print \"x\";
+190 if g%=0 then print \"a\";
+200 if a%=44+256 then print \"b\";
+210 for j%=-3 to 3:if j%=e% then print \"c\";
+220 next
+230 for k%=250 to 260:if k%=256 then print \"d\";
+240 next
+250 print
+";
+
+#[test]
+fn int16_equality_matches_the_rom() {
+    assert_eq!(text_output(INT16_EQUALITY), "123456789ABCD\n");
 }
 #[test]
 fn signed_byte_storage_operand_is_not_transposed() {
@@ -319,12 +340,12 @@ fn u8_var_vs_literal_gt_and_le_are_one_branch() {
 fn u8_var_vs_var_gt_and_le_transpose() {
     let gt = asm("10 for x=0 to 20:c=peek(1024+x):d=peek(1025+x)\n\
                   20 if c>d then print \"a\"\n30 next x\n");
-    assert_seq(&gt, &["LDA VI_D", "CMP VI_C", "BCS"]);
+    assert_seq(&gt, &["CMP VI_C", "BCS"]);
     assert_no(&gt, "__IF_U8VV_KEEP");
 
     let le = asm("10 for x=0 to 20:c=peek(1024+x):d=peek(1025+x)\n\
                   20 if c<=d then print \"a\"\n30 next x\n");
-    assert_seq(&le, &["LDA VI_D", "CMP VI_C", "BCC"]);
+    assert_seq(&le, &["CMP VI_C", "BCC"]);
     assert_no(&le, "__IF_U8VV_KEEP");
 }
 
@@ -381,13 +402,13 @@ fn every_profile_gets_the_new_encodings() {
              40 data 1000,-31768,-5,-6\n",
             profile,
         );
-        assert_seq(&a, &["SEC", "LDA VI_Y", "SBC VI_X"]);
+        assert_seq(&a, &["LDA VI_Y", "CMP VI_X"]);
 
         let f = asm_at(
             "10 a=peek(1024)/3:b=peek(1025)/7\n20 c=(a<b):print c\n",
             profile,
         );
-        assert_seq(&f, &["LDA #$FF", "BIT $61"]);
+        assert_seq(&f, &["TAX", "LDA #$FF", "CPX"]);
         assert_no(&f, "JMP __CMP_D");
     }
 }

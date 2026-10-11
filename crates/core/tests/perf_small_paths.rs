@@ -117,7 +117,11 @@ fn speed_pool_loads_preserve_signed_integer_constants_in_fac() {
     }
 
     assert!(sizes[1] > sizes[0]);
-    assert_eq!(sizes[0], sizes[2]);
+    let stand_in = asm6502::Assembler6502::new()
+        .assemble_bytes(yabcompiler_core::codegen::FAST_BYTE_GIVAYF)
+        .unwrap()
+        .len();
+    assert_eq!(sizes[0], sizes[2] + stand_in);
 }
 
 #[test]

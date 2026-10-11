@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -205,7 +203,11 @@ fn the_factoring_family_still_produces_helpers() {
     let a = asm(src);
     let helpers = a
         .lines()
-        .filter(|l| l.starts_with("__SEQ_") || l.starts_with("__JSR2_"))
+        .filter(|l| {
+            ["__SEQ_", "__JSR2_", "__TAIL_", "__PH326_"]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
         .count();
     assert!(helpers > 0, "the factoring family must still fire:\n{a}");
 }

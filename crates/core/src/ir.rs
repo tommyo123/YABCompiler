@@ -860,11 +860,7 @@ pub fn lower(prog: &ast::Program) -> Result<Module, LowerError> {
         .map(|l| {
             Ok(Line {
                 number: l.number,
-                stmts: l
-                    .statements
-                    .iter()
-                    .map(|s| lower_stmt(l.number, s, &proc_targets))
-                    .collect::<Result<_, _>>()?,
+                stmts: lower_stmts(l.number, &l.statements, &proc_targets)?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -905,13 +901,79 @@ fn lower_then_branch(
 ) -> Result<ThenIr, LowerError> {
     Ok(match then_branch {
         ThenBranch::Goto(n) => ThenIr::Goto(*n),
-        ThenBranch::Stmts(stmts) => ThenIr::Stmts(
-            stmts
-                .iter()
-                .map(|s| lower_stmt(line_no, s, proc_targets))
-                .collect::<Result<_, _>>()?,
-        ),
+        ThenBranch::Stmts(stmts) => ThenIr::Stmts(lower_stmts(line_no, stmts, proc_targets)?),
     })
+}
+
+/// Assign the FOR start value before evaluating its end and step.
+fn lower_stmts(
+    line_no: u16,
+    stmts: &[ast::Statement],
+    proc_targets: &std::collections::HashMap<ProcName, u16>,
+) -> Result<Vec<Stmt>, LowerError> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for s in stmts {
+        let lowered = lower_stmt(line_no, s, proc_targets)?;
+        match lowered {
+            Stmt::For {
+                var,
+                start,
+                end,
+                step,
+                body_int_safe,
+                body_reads_loop_var,
+                induction_const,
+                array_inductions,
+            } if expr_may_read_var(&end, &var) || expr_may_read_var(&step, &var) => {
+                out.push(Stmt::Let {
+                    var: var.clone(),
+                    value: start,
+                });
+                out.push(Stmt::For {
+                    start: Expr::Var(var.clone()),
+                    var,
+                    end,
+                    step,
+                    body_int_safe,
+                    body_reads_loop_var,
+                    induction_const,
+                    array_inductions,
+                });
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// Target marker for string READ values that only need cursor advance.
+pub fn read_skip_var() -> VarName {
+    VarName {
+        base: "__DSKIP".to_string(),
+        kind: crate::ast::VarKind::String,
+    }
+}
+
+/// Does `e` read `var`, or call a user function (whose body may)?
+pub(crate) fn expr_may_read_var(e: &Expr, var: &VarName) -> bool {
+    struct Reads<'a> {
+        var: &'a VarName,
+        found: bool,
+    }
+    impl crate::visit::Visitor for Reads<'_> {
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.found |= v == self.var;
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            if matches!(e, Expr::FnCall(..)) {
+                self.found = true;
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut reads = Reads { var, found: false };
+    crate::visit::Visitor::visit_expr(&mut reads, e);
+    reads.found
 }
 
 fn lower_stmt(

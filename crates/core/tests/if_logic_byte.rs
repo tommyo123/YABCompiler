@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -69,7 +67,7 @@ fn nums(fields: &[&str]) -> String {
 #[test]
 fn scalar_and_array_compare_takes_the_byte_path() {
     assert_path(
-        "10 DIM C(40)\n20 L=PEEK(53280)\n30 IF L=34 AND C(31)=2 THEN POKE 1024,1\n40 END\n",
+        "10 DIM C(40)\n20 L=PEEK(53280):K=PEEK(53281)\n30 IF L=34 AND C(K)=2 THEN POKE 1024,1\n40 END\n",
         true,
         false,
     );
@@ -79,7 +77,7 @@ fn scalar_and_array_compare_takes_the_byte_path() {
 #[test]
 fn or_of_two_barred_comparisons_takes_the_byte_path() {
     assert_path(
-        "10 DIM C(40)\n20 L=PEEK(53280)\n30 IF L=34 OR C(31)=2 THEN POKE 1024,1\n40 END\n",
+        "10 DIM C(40)\n20 L=PEEK(53280):K=PEEK(53281)\n30 IF L=34 OR C(K)=2 THEN POKE 1024,1\n40 END\n",
         true,
         false,
     );
@@ -124,7 +122,7 @@ fn exor_of_two_comparisons_takes_the_byte_path() {
 #[test]
 fn not_of_a_comparison_stays_in_the_byte_domain() {
     let asm =
-        compile_variant("10 DIM C(4)\n20 A=PEEK(53280)\n30 IF NOT(A=1) AND C(1)=2 THEN POKE 1024,1\n40 END\n",
+        compile_variant("10 DIM C(4)\n20 A=PEEK(53280):K=PEEK(53281)\n30 IF NOT(A=1) AND C(K)=2 THEN POKE 1024,1\n40 END\n",
         Profile::Default, false).asm;
     assert!(takes_byte_path(&asm), "byte path must fire:\n{asm}");
     assert!(
@@ -134,7 +132,7 @@ fn not_of_a_comparison_stays_in_the_byte_domain() {
 }
 #[test]
 fn the_branch_context_condition_makes_no_float() {
-    let src = "10 DIM C(40)\n20 L=PEEK(53280)\n30 IF L=34 AND C(31)=2 THEN POKE 1024,1\n40 END\n";
+    let src = "10 DIM C(40)\n20 L=PEEK(53280):K=PEEK(53281)\n30 IF L=34 AND C(K)=2 THEN POKE 1024,1\n40 END\n";
     for (profile, extraram) in VARIANTS {
         let asm = compile_variant(src, profile, extraram).asm;
         assert!(takes_byte_path(&asm), "{profile:?}: byte path must fire");
@@ -245,10 +243,10 @@ fn exor_truth_table() {
 /// operand must take its own cell.
 #[test]
 fn right_nested_chains_keep_every_stash() {
-    let src = "10 DIM Q(1)\n20 Q(0)=0:Q(1)=1\n30 FOR A=0 TO 1\n40 FOR B=0 TO 1\n\
+    let src = "10 DIM Q(1):READ U\n20 Q(0)=0:Q(1)=1\n30 FOR A=0 TO 1\n40 FOR B=0 TO 1\n\
                50 FOR C=0 TO 1\n60 FOR D=0 TO 1\n70 T=0\n\
-               80 IF Q(A)=1 AND (Q(B)=1 AND (Q(C)=1 AND Q(D)=1)) THEN T=1\n\
-               90 PRINT T\n100 NEXT D\n110 NEXT C\n120 NEXT B\n130 NEXT A\n140 END\n";
+               80 IF Q(A*U)=1 AND (Q(B*U)=1 AND (Q(C*U)=1 AND Q(D*U)=1)) THEN T=1\n\
+               90 PRINT T\n100 NEXT D\n110 NEXT C\n120 NEXT B\n130 NEXT A\n140 END\n150 DATA 1\n";
     check_output(
         src,
         &nums(&[

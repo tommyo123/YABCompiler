@@ -1,12 +1,13 @@
-
-
 mod common;
 
 use yabcompiler_core::{
     CompileOptions, Dialect, Profile, compile_with_options, tokenize_program, tokenize_program_with,
 };
 
-/// A dispatching-NEXT program whose image length is tunable.
+fn pad_text(pad: usize) -> String {
+    (0..pad).map(|k| if k % 2 == 0 { 'X' } else { 'Y' }).collect()
+}
+
 fn dispatch_program(pad: usize) -> String {
     format!(
         "10 FOR I=1 TO 3\n\
@@ -16,13 +17,13 @@ fn dispatch_program(pad: usize) -> String {
          50 PRINT \"DONE I=\";I:END\n\
          100 PRINT \"{}\"\n\
          110 GOTO 40\n",
-        "X".repeat(pad)
+        pad_text(pad)
     )
 }
 
 /// What a real C64 prints for [`dispatch_program`], as a CHROUT stream.
 fn expected_output(pad: usize) -> String {
-    let x = "X".repeat(pad);
+    let x = pad_text(pad);
     format!("A 1 \n{x}\nA 2 \n{x}\nA 3 \n{x}\nDONE I= 4 \n")
 }
 
@@ -183,7 +184,7 @@ fn on_key_target_is_covered_too() {
                40 NEXT\n50 END\n100 PRINT \"K\":END\n";
     let mut hazards = 0;
     for pad in 0..=260usize {
-        let prg = tokenize_program_with(&src.replace("{}", &"X".repeat(pad)), Dialect::Tsb)
+        let prg = tokenize_program_with(&src.replace("{}", &pad_text(pad)), Dialect::Tsb)
             .expect("tokenizes as extended BASIC");
         let c = compile_with_options(
             &prg,

@@ -5,7 +5,7 @@
 
 //! Control-flow graph for the IR.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::VarName;
 use crate::for_next_runtime::{ForTier, OrphanAnalysis};
@@ -42,6 +42,8 @@ pub struct Cfg {
     /// Stmt-paths that follow each GOSUB at runtime; every RETURN
     /// edges back to these. Over-approximation.
     pub return_targets: Vec<usize>,
+    /// Return node for each GOSUB call.
+    pub gosub_continuations: HashMap<usize, usize>,
 }
 
 impl Cfg {
@@ -107,6 +109,32 @@ impl Cfg {
         }
         s
     }
+
+    /// Find successors that keep the given FOR frame live.
+    pub fn frame_successors(
+        &self,
+        module: &Module,
+        header: usize,
+        node: usize,
+        var: &VarName,
+        next_uses_frame: bool,
+    ) -> Vec<usize> {
+        let succ = &self.nodes[node].successors;
+        match self.stmt_at(node, module) {
+            Stmt::Clr | Stmt::Run(_) | Stmt::Return => Vec::new(),
+            Stmt::For { var: v, .. } if v == var => Vec::new(),
+            Stmt::Next { .. } if next_uses_frame => {
+                let body = &self.nodes[header].successors;
+                succ.iter().copied().filter(|s| body.contains(s)).collect()
+            }
+            Stmt::GoSub { .. }
+            | Stmt::OnBranch {
+                kind: crate::ast::OnBranchKind::GoSub,
+                ..
+            } => self.gosub_continuations.get(&node).copied().into_iter().collect(),
+            _ => succ.clone(),
+        }
+    }
 }
 
 // ----- Builder state --------------------------------------------------------
@@ -124,6 +152,7 @@ struct Builder<'a> {
     by_path: HashMap<StmtPathKey, usize>,
     line_first: HashMap<u16, usize>,
     return_targets: Vec<usize>,
+    gosub_continuations: HashMap<usize, usize>,
     /// FOR/NEXT pairing stack. Each entry holds the FOR node id and
     /// its loop variable so a NEXT V can pop until matching.
     for_stack: Vec<ForFrame>,
@@ -176,6 +205,7 @@ impl<'a> Builder<'a> {
             by_path: HashMap::new(),
             line_first: HashMap::new(),
             return_targets: Vec::new(),
+            gosub_continuations: HashMap::new(),
             for_stack: Vec::new(),
             structured_loop_stack: Vec::new(),
             do_stack: Vec::new(),
@@ -207,14 +237,18 @@ impl<'a> Builder<'a> {
         }
         // Add back-edges for NEXT statements bound at runtime.
         self.add_dispatched_back_edges();
-        // Pass 3: every RETURN node edges to every recorded return
-        // target — over-approximation but sound.
+        // Connect each RETURN to the calls that can reach it.
         let return_targets = self.return_targets.clone();
+        let returns_to = self.region_return_edges();
         for node_id in 0..self.nodes.len() {
             let path = self.nodes[node_id].stmt.clone();
             let stmt = self.resolve_path(&path);
             if matches!(stmt, Stmt::Return) {
-                for &t in &return_targets {
+                let targets = match &returns_to {
+                    Some(map) => map.get(&node_id).cloned().unwrap_or_default(),
+                    None => return_targets.clone(),
+                };
+                for t in targets {
                     self.add_edge(node_id, t);
                 }
             }
@@ -231,12 +265,74 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Find return targets, or return None for control flow outside the graph.
+    fn region_return_edges(&self) -> Option<HashMap<usize, Vec<usize>>> {
+        if self.module.has_on_key() || self.module.has_error_continuation() {
+            return None;
+        }
+        let call_targets = |stmt: &Stmt| -> Option<Vec<u16>> {
+            match stmt {
+                Stmt::GoSub { target } => Some(vec![*target]),
+                Stmt::OnBranch {
+                    kind: crate::ast::OnBranchKind::GoSub,
+                    targets,
+                    ..
+                } => Some(targets.clone()),
+                _ => None,
+            }
+        };
+        let mut callers: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut calls: Vec<usize> = self.gosub_continuations.keys().copied().collect();
+        calls.sort_unstable();
+        for call in calls {
+            let back = self.gosub_continuations[&call];
+            let Some(targets) = call_targets(self.resolve_path(&self.nodes[call].stmt)) else {
+                continue;
+            };
+            for t in targets {
+                if let Some(&entry) = self.line_first.get(&t) {
+                    callers.entry(entry).or_default().push(back);
+                }
+            }
+        }
+        let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&entry, backs) in &callers {
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut work = vec![entry];
+            while let Some(n) = work.pop() {
+                if !seen.insert(n) {
+                    continue;
+                }
+                let stmt = self.resolve_path(&self.nodes[n].stmt);
+                if matches!(stmt, Stmt::Return) {
+                    let to = out.entry(n).or_default();
+                    for &b in backs {
+                        if !to.contains(&b) {
+                            to.push(b);
+                        }
+                    }
+                    continue;
+                }
+                if call_targets(stmt).is_some() {
+                    work.extend(self.gosub_continuations.get(&n).copied());
+                    continue;
+                }
+                work.extend(self.nodes[n].successors.iter().copied());
+            }
+        }
+        for to in out.values_mut() {
+            to.sort_unstable();
+        }
+        Some(out)
+    }
+
     fn finish(self) -> Cfg {
         Cfg {
             nodes: self.nodes,
             entry: 0,
             line_first: self.line_first,
             return_targets: self.return_targets,
+            gosub_continuations: self.gosub_continuations,
         }
     }
 
@@ -399,6 +495,7 @@ impl<'a> Builder<'a> {
                     if !self.return_targets.contains(&after) {
                         self.return_targets.push(after);
                     }
+                    self.gosub_continuations.insert(node_id, after);
                 }
             }
             Stmt::Return | Stmt::End | Stmt::Stop | Stmt::RaiseError(_) | Stmt::Hang => {
@@ -434,6 +531,7 @@ impl<'a> Builder<'a> {
                         if !self.return_targets.contains(&a) {
                             self.return_targets.push(a);
                         }
+                        self.gosub_continuations.insert(node_id, a);
                     }
                 }
             }
@@ -523,6 +621,14 @@ impl<'a> Builder<'a> {
                         None => self.for_stack.pop(),
                         Some(target) => {
                             let key = (var_hash(target), var_kind_marker(target));
+                            // A search that fails pops nothing (the NEXT stops the program).
+                            if !self
+                                .for_stack
+                                .iter()
+                                .any(|f| (f.var, f.var_kind_marker) == key)
+                            {
+                                continue;
+                            }
                             let mut popped = None;
                             while let Some(top) = self.for_stack.last() {
                                 if (top.var, top.var_kind_marker) == key {
@@ -946,6 +1052,61 @@ mod tests {
         assert!(cfg.nodes[2].successors.contains(&1));
         // After-GOSUB site (line 20) recorded.
         assert!(cfg.return_targets.contains(&1));
+    }
+
+    fn module_from(src: &str) -> Module {
+        use crate::ir::Pass;
+        let bytes = crate::tokenize_program(src).unwrap();
+        let program = crate::prg::Program::parse(&bytes).unwrap();
+        let ast = crate::parse::program(&program).unwrap();
+        let mut module = crate::ir::lower(&ast).unwrap();
+        crate::passes::ResolveBareNext.run(&mut module).unwrap();
+        module
+    }
+
+    /// The node of statement `idx` on line `line`.
+    fn stmt_node(cfg: &Cfg, line: u16, idx: usize) -> usize {
+        cfg.nodes
+            .iter()
+            .position(|n| n.line_no == line && n.stmt.path == [idx])
+            .unwrap_or_else(|| panic!("no node for line {line} statement {idx}"))
+    }
+
+    #[test]
+    fn a_return_goes_back_only_to_calls_of_routines_that_reach_it() {
+        let m = module_from(
+            "10 GOSUB 100:A=1:GOSUB 200:B=2:GOSUB 400:C=3:GOTO 500\n\
+             100 PRINT \"X\":RETURN\n\
+             200 GOTO 300\n\
+             300 RETURN\n\
+             400 GOTO 300\n\
+             500 RETURN\n",
+        );
+        let cfg = Cfg::build(&m);
+        let after_first = stmt_node(&cfg, 10, 1);
+        let after_second = stmt_node(&cfg, 10, 3);
+        let after_third = stmt_node(&cfg, 10, 5);
+        assert_eq!(cfg.nodes[stmt_node(&cfg, 100, 1)].successors, vec![after_first]);
+        let mut shared = cfg.nodes[stmt_node(&cfg, 300, 0)].successors.clone();
+        shared.sort_unstable();
+        assert_eq!(shared, vec![after_second, after_third]);
+        assert!(
+            cfg.nodes[stmt_node(&cfg, 500, 0)].successors.is_empty(),
+            "a RETURN only main code reaches has no call to go back to"
+        );
+    }
+
+    #[test]
+    fn a_return_after_a_routine_left_by_goto_goes_back_to_that_routines_call() {
+        let m = module_from(
+            "10 GOSUB 100:PRINT \"M\":END\n\
+             50 PRINT \"Q\":RETURN\n\
+             100 GOSUB 200:PRINT \"N\":RETURN\n\
+             200 GOTO 50\n",
+        );
+        let cfg = Cfg::build(&m);
+        assert_eq!(cfg.nodes[stmt_node(&cfg, 50, 1)].successors, vec![stmt_node(&cfg, 100, 1)]);
+        assert_eq!(cfg.nodes[stmt_node(&cfg, 100, 2)].successors, vec![stmt_node(&cfg, 10, 1)]);
     }
 
     #[test]

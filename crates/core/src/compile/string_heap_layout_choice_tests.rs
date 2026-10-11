@@ -137,7 +137,7 @@ fn automatic_string_heap_choice_uses_the_checked_compact_layout() {
         source.push_str(&format!(
             "{} PRINT \"{}AB{letter}\";\n",
             20 + u32::from(i) * 10,
-            letter.to_string().repeat(177)
+            (0..177).map(|k| if k % 8 == 7 { '.' } else { letter }).collect::<String>()
         ));
     }
     source.push_str("500 PRINT A$\n");

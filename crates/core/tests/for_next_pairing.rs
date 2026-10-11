@@ -441,6 +441,19 @@ fn then_body_next_then_end_leaves_the_outer_loop_open() {
 }
 
 #[test]
+fn a_taken_then_next_falls_out_into_its_own_continuation() {
+    let src = "10 READ H\n\
+               20 FOR T=1 TO 3\n\
+               30 FOR X=1 TO 2\n\
+               40 NEXT\n\
+               50 IF H>9 THEN NEXT:PRINT\"E\";T;X:END\n\
+               60 NEXT\n\
+               70 PRINT T;X\n\
+               80 DATA 10\n";
+    check_all_variants(src, "E 4  3 \n");
+}
+
+#[test]
 fn then_body_that_ends_still_runs_its_own_loop_when_taken() {
     let src = "10 READ H\n\
                20 FOR T=1 TO 3\n\

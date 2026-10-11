@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 const POOL: &str = "; --- string pool (length-prefixed) ---";
+/// Marker at the start of packed records.
+pub(crate) const DECODER_LABEL: &str = "__CP_BEGIN:";
 const VAL_SENTINEL: &str = "; VAL literal sentinel";
 // Includes dispatch, decoder, scratch save/restore and long-branch expansion.
-const CODE_COST_BOUND: usize = 256;
-const COMPACT_CODE_COST_BOUND: usize = 288;
+const CODE_COST_BOUND: usize = 224;
+const COMPACT_CODE_COST_BOUND: usize = 256;
 
 #[derive(Clone)]
 struct Record {
@@ -151,6 +153,9 @@ fn parse_pool(source: &str) -> Option<Pool<'_>> {
     let start = lines.iter().position(|l| *l == POOL)?;
     let end = (start + 1..lines.len()).find(|&i| lines[i].starts_with("; ---"))?;
     let records = parse_records(&lines[start + 1..end])?;
+    // A PH326 entry in front of the trampoline reaches it like a direct call does.
+    let entries = crate::peephole::str_print_inline_entry_names(source);
+    let printers = register_print_entries(&lines);
     let mut refs: BTreeMap<_, (usize, bool)> = records
         .iter()
         .map(|r| (r.name.as_str(), (0, true)))
@@ -163,9 +168,12 @@ fn parse_pool(source: &str) -> Option<Pool<'_>> {
                     continue;
                 }
                 *count += 1;
-                *safe &= line == format!(".word {name}")
+                let inline = line == format!(".word {name}")
                     && i > 0
-                    && code(lines[i - 1]) == "JSR __STR_PRINT_I";
+                    && code(lines[i - 1]).strip_prefix("JSR ").is_some_and(|target| {
+                        target == crate::peephole::STR_PRINT_INLINE_ENTRY || entries.contains(target)
+                    });
+                *safe &= inline || printed_from_registers(&lines, i, name, &printers);
             }
         }
     }
@@ -185,6 +193,71 @@ fn parse_pool(source: &str) -> Option<Pool<'_>> {
         records,
         eligible,
     })
+}
+
+/// Find entries that print the string pointer passed in A/Y.
+fn register_print_entries(lines: &[&str]) -> BTreeSet<String> {
+    let mut printers = BTreeSet::from(["__STR_PRINT".to_owned()]);
+    let mut pending: Vec<&str> = Vec::new();
+    for line in lines {
+        let line = code(line);
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(label) = line.strip_suffix(':') {
+            pending.push(label);
+            continue;
+        }
+        let prints = line == "JSR __STR_PRINT"
+            || line == "JMP __STR_PRINT"
+            || pending.contains(&"__STR_PRINT");
+        if prints {
+            printers.extend(pending.iter().map(|l| (*l).to_owned()));
+        }
+        pending.clear();
+    }
+    printers
+}
+
+fn next_code<'a>(lines: &[&'a str], i: usize) -> Option<(usize, &'a str)> {
+    (i + 1..lines.len()).map(|k| (k, code(lines[k]))).find(|(_, l)| !l.is_empty())
+}
+
+fn prev_code<'a>(lines: &[&'a str], i: usize) -> Option<(usize, &'a str)> {
+    (0..i).rev().map(|k| (k, code(lines[k]))).find(|(_, l)| !l.is_empty())
+}
+
+/// Whether the pointer load feeds only a string print call.
+fn printed_from_registers(lines: &[&str], i: usize, name: &str, printers: &BTreeSet<String>) -> bool {
+    let (lo, hi) = (format!("LDA #<{name}"), format!("LDY #>{name}"));
+    let line = code(lines[i]);
+    let first = if line == lo || line == hi {
+        let other = if line == lo { &hi } else { &lo };
+        match (prev_code(lines, i), next_code(lines, i)) {
+            (Some((k, prev)), _) if prev == other => k,
+            (_, Some((_, next))) if next == other => i,
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+    let Some((second, _)) = next_code(lines, first) else {
+        return false;
+    };
+    let mut at = second;
+    loop {
+        let Some((k, next)) = next_code(lines, at) else {
+            return false;
+        };
+        if next.ends_with(':') {
+            at = k;
+            continue;
+        }
+        return next
+            .strip_prefix("JSR ")
+            .or_else(|| next.strip_prefix("JMP "))
+            .is_some_and(|target| printers.contains(target));
+    }
 }
 
 pub(crate) fn compress(source: &str) -> Option<String> {
@@ -422,6 +495,337 @@ fn compact_model(
     })
 }
 
+/// Byte symbol or pair index plus 256.
+type Sym = u16;
+
+/// Limit recursive pair expansion to protect the stack.
+const MAX_PAIR_DEPTH: usize = 10;
+/// The tree decoder and dispatch, with the eight state bytes.
+const TREE_DECODER_COST: usize = 192 + 8;
+/// The canonical decoder and dispatch, with the eight state bytes.
+const CANONICAL_DECODER_COST: usize = 216 + 8;
+/// What pair expansion adds to the tree decoder.
+const PAIR_DECODER_COST: usize = 47;
+
+#[derive(Clone)]
+struct SymNode {
+    count: usize,
+    minimum: Sym,
+    leaf: Option<Sym>,
+    children: Option<(Box<SymNode>, Box<SymNode>)>,
+}
+
+/// Huffman tree over `freqs` (at least two symbols), ties broken as `compress` breaks them.
+fn sym_huffman(freqs: &BTreeMap<Sym, usize>) -> SymNode {
+    let mut nodes: Vec<_> = freqs
+        .iter()
+        .map(|(&symbol, &count)| SymNode {
+            count,
+            minimum: symbol,
+            leaf: Some(symbol),
+            children: None,
+        })
+        .collect();
+    while nodes.len() > 1 {
+        nodes.sort_by_key(|n| (n.count, n.minimum));
+        let a = nodes.remove(0);
+        let b = nodes.remove(0);
+        nodes.push(SymNode {
+            count: a.count + b.count,
+            minimum: a.minimum.min(b.minimum),
+            leaf: None,
+            children: Some((Box::new(a), Box::new(b))),
+        });
+    }
+    nodes.remove(0)
+}
+
+fn sym_lengths(node: &SymNode, depth: usize, out: &mut BTreeMap<Sym, usize>) {
+    match (&node.leaf, &node.children) {
+        (Some(symbol), _) => {
+            out.insert(*symbol, depth);
+        }
+        (None, Some((a, b))) => {
+            sym_lengths(a, depth + 1, out);
+            sym_lengths(b, depth + 1, out);
+        }
+        _ => {}
+    }
+}
+
+/// Build decoder tables and collect symbol codes.
+fn sym_tree(
+    node: &SymNode,
+    bits: &mut Vec<bool>,
+    index: &BTreeMap<Sym, u8>,
+    left: &mut Vec<u8>,
+    right: &mut Vec<u8>,
+    codes: &mut BTreeMap<Sym, Vec<bool>>,
+) -> u8 {
+    if let Some(symbol) = node.leaf {
+        codes.insert(symbol, bits.clone());
+        return 0x80 + index[&symbol];
+    }
+    let id = left.len();
+    left.push(0);
+    right.push(0);
+    let (a, b) = node.children.as_ref().unwrap();
+    bits.push(false);
+    left[id] = sym_tree(a, bits, index, left, right, codes);
+    *bits.last_mut().unwrap() = true;
+    right[id] = sym_tree(b, bits, index, left, right, codes);
+    bits.pop();
+    id as u8
+}
+
+type SymTokens = Vec<(Sym, Option<(u8, u8)>)>;
+
+/// Bytes followed by reachable pairs in expansion order.
+fn pair_alphabet(seqs: &[SymTokens], pairs: &[(Sym, Sym)]) -> Vec<Sym> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<Sym> = seqs.iter().flatten().map(|(s, _)| *s).collect();
+    while let Some(symbol) = stack.pop() {
+        if seen.insert(symbol) && symbol >= 256 {
+            let (a, b) = pairs[usize::from(symbol - 256)];
+            stack.extend([a, b]);
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Packed record, table and decoder sizes.
+fn pair_cost(seqs: &[SymTokens], pairs: &[(Sym, Sym)], raw: &[usize]) -> Option<(usize, Vec<Option<usize>>)> {
+    let mut freqs = BTreeMap::<Sym, usize>::new();
+    for (symbol, _) in seqs.iter().flatten() {
+        *freqs.entry(*symbol).or_default() += 1;
+    }
+    let alphabet = pair_alphabet(seqs, pairs);
+    if freqs.len() < 2 || alphabet.len() > 128 {
+        return None;
+    }
+    let mut lengths = BTreeMap::new();
+    sym_lengths(&sym_huffman(&freqs), 0, &mut lengths);
+    let mut total = 0;
+    let mut sizes = Vec::with_capacity(seqs.len());
+    for (seq, &raw) in seqs.iter().zip(raw) {
+        let bits: usize = seq.iter().map(|(s, e)| lengths[s] + if e.is_some() { 16 } else { 0 }).sum();
+        let packed = 1 + bits.div_ceil(8);
+        sizes.push((packed < raw).then_some(packed));
+        total += packed.min(raw);
+    }
+    let reached_pairs = alphabet.iter().filter(|&&s| s >= 256).count();
+    let chars = alphabet.len() - reached_pairs;
+    total += chars + 2 * (freqs.len() - 1) + 2 * reached_pairs + TREE_DECODER_COST;
+    if reached_pairs > 0 {
+        total += PAIR_DECODER_COST;
+    }
+    Some((total, sizes))
+}
+
+struct PairModel {
+    records: Vec<Record>,
+    tables: Vec<(&'static str, Vec<u8>)>,
+    chars: usize,
+    pairs: usize,
+    /// Bytes saved against leaving the eligible records raw, decoder and tables paid.
+    net: isize,
+}
+
+/// Replace common byte pairs while the total encoded size shrinks.
+fn pair_model(records: &[Record], eligible: &BTreeSet<String>) -> Option<PairModel> {
+    let which: Vec<usize> = (0..records.len()).filter(|&i| eligible.contains(&records[i].name)).collect();
+    let raw: Vec<usize> = which.iter().map(|&i| records[i].bytes.len()).collect();
+    let mut seqs: Vec<SymTokens> = which
+        .iter()
+        .map(|&i| tokens(&records[i].bytes[1..]).into_iter().map(|(s, e)| (Sym::from(s), e)).collect())
+        .collect();
+    let mut pairs: Vec<(Sym, Sym)> = Vec::new();
+    let mut depth: Vec<usize> = Vec::new();
+    let depth_of = |depth: &[usize], s: Sym| if s >= 256 { depth[usize::from(s - 256)] } else { 0 };
+    let (mut best_cost, _) = pair_cost(&seqs, &pairs, &raw)?;
+    let mut best = (seqs.clone(), pairs.clone());
+    let mut banned = BTreeSet::new();
+    while pairs.len() < 127 {
+        let mut counts = BTreeMap::<(Sym, Sym), usize>::new();
+        for seq in &seqs {
+            let mut i = 0;
+            while i + 1 < seq.len() {
+                let ((a, ea), (b, eb)) = (seq[i], seq[i + 1]);
+                if ea.is_none() && eb.is_none() {
+                    *counts.entry((a, b)).or_default() += 1;
+                    if a == b {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+        let Some((&(a, b), &count)) = counts
+            .iter()
+            .filter(|(pair, _)| !banned.contains(*pair))
+            .filter(|((a, b), _)| 1 + depth_of(&depth, *a).max(depth_of(&depth, *b)) <= MAX_PAIR_DEPTH)
+            .max_by_key(|((a, b), count)| (**count, std::cmp::Reverse((*a, *b))))
+        else {
+            break;
+        };
+        if count < 3 {
+            break;
+        }
+        let symbol = 256 + pairs.len() as Sym;
+        let next: Vec<SymTokens> = seqs
+            .iter()
+            .map(|seq| {
+                let mut out = Vec::with_capacity(seq.len());
+                let mut i = 0;
+                while i < seq.len() {
+                    if i + 1 < seq.len() && seq[i] == (a, None) && seq[i + 1] == (b, None) {
+                        out.push((symbol, None));
+                        i += 2;
+                    } else {
+                        out.push(seq[i]);
+                        i += 1;
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut grown = pairs.clone();
+        grown.push((a, b));
+        let Some((cost, _)) = pair_cost(&next, &grown, &raw) else {
+            banned.insert((a, b));
+            continue;
+        };
+        depth.push(1 + depth_of(&depth, a).max(depth_of(&depth, b)));
+        seqs = next;
+        pairs = grown;
+        if cost < best_cost {
+            best_cost = cost;
+            best = (seqs.clone(), pairs.clone());
+        }
+    }
+    let (seqs, pairs) = best;
+    let alphabet = pair_alphabet(&seqs, &pairs);
+    let index: BTreeMap<Sym, u8> = alphabet.iter().enumerate().map(|(i, &s)| (s, i as u8)).collect();
+    let chars = alphabet.iter().filter(|&&s| s < 256).count();
+    let mut freqs = BTreeMap::<Sym, usize>::new();
+    for (symbol, _) in seqs.iter().flatten() {
+        *freqs.entry(*symbol).or_default() += 1;
+    }
+    let (mut left, mut right, mut codes) = (Vec::new(), Vec::new(), BTreeMap::new());
+    sym_tree(&sym_huffman(&freqs), &mut Vec::new(), &index, &mut left, &mut right, &mut codes);
+    if left.len() > 127 {
+        return None;
+    }
+    let mut records = records.to_vec();
+    let mut saving = 0isize;
+    for (seq, &i) in seqs.iter().zip(&which) {
+        let r = &mut records[i];
+        let mut bits = Vec::new();
+        for (symbol, extra) in seq {
+            bits.extend_from_slice(&codes[symbol]);
+            if let Some((count, byte)) = extra {
+                for value in [count, byte] {
+                    bits.extend((0..8).rev().map(|shift| value & (1 << shift) != 0));
+                }
+            }
+        }
+        r.packed = vec![r.bytes[0]];
+        r.packed.extend(bits.chunks(8).map(|chunk| {
+            (0..8).fold(0, |v, bit| (v << 1) | u8::from(chunk.get(bit).copied().unwrap_or(false)))
+        }));
+        if r.packed.len() >= r.bytes.len() {
+            r.packed.clear();
+        } else {
+            saving += (r.bytes.len() - r.packed.len()) as isize;
+        }
+    }
+    let values: Vec<u8> = alphabet.iter().filter(|&&s| s < 256).map(|&s| s as u8).collect();
+    let pair_tables: (Vec<u8>, Vec<u8>) = alphabet
+        .iter()
+        .filter(|&&s| s >= 256)
+        .map(|&s| {
+            let (a, b) = pairs[usize::from(s - 256)];
+            (index[&a], index[&b])
+        })
+        .unzip();
+    let pair_count = pair_tables.0.len();
+    let mut cost = TREE_DECODER_COST + values.len() + left.len() + right.len();
+    if pair_count > 0 {
+        cost += PAIR_DECODER_COST + 2 * pair_count;
+    }
+    let mut tables = vec![("LEFT", left), ("RIGHT", right), ("VALUES", values)];
+    if pair_count > 0 {
+        tables.push(("PAIRL", pair_tables.0));
+        tables.push(("PAIRR", pair_tables.1));
+    }
+    Some(PairModel {
+        records,
+        tables,
+        chars,
+        pairs: pair_count,
+        net: saving - cost as isize,
+    })
+}
+
+/// Expand pair symbols through recursive printing.
+fn pair_decoder(chars: usize) -> String {
+    let c = format!("${chars:02X}");
+    DECODER
+        .replacen(
+            "__CP_LEAF:\n    AND #$7F\n    TAX\n",
+            &format!("__CP_LEAF:\n    AND #$7F\n    CMP #{c}\n    BCS __CP_LEAF_PAIR\n    TAX\n"),
+            1,
+        )
+        .replacen(
+            "    BNE __CP_NEXT\n__CP_DONE:\n",
+            "    BNE __CP_NEXT\n    BEQ __CP_DONE\n__CP_LEAF_PAIR:\n    JSR __CP_EMIT\n    LDX __CP_STATE\n    BEQ __CP_DONE\n    JMP __CP_NEXT\n__CP_DONE:\n",
+            1,
+        )
+        + &format!(
+            "__CP_EMIT:\n    CMP #{c}\n    BCS __CP_EMIT_PAIR\n    TAX\n    LDA __CP_VALUES,X\n    JSR $FFD2\n    DEC __CP_STATE\n    RTS\n\
+             __CP_EMIT_PAIR:\n    TAX\n    LDA __CP_PAIRR-{c},X\n    PHA\n    LDA __CP_PAIRL-{c},X\n    JSR __CP_EMIT\n    PLA\n    JMP __CP_EMIT\n"
+        )
+}
+
+/// Choose the smaller packing after including its decoder cost.
+pub(crate) fn compress_size(source: &str, other: bool) -> Option<String> {
+    let Pool {
+        lines,
+        start,
+        end,
+        records,
+        eligible,
+    } = parse_pool(source)?;
+    let pair = pair_model(&records, &eligible);
+    let canonical = compact_model(&records, &eligible, None).map(|m| {
+        let net = m.score() - CANONICAL_DECODER_COST as isize;
+        (m, net)
+    });
+    let pair_net = pair.as_ref().map_or(isize::MIN, |m| m.net);
+    let canonical_net = canonical.as_ref().map_or(isize::MIN, |(_, net)| *net);
+    let take_pair = (pair_net >= canonical_net) != other;
+    if (if take_pair { pair_net } else { canonical_net }) <= 0 {
+        return None;
+    }
+    if take_pair {
+        let model = pair?;
+        let decoder = if model.pairs > 0 { pair_decoder(model.chars) } else { DECODER.to_owned() };
+        let tables: Vec<(&str, &[u8])> = model.tables.iter().map(|(n, t)| (*n, t.as_slice())).collect();
+        emit_pool(&lines, start, end, &model.records, &tables, &decoder)
+    } else {
+        let (model, _) = canonical?;
+        let decoder = DECODER.replacen(TREE_NODE, CANONICAL_NODE, 1);
+        emit_pool(
+            &lines,
+            start,
+            end,
+            &model.records,
+            &[("COUNTS", &model.counts), ("VALUES", &model.values)],
+            &decoder,
+        )
+    }
+}
+
 /// Extra model search for the final Compact retry.
 pub(crate) fn compress_compact(source: &str) -> Option<String> {
     let Pool {
@@ -552,9 +956,7 @@ fn emit_pool(
         writeln!(pool, "__CP_{name}:").unwrap();
         byte_line(&mut pool, bytes);
     }
-    for name in ["REMAIN", "LENGTH", "BITS", "BUFFER", "RUN", "CHAR", "BYTE"] {
-        writeln!(pool, "__CP_{name}:\n    .byte $00").unwrap();
-    }
+    pool.push_str("__CP_STATE:\n    .byte $00,$00,$00,$00,$00,$00,$00\n__CP_RET:\n    .byte $00\n");
     let mut output = lines[..start].join("\n") + "\n" + &pool + &lines[end..].join("\n") + "\n";
     if output.matches("__STR_PRINT_PTR:\n").count() != 1 {
         return None;
@@ -624,52 +1026,44 @@ const CANONICAL_NODE: &str = "__CP_NEXT:
     PHP
     CLD
     LDX #$00
-    STX __CP_BYTE
-    STX __CP_CHAR
+    STX __CP_STATE+6
+    STX __CP_STATE+5
 __CP_NODE:
     JSR __CP_BIT
-    ROL __CP_CHAR
-    LDA __CP_CHAR
+    ROL __CP_STATE+5
+    LDA __CP_STATE+5
     CMP __CP_COUNTS,X
     BCC __CP_LEAF
     SBC __CP_COUNTS,X
-    STA __CP_CHAR
-    LDA __CP_BYTE
+    STA __CP_STATE+5
+    LDA __CP_STATE+6
     CLC
     ADC __CP_COUNTS,X
-    STA __CP_BYTE
+    STA __CP_STATE+6
     INX
     BNE __CP_NODE
 __CP_LEAF:
     CLC
-    ADC __CP_BYTE
+    ADC __CP_STATE+6
     TAX
     PLP
     LDA __CP_VALUES,X";
 
 const DECODER: &str = "__CP_PACKED:
     PLP
-    LDA __CP_REMAIN
+    LDX #$06
+__CP_SAVE:
+    LDA __CP_STATE,X
     PHA
-    LDA __CP_LENGTH
-    PHA
-    LDA __CP_BITS
-    PHA
-    LDA __CP_BUFFER
-    PHA
-    LDA __CP_RUN
-    PHA
-    LDA __CP_CHAR
-    PHA
-    LDA __CP_BYTE
-    PHA
+    DEX
+    BPL __CP_SAVE
     LDY #$00
     LDA (@PRINT_LO@),Y
-    STA __CP_REMAIN
-    STA __CP_LENGTH
+    STA __CP_STATE
+    STA __CP_STATE+1
     INY
     LDA #$00
-    STA __CP_BITS
+    STA __CP_STATE+2
 __CP_NEXT:
     LDX #$00
 __CP_NODE:
@@ -689,65 +1083,57 @@ __CP_LEAF:
     LDA __CP_VALUES,X
     BNE __CP_LITERAL
     JSR __CP_READ_BYTE
-    STA __CP_RUN
+    STA __CP_STATE+4
     JSR __CP_READ_BYTE
-    STA __CP_CHAR
+    STA __CP_STATE+5
 __CP_REPEAT:
-    LDA __CP_CHAR
+    LDA __CP_STATE+5
     JSR $FFD2
-    DEC __CP_REMAIN
-    DEC __CP_RUN
+    DEC __CP_STATE
+    DEC __CP_STATE+4
     BNE __CP_REPEAT
-    LDX __CP_REMAIN
+    LDX __CP_STATE
     BNE __CP_NEXT
     BEQ __CP_DONE
 __CP_LITERAL:
     JSR $FFD2
-    DEC __CP_REMAIN
+    DEC __CP_STATE
     BNE __CP_NEXT
 __CP_DONE:
-    LDY __CP_LENGTH
+    LDY __CP_STATE+1
     INY
-    TAX
+    STA __CP_RET
+    LDX #$F9
+__CP_RESTORE:
     PLA
-    STA __CP_BYTE
-    PLA
-    STA __CP_CHAR
-    PLA
-    STA __CP_RUN
-    PLA
-    STA __CP_BUFFER
-    PLA
-    STA __CP_BITS
-    PLA
-    STA __CP_LENGTH
-    PLA
-    STA __CP_REMAIN
-    TXA
+    STA __CP_STATE-$F9,X
+    INX
+    BNE __CP_RESTORE
+    LDA __CP_RET
     LDX #$00
     RTS
 __CP_BIT:
-    LDA __CP_BITS
+    LDA __CP_STATE+2
     BNE __CP_SHIFT
     LDA (@PRINT_LO@),Y
     INY
-    STA __CP_BUFFER
+    STA __CP_STATE+3
     LDA #$08
-    STA __CP_BITS
+    STA __CP_STATE+2
 __CP_SHIFT:
-    ASL __CP_BUFFER
-    DEC __CP_BITS
+    ASL __CP_STATE+3
+    DEC __CP_STATE+2
     RTS
 __CP_READ_BYTE:
     LDA #$00
-    STA __CP_BYTE
+    STA __CP_STATE+6
     LDX #$08
 __CP_BYTE_BIT:
     JSR __CP_BIT
-    ROL __CP_BYTE
+    ROL __CP_STATE+6
     DEX
     BNE __CP_BYTE_BIT
-    LDA __CP_BYTE
+    LDA __CP_STATE+6
     RTS
 ";
 
@@ -897,6 +1283,23 @@ __RAW_DONE:
     }
 
     #[test]
+    fn register_prints_pack_and_other_uses_stay_raw() {
+        let site = |i: usize| format!("    JSR __STR_PRINT_I\n    .word S{i}\n");
+        let helper = "__SEQ_9:\n    JSR __STR_PRINT\n    RTS\n__STR_ASSIGN:\n    RTS\n";
+        let source = fixture(&corpus(), helper, false)
+            .replacen(&site(0), "    LDA #<S0\n    LDY #>S0\n    JSR __STR_PRINT\n", 1)
+            .replacen(&site(1), "    LDY #>S1\n    LDA #<S1\n__TAIL_1:\n    JMP __SEQ_9\n", 1)
+            .replacen(&site(2), "    LDA #<S2\n    LDY #>S2\n    JSR __STR_ASSIGN\n", 1)
+            .replacen(&site(3), "    LDA #<S3\n    LDY #>S3\n    JSR __STR_PRINT\n    LDA #<S3\n", 1);
+        let packed = compress(&source).expect("profitable");
+        let (begin, end) = (packed.find("__CP_BEGIN:").unwrap(), packed.find("__CP_END:").unwrap());
+        let at = |name: &str| packed.find(&format!("\n{name}:\n")).unwrap();
+        for (name, packs) in [("S0", true), ("S1", true), ("S2", false), ("S3", false), ("S4", true)] {
+            assert_eq!((begin..end).contains(&at(name)), packs, "{name}");
+        }
+    }
+
+    #[test]
     fn relocated_print_pointer_decodes_both_codecs_and_preserves_nested_abi() {
 
         let mut record: Vec<u8> = (1..=127).collect();
@@ -1015,6 +1418,82 @@ __RAW_DONE:
                 }
             }
         }
+    }
+
+    fn text_corpus() -> Vec<Vec<u8>> {
+        let words = [
+            "THE", "YOU", "ARE", "IN", "A", "DARK", "ROOM", "THERE", "IS", "DOOR", "TO", "NORTH",
+            "SOUTH", "AND", "AN", "OLD", "LAMP", "HERE", "CAN", "SEE", "PASSAGE", "LEADS", "WEST",
+        ];
+        let mut seed = 12345u32;
+        (0..260)
+            .map(|_| {
+                let mut text = String::new();
+                for _ in 0..8 + seed as usize % 9 {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    text.push_str(words[(seed >> 16) as usize % words.len()]);
+                    text.push(' ');
+                }
+                text.push('.');
+                text.into_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pair_decoder_matches_the_raw_print() {
+        for (records, pairs) in [(text_corpus(), true), (corpus(), false)] {
+            let source = fixture(&records, "", true);
+            let packed = compress_size(&source, false).unwrap();
+            assert_eq!(packed.contains("__CP_PAIRL:"), pairs);
+            let mut a = image(&source);
+            let mut b = image(&packed);
+            assert!(b.len < a.len);
+            for (nested, flags) in [(false, 0x65), (true, 0x65), (false, 0x6D), (true, 0x6D)] {
+                for (i, expected) in records.iter().enumerate() {
+                    for img in [&mut a, &mut b] {
+                        img.sys.cpu.regs.a = 0xa5;
+                        img.sys.cpu.regs.x = 37;
+                        img.sys.cpu.regs.y = 91;
+                        img.sys.cpu.regs.p = flags;
+                        img.sys.cpu.regs.sp = 0xd0;
+                    }
+                    let (mut raw, mut decoded) = (Vec::new(), Vec::new());
+                    invoke(&mut a, i, nested, &mut raw);
+                    invoke(&mut b, i, nested, &mut decoded);
+                    assert_eq!(raw, decoded, "record {i}, nested {nested}");
+                    if !nested {
+                        assert_eq!(&decoded, expected);
+                    }
+                    let (x, y) = (a.sys.cpu.regs, b.sys.cpu.regs);
+                    assert_eq!((x.a, x.x, x.y, x.p), (y.a, y.x, y.y, y.p), "record {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pairs_shrink_text_below_the_plain_tree_code() {
+        let source = fixture(&text_corpus(), "", false);
+        let plain = image(&compress(&source).unwrap()).len;
+        let paired = image(&compress_size(&source, false).unwrap()).len;
+        assert!(paired + 200 < plain, "{paired} vs {plain}");
+    }
+
+    #[test]
+    fn decoder_prices_are_the_assembled_sizes() {
+        let size = |decoder: &str| {
+            let src = format!(
+                "*=$2000\n{}{}__CP_LEFT:\n__CP_RIGHT:\n__CP_VALUES:\n__CP_COUNTS:\n__CP_PAIRL:\n\
+                 __CP_PAIRR:\n__CP_BEGIN:\n__CP_END:\n__CP_STATE:\n__CP_RET:\n",
+                bind_pointer(DISPATCH, "$FD", "$FE"),
+                bind_pointer(decoder, "$FD", "$FE")
+            );
+            asm6502::Assembler6502::new().assemble_bytes(&src).unwrap().len() + 8
+        };
+        assert_eq!(size(DECODER), TREE_DECODER_COST);
+        assert_eq!(size(&DECODER.replacen(TREE_NODE, CANONICAL_NODE, 1)), CANONICAL_DECODER_COST);
+        assert_eq!(size(&pair_decoder(40)) - size(DECODER), PAIR_DECODER_COST);
     }
 
     #[test]
@@ -1155,16 +1634,15 @@ __RAW_DONE:
             .replacen("__STR_PRINT_PTR:\n", "", 1);
                 let mut asm = asm6502::Assembler6502::new();
                 let mut source = bind_pointer(&source, "$FD", "$FE");
-                for name in [
-                    "LEFT", "RIGHT", "VALUES", "REMAIN", "LENGTH", "BITS", "BUFFER", "RUN", "CHAR",
-                    "BYTE", "COUNTS",
-                ] {
+                for name in ["LEFT", "RIGHT", "VALUES", "COUNTS"] {
                     writeln!(source, "__CP_{name}:\n    .byte $00").unwrap();
                 }
+                source.push_str("__CP_STATE:\n    .byte $00,$00,$00,$00,$00,$00,$00\n__CP_RET:\n    .byte $00\n");
                 let total = asm.assemble_bytes(&source).unwrap().len();
                 let mut raw = asm6502::Assembler6502::new();
                 let raw_len = raw.assemble_bytes(RAW).unwrap().len();
-                let overhead = total - raw_len - padding - 1 - 11;
+                // The bound covers the eight state bytes, not the four one-byte tables.
+                let overhead = total - raw_len - padding - 1 - 4;
                 assert!(overhead <= bound, "actual dispatch/decoder cost {overhead}");
             }
         }

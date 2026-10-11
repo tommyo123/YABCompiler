@@ -24,16 +24,19 @@ fn asm_at(src: &str, profile: Profile) -> String {
         .asm
 }
 
-/// The body of a labelled helper, up to (not including) the next label.
 fn helper_body<'a>(asm: &'a str, label: &str) -> &'a str {
     let after = asm
         .split(&format!("\n{label}:\n"))
         .nth(1)
         .unwrap_or_else(|| panic!("{label} is emitted:\n{asm}"));
-    match after.find("\n_") {
-        Some(i) => &after[..i],
-        None => after,
+    let mut at = 0;
+    while let Some(i) = after[at..].find("\n_") {
+        if !after[at + i + 1..].starts_with("__PN_") {
+            return &after[..at + i];
+        }
+        at += i + 1;
     }
+    after
 }
 
 /// Longest run of `byte` in `out`.
@@ -197,7 +200,8 @@ fn all_four_gap_sites_go_through_the_rom_routine() {
     let src = "10 PRINT 1;2\n20 PRINT \"A\",\"B\"\n30 PRINT TAB(5);\"C\";SPC(3);\"D\"\n";
     for profile in ALL_PROFILES {
         let asm = asm_at(src, profile);
-        for label in ["__PRINT_FAC", "__TAB_LOOP", "__SPC_LOOP", "__PC_PAD"] {
+        let number = if asm.contains("\n__PRINT_FAC:\n") { "__PRINT_FAC" } else { "__PRINT_INT16" };
+        for label in [number, "__TAB_LOOP", "__SPC_LOOP", "__PC_PAD"] {
             let body = helper_body(&asm, label);
             assert!(
                 body.contains("$AB3B"),
@@ -301,12 +305,20 @@ fn get_file_brackets_channl_in_the_rom_order() {
     }
 }
 
+fn sets_channl_right_before_chkin(asm: &str) -> bool {
+    asm.contains("STX $13\n    JSR $FFC6")
+        || asm.split("STX $13\n    JSR ").skip(1).any(|rest| {
+            let target = rest.lines().next().unwrap_or("").trim();
+            asm.contains(&format!("\n{target}:\n    JSR $FFC6\n"))
+        })
+}
+
 #[test]
 fn input_file_brackets_channl_around_the_whole_statement() {
     for profile in ALL_PROFILES {
         let asm = asm_at("10 OPEN 1,3\n20 INPUT#1,A\n30 CLOSE 1\n", profile);
         assert!(
-            asm.contains("STX $13\n    JSR $FFC6"),
+            sets_channl_right_before_chkin(&asm),
             "{profile:?}: INPUT# must set CHANNL immediately before CHKIN:\n{asm}"
         );
         assert!(
@@ -388,7 +400,7 @@ fn input_line_closing_cr_is_suppressed_while_a_channel_is_open() {
         assert!(
             asm.contains(
                 "    LDA $13\n    BNE __INPUT_NOCR\n    LDA #$0D\n    JSR $FFD2\n\
-                 __INPUT_NOCR:\n    RTS\n"
+                 __INPUT_NOCR:\n"
             ),
             "{profile:?}: INLIN's closing CR must be guarded by LDA $13 / BNE:\n{asm}"
         );

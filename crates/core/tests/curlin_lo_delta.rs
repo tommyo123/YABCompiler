@@ -15,9 +15,10 @@ fn asm_dialect(src: &str, dialect: Dialect) -> String {
         dialect,
         ..CompileOptions::default()
     };
-    compile_with_options(&prg, opts)
+    let asm = compile_with_options(&prg, opts)
         .unwrap_or_else(|e| panic!("compiles: {e}"))
-        .asm
+        .asm;
+    common::expand_call_entries(&asm)
 }
 
 fn asm(src: &str) -> String {
@@ -401,9 +402,10 @@ fn the_delta_encoding_is_what_makes_the_run_cheaper() {
     let (run, tens) = (size(RUN_SRC), size(TENS_SRC));
     assert_eq!(
         tens - run,
-        2,
+        6,
         "the delta encoding's 8 bytes less the 6 PH309 recovers from the tens \
-         build's shared `STA $39`: run={run} tens={tens}"
+         build's shared `STA $39`, plus the 4 PH326 recovers from the run's three \
+         `INC $39` before one routine: run={run} tens={tens}"
     );
 }
 

@@ -11,7 +11,17 @@ enum Line {
     Label(String),
 }
 
-/// Strip comments and blanks, and classify what is left.
+fn zero_page_names(asm: &str) -> std::collections::HashSet<String> {
+    asm.lines()
+        .filter_map(|l| {
+            let (name, value) = l.split(';').next()?.split_once('=')?;
+            let hex = value.trim().strip_prefix('$')?;
+            (hex.len() <= 2 && u8::from_str_radix(hex, 16).is_ok())
+                .then(|| name.trim().to_string())
+        })
+        .collect()
+}
+
 fn code_lines(asm: &str) -> Vec<Line> {
     let mut out = Vec::new();
     for raw in asm.lines() {
@@ -45,22 +55,35 @@ fn is_cond_branch(m: &str) -> bool {
         "BEQ" | "BNE" | "BCC" | "BCS" | "BMI" | "BPL" | "BVC" | "BVS"
     )
 }
-fn min_insn_bytes(mnem: &str, operand: Option<&str>) -> usize {
+fn min_insn_bytes(mnem: &str, operand: Option<&str>, zp: &std::collections::HashSet<String>) -> usize {
     match mnem {
         "BEQ" | "BNE" | "BCC" | "BCS" | "BMI" | "BPL" | "BVC" | "BVS" => 2,
         "JSR" | "JMP" => 3,
         _ => match operand {
             None => 1,
-            Some(_) => 2,
+            Some(op) => {
+                let base = op.split(',').next().unwrap_or(op).trim();
+                let name = base.split(['+', '-']).next().unwrap_or(base).trim();
+                let short = op.starts_with('#')
+                    || op.starts_with('(')
+                    || base.strip_prefix('$').is_some_and(|h| h.len() <= 2)
+                    || zp.contains(name);
+                if short { 2 } else { 3 }
+            }
         },
     }
 }
-fn min_distance(lines: &[Line], from: usize, target: &str) -> Option<usize> {
+fn min_distance(
+    lines: &[Line],
+    from: usize,
+    target: &str,
+    zp: &std::collections::HashSet<String>,
+) -> Option<usize> {
     let mut bytes = 0usize;
     for l in &lines[from..] {
         match l {
             Line::Label(n) if n == target => return Some(bytes),
-            Line::Insn(m, op) => bytes += min_insn_bytes(m, op.as_deref()),
+            Line::Insn(m, op) => bytes += min_insn_bytes(m, op.as_deref(), zp),
             _ => {}
         }
     }
@@ -68,7 +91,7 @@ fn min_distance(lines: &[Line], from: usize, target: &str) -> Option<usize> {
     for l in lines[..from].iter().rev() {
         match l {
             Line::Label(n) if n == target => return Some(bytes),
-            Line::Insn(m, op) => bytes += min_insn_bytes(m, op.as_deref()),
+            Line::Insn(m, op) => bytes += min_insn_bytes(m, op.as_deref(), zp),
             _ => {}
         }
     }
@@ -85,6 +108,7 @@ struct Scan {
 
 fn scan(name: &str, asm: &str, acc: &mut Scan) {
     let lines = code_lines(asm);
+    let zp = zero_page_names(asm);
     for l in &lines {
         if let Line::Label(n) = l
             && (n.starts_with("__SEQ_") || n.starts_with("__JSR2_") || n.starts_with("__TAIL_"))
@@ -112,7 +136,7 @@ fn scan(name: &str, asm: &str, acc: &mut Scan) {
         if jt.starts_with('$') {
             continue;
         }
-        match min_distance(&lines, i, jt) {
+        match min_distance(&lines, i, jt, &zp) {
             Some(d) if d <= DEFINITELY_IN_REACH => {
                 acc.foldable_branch
                     .push(format!("{name}: {m} {bt} / JMP {jt} (~{d} bytes away)"));

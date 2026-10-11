@@ -364,6 +364,205 @@ fn label_within_branch_range(
     false
 }
 
+/// Invert a branch over JMP and let assembly check its final reach.
+fn ph329_branch_straight_to_the_jmp_target(items: &mut Vec<Item>) -> bool {
+    let labels: std::collections::HashSet<String> = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Label(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut rewrites: Vec<(usize, &'static str, String, usize)> = Vec::new();
+    for i in 0..items.len() {
+        let Item::Insn(branch) = &items[i] else {
+            continue;
+        };
+        let Some(inverted) = invert_branch(&branch.mnem) else {
+            continue;
+        };
+        let Some(over) = branch.operand.as_deref() else {
+            continue;
+        };
+        let Some(j) = next_struct(items, i) else {
+            continue;
+        };
+        let Item::Insn(jmp) = &items[j] else {
+            continue;
+        };
+        let Some(target) = jmp.operand.as_deref() else {
+            continue;
+        };
+        if jmp.mnem != "JMP" || !is_label_target(target) || !labels.contains(target) {
+            continue;
+        }
+        let mut k = j;
+        let mut lands_after_jmp = false;
+        while let Some(n) = next_struct(items, k) {
+            let Item::Label(name) = &items[n] else {
+                break;
+            };
+            if name == over {
+                lands_after_jmp = true;
+                break;
+            }
+            k = n;
+        }
+        if lands_after_jmp {
+            rewrites.push((i, inverted, target.to_string(), j));
+        }
+    }
+    for &(i, inverted, ref target, j) in rewrites.iter().rev() {
+        items.remove(j);
+        if let Item::Insn(branch) = &mut items[i] {
+            branch.mnem = inverted.to_string();
+            branch.operand = Some(target.clone());
+        }
+    }
+    !rewrites.is_empty()
+}
+
+/// Remove zero additions or subtractions when carry and flags permit it.
+fn ph330_drop_add_of_zero_with_known_carry(items: &mut Vec<Item>) -> bool {
+    if items
+        .iter()
+        .any(|it| matches!(it, Item::Insn(i) if i.mnem == "PHP"))
+    {
+        return false;
+    }
+    let candidate = |insn: &Insn| {
+        matches!(insn.mnem.as_str(), "ADC" | "SBC")
+            && insn.operand.as_deref().map(str::trim) == Some("#$00")
+    };
+    if !items
+        .iter()
+        .any(|it| matches!(it, Item::Insn(i) if candidate(i)))
+    {
+        return false;
+    }
+    // Neither reads nor writes C.
+    const CARRY_NEUTRAL: [&str; 22] = [
+        "LDA", "LDX", "LDY", "STA", "STX", "STY", "TAX", "TAY", "TXA", "TYA", "AND", "ORA",
+        "EOR", "INC", "DEC", "INX", "INY", "DEX", "DEY", "BIT", "NOP", "CLV",
+    ];
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
+    let mut to_drop = Vec::new();
+    for (idx, it) in items.iter().enumerate() {
+        let Item::Insn(insn) = it else { continue };
+        if !candidate(insn) {
+            continue;
+        }
+        let wants = if insn.mnem == "ADC" { "CLC" } else { "SEC" };
+        let mut carry_known = false;
+        let mut k = idx;
+        while let Some(p) = prev_struct(items, k) {
+            let Item::Insn(prev) = &items[p] else {
+                break;
+            };
+            if prev.mnem == wants {
+                carry_known = true;
+                break;
+            }
+            if !CARRY_NEUTRAL.contains(&prev.mnem.as_str()) {
+                break;
+            }
+            k = p;
+        }
+        if !carry_known
+            || flags.is_live_out(idx, Flag::N)
+            || flags.is_live_out(idx, Flag::Z)
+            || flags.is_live_out(idx, Flag::V)
+        {
+            continue;
+        }
+        to_drop.push(idx);
+    }
+    for &idx in to_drop.iter().rev() {
+        items.remove(idx);
+    }
+    !to_drop.is_empty()
+}
+
+/// Give shared zero page cells one name.
+fn canonicalize_zp_aliases(items: &mut [Item]) -> bool {
+    use std::collections::HashMap;
+    let kind = |name: &str| name.find('_').map(|i| name[..=i].to_string());
+    let mut first: HashMap<String, String> = HashMap::new();
+    let mut mixed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut alias: HashMap<String, String> = HashMap::new();
+    let mut equates: Vec<(String, String)> = Vec::new();
+    for it in items.iter() {
+        let Item::Directive(raw) = it else { continue };
+        let Some((name, value)) = raw.split_once('=') else { continue };
+        let (name, value) = (name.trim(), value.trim());
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || !value.starts_with('$')
+            || value.len() > 3
+        {
+            continue;
+        }
+        equates.push((name.to_string(), value.to_string()));
+    }
+    for (name, addr) in &equates {
+        match first.get(addr) {
+            None => {
+                first.insert(addr.clone(), name.clone());
+            }
+            Some(f) => {
+                if kind(f) != kind(name) {
+                    mixed.insert(addr.clone());
+                }
+            }
+        }
+    }
+    for (name, addr) in &equates {
+        if mixed.contains(addr) {
+            continue;
+        }
+        let f = &first[addr];
+        if f != name {
+            alias.insert(name.clone(), f.clone());
+        }
+    }
+    if alias.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for it in items.iter_mut() {
+        let Item::Insn(insn) = it else { continue };
+        let Some(op) = insn.operand.as_mut() else { continue };
+        let mut out = String::with_capacity(op.len());
+        let bytes = op.as_bytes();
+        let mut i = 0;
+        let mut touched = false;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if (c.is_ascii_alphabetic() || c == '_') && (i == 0 || bytes[i - 1] != b'$') {
+                let start = i;
+                while i < bytes.len() && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let tok = &op[start..i];
+                match alias.get(tok) {
+                    Some(canon) => {
+                        out.push_str(canon);
+                        touched = true;
+                    }
+                    None => out.push_str(tok),
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        if touched {
+            *op = out;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Invert a conditional branch mnemonic. Used by PH005.
 fn invert_branch(mnem: &str) -> Option<&'static str> {
     Some(match mnem {
@@ -849,6 +1048,10 @@ struct StaticAsmFacts {
     mem_imm: BTreeMap<String, u8>,
     /// Shared zero-page equates used to invalidate aliased memory facts.
     zp_equ: std::rc::Rc<std::collections::HashMap<String, u16>>,
+    /// Registers whose values match the current N and Z flags.
+    nz_regs: RegSet,
+    /// Decimal mode does not set N and Z from the stored ADC result.
+    adc_sets_nz: bool,
 }
 
 impl Default for StaticAsmFacts {
@@ -864,6 +1067,8 @@ impl Default for StaticAsmFacts {
             flag_n: None,
             mem_imm: BTreeMap::new(),
             zp_equ: std::rc::Rc::default(),
+            nz_regs: RegSet::EMPTY,
+            adc_sets_nz: true,
         }
     }
 }
@@ -871,8 +1076,10 @@ impl Default for StaticAsmFacts {
 impl StaticAsmFacts {
     fn reset(&mut self) {
         let zp_equ = std::rc::Rc::clone(&self.zp_equ);
+        let adc_sets_nz = self.adc_sets_nz;
         *self = Self::default();
         self.zp_equ = zp_equ;
+        self.adc_sets_nz = adc_sets_nz;
     }
 
     fn reg(&self, reg: Reg) -> &StaticRegFact {
@@ -907,13 +1114,23 @@ impl StaticAsmFacts {
         self.mem_imm.clear();
     }
 
+    /// Whether both fact keys resolve to the same byte.
+    fn same_cell(&self, a: &str, b: &str) -> bool {
+        a == b
+            || fact_key_addr(&self.zp_equ, a)
+                .is_some_and(|x| fact_key_addr(&self.zp_equ, b) == Some(x))
+    }
+
     fn invalidate_mem_origin(&mut self, mem: &str) {
+        let addr = fact_key_addr(&self.zp_equ, mem);
+        let zp_equ = std::rc::Rc::clone(&self.zp_equ);
+        let hits = |key: &str| key == mem || addr.is_some_and(|a| fact_key_addr(&zp_equ, key) == Some(a));
         for fact in &mut self.regs {
-            if fact.mem.as_deref() == Some(mem) {
+            if fact.mem.as_deref().is_some_and(hits) {
                 fact.mem = None;
             }
         }
-        self.mem_imm.remove(mem);
+        self.mem_imm.retain(|k, _| !hits(k));
     }
 
     fn record_mem_imm(&mut self, mem: &str, value: u8) {
@@ -921,7 +1138,14 @@ impl StaticAsmFacts {
     }
 
     fn known_mem_imm(&self, mem: &str) -> Option<u8> {
-        self.mem_imm.get(mem).copied()
+        if let Some(v) = self.mem_imm.get(mem) {
+            return Some(*v);
+        }
+        let addr = fact_key_addr(&self.zp_equ, mem)?;
+        self.mem_imm
+            .iter()
+            .find(|(k, _)| fact_key_addr(&self.zp_equ, k) == Some(addr))
+            .map(|(_, v)| *v)
     }
 
     fn set_nz_from_imm(&mut self, imm: &ImmFact) {
@@ -1163,6 +1387,12 @@ impl StaticAsmFacts {
     }
 
     fn update_insn(&mut self, insn: &Insn) {
+        let nz_before = self.nz_regs;
+        self.update_insn_values(insn);
+        self.nz_regs = nz_regs_after(insn, nz_before, self.adc_sets_nz);
+    }
+
+    fn update_insn_values(&mut self, insn: &Insn) {
         match insn.mnem.as_str() {
             "LDA" => self.load_reg(Reg::A, insn.operand.as_deref()),
             "LDX" => self.load_reg(Reg::X, insn.operand.as_deref()),
@@ -1242,6 +1472,27 @@ impl StaticAsmFacts {
     }
 }
 
+/// Track registers whose values match N and Z after this instruction.
+fn nz_regs_after(insn: &Insn, before: RegSet, adc_sets_nz: bool) -> RegSet {
+    let on_a = insn
+        .operand
+        .as_deref()
+        .is_none_or(|op| op.trim().eq_ignore_ascii_case("A"));
+    match insn.mnem.as_str() {
+        "LDA" | "PLA" | "AND" | "ORA" | "EOR" => RegSet::A,
+        "ADC" | "SBC" if adc_sets_nz => RegSet::A,
+        "ASL" | "LSR" | "ROL" | "ROR" if on_a => RegSet::A,
+        "LDX" | "TSX" | "INX" | "DEX" => RegSet::X,
+        "LDY" | "INY" | "DEY" => RegSet::Y,
+        "TAX" | "TXA" => RegSet::A.union(RegSet::X),
+        "TAY" | "TYA" => RegSet::A.union(RegSet::Y),
+        "STA" | "STX" | "STY" | "CLC" | "SEC" | "CLV" | "CLD" | "SED" | "CLI" | "SEI"
+        | "NOP" | "PHA" | "PHP" | "TXS" => before,
+        m if is_cond_branch(m) => before,
+        _ => RegSet::EMPTY,
+    }
+}
+
 fn reg_idx(reg: Reg) -> usize {
     match reg {
         Reg::A => 0,
@@ -1311,12 +1562,17 @@ fn store_window_misses_zero_page(op: &str) -> bool {
 
 /// Is `key` (a `static_fact_mem_operand` string) provably a zero-page cell?
 fn fact_key_is_zp(zp_equ: &std::collections::HashMap<String, u16>, key: &str) -> bool {
+    fact_key_addr(zp_equ, key).is_some()
+}
+
+/// Resolve a fact key to a zero page address.
+fn fact_key_addr(zp_equ: &std::collections::HashMap<String, u16>, key: &str) -> Option<u16> {
     let (base, off) = match key.split_once('+') {
-        Some((b, o)) => match o.trim().parse::<u16>() {
-            Ok(off) => (b.trim(), off),
-            Err(_) => return false,
+        Some((b, o)) => (b.trim(), i32::from(o.trim().parse::<u16>().ok()?)),
+        None => match key.split_once('-') {
+            Some((b, o)) => (b.trim(), -i32::from(o.trim().parse::<u16>().ok()?)),
+            None => (key, 0),
         },
-        None => (key, 0),
     };
     let val = if let Some(hex) = base.strip_prefix('$') {
         if hex.len() == 2 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1327,23 +1583,72 @@ fn fact_key_is_zp(zp_equ: &std::collections::HashMap<String, u16>, key: &str) ->
     } else {
         zp_equ.get(base).copied()
     };
-    matches!(val, Some(v) if v.saturating_add(off) < 0x0100)
+    let addr = i32::from(val?) + off;
+    (0..0x0100).contains(&addr).then_some(addr as u16)
 }
 
 fn analyze_static_asm_facts(items: &[Item]) -> Vec<StaticAsmFacts> {
     let mut current = StaticAsmFacts::default();
+    current.adc_sets_nz = !items
+        .iter()
+        .any(|it| matches!(it, Item::Insn(i) if i.mnem == "SED"));
     current.zp_equ = std::rc::Rc::new(
         collect_equ_values(items)
             .into_iter()
             .filter(|(_, v)| *v < 0x0100)
             .collect(),
     );
-    let mut facts = Vec::with_capacity(items.len());
-    for item in items {
+    let entered_by_one_branch = labels_entered_by_one_forward_branch(items);
+    let mut facts: Vec<StaticAsmFacts> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
         facts.push(current.clone());
         current.update_item(item);
+        if let Some(&branch) = entered_by_one_branch.get(&i) {
+            let mut inherited = facts[branch].clone();
+            inherited.update_item(&items[branch]);
+            current = inherited;
+        }
     }
     facts
+}
+
+/// Find labels reached only by one forward conditional branch.
+fn labels_entered_by_one_forward_branch(
+    items: &[Item],
+) -> std::collections::HashMap<usize, usize> {
+    let refs = label_ref_counts(items);
+    let mut branch_to: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (j, it) in items.iter().enumerate() {
+        if let Item::Insn(insn) = it
+            && is_cond_branch(&insn.mnem)
+            && let Some(op) = insn.operand.as_deref()
+        {
+            branch_to.insert(op.trim(), j);
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for (i, it) in items.iter().enumerate() {
+        let Item::Label(name) = it else { continue };
+        if refs.get(name.as_str()).copied() != Some(1) {
+            continue;
+        }
+        let Some(&branch) = branch_to.get(name.as_str()) else {
+            continue;
+        };
+        if branch >= i {
+            continue;
+        }
+        let falls_in = prev_struct(items, i).is_none_or(|p| {
+            !matches!(&items[p], Item::Insn(insn) if is_uncond_terminator(&insn.mnem))
+        });
+        let shares_address = next_struct(items, i)
+            .is_some_and(|n| matches!(items[n], Item::Label(_)));
+        if falls_in || shares_address {
+            continue;
+        }
+        out.insert(i, branch);
+    }
+    out
 }
 
 // ----- Flag liveness --------------------------------------------------------
@@ -1979,28 +2284,95 @@ fn parse_hex_addr(operand: &str) -> Option<u16> {
     u16::from_str_radix(body, 16).ok()
 }
 
-/// PH015 — drop dead register transfer.
-///
-/// Pattern: `TAX|TAY|TXA|TYA` where the destination register is dead
-/// at the live-out of the transfer. Rare in freshly-emitted code,
-/// but later peephole passes (PH008/PH009/dead-store) can leave a
-/// transfer whose only consumer is gone.
-///
-/// Caveat: register transfers also set the N/Z flags on the value.
-/// We don't track flags, so we conservatively refuse if the next
-/// structural instruction is a conditional branch — the branch
-/// could be relying on the flags the transfer set.
-fn ph015_drop_dead_transfer(items: &mut Vec<Item>) -> bool {
-    let config = liveness_config_with_helpers();
-    let live = analyze_register_liveness_with_config(items, &config);
+/// Drop immediate loads only when the register and N/Z are dead.
+fn ph317_drop_dead_load_via_flag_liveness(items: &mut Vec<Item>) -> bool {
+    // PHP reads flags through the stack, so disable this pass.
+    if items
+        .iter()
+        .any(|it| matches!(it, Item::Insn(i) if i.mnem == "PHP"))
+    {
+        return false;
+    }
+    // Skip liveness analysis when there are no immediate loads.
+    if !items.iter().any(|it| {
+        matches!(it, Item::Insn(i)
+            if matches!(i.mnem.as_str(), "LDA" | "LDX" | "LDY")
+                && i.operand.as_deref().is_some_and(|op| op.starts_with('#')))
+    }) {
+        return false;
+    }
+    let reg_config = liveness_config_with_helpers();
+    let regs = analyze_register_liveness_with_config(items, &reg_config);
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
     let smc = smc_patched_labels(items);
     let mut to_drop = Vec::new();
     for (idx, it) in items.iter().enumerate() {
         let Item::Insn(insn) = it else { continue };
         let dest = match insn.mnem.as_str() {
-            "TAX" => Reg::X,
-            "TAY" => Reg::Y,
-            "TXA" | "TYA" => Reg::A,
+            "LDA" => Reg::A,
+            "LDX" => Reg::X,
+            "LDY" => Reg::Y,
+            _ => continue,
+        };
+        // The loaded register must be dead.
+        if regs.is_live_out(idx, dest) {
+            continue;
+        }
+        // Both flags set by the load must be dead.
+        if flags.is_live_out(idx, Flag::N) || flags.is_live_out(idx, Flag::Z) {
+            continue;
+        }
+        // Require an instruction after the load to avoid layout barriers.
+        let Some(j) = next_struct(items, idx) else {
+            continue;
+        };
+        if !matches!(items[j], Item::Insn(_)) {
+            continue;
+        }
+        if insn_is_smc_target(items, idx, &smc) {
+            continue;
+        }
+        let Some(op) = insn.operand.as_deref() else {
+            continue;
+        };
+        if !op.starts_with('#') {
+            continue;
+        }
+        if op.starts_with('(') {
+            continue;
+        }
+        if let Some(addr) = parse_hex_addr(op)
+            && (0xD000..=0xDFFF).contains(&addr)
+        {
+            continue;
+        }
+        to_drop.push(idx);
+    }
+    if to_drop.is_empty() {
+        return false;
+    }
+    for idx in to_drop.into_iter().rev() {
+        items.remove(idx);
+    }
+    true
+}
+
+/// Drop register transfers only when the destination and flags are dead.
+fn ph015_drop_dead_transfer(items: &mut Vec<Item>) -> bool {
+    let config = liveness_config_with_helpers();
+    let live = analyze_register_liveness_with_config(items, &config);
+    let smc = smc_patched_labels(items);
+    let facts = analyze_static_asm_facts(items);
+    let labels = collect_label_index(items);
+    let contracts = conservative_return_flag_config();
+    let mut to_drop = Vec::new();
+    for (idx, it) in items.iter().enumerate() {
+        let Item::Insn(insn) = it else { continue };
+        let (src, dest) = match insn.mnem.as_str() {
+            "TAX" => (Reg::A, Reg::X),
+            "TAY" => (Reg::A, Reg::Y),
+            "TXA" => (Reg::X, Reg::A),
+            "TYA" => (Reg::Y, Reg::A),
             _ => continue,
         };
         if live.is_live_out(idx, dest) {
@@ -2010,11 +2382,8 @@ fn ph015_drop_dead_transfer(items: &mut Vec<Item>) -> bool {
         if insn_is_smc_target(items, idx, &smc) {
             continue;
         }
-        // Flag-safety: the next structural item must not be a
-        // conditional branch reading the flags this transfer sets.
-        if let Some(j) = next_struct(items, idx)
-            && let Some(Item::Insn(next)) = items.get(j)
-            && is_cond_branch(&next.mnem)
+        if !facts[idx].nz_regs.contains(src)
+            && !nz_dead_after(items, idx, &labels, &smc, &contracts, 3)
         {
             continue;
         }
@@ -2306,13 +2675,21 @@ fn ph001_dead_jump_to_next(items: &mut Vec<Item>) -> bool {
             if (insn.mnem == "JMP" || is_cond_branch(&insn.mnem))
                 && let Some(target) = &insn.operand
             {
-                // Search forward for the next label / non-blank-non-comment.
-                // If the very next structural item is a label matching
-                // our operand, drop the branch.
-                if let Some(next) = next_struct(items, i)
-                    && let Item::Label(name) = &items[next]
-                    && name == target
-                {
+                // Remove jumps to the immediately following label group.
+                let mut j = i + 1;
+                let mut dead = false;
+                while j < items.len() {
+                    match &items[j] {
+                        Item::Blank | Item::Comment(_) => j += 1,
+                        Item::Label(name) if name == target => {
+                            dead = true;
+                            break;
+                        }
+                        Item::Label(_) => j += 1,
+                        _ => break,
+                    }
+                }
+                if dead {
                     items.remove(i);
                     changed = true;
                     continue;
@@ -2459,6 +2836,28 @@ fn ph004_jump_cascade(items: &mut Vec<Item>) -> bool {
     changed
 }
 
+/// Route JSR directly through a JMP trampoline.
+fn ph328_thread_calls_through_trampolines(items: &mut [Item]) -> bool {
+    let trampolines = collect_trampolines(items);
+    if trampolines.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for it in items.iter_mut() {
+        if let Item::Insn(insn) = it
+            && insn.mnem == "JSR"
+            && let Some(target) = &insn.operand
+            && let Some(final_target) = trampolines.get(target.as_str())
+            && final_target != target
+            && !final_target.starts_with('(')
+        {
+            insn.operand = Some(final_target.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Walk the items once, finding labels whose first instruction is
 /// `JMP <target>`. Return a map from trampoline label to terminal
 /// target. Resolves multi-hop chains (A → B → C ⇒ A maps to C).
@@ -2550,10 +2949,157 @@ fn ph005_branch_around_jmp(items: &mut Vec<Item>) -> bool {
     changed
 }
 
+/// Invert branches over JMP when intervening labels have no references.
+fn ph315_branch_over_jmp_past_dead_labels(items: &mut Vec<Item>) -> bool {
+    let zp = ZpEquates::scan(items);
+    let smc = smc_patched_labels(items);
+    let mut changed = false;
+    // Recount references after each rewrite.
+    while let Some((i, j)) = ph315_find_site(items, &label_ref_counts(items), &smc, &zp) {
+        let inverted = match &items[i] {
+            Item::Insn(branch) => invert_branch(&branch.mnem),
+            _ => None,
+        };
+        let else_target = match &items[j] {
+            Item::Insn(jmp) => jmp.operand.clone(),
+            _ => None,
+        };
+        if let (Some(inv), Some(target), Item::Insn(branch)) =
+            (inverted, else_target, &mut items[i])
+        {
+            branch.mnem = inv.to_string();
+            branch.operand = Some(target);
+            // Remove the JMP and leave unused labels for their own pass.
+            items.remove(j);
+            changed = true;
+        } else {
+            break;
+        }
+    }
+    changed
+}
+
+/// The first PH315 window in `items`, as `(branch index, JMP index)`.
+fn ph315_find_site(
+    items: &[Item],
+    refs: &std::collections::HashMap<String, usize>,
+    smc: &std::collections::HashSet<String>,
+    zp: &ZpEquates,
+) -> Option<(usize, usize)> {
+    for i in 0..items.len() {
+        let Item::Insn(branch) = &items[i] else { continue };
+        if !is_cond_branch(&branch.mnem) {
+            continue;
+        }
+        let Some(then_label) = branch.operand.as_deref() else { continue };
+        // A `$XXXX` or `(ptr)` operand is not a label to match against.
+        if !is_label_target(then_label) {
+            continue;
+        }
+        // Keep instructions whose bytes change at runtime.
+        if insn_is_smc_target(items, i, smc) {
+            continue;
+        }
+
+        // Intervening labels must have no instruction or data references.
+        let mut j = i + 1;
+        let mut orphans = 0usize;
+        while j < items.len() {
+            match &items[j] {
+                Item::Blank | Item::Comment(_) => j += 1,
+                Item::Label(name) if refs.get(name).copied().unwrap_or(0) == 0 => {
+                    orphans += 1;
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+        let Item::Insn(jmp) = items.get(j)? else {
+            continue;
+        };
+        if jmp.mnem != "JMP" {
+            continue;
+        }
+        let Some(else_label) = jmp.operand.as_deref() else {
+            continue;
+        };
+        if else_label == then_label || !is_label_target(else_label) {
+            continue;
+        }
+        // Keep jumps with runtime operand writes.
+        if insn_is_smc_target(items, j, smc) || smc.contains(else_label) {
+            continue;
+        }
+
+        // Labels after the JMP share the same address.
+        let mut k = j + 1;
+        let mut first_is_then = true;
+        let mut found = false;
+        let mut first_label = true;
+        while k < items.len() {
+            match &items[k] {
+                Item::Blank | Item::Comment(_) => k += 1,
+                Item::Label(name) => {
+                    if first_label {
+                        first_is_then = name == then_label;
+                        first_label = false;
+                    }
+                    found |= name == then_label;
+                    k += 1;
+                }
+                _ => break,
+            }
+        }
+        if !found {
+            continue;
+        }
+        if orphans == 0 && first_is_then {
+            continue;
+        }
+        // Keep label groups containing code modified at runtime.
+        if items[j + 1..k]
+            .iter()
+            .any(|it| matches!(it, Item::Label(n) if smc.contains(n)))
+        {
+            continue;
+        }
+        // Stop at reentry markers, data directives and origins.
+        if items[i + 1..k].iter().any(|it| {
+            matches!(it, Item::Directive(_) | Item::Origin(_)) || is_sys_wrap_marker(it)
+        }) {
+            continue;
+        }
+        // The inverted branch must reach the jump target.
+        if !label_within_branch_range(items, i, else_label, PH005_REACH, zp) {
+            continue;
+        }
+        // An origin makes the distance estimate unreliable.
+        if ph315_origin_blocks(items, i, else_label) {
+            continue;
+        }
+        return Some((i, j));
+    }
+    None
+}
+
+/// Whether an origin lies between the instruction and target.
+fn ph315_origin_blocks(items: &[Item], from: usize, target: &str) -> bool {
+    let Some(t) = items
+        .iter()
+        .position(|it| matches!(it, Item::Label(n) if n == target))
+    else {
+        return true;
+    };
+    let (lo, hi) = if t < from { (t, from) } else { (from, t) };
+    items[lo..=hi]
+        .iter()
+        .any(|it| matches!(it, Item::Origin(_)))
+}
+
 /// Share matching instruction tails across straight-line blocks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CurlinHi {
-    /// No path reaches here yet ; the identity for `meet`.
+    /// No reachable path yet.
     Unreached,
     Known(u8),
     Unknown,
@@ -2637,11 +3183,81 @@ enum HiEffect {
     Transparent,
 }
 
+/// Recognized ON GOTO tables and their control flow edges.
+struct OnDispatches {
+    targets: std::collections::HashMap<usize, Vec<usize>>,
+    table_rows: std::collections::HashSet<usize>,
+}
+
+fn on_dispatches(items: &[Item], labels: &std::collections::HashMap<String, usize>) -> OnDispatches {
+    let mut out = OnDispatches {
+        targets: std::collections::HashMap::new(),
+        table_rows: std::collections::HashSet::new(),
+    };
+    let insn_at = |i: usize| match &items[i] {
+        Item::Insn(insn) => Some((insn.mnem.as_str(), insn.operand.as_deref().unwrap_or("").trim())),
+        _ => None,
+    };
+    // The entries of the `.byte` row under `label`, each with `part` (`<` or `>`) stripped.
+    let row = |label: &str, part: char| -> Option<(usize, Vec<String>)> {
+        let at = next_struct(items, *labels.get(label)?)?;
+        let Item::Directive(raw) = &items[at] else {
+            return None;
+        };
+        let body = raw.split(';').next()?.trim().strip_prefix(".byte")?;
+        let entries = body
+            .split(',')
+            .map(|e| e.trim().strip_prefix(part).map(str::to_string))
+            .collect::<Option<Vec<_>>>()?;
+        Some((at, entries))
+    };
+    for i in 0..items.len() {
+        if insn_at(i) != Some(("JMP", "($22)")) {
+            continue;
+        }
+        let mut back = Vec::with_capacity(4);
+        let mut j = i;
+        for _ in 0..4 {
+            let Some(p) = prev_struct(items, j) else { break };
+            let Some(insn) = insn_at(p) else { break };
+            back.push(insn);
+            j = p;
+        }
+        let [("STA", "$23"), ("LDA", hi), ("STA", "$22"), ("LDA", lo)] = back.as_slice() else {
+            continue;
+        };
+        let (Some(lo), Some(hi)) = (lo.strip_suffix("-1,X"), hi.strip_suffix("-1,X")) else {
+            continue;
+        };
+        let (Some(k), Some(k_hi)) = (lo.strip_prefix("__ON_LO_"), hi.strip_prefix("__ON_HI_")) else {
+            continue;
+        };
+        if k != k_hi {
+            continue;
+        }
+        let (Some((lo_at, lo_row)), Some((hi_at, hi_row))) = (row(lo, '<'), row(hi, '>')) else {
+            continue;
+        };
+        if lo_row != hi_row {
+            continue;
+        }
+        let Some(to) = lo_row.iter().map(|l| labels.get(l).copied()).collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        out.targets.insert(i, to);
+        out.table_rows.insert(lo_at);
+        out.table_rows.insert(hi_at);
+    }
+    out
+}
+
 fn ph306_classify(
     items: &[Item],
     labels: &std::collections::HashMap<String, usize>,
     zp_equ: &std::collections::HashMap<String, u16>,
     cell: u16,
+    dispatches: &OnDispatches,
 ) -> Vec<HiEffect> {
     let cell_op = format!("${cell:02X}");
     let mut out = Vec::with_capacity(items.len());
@@ -2680,7 +3296,13 @@ fn ph306_classify(
                             HiEffect::Transparent
                         }
                     }
-                    "JMP" if op.trim_start().starts_with('(') => HiEffect::Clobber,
+                    "JMP" if op.trim_start().starts_with('(') => {
+                        if dispatches.targets.contains_key(&i) {
+                            HiEffect::Transparent
+                        } else {
+                            HiEffect::Clobber
+                        }
+                    }
                     "JSR" => {
                         let t = op.trim();
                         if t.starts_with('(') {
@@ -2708,6 +3330,7 @@ fn ph306_succs(
     idx: usize,
     labels: &std::collections::HashMap<String, usize>,
     effects: &[HiEffect],
+    dispatches: &OnDispatches,
     out: &mut Vec<usize>,
 ) {
     out.clear();
@@ -2718,6 +3341,8 @@ fn ph306_succs(
             fallthrough = false;
             if let Some(&t) = labels.get(op) {
                 out.push(t);
+            } else if let Some(to) = dispatches.targets.get(&idx) {
+                out.extend(to);
             }
         } else if is_uncond_terminator(&insn.mnem) {
             fallthrough = false;
@@ -2753,7 +3378,8 @@ fn ph306_curlin_known(items: &mut Vec<Item>, cell: u16) -> bool {
         .into_iter()
         .filter(|(_, v)| *v < 0x0100)
         .collect();
-    let effects = ph306_classify(items, &labels, &zp_equ, cell);
+    let dispatches = on_dispatches(items, &labels);
+    let effects = ph306_classify(items, &labels, &zp_equ, cell, &dispatches);
     if !effects.iter().any(|e| matches!(e, HiEffect::Stamp(_))) {
         return false;
     }
@@ -2762,7 +3388,7 @@ fn ph306_curlin_known(items: &mut Vec<Item>, cell: u16) -> bool {
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut succ_buf = Vec::new();
     for i in 0..n {
-        ph306_succs(items, i, &labels, &effects, &mut succ_buf);
+        ph306_succs(items, i, &labels, &effects, &dispatches, &mut succ_buf);
         for &s in &succ_buf {
             preds[s].push(i);
         }
@@ -2787,29 +3413,45 @@ fn ph306_curlin_known(items: &mut Vec<Item>, cell: u16) -> bool {
         }
     }
 
+    // Merge every value the callee can write before returning.
+    let mut writes = vec![CurlinHi::Unreached; n];
+    let mut work: Vec<usize> = Vec::new();
+    for i in 0..n {
+        writes[i] = match effects[i] {
+            HiEffect::Stamp(k) => CurlinHi::Known(k),
+            HiEffect::Clobber | HiEffect::Call(None) => CurlinHi::Unknown,
+            _ => continue,
+        };
+        work.push(i);
+    }
+    while let Some(i) = work.pop() {
+        for &p in &preds[i] {
+            let merged = writes[p].meet(writes[i]);
+            if merged != writes[p] {
+                writes[p] = merged;
+                work.push(p);
+            }
+        }
+    }
+
     let mut external = vec![false; n];
     external[0] = true;
     for (i, it) in items.iter().enumerate() {
         let text = match it {
             Item::Insn(insn) => {
                 let op = insn.operand.as_deref().unwrap_or("");
-                let bare_control = (insn.mnem == "JMP" || is_cond_branch(&insn.mnem))
-                    && labels.contains_key(op.trim());
-                if bare_control {
-                    continue;
-                }
-                if insn.mnem == "JSR"
-                    && let Some(&t) = labels.get(op.trim())
-                {
-                    external[t] = true;
+                let bare_control = matches!(insn.mnem.as_str(), "JMP" | "JSR")
+                    || is_cond_branch(&insn.mnem);
+                if bare_control && labels.contains_key(op.trim()) {
                     continue;
                 }
                 op.to_string()
             }
+            // A dispatch table's entries are the dispatch's edges.
+            Item::Directive(_) if dispatches.table_rows.contains(&i) => continue,
             Item::Directive(s) => s.clone(),
             _ => continue,
         };
-        let _ = i;
         for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
             if tok.is_empty() {
                 continue;
@@ -2834,20 +3476,20 @@ fn ph306_curlin_known(items: &mut Vec<Item>, cell: u16) -> bool {
             let after = match effects[i] {
                 HiEffect::Stamp(k) => CurlinHi::Known(k),
                 HiEffect::Clobber => CurlinHi::Unknown,
-                HiEffect::Call(t) => match t {
-                    Some(t) if !touches[t] => state[i],
-                    Some(_) => CurlinHi::Unknown,
-                    None => CurlinHi::Unknown,
-                },
+                HiEffect::Call(Some(t)) => state[i].meet(writes[t]),
+                HiEffect::Call(None) => CurlinHi::Unknown,
                 HiEffect::Transparent => state[i],
             };
             if after == CurlinHi::Unreached {
                 continue;
             }
-            ph306_succs(items, i, &labels, &effects, &mut succ_buf);
+            ph306_succs(items, i, &labels, &effects, &dispatches, &mut succ_buf);
             for &s in &succ_buf {
-
-                let merged = state[s].meet(after);
+                let carried = match effects[i] {
+                    HiEffect::Call(Some(t)) if s == t && s != i + 1 => state[i],
+                    _ => after,
+                };
+                let merged = state[s].meet(carried);
                 if merged != state[s] {
                     state[s] = merged;
                     changed = true;
@@ -4813,12 +5455,18 @@ fn ph009_load_store_identity(items: &mut Vec<Item>) -> bool {
 /// only track stable compiler-style labels and low zero-page operands;
 /// indexed/indirect/IO operands are opaque.
 fn ph020_static_known_value_cleanup(items: &mut Vec<Item>) -> bool {
+    ph020_known_value_cleanup(items, true)
+}
+
+/// Retain counter reloads until loop promotion has finished.
+fn ph020_known_value_cleanup(items: &mut Vec<Item>, keep_counter_reloads: bool) -> bool {
     let facts = analyze_static_asm_facts(items);
     let flag_config = FlagLivenessConfig::default();
     let flag_live = analyze_flag_liveness_with_config(items, &flag_config);
 
     let inc_dec_cells: std::collections::HashSet<&str> = items
         .iter()
+        .filter(|_| keep_counter_reloads)
         .filter_map(|it| match it {
             Item::Insn(insn) if matches!(insn.mnem.as_str(), "INC" | "DEC") => {
                 insn.operand.as_deref()
@@ -4844,7 +5492,7 @@ fn ph020_static_known_value_cleanup(items: &mut Vec<Item>) -> bool {
                 };
                 let fact = &facts[idx];
 
-                if reg_fact_matches_load(fact.reg(dest), insn)
+                if reg_fact_matches_load(fact, dest, insn)
                     && load_removal_preserves_live_flags(insn, fact, flag_live.live_out_at(idx))
                 {
                     plans.push((idx, Rewrite::Drop));
@@ -4897,7 +5545,8 @@ fn load_dest_reg(insn: &Insn) -> Option<Reg> {
     }
 }
 
-fn reg_fact_matches_load(fact: &StaticRegFact, insn: &Insn) -> bool {
+fn reg_fact_matches_load(facts: &StaticAsmFacts, reg: Reg, insn: &Insn) -> bool {
+    let fact = facts.reg(reg);
     if let Some(op) = insn.operand.as_deref()
         && let Some(imm) = ImmFact::from_operand(op)
     {
@@ -4909,7 +5558,7 @@ fn reg_fact_matches_load(fact: &StaticRegFact, insn: &Insn) -> bool {
     if let Some(op) = insn.operand.as_deref()
         && let Some(mem) = static_fact_mem_operand(op)
     {
-        return fact.mem.as_deref() == Some(mem.as_str());
+        return fact.mem.as_deref().is_some_and(|m| facts.same_cell(m, &mem));
     }
     false
 }
@@ -4922,6 +5571,9 @@ fn load_removal_preserves_live_flags(
     let needs_z = live_out.contains(Flag::Z);
     let needs_n = live_out.contains(Flag::N);
     if !needs_z && !needs_n {
+        return true;
+    }
+    if load_dest_reg(insn).is_some_and(|r| facts.nz_regs.contains(r)) {
         return true;
     }
 
@@ -4941,16 +5593,16 @@ fn load_removal_preserves_live_flags(
 fn best_transfer_for_load(facts: &StaticAsmFacts, dest: Reg, insn: &Insn) -> Option<&'static str> {
     match dest {
         Reg::A => {
-            if reg_fact_matches_load(facts.reg(Reg::X), insn) {
+            if reg_fact_matches_load(facts, Reg::X, insn) {
                 Some("TXA")
-            } else if reg_fact_matches_load(facts.reg(Reg::Y), insn) {
+            } else if reg_fact_matches_load(facts, Reg::Y, insn) {
                 Some("TYA")
             } else {
                 None
             }
         }
-        Reg::X => reg_fact_matches_load(facts.reg(Reg::A), insn).then_some("TAX"),
-        Reg::Y => reg_fact_matches_load(facts.reg(Reg::A), insn).then_some("TAY"),
+        Reg::X => reg_fact_matches_load(facts, Reg::A, insn).then_some("TAX"),
+        Reg::Y => reg_fact_matches_load(facts, Reg::A, insn).then_some("TAY"),
     }
 }
 
@@ -5203,15 +5855,7 @@ fn ph025_drop_redundant_store(items: &mut Vec<Item>) -> bool {
 
 /// Remove comparisons whose output flags are unused.
 fn ph024_drop_dead_cmp(items: &mut Vec<Item>) -> bool {
-    // Use the default conservative config: `return_live_out: ALL`.
-    // We do have helpers that return meaningful flags (e.g.
-    // `__DIV_BY_10` exits with Z reflecting the remainder so a
-    // PRINT-comma caller can `BEQ` on "at zone boundary"). An
-    // EMPTY-return config would let PH024 drop the trailing
-    // `CMP #$00` we deliberately emit there, silently breaking
-    // the caller's branch — caught by an infinite-loop hang in
-    // `print "x", t`. We forfeit the tail-CMP optimisation in
-    // exchange for correctness across the helper boundary.
+    // Keep flags live across returns.
     let flag_config = FlagLivenessConfig::default();
     let live = analyze_flag_liveness_with_config(items, &flag_config);
 
@@ -5251,18 +5895,1721 @@ fn ph024_drop_dead_cmp(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH022 — replace `JMP <label>` with `RTS` when the label's body
-/// is a bare `RTS`.
-///
-/// Saves 2 bytes (3-byte JMP → 1-byte RTS) plus the wasted cycles for the JMP
-/// and the redundant pipeline fetch at the destination. Common in
-/// codegen output where multiple early-exit paths funnel through a
-/// shared `JMP rts_helper`.
-///
-/// Rewrite is conservative:
-///   * we only act on plain `JMP`, never on conditional branches
-///   * the destination must be a known label whose first non-blank
-///     non-comment item is exactly `RTS`
+/// Operand forms safe for replacing subtraction with comparison.
+fn ph316_cmp_safe_operand(op: &str) -> bool {
+    let op = op.trim();
+    if op.is_empty() || op.contains('(') {
+        return false;
+    }
+    let (base, idx) = match op.rsplit_once(',') {
+        Some((b, i)) => (b, i.trim()),
+        None => (op, ""),
+    };
+    if !matches!(idx, "" | "X" | "Y") {
+        return false;
+    }
+    if let Some(imm) = base.strip_prefix('#') {
+        return !imm.is_empty() && !imm.contains(',');
+    }
+    let (body, off) = match base.split_once('+') {
+        Some((b, o)) => (b, Some(o)),
+        None => (base, None),
+    };
+    let off_ok = off.is_none_or(|o| !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()));
+    if let Some(hex) = body.strip_prefix('$') {
+        return off_ok
+            && !hex.is_empty()
+            && hex.len() <= 4
+            && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    off_ok
+        && !body.is_empty()
+        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !body.as_bytes()[0].is_ascii_digit()
+}
+
+/// Replace SEC/LDA/SBC/LDA with LDA/CMP/LDA when A and V are dead.
+fn ph316_sec_lda_sbc_to_cmp(items: &mut Vec<Item>) -> bool {
+    if items
+        .iter()
+        .any(|it| matches!(it, Item::Insn(i) if i.mnem == "SED"))
+    {
+        return false;
+    }
+    let smc = smc_patched_labels(items);
+    let mut drops: Vec<usize> = Vec::new();
+    let mut rewrites: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        if !matches!(&items[i], Item::Insn(ins) if ins.mnem == "SEC") {
+            i += 1;
+            continue;
+        }
+        let sec = i;
+        let Some(lda1) = next_struct(items, sec) else {
+            i += 1;
+            continue;
+        };
+        let Some(sbc) = next_struct(items, lda1) else {
+            i += 1;
+            continue;
+        };
+        let Some(lda2) = next_struct(items, sbc) else {
+            i += 1;
+            continue;
+        };
+        let (Item::Insn(l1), Item::Insn(s), Item::Insn(l2)) =
+            (&items[lda1], &items[sbc], &items[lda2])
+        else {
+            i += 1;
+            continue;
+        };
+        if l1.mnem != "LDA" || s.mnem != "SBC" || l2.mnem != "LDA" {
+            i += 1;
+            continue;
+        }
+        let Some(op) = s.operand.as_deref() else {
+            i += 1;
+            continue;
+        };
+        let refused = !ph316_cmp_safe_operand(op)
+            || parse_hex_addr(op).is_some_and(|a| {
+                (0x0100..=0x01FF).contains(&a) || (0xD000..=0xDFFF).contains(&a)
+            })
+            || insn_is_smc_target(items, sbc, &smc)
+            || insn_is_smc_target(items, sec, &smc)
+            || crosses_sys_wrap(items, sec, lda2);
+        if refused {
+            i += 1;
+            continue;
+        }
+        drops.push(sec);
+        rewrites.push(sbc);
+        i = lda2 + 1;
+    }
+    if drops.is_empty() {
+        return false;
+    }
+    for &k in &rewrites {
+        if let Item::Insn(ins) = &mut items[k] {
+            ins.mnem = "CMP".to_string();
+        }
+    }
+    for &k in drops.iter().rev() {
+        items.remove(k);
+    }
+    true
+}
+
+/// Direct cell operands safe for 16 bit rewrites.
+fn ph318_cell_operand(op: &str) -> bool {
+    let op = op.trim();
+    if op.is_empty() || op.contains('(') || op.contains(',') || op.starts_with('#') {
+        return false;
+    }
+    let (body, off) = match op.split_once('+') {
+        Some((b, o)) => (b, Some(o)),
+        None => (op, None),
+    };
+    let off_ok = off.is_none_or(|o| !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()));
+    if let Some(hex) = body.strip_prefix('$') {
+        return off_ok
+            && !hex.is_empty()
+            && hex.len() <= 4
+            && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    off_ok
+        && !body.is_empty()
+        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !body.as_bytes()[0].is_ascii_digit()
+}
+
+/// Read immediate zero or one.
+fn ph318_imm(insn: &Insn) -> Option<u8> {
+    let op = insn.operand.as_deref()?.trim();
+    let hex = op.strip_prefix("#$")?;
+    if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// Whether the high cell immediately follows the low cell.
+fn ph318_next_cell(lo: &str, hi: &str) -> bool {
+    if hi == format!("{lo}+1") {
+        return true;
+    }
+    matches!(
+        (parse_plain_addr(lo), parse_plain_addr(hi)),
+        (Some(a), Some(b)) if b == a.wrapping_add(1)
+    )
+}
+
+/// Replace carry propagation with INC or DEC when exit registers and flags are dead.
+fn ph319_carry_fold(items: &mut Vec<Item>) -> bool {
+    if items.iter().any(|it| {
+        matches!(it, Item::Insn(i) if matches!(i.mnem.as_str(), "SED" | "PHP"))
+    }) {
+        return false;
+    }
+    if !items.iter().any(|it| {
+        matches!(it, Item::Insn(i)
+            if matches!(i.mnem.as_str(), "ADC" | "SBC") && ph318_imm(i) == Some(0))
+    }) {
+        return false;
+    }
+    let reg_config = liveness_config_with_helpers();
+    let regs = analyze_register_liveness_with_config(items, &reg_config);
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
+    let smc = smc_patched_labels(items);
+    let zp = ZpEquates::scan(items);
+
+    struct Site {
+        head: usize,
+        tail: usize,
+        inc: bool,
+        cell: String,
+        comment: Option<String>,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let site = (|| {
+            let Item::Insn(lda) = &items[i] else { return None };
+            if lda.mnem != "LDA" {
+                return None;
+            }
+            let cell = lda.operand.as_deref()?.trim().to_string();
+            let j_alu = next_struct(items, i)?;
+            let Item::Insn(alu) = &items[j_alu] else { return None };
+            let inc = match alu.mnem.as_str() {
+                "ADC" => true,
+                "SBC" => false,
+                _ => return None,
+            };
+            if ph318_imm(alu) != Some(0) {
+                return None;
+            }
+            let j_sta = next_struct(items, j_alu)?;
+            let Item::Insn(sta) = &items[j_sta] else { return None };
+            if sta.mnem != "STA" || sta.operand.as_deref().map(str::trim) != Some(cell.as_str()) {
+                return None;
+            }
+            if !ph318_cell_operand(&cell)
+                || parse_hex_addr(&cell).is_some_and(|a| {
+                    (0x0100..=0x01FF).contains(&a) || (0xD000..=0xDFFF).contains(&a)
+                })
+            {
+                return None;
+            }
+            for &k in &[i, j_alu, j_sta] {
+                if insn_is_smc_target(items, k, &smc) {
+                    return None;
+                }
+            }
+            if crosses_sys_wrap(items, i, j_sta) {
+                return None;
+            }
+            if regs.is_live_out(j_sta, Reg::A) {
+                return None;
+            }
+            for flag in [Flag::N, Flag::Z, Flag::V, Flag::C] {
+                if flags.is_live_out(j_sta, flag) {
+                    return None;
+                }
+            }
+            let skipped = Insn {
+                mnem: if inc { "INC" } else { "DEC" }.to_string(),
+                operand: Some(cell.clone()),
+                comment: None,
+            };
+            if approx_insn_bytes(&skipped, &zp) > 127 {
+                return None;
+            }
+            Some(Site {
+                head: i,
+                tail: j_sta,
+                inc,
+                cell,
+                comment: alu.comment.clone(),
+            })
+        })();
+        match site {
+            Some(s) => {
+                i = s.tail + 1;
+                sites.push(s);
+            }
+            None => i += 1,
+        }
+    }
+    if sites.is_empty() {
+        return false;
+    }
+    for (next_id, site) in (ph319_next_label_id(items)..).zip(sites.into_iter().rev()) {
+        let label = format!("__PH319_{next_id}");
+        let branch = if site.inc { "BCC" } else { "BCS" };
+        let rmw = if site.inc { "INC" } else { "DEC" };
+        items.splice(
+            site.head..=site.tail,
+            [
+                Item::Insn(Insn {
+                    mnem: branch.to_string(),
+                    operand: Some(label.clone()),
+                    comment: None,
+                }),
+                Item::Insn(Insn {
+                    mnem: rmw.to_string(),
+                    operand: Some(site.cell),
+                    comment: site.comment,
+                }),
+                Item::Label(label),
+            ],
+        );
+    }
+    true
+}
+
+/// Fresh-label id for PH319's skips (the ph318_next_label_id scan).
+fn ph319_next_label_id(items: &[Item]) -> u32 {
+    let mut next = 0;
+    for it in items {
+        if let Item::Label(name) = it
+            && let Some(rest) = name.strip_prefix("__PH319_")
+            && let Ok(n) = rest.parse::<u32>()
+        {
+            next = next.max(n + 1);
+        }
+    }
+    next
+}
+
+/// Merge 16 bit increments when A and flags are dead. Limit runs to 255.
+fn ph320_merge_inc_runs(items: &mut Vec<Item>) -> bool {
+    if items.iter().any(|it| {
+        matches!(it, Item::Insn(i) if matches!(i.mnem.as_str(), "SED" | "PHP"))
+    }) {
+        return false;
+    }
+    if !items.iter().any(|it| matches!(it, Item::Insn(i) if i.mnem == "INC")) {
+        return false;
+    }
+    let reg_config = liveness_config_with_helpers();
+    let regs = analyze_register_liveness_with_config(items, &reg_config);
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
+    let smc = smc_patched_labels(items);
+    let zp = ZpEquates::scan(items);
+    let refs = label_ref_counts(items);
+
+    struct Site {
+        head: usize,
+        tail: usize,
+        k: usize,
+        lo: String,
+        hi: String,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    let mut i = 0;
+    'outer: while i < items.len() {
+        let Item::Insn(insn) = &items[i] else {
+            i += 1;
+            continue;
+        };
+        if insn.mnem != "INC" {
+            i += 1;
+            continue;
+        }
+        let Some(lo) = insn.operand.as_deref().map(str::trim) else {
+            i += 1;
+            continue;
+        };
+        // Try to match a run of blocks starting at i.
+        let mut k = 0usize;
+        let mut tail = i;
+        let mut cur = i;
+        let run_ok = true;
+        let mut hi_cell: Option<String> = None;
+        while run_ok {
+            let Some(j_bne) = next_struct(items, cur) else { break; };
+            let Item::Insn(bne) = &items[j_bne] else { break; };
+            if bne.mnem != "BNE" {
+                break;
+            }
+            let Some(bne_target) = bne.operand.as_deref().map(str::trim) else { break; };
+            let Some(j_inc_hi) = next_struct(items, j_bne) else { break; };
+            let Item::Insn(inc_hi) = &items[j_inc_hi] else { break; };
+            if inc_hi.mnem != "INC" {
+                break;
+            }
+            let hi = inc_hi.operand.as_deref().map(str::trim).unwrap_or("");
+            if !ph318_next_cell(lo, hi) {
+                break;
+            }
+            if let Some(first) = &hi_cell {
+                if first != hi {
+                    break;
+                }
+            } else {
+                hi_cell = Some(hi.to_string());
+            }
+            let Some(j_lbl) = next_struct(items, j_inc_hi) else { break; };
+            let Item::Label(name) = &items[j_lbl] else { break; };
+            if name != bne_target {
+                break;
+            }
+            k += 1;
+            tail = j_lbl;
+            if k == 255 {
+                break;
+            }
+            match next_struct(items, j_lbl) {
+                Some(next) => match &items[next] {
+                    Item::Insn(nxt)
+                        if nxt.mnem == "INC"
+                            && nxt.operand.as_deref().map(str::trim) == Some(lo) =>
+                    {
+                        cur = next;
+                    }
+                    _ => break,
+                },
+                None => break,
+            }
+        }
+        if k < 2 {
+            i += 1;
+            continue;
+        }
+        let Some(hi) = hi_cell else {
+            i += 1;
+            continue;
+        };
+        // Every block label referenced only by its own BNE.
+        let mut idx = i;
+        while idx <= tail {
+            if let Item::Label(name) = &items[idx]
+                && refs.get(name).copied().unwrap_or(0) != 1
+            {
+                i = idx + 1;
+                continue 'outer;
+            }
+            idx += 1;
+        }
+        // Operand forms + volatile screens (PH318's, RMW discipline).
+        let screens = |op: &str| {
+            ph318_cell_operand(op)
+                && !parse_hex_addr(op).is_some_and(|a| {
+                    (0x0100..=0x01FF).contains(&a) || (0xD000..=0xDFFF).contains(&a)
+                })
+                && zp.map.get(op.split_once('+').map_or(op, |(b, _)| b).trim()) != Some(&0x00FF)
+        };
+        if !screens(lo) || !screens(&hi) {
+            i = tail + 1;
+            continue;
+        }
+        // SMC anchors anywhere in the run.
+        let mut idx = i;
+        while idx <= tail {
+            if insn_is_smc_target(items, idx, &smc) {
+                i = tail + 1;
+                continue 'outer;
+            }
+            idx += 1;
+        }
+        if crosses_sys_wrap(items, i, tail) {
+            i = tail + 1;
+            continue;
+        }
+        // Everything the merge newly defines must be dead at the exit.
+        if regs.is_live_out(tail, Reg::A) {
+            i = tail + 1;
+            continue;
+        }
+        if [Flag::N, Flag::Z, Flag::V, Flag::C]
+            .iter()
+            .any(|f| flags.is_live_out(tail, *f))
+        {
+            i = tail + 1;
+            continue;
+        }
+        let skipped = Insn {
+            mnem: "INC".to_string(),
+            operand: Some(hi.clone()),
+            comment: None,
+        };
+        if approx_insn_bytes(&skipped, &zp) > 127 {
+            i = tail + 1;
+            continue;
+        }
+        sites.push(Site {
+            head: i,
+            tail,
+            k,
+            lo: lo.to_string(),
+            hi: hi.to_string(),
+        });
+        i = tail + 1;
+    }
+    if sites.is_empty() {
+        return false;
+    }
+    for (next_id, site) in (ph320_next_label_id(items)..).zip(sites.into_iter().rev()) {
+        let label = format!("__PH320_{next_id}");
+        let ins = |mnem: &str, op: &str| {
+            Item::Insn(Insn {
+                mnem: mnem.to_string(),
+                operand: Some(op.to_string()),
+                comment: None,
+            })
+        };
+        let repl = vec![
+            Item::Insn(Insn { mnem: "CLC".to_string(), operand: None, comment: None }),
+            ins("LDA", &site.lo),
+            ins("ADC", &format!("#${:02X}", site.k)),
+            ins("STA", &site.lo),
+            Item::Insn(Insn {
+                mnem: "BCC".to_string(),
+                operand: Some(label.clone()),
+                comment: None,
+            }),
+            ins("INC", &site.hi),
+            Item::Label(label),
+        ];
+        items.splice(site.head..=site.tail, repl);
+    }
+    true
+}
+
+/// Fresh-label id for PH320's skips (the ph318_next_label_id scan).
+fn ph320_next_label_id(items: &[Item]) -> u32 {
+    let mut next = 0;
+    for it in items {
+        if let Item::Label(name) = it
+            && let Some(rest) = name.strip_prefix("__PH320_")
+            && let Ok(n) = rest.parse::<u32>()
+        {
+            next = next.max(n + 1);
+        }
+    }
+    next
+}
+
+/// Move a second store next to its source store when reads and flags permit it.
+fn ph321_store_forward_sink(items: &mut Vec<Item>) -> bool {
+    if !items
+        .iter()
+        .any(|it| matches!(it, Item::Insn(i) if i.mnem == "STA"))
+    {
+        return false;
+    }
+    let equ = collect_equ_values(items);
+    let origin = lowest_origin_addr(items);
+    let smc = smc_patched_labels(items);
+    let reg_config = liveness_config_with_helpers();
+    let regs = analyze_register_liveness_with_config(items, &reg_config);
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
+
+    /// A store, its window, and the reload pair it feeds.
+    struct Site {
+        sta_x: usize,
+        lda_x: usize,
+        sta_z: usize,
+        z_operand: String,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    let mut i = 0;
+    'outer: while i < items.len() {
+        let (x_text, x_cell) = match &items[i] {
+            Item::Insn(insn) if insn.mnem == "STA" => {
+                let Some(t) = insn.operand.as_deref() else {
+                    i += 1;
+                    continue;
+                };
+                if !is_label_or_zp_safe(t) || t.contains('+') {
+                    i += 1;
+                    continue;
+                }
+                let Some(cell) = cell_of_plain_operand(t, &equ) else {
+                    i += 1;
+                    continue;
+                };
+                (t.to_string(), cell)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if insn_is_smc_target(items, i, &smc) {
+            i += 1;
+            continue;
+        }
+        let mut w_end = i;
+        for _ in 0..8 {
+            let Some(j) = next_struct(items, w_end) else {
+                i += 1;
+                continue 'outer;
+            };
+            let Item::Insn(insn) = &items[j] else {
+                i += 1;
+                continue 'outer;
+            };
+            if insn.mnem == "LDA" && insn.operand.as_deref() == Some(x_text.as_str()) {
+                // The reload. Its partner must be a plain safe store.
+                let Some(k) = next_struct(items, j) else {
+                    i += 1;
+                    continue 'outer;
+                };
+                let ok = match &items[k] {
+                    Item::Insn(st) => {
+                        st.mnem == "STA"
+                            && st.operand.as_deref().is_some_and(|z| {
+                                is_label_or_zp_safe(z) && !z.contains('+')
+                            })
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    i += 1;
+                    continue 'outer;
+                }
+                let z_text = match &items[k] {
+                    Item::Insn(st) => st.operand.clone().unwrap(),
+                    _ => unreachable!(),
+                };
+                let Some(z_cell) = cell_of_plain_operand(&z_text, &equ) else {
+                    i += 1;
+                    continue 'outer;
+                };
+                if mem_cells_may_alias(&x_cell, &z_cell, origin) {
+                    i += 1;
+                    continue 'outer;
+                }
+                if insn_is_smc_target(items, j, &smc)
+                    || insn_is_smc_target(items, k, &smc)
+                {
+                    i += 1;
+                    continue 'outer;
+                }
+                if crosses_sys_wrap(items, i, k) {
+                    i += 1;
+                    continue 'outer;
+                }
+                // W (strictly between the stores) never touches Z.
+                let mut m = i;
+                while m < j {
+                    if let Item::Insn(w) = &items[m] {
+                        if !window_insn_preserves_cell(w, &z_cell, &equ, origin) {
+                            i += 1;
+                            continue 'outer;
+                        }
+                    }
+                    m += 1;
+                }
+                if regs.is_live_out(k, Reg::A)
+                    || flags.is_live_out(k, Flag::N)
+                    || flags.is_live_out(k, Flag::Z)
+                {
+                    i += 1;
+                    continue 'outer;
+                }
+                sites.push(Site {
+                    sta_x: i,
+                    lda_x: j,
+                    sta_z: k,
+                    z_operand: z_text,
+                });
+                i = k + 1;
+                continue 'outer;
+            }
+            // Window continues only through insns X survives.
+            if !window_insn_preserves_cell(insn, &x_cell, &equ, origin) {
+                i += 1;
+                continue 'outer;
+            }
+            w_end = j;
+        }
+        i += 1;
+    }
+    if sites.is_empty() {
+        return false;
+    }
+    for site in sites.into_iter().rev() {
+        items.remove(site.sta_z);
+        items.remove(site.lda_x);
+        items.insert(
+            site.sta_x + 1,
+            Item::Insn(Insn {
+                mnem: "STA".to_string(),
+                operand: Some(site.z_operand),
+                comment: None,
+            }),
+        );
+    }
+    true
+}
+
+/// Use absolute array addresses when the pointer and Y are dead.
+fn ph322_const_deref_to_abs(items: &mut Vec<Item>) -> bool {
+    if !items.iter().any(|it| matches!(it, Item::Insn(i) if i.mnem == "LDA")) {
+        return false;
+    }
+    let equ = collect_equ_values(items);
+    let origin = lowest_origin_addr(items);
+    let smc = smc_patched_labels(items);
+    let reg_config = liveness_config_with_helpers();
+    let regs = analyze_register_liveness_with_config(items, &reg_config);
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
+
+    /// Add a constant offset to the operand text.
+    fn base_plus(expr: &str, k: u8) -> Option<String> {
+        let (sym, off) = match expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')) {
+            Some(inner) => {
+                let (s, n) = inner.split_once('+')?;
+                if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                (s, n.parse::<u32>().ok()?)
+            }
+            None => (expr, 0),
+        };
+        if sym.is_empty()
+            || !sym
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || sym.as_bytes()[0].is_ascii_digit()
+        {
+            return None;
+        }
+        Some(format!("{sym}+{}", off + k as u32))
+    }
+
+    struct Site {
+        /// Instruction indices removed by the rewrite.
+        del: Vec<usize>,
+        /// (deref index, replacement operand) pairs
+        derefs: Vec<(usize, String)>,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    let mut i = 0;
+    'outer: while i + 5 < items.len() {
+        let expr = match &items[i] {
+            Item::Insn(a) if a.mnem == "LDA" => {
+                match a.operand.as_deref().unwrap_or("").strip_prefix("#<") {
+                    Some(e) if !e.is_empty() && !e.contains(',') => e.to_string(),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if expr.is_empty() || expr.contains(',') {
+            i += 1;
+            continue;
+        }
+        let steps: Vec<Option<usize>> = (0..5).map(|d| next_struct(items, i + d)).collect();
+        let (lo, hi) = match (
+            steps[0].and_then(|j| match &items[j] {
+                Item::Insn(x) if x.mnem == "STA" => x.operand.clone(),
+                _ => None,
+            }),
+            steps[1].and_then(|j| match &items[j] {
+                Item::Insn(x) if x.mnem == "LDA" => x.operand.clone(),
+                _ => None,
+            }),
+            steps[2].and_then(|j| match &items[j] {
+                Item::Insn(x) if x.mnem == "STA" => x.operand.clone(),
+                _ => None,
+            }),
+            steps[3].and_then(|j| match &items[j] {
+                Item::Insn(x) if x.mnem == "LDY" => x.operand.clone(),
+                _ => None,
+            }),
+        ) {
+            (Some(lo), Some(hi_e), Some(hi), Some(y)) => {
+                if hi_e != format!("#>{expr}") || y != "#$00" {
+                    i += 1;
+                    continue;
+                }
+                (lo, hi)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let lo = lo.trim().to_string();
+        let hi = hi.trim().to_string();
+        if !ph318_next_cell(&lo, &hi) {
+            i += 1;
+            continue;
+        }
+        let Some(mut cur) = steps[3] else {
+            i += 1;
+            continue;
+        };
+        let lo_cell = match cell_of_plain_operand(&lo, &equ) {
+            Some(c) => c,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let hi_cell = match cell_of_plain_operand(&hi, &equ) {
+            Some(c) => c,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut del = vec![i];
+        for &d in steps.iter().take(4) {
+            del.push(d.expect("step"));
+        }
+        let mut derefs: Vec<(usize, String)> = Vec::new();
+        let mut offset: u8 = 0;
+        // Limit liveness checks to the rewritten instructions.
+        let mut tail = steps[3].expect("ldy index");
+        let mut saw_deref = false;
+        for _ in 0..8 {
+            let Some(j) = next_struct(items, cur) else { break; };
+            let Item::Insn(insn) = &items[j] else { break; };
+            let is_lo_deref = insn
+                .operand
+                .as_deref()
+                .is_some_and(|o| o.trim() == format!("({lo}),Y"));
+            if is_lo_deref && matches!(insn.mnem.as_str(), "LDA" | "STA") {
+                let Some(repl) = base_plus(&expr, offset) else { break; };
+                derefs.push((j, repl));
+                saw_deref = true;
+                tail = j;
+                cur = j;
+                continue;
+            }
+            if insn.mnem == "INY" && insn.operand.is_none() {
+                if !saw_deref {
+                    break;
+                }
+                offset = offset.saturating_add(1);
+                del.push(j);
+                tail = j;
+                cur = j;
+                continue;
+            }
+            _ = ();
+            let keeps_cells = window_insn_preserves_cell(insn, &lo_cell, &equ, origin)
+                && window_insn_preserves_cell(insn, &hi_cell, &equ, origin);
+            let writes_y = match insn.mnem.as_str() {
+                "LDY" | "TAY" | "INY" | "DEY" | "PLA" => true,
+                _ => false,
+            };
+            if !keeps_cells || writes_y {
+                break;
+            }
+            cur = j;
+        }
+        if !saw_deref {
+            i += 1;
+            continue;
+        }
+        // SMC anchors anywhere in the window.
+        let mut idx = i;
+        while idx <= tail {
+            if insn_is_smc_target(items, idx, &smc) {
+                i = tail + 1;
+                continue 'outer;
+            }
+            idx += 1;
+        }
+        if crosses_sys_wrap(items, i, tail) {
+            i = tail + 1;
+            continue;
+        }
+        // Require deleted register and flag outputs to be dead.
+        let del_set: std::collections::HashSet<usize> = del.iter().copied().collect();
+        let mut last_a_def_deleted = true;
+        let mut last_nz_def_deleted = true;
+        for k in i..=tail {
+            let Item::Insn(w) = &items[k] else { continue; };
+            let defines_a = matches!(w.mnem.as_str(), "LDA" | "PLA" | "TXA" | "TYA" | "ADC" | "SBC");
+            let defines_nz = defines_a
+                || matches!(
+                    w.mnem.as_str(),
+                    "LDX" | "LDY" | "INC" | "DEC" | "ASL" | "LSR" | "ROL" | "ROR" | "BIT"
+                );
+            if defines_a {
+                last_a_def_deleted = del_set.contains(&k);
+            }
+            if defines_nz {
+                last_nz_def_deleted = del_set.contains(&k);
+            }
+        }
+        if regs.is_live_out(tail, Reg::Y)
+            || (last_a_def_deleted && regs.is_live_out(tail, Reg::A))
+            || (last_nz_def_deleted
+                && (flags.is_live_out(tail, Flag::N) || flags.is_live_out(tail, Flag::Z)))
+        {
+            i = tail + 1;
+            continue;
+        }
+        sites.push(Site { del, derefs });
+        i = tail + 1;
+    }
+    if sites.is_empty() {
+        return false;
+    }
+    for site in sites.into_iter().rev() {
+        for (idx, repl) in site.derefs.iter().rev() {
+            if let Item::Insn(insn) = &mut items[*idx] {
+                insn.operand = Some(repl.clone());
+            }
+        }
+        // Then delete the setup insns, back to front.
+        let mut del = site.del.clone();
+        del.sort_unstable();
+        del.dedup();
+        for idx in del.into_iter().rev() {
+            items.remove(idx);
+        }
+    }
+    true
+}
+
+/// Fold constant array store indices when X and flags are dead.
+fn ph323_const_index_store_to_abs(items: &mut Vec<Item>) -> bool {
+    if !items.iter().any(|it| matches!(it, Item::Insn(i) if i.mnem == "LDX")) {
+        return false;
+    }
+    let smc = smc_patched_labels(items);
+    let zp = ZpEquates::scan(items);
+    let reg_config = liveness_config_with_helpers();
+    let regs = analyze_register_liveness_with_config(items, &reg_config);
+
+    // Keep zero page indexed stores because their addresses wrap within the page.
+    let zp_indexed = |op: &str| -> bool {
+        let base = op.split_once('+').map_or(op, |(b, _)| b).trim();
+        if let Some(hex) = base.strip_prefix('$') {
+            return hex.len() <= 2;
+        }
+        zp.map.contains_key(base)
+    };
+
+    struct Site {
+        /// First and last instruction indices replaced.
+        head: usize,
+        tail: usize,
+        /// the whole replacement block
+        repl: Vec<Item>,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    let mut i = 0;
+    'outer: while i + 2 < items.len() {
+        let (k, k_idx) = match &items[i] {
+            Item::Insn(x) if x.mnem == "LDX" => {
+                let Some(v) = x.operand.as_deref().and_then(parse_byte_immediate) else {
+                    i += 1;
+                    continue;
+                };
+                (v, i)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if insn_is_smc_target(items, i, &smc) {
+            i += 1;
+            continue;
+        }
+        let s0 = next_struct(items, k_idx);
+        let Some(s0) = s0 else {
+            i += 1;
+            continue;
+        };
+        let Item::Insn(lda) = &items[s0] else {
+            i += 1;
+            continue;
+        };
+        if lda.mnem == "LDA"
+            && let Some(lo_op) = lda.operand.as_deref()
+            && let Some(sym) = lo_op.strip_prefix("#<")
+            && !sym.is_empty()
+            && !sym.contains(',')
+        {
+            let steps: Vec<Option<usize>> = (0..4).map(|d| next_struct(items, s0 + d)).collect();
+            let (b1, b2) = match (
+                steps[0].and_then(|j| match &items[j] {
+                    Item::Insn(x) if x.mnem == "LDY" => x.operand.clone(),
+                    _ => None,
+                }),
+                steps[1].and_then(|j| match &items[j] {
+                    Item::Insn(x) if x.mnem == "STA" => x.operand.clone(),
+                    _ => None,
+                }),
+                steps[2].and_then(|j| match &items[j] {
+                    Item::Insn(x) if x.mnem == "TYA" && x.operand.is_none() => Some(()),
+                    _ => None,
+                }),
+                steps[3].and_then(|j| match &items[j] {
+                    Item::Insn(x) if x.mnem == "STA" => x.operand.clone(),
+                    _ => None,
+                }),
+            ) {
+                (Some(hi_op), Some(b1), Some(()), Some(b2)) if hi_op == format!("#>{sym}") => {
+                    (b1, b2)
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            // b,X and b+1,X with a constant k -> absolute forms.
+            let (base1, base2) = match (b1.strip_suffix(",X"), b2.strip_suffix(",X")) {
+                (Some(b1), Some(b2)) => (b1.to_string(), b2.to_string()),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if !ph318_next_cell(&base1, &base2) || zp_indexed(&base1) || zp_indexed(&base2) {
+                i += 1;
+                continue;
+            }
+            let tail = steps[3].expect("st2 index");
+            for &idx in &[k_idx, s0, steps[0].expect("ldy"), steps[1].expect("st1"), steps[2].expect("tya"), tail] {
+                if insn_is_smc_target(items, idx, &smc) {
+                    i = tail + 1;
+                    continue 'outer;
+                }
+            }
+            if crosses_sys_wrap(items, k_idx, tail) {
+                i = tail + 1;
+                continue;
+            }
+            if regs.is_live_out(tail, Reg::X) || regs.is_live_out(tail, Reg::A) {
+                i = tail + 1;
+                continue;
+            }
+            let ins = |mnem: &str, op: &str| {
+                Item::Insn(Insn {
+                    mnem: mnem.to_string(),
+                    operand: Some(op.to_string()),
+                    comment: None,
+                })
+            };
+            let plus = |b: &str| if k == 0 { b.to_string() } else { format!("{b}+{k}") };
+            sites.push(Site {
+                head: k_idx,
+                tail,
+                repl: vec![
+                    ins("LDA", &format!("#<{sym}")),
+                    ins("STA", &plus(&base1)),
+                    ins("LDY", &format!("#>{sym}")),
+                    ins("STY", &plus(&base2)),
+                ],
+            });
+            i = tail + 1;
+            continue;
+        }
+        if lda.mnem == "LDA"
+            && let Some(imm) = lda.operand.as_deref()
+            && imm.starts_with("#$")
+        {
+            let Some(j) = next_struct(items, s0) else {
+                i += 1;
+                continue;
+            };
+            let base = match &items[j] {
+                Item::Insn(x) if x.mnem == "STA" => {
+                    x.operand.as_deref().and_then(|o| o.strip_suffix(",X"))
+                }
+                _ => None,
+            }
+            .map(str::to_string);
+            let Some(base) = base else {
+                i += 1;
+                continue;
+            };
+            if zp_indexed(&base) {
+                i = j + 1;
+                continue;
+            }
+            if insn_is_smc_target(items, j, &smc) || crosses_sys_wrap(items, k_idx, j) {
+                i = j + 1;
+                continue;
+            }
+            if regs.is_live_out(j, Reg::X) {
+                i = j + 1;
+                continue;
+            }
+            sites.push(Site {
+                head: k_idx,
+                tail: j,
+                repl: vec![
+                    Item::Insn(Insn {
+                        mnem: "LDA".to_string(),
+                        operand: Some(imm.to_string()),
+                        comment: None,
+                    }),
+                    Item::Insn(Insn {
+                        mnem: "STA".to_string(),
+                        operand: Some(if k == 0 {
+                            base.clone()
+                        } else {
+                            format!("{base}+{k}")
+                        }),
+                        comment: None,
+                    }),
+                ],
+            });
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    if sites.is_empty() {
+        return false;
+    }
+    for site in sites.into_iter().rev() {
+        items.splice(site.head..=site.tail, site.repl);
+    }
+    true
+}
+
+/// Whether N and Z are redefined before any use.
+fn nz_dead_after(
+    items: &[Item],
+    idx: usize,
+    labels: &std::collections::HashMap<String, usize>,
+    smc: &std::collections::HashSet<String>,
+    config: &FlagLivenessConfig,
+    depth: usize,
+) -> bool {
+    let reads_nz = |set: FlagSet| set.contains(Flag::N) || set.contains(Flag::Z);
+    let defines_nz = |set: FlagSet| set.contains(Flag::N) && set.contains(Flag::Z);
+    let mut i = idx;
+    while let Some(j) = next_struct(items, i) {
+        i = j;
+        let insn = match &items[j] {
+            Item::Label(_) => continue,
+            Item::Insn(insn) => insn,
+            _ => return false,
+        };
+        match insn.mnem.as_str() {
+            "JSR" | "JMP" => {
+                if insn_is_smc_target(items, j, smc) {
+                    return false;
+                }
+                let Some(target) = insn.operand.as_deref() else {
+                    return false;
+                };
+                if let Some(eff) = config.jsr_effect(target) {
+                    return !reads_nz(eff.uses) && defines_nz(eff.defs);
+                }
+                match labels.get(target) {
+                    Some(&at) if depth > 0 => {
+                        return nz_dead_after(items, at, labels, smc, config, depth - 1);
+                    }
+                    _ => return false,
+                }
+            }
+            m if is_cond_branch(m) => return false,
+            "RTS" | "RTI" | "BRK" | "PHP" => return false,
+            _ => {
+                let fx = insn_flag_effect_inner(insn, false, config);
+                if reads_nz(fx.uses) {
+                    return false;
+                }
+                if defines_nz(fx.defs) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Branch reach estimate with room for size uncertainty.
+const PH325_REACH: i32 = 112;
+
+/// Byte size of data directives and equates.
+fn directive_bytes(raw: &str) -> Option<i32> {
+    let body = raw.split(';').next().unwrap_or("").trim();
+    let count = |list: &str| -> Option<i32> {
+        let n = list.split(',').map(str::trim).filter(|e| !e.is_empty()).count();
+        (!list.contains('"') && !list.contains('\'')).then_some(n as i32)
+    };
+    if let Some(list) = body.strip_prefix(".byte ") {
+        return count(list);
+    }
+    if let Some(list) = body.strip_prefix(".word ") {
+        return count(list).map(|n| 2 * n);
+    }
+    (!body.starts_with('.') && body.contains('=')).then_some(0)
+}
+
+/// Instructions PH326 walks back from a call.
+const PH326_RUN: usize = 3;
+/// Maximum rounds of shared call prefix extraction.
+const PH326_ROUNDS: usize = 4;
+
+/// Share repeated call prefixes through a new routine entry.
+fn ph326_absorb_shared_call_prefix(items: &mut Vec<Item>) -> bool {
+    let mut any = false;
+    for _ in 0..PH326_ROUNDS {
+        if !ph326_round(items) {
+            break;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Follow shared prefix entries to their routine.
+fn ph326_chain_end(items: &[Item], at: usize) -> Option<&str> {
+    let Item::Label(name) = &items[at] else { return None };
+    if !name.starts_with("__PH326_") {
+        return Some(name);
+    }
+    items[at + 1..].iter().find_map(|it| match it {
+        Item::Label(n) if !n.starts_with("__PH326_") => Some(Some(n.as_str())),
+        Item::Insn(_) | Item::Label(_) | Item::Blank | Item::Comment(_) => None,
+        _ => Some(None),
+    })?
+}
+
+fn ph326_touches_port(item: &Item, zp: &ZpEquates) -> bool {
+    let Item::Insn(insn) = item else { return false };
+    let Some(op) = insn.operand.as_deref() else { return false };
+    if op.starts_with('#') {
+        return false;
+    }
+    let base = op.split(',').next().unwrap_or(op).trim().trim_start_matches('(').trim_end_matches(')');
+    matches!(parse_plain_addr(base).or_else(|| zp.map.get(base).copied()), Some(0x00 | 0x01))
+}
+
+fn ph326_round(items: &mut Vec<Item>) -> bool {
+    type Key = (String, Option<String>);
+    let zp = ZpEquates::scan(items);
+    let smc = smc_patched_labels(items);
+    let defined: std::collections::HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| match it {
+            Item::Label(name) => Some((name.as_str(), i)),
+            _ => None,
+        })
+        .collect();
+    let mut calls: std::collections::HashMap<String, Vec<(usize, Vec<usize>)>> =
+        std::collections::HashMap::new();
+    let mut refused: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (site, it) in items.iter().enumerate() {
+        let Item::Insn(insn) = it else { continue };
+        if !matches!(insn.mnem.as_str(), "JSR" | "JMP") {
+            continue;
+        }
+        let Some(target) = insn.operand.as_deref() else { continue };
+        if !defined.contains_key(target) {
+            continue;
+        }
+        let inline_data = insn.mnem == "JSR"
+            && matches!(next_struct(items, site), Some(n) if matches!(items[n], Item::Directive(_)));
+        if insn_is_smc_target(items, site, &smc)
+            || (inline_data
+                && ph326_chain_end(items, defined[target]) != Some(STR_PRINT_INLINE_ENTRY))
+        {
+            refused.insert(target.to_string());
+            continue;
+        }
+        let mut run = Vec::new();
+        let mut at = site;
+        while run.len() < PH326_RUN {
+            let Some(p) = prev_struct(items, at) else { break };
+            if crosses_sys_wrap(items, p, site)
+                || relocatable_insn_key(items, p, &smc).is_none()
+                || ph326_touches_port(&items[p], &zp)
+            {
+                break;
+            }
+            run.push(p);
+            at = p;
+        }
+        calls.entry(target.to_string()).or_default().push((site, run));
+    }
+
+    let mut plans: Vec<(usize, usize, Vec<Key>, &str, Vec<(usize, Vec<usize>)>)> = Vec::new();
+    for (target, sites) in &calls {
+        if refused.contains(target) || smc.contains(target) || sites.len() < 2 {
+            continue;
+        }
+        // The first label of the routine's label run, and what precedes it.
+        let mut head = defined[target.as_str()];
+        while let Some(p) = prev_struct(items, head) {
+            if !matches!(items[p], Item::Label(_)) {
+                break;
+            }
+            head = p;
+        }
+        let barrier = prev_struct(items, head).is_some_and(
+            |p| matches!(&items[p], Item::Insn(i) if is_uncond_terminator(&i.mnem)),
+        );
+        if !barrier {
+            continue;
+        }
+        let key_of = |idx: usize| relocatable_insn_key(items, idx, &smc).expect("screened");
+        let mut best: Option<(usize, Vec<Key>)> = None;
+        for len in 1..=PH326_RUN {
+            let mut counts: std::collections::HashMap<Vec<Key>, usize> =
+                std::collections::HashMap::new();
+            for (_, run) in sites {
+                if run.len() >= len {
+                    let suffix: Vec<Key> = run[..len].iter().rev().map(|&i| key_of(i)).collect();
+                    *counts.entry(suffix).or_default() += 1;
+                }
+            }
+            for (suffix, n) in counts {
+                if n < 2 {
+                    continue;
+                }
+                let bytes: usize = sites
+                    .iter()
+                    .find(|(_, run)| {
+                        run.len() >= len
+                            && run[..len].iter().rev().map(|&i| key_of(i)).eq(suffix.iter().cloned())
+                    })
+                    .map(|(_, run)| {
+                        run[..len]
+                            .iter()
+                            .map(|&i| match &items[i] {
+                                Item::Insn(insn) => approx_insn_bytes(insn, &zp),
+                                _ => 0,
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let gain = (n - 1) * bytes;
+                if gain > 0 && best.as_ref().is_none_or(|(g, b)| gain > *g || (gain == *g && suffix < *b)) {
+                    best = Some((gain, suffix));
+                }
+            }
+        }
+        let Some((gain, suffix)) = best else { continue };
+        let len = suffix.len();
+        let chosen: Vec<(usize, Vec<usize>)> = sites
+            .iter()
+            .filter(|(_, run)| {
+                run.len() >= len && run[..len].iter().rev().map(|&i| key_of(i)).eq(suffix.iter().cloned())
+            })
+            .map(|(site, run)| (*site, run[..len].to_vec()))
+            .collect();
+        plans.push((head, gain, suffix, target.as_str(), chosen));
+    }
+    if plans.is_empty() {
+        return false;
+    }
+    plans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then_with(|| (&a.2, a.3).cmp(&(&b.2, b.3))));
+    plans.dedup_by_key(|p| p.0);
+    let plans: Vec<(usize, Vec<Key>, Vec<(usize, Vec<usize>)>)> =
+        plans.into_iter().map(|(head, _, suffix, _, chosen)| (head, suffix, chosen)).collect();
+    let mut next_id = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Label(n) => n.strip_prefix("__PH326_")?.parse::<usize>().ok(),
+            _ => None,
+        })
+        .max()
+        .map_or(0, |n| n + 1);
+    let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut retarget: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut entries: std::collections::HashMap<usize, Vec<Item>> = std::collections::HashMap::new();
+    for (head, suffix, chosen) in plans {
+        let entry = format!("__PH326_{next_id}");
+        next_id += 1;
+        let model = &chosen[0].1;
+        let mut block = vec![Item::Label(entry.clone())];
+        for &i in model.iter().rev() {
+            let Item::Insn(insn) = &items[i] else { unreachable!() };
+            block.push(Item::Insn(Insn { comment: None, ..insn.clone() }));
+        }
+        debug_assert_eq!(block.len(), suffix.len() + 1);
+        for (site, run) in chosen {
+            drop.extend(run);
+            retarget.insert(site, entry.clone());
+        }
+        entries.insert(head, block);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (i, it) in items.drain(..).enumerate() {
+        if let Some(block) = entries.remove(&i) {
+            out.extend(block);
+        }
+        if drop.contains(&i) {
+            continue;
+        }
+        match (it, retarget.get(&i)) {
+            (Item::Insn(mut insn), Some(entry)) => {
+                insn.operand = Some(entry.clone());
+                out.push(Item::Insn(insn));
+            }
+            (it, _) => out.push(it),
+        }
+    }
+    *items = out;
+    true
+}
+
+/// Aim a branch at a reachable shared jump or its target.
+fn ph325_branch_via_shared_jmp(items: &mut Vec<Item>) -> bool {
+    let zp = ZpEquates::scan(items);
+    let smc = smc_patched_labels(items);
+    let mut pos: Vec<(u32, i32)> = Vec::with_capacity(items.len());
+    let (mut seg, mut off) = (0u32, 0i32);
+    for it in items.iter() {
+        pos.push((seg, off));
+        match it {
+            Item::Insn(insn) => off += approx_insn_bytes(insn, &zp) as i32,
+            Item::Directive(d) => match directive_bytes(d) {
+                Some(n) => off += n,
+                None => {
+                    seg += 1;
+                    off = 0;
+                }
+            },
+            Item::Origin(_) => {
+                seg += 1;
+                off = 0;
+            }
+            Item::Label(_) | Item::Blank | Item::Comment(_) => {}
+        }
+    }
+    let jmp_target = |idx: usize| -> Option<&str> {
+        match &items[idx] {
+            Item::Insn(i) if i.mnem == "JMP" => {
+                let op = i.operand.as_deref()?.trim();
+                (!op.starts_with('(') && !insn_is_smc_target(items, idx, &smc)).then_some(op)
+            }
+            _ => None,
+        }
+    };
+    let mut anchors: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for idx in 0..items.len() {
+        if let Some(t) = jmp_target(idx) {
+            anchors.entry(t).or_default().push(idx);
+        }
+    }
+    let labels = collect_label_index(items);
+
+    enum Aim {
+        Label(String),
+        Anchor(usize),
+    }
+    struct Site {
+        branch: usize,
+        aim: Aim,
+    }
+    let mut pairs: Vec<(usize, usize, &str)> = Vec::new();
+    for b in 0..items.len() {
+        let Item::Insn(br) = &items[b] else { continue };
+        if !is_cond_branch(&br.mnem) || insn_is_smc_target(items, b, &smc) {
+            continue;
+        }
+        let Some(skip) = br.operand.as_deref() else { continue };
+        let Some(j) = next_struct(items, b) else { continue };
+        let Some(x) = jmp_target(j) else { continue };
+        let mut k = j;
+        let mut lands = false;
+        while let Some(n) = next_struct(items, k) {
+            match &items[n] {
+                Item::Label(name) => {
+                    if name == skip {
+                        lands = true;
+                        break;
+                    }
+                    k = n;
+                }
+                _ => break,
+            }
+        }
+        if lands {
+            pairs.push((b, j, x));
+        }
+    }
+    let pair_jmps: std::collections::HashSet<usize> = pairs.iter().map(|&(_, j, _)| j).collect();
+
+    let mut sites: Vec<Site> = Vec::new();
+    let mut removed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &(b, j, x) in &pairs {
+        if used.contains(&j) {
+            continue;
+        }
+        let from = (pos[b].0, pos[b].1 + 2);
+        let reach = |at: usize| -> Option<i32> {
+            let (s, o) = pos[at];
+            let d = o - from.1;
+            (s == from.0 && (-PH325_REACH..=PH325_REACH).contains(&d)).then_some(d.abs())
+        };
+        let direct = labels.get(x).and_then(|&at| reach(at)).map(|d| (d, Aim::Label(x.to_string())));
+        let shared = anchors
+            .get(x)
+            .into_iter()
+            .flatten()
+            .filter(|&&a| a != j && !removed.contains(&a))
+            .filter_map(|&a| {
+                let rank = if used.contains(&a) {
+                    0
+                } else if !pair_jmps.contains(&a) {
+                    1
+                } else {
+                    2
+                };
+                reach(a).map(|d| ((rank, d), Aim::Anchor(a)))
+            })
+            .min_by_key(|(key, _)| *key);
+        let aim = match (direct, shared) {
+            (Some(d), _) => d.1,
+            (None, Some(s)) => s.1,
+            (None, None) => continue,
+        };
+        if let Aim::Anchor(a) = aim {
+            used.insert(a);
+        }
+        removed.insert(j);
+        sites.push(Site { branch: b, aim });
+    }
+    if sites.is_empty() {
+        return false;
+    }
+
+    // An anchor reuses a label already naming it, else gets a fresh one.
+    let mut next_id = 0u32;
+    for it in items.iter() {
+        if let Item::Label(n) = it
+            && let Some(rest) = n.strip_prefix("__PH325_")
+            && let Ok(v) = rest.parse::<u32>()
+        {
+            next_id = next_id.max(v + 1);
+        }
+    }
+    let mut anchor_label: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut insert_before: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for site in &sites {
+        if let Aim::Anchor(a) = site.aim
+            && !anchor_label.contains_key(&a)
+        {
+            let name = match prev_struct(items, a).map(|p| &items[p]) {
+                Some(Item::Label(n)) => n.clone(),
+                _ => {
+                    let n = format!("__PH325_{next_id}");
+                    next_id += 1;
+                    insert_before.insert(a, n.clone());
+                    n
+                }
+            };
+            anchor_label.insert(a, name);
+        }
+    }
+    let mut rewrite: std::collections::HashMap<usize, (&'static str, String)> = std::collections::HashMap::new();
+    for site in &sites {
+        let Item::Insn(br) = &items[site.branch] else { unreachable!() };
+        let inv = invert_branch(&br.mnem).expect("conditional branch");
+        let target = match &site.aim {
+            Aim::Label(l) => l.clone(),
+            Aim::Anchor(a) => anchor_label[a].clone(),
+        };
+        rewrite.insert(site.branch, (inv, target));
+    }
+    let old = std::mem::take(items);
+    for (idx, it) in old.into_iter().enumerate() {
+        if let Some(name) = insert_before.remove(&idx) {
+            items.push(Item::Label(name));
+        }
+        if removed.contains(&idx) {
+            continue;
+        }
+        match (rewrite.remove(&idx), it) {
+            (Some((mnem, target)), Item::Insn(mut br)) => {
+                br.mnem = mnem.to_string();
+                br.operand = Some(target);
+                items.push(Item::Insn(br));
+            }
+            (_, it) => items.push(it),
+        }
+    }
+    true
+}
+
+/// Most window instructions PH324 hoists a copy past.
+const PH324_WINDOW: usize = 6;
+
+/// Replace reloads with earlier register transfers when values and flags permit it.
+fn ph324_hoist_reload_to_transfer(items: &mut Vec<Item>) -> bool {
+    if !items.iter().any(|it| {
+        matches!(it, Item::Insn(i) if matches!(i.mnem.as_str(), "LDA" | "LDX" | "LDY")
+            && i.operand.as_deref().is_some_and(|op| !op.starts_with('#')))
+    }) {
+        return false;
+    }
+    let smc = smc_patched_labels(items);
+    let equ = collect_equ_values(items);
+    let equ_names: std::collections::HashSet<String> = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Directive(d) => d.trim().split_once('=').map(|(n, _)| n.trim().to_string()),
+            _ => None,
+        })
+        .collect();
+    let flags = analyze_flag_liveness_with_config(items, &FlagLivenessConfig::default());
+    let contracts = conservative_return_flag_config();
+    let labels = collect_label_index(items);
+    let base_of = |op: &str| -> String {
+        op.split(['+', '-']).next().unwrap_or(op).trim().to_string()
+    };
+    let resolve = |op: &str| -> Option<u16> {
+        let (base, off) = match op.split_once('+') {
+            Some((b, o)) => (b.trim(), i32::from(o.trim().parse::<u16>().ok()?)),
+            None => match op.split_once('-') {
+                Some((b, o)) => (b.trim(), -i32::from(o.trim().parse::<u16>().ok()?)),
+                None => (op.trim(), 0),
+            },
+        };
+        let v = match base.strip_prefix('$') {
+            Some(_) => parse_plain_addr(base)?,
+            None => *equ.get(base)?,
+        };
+        u16::try_from(i32::from(v) + off).ok()
+    };
+    let unresolved_equate = |op: &str| resolve(op).is_none() && equ_names.contains(&base_of(op));
+    let may_hit = |w: &str, m: &str| -> bool {
+        if w == m
+            || w.contains(',')
+            || w.contains('(')
+            || matches!(resolve(w), Some(0x00 | 0x01))
+            || unresolved_equate(w)
+        {
+            return true;
+        }
+        match (resolve(w), resolve(m)) {
+            (Some(a), Some(b)) => a == b,
+            (Some(a), None) => a >= 0x0100,
+            (None, Some(b)) => b >= 0x0100,
+            // Two distinct storage/code labels name distinct bytes.
+            (None, None) => false,
+        }
+    };
+
+    struct Site {
+        store: usize,
+        reload: usize,
+        copy: &'static str,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    let mut claimed_upto = 0usize;
+    for j in 0..items.len() {
+        let Item::Insn(ld) = &items[j] else { continue };
+        let (dest, store_mnem, copy) = match ld.mnem.as_str() {
+            "LDX" => (Reg::X, "STA", "TAX"),
+            "LDY" => (Reg::Y, "STA", "TAY"),
+            "LDA" => (Reg::A, "", ""),
+            _ => continue,
+        };
+        let Some(m) = ld.operand.as_deref() else { continue };
+        if static_fact_mem_operand(m).is_none()
+            || unresolved_equate(m)
+            || resolve(m).is_some_and(|a| a <= 0x01 || a >= 0x0100)
+        {
+            continue;
+        }
+        if insn_is_smc_target(items, j, &smc) {
+            continue;
+        }
+        // Walk back to the store, auditing the window.
+        let mut k = j;
+        let mut window = 0usize;
+        let mut window_sets_nz = false;
+        let found = loop {
+            let Some(p) = prev_struct(items, k) else { break None };
+            k = p;
+            let Item::Insn(x) = &items[p] else { break None };
+            let is_store = match dest {
+                Reg::A => matches!(x.mnem.as_str(), "STX" | "STY"),
+                _ => x.mnem == store_mnem,
+            };
+            if is_store && x.operand.as_deref() == Some(m) {
+                let copy = match (dest, x.mnem.as_str()) {
+                    (Reg::A, "STX") => "TXA",
+                    (Reg::A, _) => "TYA",
+                    _ => copy,
+                };
+                break Some((p, copy));
+            }
+            let modelled = matches!(
+                x.mnem.as_str(),
+                "LDA" | "LDX" | "LDY" | "STA" | "STX" | "STY" | "TAX" | "TAY" | "TXA" | "TYA"
+                    | "TSX" | "PHA" | "PLA" | "ADC" | "SBC" | "AND" | "ORA" | "EOR" | "CMP"
+                    | "CPX" | "CPY" | "BIT" | "INC" | "DEC" | "INX" | "DEX" | "INY" | "DEY"
+                    | "ASL" | "LSR" | "ROL" | "ROR" | "CLC" | "SEC" | "CLV" | "CLD" | "CLI"
+                    | "SEI" | "NOP"
+            );
+            if window == PH324_WINDOW || !modelled {
+                break None;
+            }
+            let eff = insn_register_effect_inner(x, false, &RegisterLivenessConfig::default());
+            if eff.uses.contains(dest) || eff.defs.contains(dest) {
+                break None;
+            }
+            let writes_mem = match x.mnem.as_str() {
+                "STA" | "STX" | "STY" => true,
+                "INC" | "DEC" | "ASL" | "LSR" | "ROL" | "ROR" => x
+                    .operand
+                    .as_deref()
+                    .is_some_and(|op| !op.eq_ignore_ascii_case("A")),
+                _ => false,
+            };
+            if writes_mem && x.operand.as_deref().is_none_or(|w| may_hit(w, m)) {
+                break None;
+            }
+            let fx = insn_flag_effect_inner(x, false, &FlagLivenessConfig::default());
+            window_sets_nz |= fx.defs.contains(Flag::N) || fx.defs.contains(Flag::Z);
+            window += 1;
+        };
+        let Some((st, copy)) = found else { continue };
+        if st < claimed_upto || insn_is_smc_target(items, st, &smc) || crosses_sys_wrap(items, st, j) {
+            continue;
+        }
+        if window > 0 {
+            let nz_live = |idx: usize| flags.is_live_out(idx, Flag::N) || flags.is_live_out(idx, Flag::Z);
+            if nz_live(st)
+                || (window_sets_nz
+                    && nz_live(j)
+                    && !nz_dead_after(items, j, &labels, &smc, &contracts, 3))
+            {
+                continue;
+            }
+        }
+        claimed_upto = j + 1;
+        sites.push(Site { store: st, reload: j, copy });
+    }
+    if sites.is_empty() {
+        return false;
+    }
+    for site in sites.into_iter().rev() {
+        items.remove(site.reload);
+        items.insert(
+            site.store + 1,
+            Item::Insn(Insn {
+                mnem: site.copy.to_string(),
+                operand: None,
+                comment: None,
+            }),
+        );
+    }
+    true
+}
+
 fn ph022_jmp_to_rts(items: &mut Vec<Item>) -> bool {
     let label_to_idx = collect_label_index(items);
     let mut plans: Vec<usize> = Vec::new();
@@ -5318,19 +7665,7 @@ fn first_real_insn_is_rts(items: &[Item], label_idx: usize) -> bool {
     false
 }
 
-/// PH021 — constant-fold conditional branches.
-///
-/// When the same forward static analysis as PH020 has nailed down
-/// a flag's value (Z, N, or C), a conditional branch becomes
-/// statically resolvable:
-///
-/// * branch always taken    → rewrite to `JMP target`
-/// * branch never taken     → drop the instruction entirely
-///
-/// The bias is conservative — flags must be Some(known) at the
-/// point of the branch, and the operand must be a recognisable
-/// label (not a relative offset, not a numeric address). We don't
-/// touch BVS/BVC because we don't track V.
+/// Fold conditional branches when their flags are known.
 fn ph021_constant_branch_fold(items: &mut Vec<Item>) -> bool {
     let facts = analyze_static_asm_facts(items);
 
@@ -5346,9 +7681,7 @@ fn ph021_constant_branch_fold(items: &mut Vec<Item>) -> bool {
         let Some(taken) = static_branch_outcome(&facts[idx], &insn.mnem) else {
             continue;
         };
-        // Bail when the operand isn't a clean label — relative
-        // numeric branches and missing operands aren't safe to
-        // rewrite without more context.
+        // Rewrite only plain label targets.
         let Some(op) = insn.operand.as_deref() else {
             continue;
         };
@@ -5389,24 +7722,7 @@ fn static_branch_outcome(facts: &StaticAsmFacts, mnem: &str) -> Option<bool> {
     }
 }
 
-/// PH012 — drop redundant `CMP #$00` after a flag-setting op.
-///
-/// Pattern:
-/// ```text
-///     LDA value
-///     CMP #$00
-///     BEQ zero
-/// ```
-///
-/// `LDA` already sets `Z` and `N` based on the loaded byte, so the
-/// `CMP #$00` is pure overhead. Same goes for any instruction whose
-/// "Z based on A/X/Y" semantics matches `CMP #$00`.
-///
-/// Caveat: `CMP` also clears `C` (sets it for ≥, clears for <). If
-/// any subsequent instruction reads `C` before resetting it, we'd
-/// break that. Conservatively bail when the branch immediately
-/// after `CMP #$00` is `BCC/BCS` — those read `C`. All others
-/// (BEQ/BNE/BMI/BPL/BVC/BVS) don't, and they're the common case.
+/// Remove CMP zero only when N/Z match A and carry is dead.
 fn ph012_drop_cmp_zero(items: &mut Vec<Item>) -> bool {
     let mut changed = false;
     let mut i = 0;
@@ -5419,17 +7735,7 @@ fn ph012_drop_cmp_zero(items: &mut Vec<Item>) -> bool {
                 && cmp.operand.as_deref() == Some("#$00")
         );
         if drop && let Some(j) = next_struct(items, i) {
-            // Check what follows the CMP. If any of the
-            // immediately-following branches read the carry
-            // flag (BCC / BCS), bail — those bits come from CMP,
-            // not LDA. A single-step look-ahead isn't enough: codegen
-            // patterns like `IF X > 0` emit
-            //   LDA X / CMP #$00 / BEQ skip / BCC skip
-            // where the BCC sits TWO branches after the CMP. The
-            // BEQ in between only reads Z (which LDA does set),
-            // but dropping the CMP would still corrupt the BCC's
-            // carry. Scan forward through consecutive branch
-            // instructions and bail if any of them is C-based.
+            // Keep comparisons whose carry is read before redefinition.
             let mut scan = next_struct(items, j);
             let mut reads_c = false;
             while let Some(k) = scan {
@@ -5439,13 +7745,23 @@ fn ph012_drop_cmp_zero(items: &mut Vec<Item>) -> bool {
                         reads_c = true;
                         break;
                     }
+                    "SBC" | "ADC" | "ROL" | "ROR" | "PHP" => {
+                        reads_c = true;
+                        break;
+                    }
+                    "SEC" | "CLC" | "CMP" | "CPX" | "CPY" | "ASL" | "LSR" => {
+                        break;
+                    }
                     "BEQ" | "BNE" | "BMI" | "BPL" | "BVC" | "BVS" => {
-                        // Pure Z/N/V branch — keep looking; the
-                        // CMP's carry might still feed a later
-                        // BCC/BCS in the same IF lowering.
+                        // Continue checking for carry readers past N, Z and V branches.
                         scan = next_struct(items, k);
                     }
-                    _ => break,
+                    "JMP" | "RTS" | "RTI" | "BRK" | "JSR" => {
+                        break;
+                    }
+                    _ => {
+                        scan = next_struct(items, k);
+                    }
                 }
             }
             if reads_c {
@@ -5454,8 +7770,7 @@ fn ph012_drop_cmp_zero(items: &mut Vec<Item>) -> bool {
             }
             items.remove(j);
             changed = true;
-            // Don't advance — the same prev might collide with the
-            // next CMP after re-shuffling.
+            // Recheck the same predecessor after removal.
             continue;
         }
         i += 1;
@@ -5463,60 +7778,23 @@ fn ph012_drop_cmp_zero(items: &mut Vec<Item>) -> bool {
     changed
 }
 
-/// Helpers / instructions that already leave the `Z` flag set
-/// equivalently to a `CMP #$00` against `A`. Conservatively gated —
-/// the peephole drops a `CMP #$00`, so the prior instruction's Z
-/// flag must reflect `A`, not some other register or memory byte:
-///   * `LDA` (immediate or memory) sets Z based on the loaded byte
-///     in A.
-///   * A-arithmetic / A-logic ops (AND, ORA, EOR, ADC, SBC) set Z
-///     based on the result in A. ADC/SBC also touch C/V — but PH012
-///     only drops the CMP, not the following branch, and C/V are
-///     the post-arith values which the coder-supplied branch
-///     presumably wants anyway.
-///   * `TXA` / `TYA` / `PLA` write A and set Z accordingly.
-///   * `TAX` / `TAY` set Z based on the byte transferred — which
-///     equals A — so the post-instruction Z still answers
-///     "A == 0?" correctly.
-///   * Implicit-mode `ASL` / `LSR` / `ROL` / `ROR` (no memory
-///     operand) shift A and set Z on the result. With a memory
-///     operand they instead set Z on the modified byte, so guard
-///     on `insn.operand.is_none()`.
-///   * Calls into compiler-owned helpers that document Z-preserving
-///     return contracts. Right now the only one is `__STRCMP`.
-///
-/// Excluded — these set Z based on X/Y or memory, NOT A. Lumping
-/// them in here would let the pass delete `CMP #$00` against A in
-/// sequences like `LDX #$01 / CMP #$00 / BNE ...`, breaking control
-/// flow in `__GET_STR`.
-///   * `LDX` / `LDY` — Z reflects X/Y.
-///   * `INX` / `INY` / `DEX` / `DEY` — Z reflects X/Y.
-///   * `INC` / `DEC` — Z reflects the modified memory byte.
+/// Instructions whose Z flag already tests A for zero.
 fn sets_z_flag_for_cmp_zero(insn: &Insn) -> bool {
     match insn.mnem.as_str() {
         "LDA" | "TAX" | "TAY" | "TXA" | "TYA" | "AND" | "ORA" | "EOR" | "ADC" | "SBC" | "PLA" => {
             true
         }
-        // Shift/rotate set Z on A only in implicit-accumulator mode.
-        // With an explicit memory operand, Z reflects the memory
-        // byte, which doesn't equal A.
+        // Memory shifts set Z from memory rather than A.
         "ASL" | "LSR" | "ROL" | "ROR" => insn.operand.is_none(),
         "JSR" => insn.operand.as_deref() == Some("__STRCMP"),
         _ => false,
     }
 }
 
-/// Extract every label-like token from an instruction operand.
-///
-/// Matches both bare label refs (`JMP __HELPER`, `STA __PTR_LO`)
-/// and high/low-byte immediate forms (`LDA #<__VARS_START`,
-/// `LDY #>__HEAP_END`). Labels are anything that starts with an
-/// ASCII letter or `_` and uses identifier-friendly characters.
+/// Extract label tokens from instruction operands.
 fn extract_labels_from_operand(op: &str) -> Vec<String> {
     let mut out = Vec::new();
-    // Walk the string collecting maximal identifier runs. Skip any
-    // run that's preceded by a `$` (hex literal) or starts inside
-    // a `#$` immediate.
+    // Skip identifiers inside hexadecimal literals.
     let bytes = op.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -5531,8 +7809,6 @@ fn extract_labels_from_operand(op: &str) -> Vec<String> {
                     break;
                 }
             }
-            // Was this preceded by a `$`? If so it was a hex literal
-            // that just happened to contain a letter (e.g. `$BBA2`).
             let before_is_hex_marker = start > 0 && bytes[start - 1] == b'$';
             // Skip register-name pseudo-operands (",X", ",Y" tail).
             let token = &op[start..i];
@@ -5546,9 +7822,7 @@ fn extract_labels_from_operand(op: &str) -> Vec<String> {
     out
 }
 
-/// Labels named on a directive or origin line.
-///
-/// Strips the comment and the leading `.mnemonic` first, then scans the rest.
+/// Extract labels from directive operands without comments.
 fn directive_operand_labels(raw: &str) -> Vec<String> {
     let body = raw.split(';').next().unwrap_or(raw).trim();
     let operands = match body.strip_prefix('.') {
@@ -5558,26 +7832,12 @@ fn directive_operand_labels(raw: &str) -> Vec<String> {
     extract_labels_from_operand(operands)
 }
 
-/// PH106 — factor `LDA #$00 ; LDY #imm ; JSR $B391` into a helper.
-///
-/// This is the dominant int-byte-to-FAC pattern: integer constants
-/// in [0,255] go through GIVAYF with `A=$00, Y=byte`. Each callsite
-/// is 7 bytes (2+2+3); routing through a `__LD_BYTE_FAC` stub turns
-/// each callsite into 5 bytes (`LDY #imm; JSR __LD_BYTE_FAC`) at
-/// the cost of one 5-byte helper (`LDA #$00; JMP $B391`).
-///
-/// Net: −2 bytes per call, +5 bytes for the helper. Break-even at
-/// 3 calls; we conservatively gate at 4+ to stay net-positive even
-/// after rounding.
-///
-/// Runtime cost: ~3 extra cycles per call (the JSR+JMP detour vs
-/// inline LDA+LDY+JSR). Within the Default profile's size bias.
+/// Share repeated byte to FAC conversions.
 fn ph106_factor_int_byte_to_fac(items: &mut Vec<Item>) -> bool {
 
     if items.iter().any(|item| matches!(item, Item::Label(name) if name == "__LD_BYTE_FAC")) {
         return false;
     }
-    // First pass: locate all matching triples.
     let mut sites: Vec<usize> = Vec::new();
     let mut i = 0;
     while i + 2 < items.len() {
@@ -5604,23 +7864,16 @@ fn ph106_factor_int_byte_to_fac(items: &mut Vec<Item>) -> bool {
     if sites.len() < 4 {
         return false;
     }
-    // Second pass: rewrite. Walk in reverse so removing triples
-    // doesn't invalidate later indices.
+    // Rewrite from the end so instruction indices stay valid.
     for &start in sites.iter().rev() {
         let j = next_struct(items, start).expect("paired LDY");
         let k = next_struct(items, j).expect("paired JSR");
-        // Replace JSR $B391 → JSR __LD_BYTE_FAC.
         if let Item::Insn(insn) = &mut items[k] {
             insn.operand = Some("__LD_BYTE_FAC".to_string());
         }
-        // Drop LDA #$00 (start). LDY remains in place. The JSR has
-        // been retargeted at index k.
         items.remove(start);
     }
-    // Inject the helper as labelled instructions BEFORE the runtime
-    // string heap starts (`__HEAP_BOTTOM:`). If we appended after the
-    // heap label, the heap allocator would overwrite our helper code
-    // at runtime as soon as a few strings get allocated.
+    // Place helpers before the runtime heap.
     let mut helpers: Vec<Item> = Vec::new();
     if !helper_section_present(items) {
         helpers.push(Item::Blank);
@@ -5643,16 +7896,7 @@ fn ph106_factor_int_byte_to_fac(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH109 — per-imm specialisation of `__LD_BYTE_FAC`. Runs AFTER
-/// PH106 has already shrunk `LDA #$00 / LDY #imm / JSR $B391` into
-/// `LDY #imm / JSR __LD_BYTE_FAC`. Frequently repeated immediates
-/// get their own helper.
-/// Adding a per-imm stub turns each callsite into a single
-/// `JSR __LDV_<imm>_FAC` (3 bytes) at the cost of a 7-byte helper
-/// per emitted imm.
-///
-/// Net per call: 5 bytes → 3 bytes. Helper: 7 bytes once.
-/// Break-even: 4 calls per imm.
+/// Share byte to FAC conversions with the same constant.
 fn ph109_factor_per_imm_byte_fac(items: &mut Vec<Item>) -> bool {
     use std::collections::HashMap;
     // Pre-scan for `LDY #$xx / JSR __LD_BYTE_FAC` pairs.
@@ -5684,7 +7928,6 @@ fn ph109_factor_per_imm_byte_fac(items: &mut Vec<Item>) -> bool {
     }
     to_factor.sort_by_key(|(imm, _)| *imm);
 
-    // Rewrite phase: stage replacements before mutating.
     let mut removals: Vec<usize> = Vec::new();
     for (imm, sites) in &to_factor {
         let helper = format!("__LDV_{:02X}_FAC", imm);
@@ -5703,8 +7946,7 @@ fn ph109_factor_per_imm_byte_fac(items: &mut Vec<Item>) -> bool {
         items.remove(idx);
     }
 
-    // Emit per-imm helpers BEFORE __HEAP_BOTTOM (same constraint as
-    // PH106/PH107).
+    // Place helpers before the runtime heap.
     let mut helpers: Vec<Item> = Vec::new();
     if !helper_section_present(items) {
         helpers.push(Item::Blank);
@@ -5734,29 +7976,10 @@ fn ph109_factor_per_imm_byte_fac(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH107 — factor `LDA #imm ; JSR <rom>` pairs into per-(imm, rom)
-/// helpers when the same pair appears often enough.
-///
-/// Dominant case: `LDA #$0D ; JSR $FFD2` (CHROUT carriage-return)
-/// at repeated PRINT line endings.
-///
-/// Each callsite drops from 5 bytes (LDA imm + JSR addr) to 3 bytes
-/// (JSR helper). The helper is 5 bytes (LDA imm + JMP addr — fall
-/// through saves the RTS). Break-even at 3 callsites; we gate at
-/// **4+** so the win is at least 3 bytes per fired pattern.
-///
-/// Currently restricted to `JSR $FFD2` (KERNAL CHROUT). Generalising
-/// to other ROM addresses would help future patterns, but CHROUT is
-/// where the volume is — extending later when measurement says so.
-///
-/// Safety: the JSR target must be a known ROM routine that returns
-/// with `RTS`. CHROUT is documented to do so. We bail on any callsite
-/// whose preceding instruction isn't a *bare* `LDA #imm` immediate
-/// (no further expressions).
+/// Share repeated constant character output calls.
 fn ph107_factor_chrout_byte(items: &mut Vec<Item>) -> bool {
     use std::collections::HashMap;
-    // Pre-scan: collect all (i, imm_byte) pairs where items[i] is
-    // `LDA #$<imm>` and the next struct is `JSR $FFD2`.
+    // Collect output calls by immediate byte.
     let mut sites_by_imm: HashMap<u8, Vec<usize>> = HashMap::new();
     let mut i = 0;
     while i + 1 < items.len() {
@@ -5782,16 +8005,10 @@ fn ph107_factor_chrout_byte(items: &mut Vec<Item>) -> bool {
             matches!(item, Item::Label(name) if name == &format!("__CHROUT_{imm:02X}"))))
         .collect();
     if to_factor.is_empty() {
-        return false;
+        return ph107_sweep_chrout_tails(items);
     }
-    // Sort descending so removals don't disturb earlier indices we
-    // still need.
     to_factor.sort_by_key(|(imm, _)| *imm);
 
-    // Phase 1: collect all removal indices across all imm-groups, in
-    // descending order, and rewrite each JSR site in-place to the
-    // matching helper. We do the rewrites first (still valid because
-    // we haven't removed anything), then drop LDAs in reverse.
     let mut removals: Vec<usize> = Vec::new();
     for (imm, sites) in &to_factor {
         let helper = format!("__CHROUT_{:02X}", imm);
@@ -5810,10 +8027,7 @@ fn ph107_factor_chrout_byte(items: &mut Vec<Item>) -> bool {
         items.remove(idx);
     }
 
-    // Phase 2: emit one helper per imm-value. Routed through
-    // `append_helpers_before_heap` so we don't drop them into the
-    // runtime string heap region (which would clobber them as soon
-    // as the allocator started writing).
+    // Emit one helper per constant before the runtime heap.
     let mut helpers: Vec<Item> = Vec::new();
     if !helper_section_present(items) {
         helpers.push(Item::Blank);
@@ -5835,12 +8049,76 @@ fn ph107_factor_chrout_byte(items: &mut Vec<Item>) -> bool {
         }));
     }
     append_helpers_before_heap(items, helpers);
+    let _ = ph107_sweep_chrout_tails(items);
     true
 }
 
-/// Parse `#$XX` immediate operand. Returns the byte value, or `None`
-/// for non-byte-immediate operands (like labels, `#<...`, or 16-bit
-/// hex literals).
+/// Reuse existing character output helpers for tail calls.
+fn ph107_sweep_chrout_tails(items: &mut Vec<Item>) -> bool {
+    let existing: std::collections::HashSet<String> = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Label(name) if name.starts_with("__CHROUT_") => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    if existing.is_empty() {
+        return false;
+    }
+    let mut removals: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + 1 < items.len() {
+        let matched = (|| {
+            let Item::Insn(a) = &items[i] else { return None };
+            if a.mnem != "LDA" {
+                return None;
+            }
+            let imm = parse_byte_immediate(a.operand.as_deref()?)?;
+            let helper = format!("__CHROUT_{imm:02X}");
+            if !existing.contains(&helper) {
+                return None;
+            }
+            let j = next_struct(items, i)?;
+            let Item::Insn(b) = &items[j] else { return None };
+            if b.mnem != "JMP" || b.operand.as_deref() != Some("$FFD2") {
+                return None;
+            }
+            // Skip every label belonging to the helper itself.
+            let mut p = i;
+            while p > 0 {
+                p -= 1;
+                match &items[p] {
+                    Item::Blank | Item::Comment(_) => {}
+                    Item::Label(n) if n == &helper => return None,
+                    Item::Label(_) => {}
+                    _ => break,
+                }
+            }
+            Some((j, helper))
+        })();
+        match matched {
+            Some((j, helper)) => {
+                if let Item::Insn(insn) = &mut items[j] {
+                    insn.operand = Some(helper);
+                }
+                removals.push(i);
+                i = j + 1;
+                continue;
+            }
+            None => i += 1,
+        }
+    }
+    if removals.is_empty() {
+        return false;
+    }
+    removals.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in removals {
+        items.remove(idx);
+    }
+    true
+}
+
+/// Parse a byte immediate, or return None.
 fn parse_byte_immediate(op: &str) -> Option<u8> {
     let rest = op.strip_prefix("#$")?;
     if rest.len() != 2 {
@@ -5860,13 +8138,10 @@ fn allocate_helper_name(items: &[Item], prefix: &str, next: &mut u32) -> String 
     }
 }
 
-/// PH113 — factor adjacent `JSR A; JSR B; JSR C` triples that recur.
-/// Same shape as PH110 but a step longer. Each callsite drops from
-/// 9 bytes to 3 bytes; helper is 9 bytes (`JSR A; JSR B; JMP C`).
-/// Save 6 bytes per call. Break-even at 2 calls; we gate at 4+.
+/// Share repeated triples of calls.
 fn ph113_factor_jsr_triple(items: &mut Vec<Item>) -> bool {
     use std::collections::HashMap;
-    // `A` and `B` stay `JSR`s inside the stub and so gain a frame; only `C`, which becomes the tail `JMP`, is frame-transparent.
+    // The first two calls add frames. The tail jump does not.
     let sensitive = frame_sensitive_labels(items);
     let mut sites: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     let mut i = 0;
@@ -5999,7 +8274,8 @@ fn ph110_factor_jsr_pair(items: &mut Vec<Item>) -> bool {
                 .entry((target_a.to_string(), target_b.to_string()))
                 .or_default()
                 .push(i);
-            i = j + 1;
+            // Advance one instruction so overlapping pairs remain candidates.
+            i += 1;
             continue;
         }
         i += 1;
@@ -6014,8 +8290,6 @@ fn ph110_factor_jsr_pair(items: &mut Vec<Item>) -> bool {
     // Sort deterministically for stable helper naming.
     to_factor.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Allocate helper IDs starting at 0 (no collision with PH301's
-    // __SEQ_ namespace).
     let mut helper_idx = 0u32;
 
     // Stage rewrites first, mutate after.
@@ -6031,6 +8305,7 @@ fn ph110_factor_jsr_pair(items: &mut Vec<Item>) -> bool {
     }
     // Rewrite in reverse so removals don't shift earlier indices.
     all_removals.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (start, second) in &all_removals {
         // Determine target pair from the (still-present) instructions.
         let (Item::Insn(a_insn), Item::Insn(b_insn)) = (&items[*start], &items[*second]) else {
@@ -6045,12 +8320,17 @@ fn ph110_factor_jsr_pair(items: &mut Vec<Item>) -> bool {
             .find(|(p, _)| p == &pair)
             .map(|(_, l)| l.clone());
         let Some(helper_label) = helper else { continue };
+        used.insert(helper_label.clone());
         // Replace the first JSR's operand with the helper.
         if let Item::Insn(insn) = &mut items[*start] {
             insn.operand = Some(helper_label);
         }
         // Drop the second JSR.
         items.remove(*second);
+    }
+    // Do not emit a helper when all its sites are taken.
+    if used.is_empty() {
+        return false;
     }
 
     // Emit helpers BEFORE __HEAP_BOTTOM.
@@ -6062,6 +8342,9 @@ fn ph110_factor_jsr_pair(items: &mut Vec<Item>) -> bool {
         ));
     }
     for ((a, b), label) in &emitted {
+        if !used.contains(label) {
+            continue;
+        }
         helpers.push(Item::Label(label.clone()));
         helpers.push(Item::Insn(Insn {
             mnem: "JSR".to_string(),
@@ -6078,18 +8361,7 @@ fn ph110_factor_jsr_pair(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH112 — factor `LDA <var> / LDY <var>+1 / JSR T` triples that
-/// recur. This is the dominant "load string-descriptor pointer for
-/// var, then call helper" idiom (`__STR_PRINT`, string concat, etc.).
-///
-/// Pattern requires the LDA's operand to be a stable label `X` and
-/// the LDY's operand to be exactly `X+1` — the two halves of the
-/// var slot. We also accept indirect zero-page forms (`$03`/`$03+1`
-/// etc.) since those follow the same shape.
-///
-/// Per call: 9 bytes (LDA + LDY + JSR, all absolute) → 3 bytes.
-/// Helper: 10 bytes (LDA + LDY + JMP). Save 6 bytes per call.
-/// Break-even at 2 calls; we gate at 4 for margin.
+/// Share repeated variable pointer loads followed by calls.
 fn ph112_factor_varptr_jsr(items: &mut Vec<Item>) -> bool {
     use std::collections::HashMap;
     let mut sites: HashMap<(String, String), Vec<usize>> = HashMap::new();
@@ -6098,7 +8370,6 @@ fn ph112_factor_varptr_jsr(items: &mut Vec<Item>) -> bool {
         if let Item::Insn(a) = &items[i]
             && a.mnem == "LDA"
             && let Some(a_op) = a.operand.as_deref()
-            // Reject immediate operands — those go through PH111.
             && !a_op.starts_with('#')
             && let Some(j) = next_struct(items, i)
             && let Item::Insn(b) = &items[j]
@@ -6122,9 +8393,6 @@ fn ph112_factor_varptr_jsr(items: &mut Vec<Item>) -> bool {
         }
         i += 1;
     }
-    // Threshold = 3 (same math as PH111): each site saves 4 bytes
-    // (7-byte triple → 3-byte JSR), helper costs 7 bytes, so 3
-    // sites is the smallest net-positive group.
     let mut to_factor: Vec<((String, String), Vec<usize>)> = sites
         .into_iter()
         .filter(|(_, sites)| sites.len() >= 3)
@@ -6201,24 +8469,10 @@ fn ph112_factor_varptr_jsr(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH111 — factor `LDA #<X / LDY #>X / JSR T` triples that recur.
-///
-/// Setup-and-call to ROM/helper subroutines is the dominant 7-byte
-/// shape in our generated asm. PH301 doesn't catch these because
-/// it refuses windows that contain a JSR. PH110 doesn't catch them
-/// because they're 3 instructions, not 2.
-///
-/// Per call: 7 bytes (LDA imm + LDY imm + JSR) → 3 bytes (JSR
-/// helper). Helper: 7 bytes once (LDA imm + LDY imm + JMP target).
-/// Save 4 bytes per call; break-even at 2 calls. We gate at 4+ for
-/// margin and to avoid emitting too many tiny helpers.
-///
-/// Useful for repeated FAC setup-and-call shapes.
+/// Share repeated immediate pointer loads followed by calls.
 fn ph111_factor_lda_ldy_jsr(items: &mut Vec<Item>) -> bool {
     use std::collections::HashMap;
-    // Sites grouped by (mnem_a, lda_operand, ldy_operand, jsr_target).
-    // The first mnem can be `LDA` (for FAC float ops) or `LDX` (for
-    // MOVMF-style calls that take pointer in X/Y).
+    // Group sites by load instructions, operands and call target.
     let mut sites: HashMap<(String, String, String, String), Vec<usize>> = HashMap::new();
     let mut i = 0;
     while i + 2 < items.len() {
@@ -6235,8 +8489,7 @@ fn ph111_factor_lda_ldy_jsr(items: &mut Vec<Item>) -> bool {
             && let Item::Insn(c) = &items[k]
             && c.mnem == "JSR"
             && let Some(c_op) = c.operand.as_deref()
-            // Don't factor a triple that already calls one of OUR
-            // own __T<n> helpers (would create endless wrappers).
+            // Skip generated helpers to avoid repeated wrapping.
             && !c_op.starts_with("__T")
         {
             sites
@@ -6253,11 +8506,6 @@ fn ph111_factor_lda_ldy_jsr(items: &mut Vec<Item>) -> bool {
         }
         i += 1;
     }
-    // Threshold = 3: each site saves 4 bytes (7-byte triple → 3-byte
-    // JSR), helper itself is 7 bytes. At 3 sites: 12 saved - 7 helper
-    // = 5 bytes net. Threshold 4 was the original (9 bytes net),
-    // dropping to 3 catches the long tail of medium-frequency triples
-    // — roughly 1-2% smaller on real programs.
     let mut to_factor: Vec<((String, String, String, String), Vec<usize>)> = sites
         .into_iter()
         .filter(|(_, sites)| sites.len() >= 3)
@@ -6303,8 +8551,6 @@ fn ph111_factor_lda_ldy_jsr(items: &mut Vec<Item>) -> bool {
         let Some(helper_label) = helper_label else {
             continue;
         };
-        // Replace LDA/LDX at `start` with JSR helper. Drop LDY (mid)
-        // and JSR (end).
         if let Item::Insn(insn) = &mut items[*start] {
             insn.mnem = "JSR".to_string();
             insn.operand = Some(helper_label);
@@ -6400,6 +8646,252 @@ fn append_str_print_inline_helper(items: &mut Vec<Item>, lo: String, hi: String)
     push_insn(items, "JMP", Some("__STR_PRINT_PTR".to_string()));
 }
 
+/// Bytes of one `LDA #< / LDY #> / JSR` print call, or of the run call that replaces a run.
+const PH327_CALL: isize = 7;
+/// Shortest run worth looking at.
+const PH327_MIN_RUN: usize = 8;
+/// `__PRINT_RUN`'s own bytes.
+const PH327_HELPER: isize = 7;
+
+/// Read plain string pool bytes after the length byte.
+fn ph327_pool_record(items: &[Item], at: usize) -> Option<(Vec<u8>, usize)> {
+    let Item::Label(name) = &items[at] else { return None };
+    if !name.strip_prefix('S').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut end = at + 1;
+    while let Some(Item::Directive(raw)) = items.get(end) {
+        let body = raw.trim().strip_prefix(".byte ")?;
+        for v in body.split(',') {
+            bytes.push(u8::from_str_radix(v.trim().strip_prefix('$')?, 16).ok()?);
+        }
+        end += 1;
+    }
+    let (&len, payload) = bytes.split_first()?;
+    (usize::from(len) == payload.len()).then(|| (payload.to_vec(), end))
+}
+
+/// Print repeated characters with a loop when it saves space.
+fn ph327_split_print_runs(items: &mut Vec<Item>) -> bool {
+    use std::collections::HashMap;
+    let mut records: HashMap<String, (usize, usize, Vec<u8>)> = HashMap::new();
+    for at in 0..items.len() {
+        if let Some((payload, end)) = ph327_pool_record(items, at)
+            && let Item::Label(name) = &items[at]
+        {
+            records.insert(name.clone(), (at, end, payload));
+        }
+    }
+    if records.is_empty() || !item_label_present(items, "__STR_PRINT") {
+        return false;
+    }
+    // Every mention of a pool label, and the print calls among them.
+    let mut mentions: HashMap<&str, usize> = HashMap::new();
+    for it in items.iter() {
+        let text = match it {
+            Item::Insn(insn) => insn.operand.as_deref().unwrap_or(""),
+            Item::Directive(raw) => raw.as_str(),
+            _ => continue,
+        };
+        for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if let Some((name, _)) = records.get_key_value(tok) {
+                *mentions.entry(name.as_str()).or_default() += 1;
+            }
+        }
+    }
+    let mut sites: HashMap<String, Vec<(usize, usize, usize)>> = HashMap::new();
+    for i in 0..items.len() {
+        let Item::Insn(lda) = &items[i] else { continue };
+        let Some(name) = lda.operand.as_deref().and_then(|op| op.strip_prefix("#<")) else { continue };
+        if lda.mnem != "LDA" || !records.contains_key(name) {
+            continue;
+        }
+        let Some(j) = next_struct(items, i) else { continue };
+        let Some(k) = next_struct(items, j) else { continue };
+        let ok = matches!(&items[j], Item::Insn(ldy) if ldy.mnem == "LDY"
+                && ldy.operand.as_deref() == Some(format!("#>{name}").as_str()))
+            && matches!(&items[k], Item::Insn(call) if matches!(call.mnem.as_str(), "JSR" | "JMP")
+                && call.operand.as_deref() == Some("__STR_PRINT"));
+        if ok {
+            sites.entry(name.to_string()).or_default().push((i, j, k));
+        }
+    }
+    let smc = smc_patched_labels(items);
+    let mut plans: Vec<(String, Vec<Result<Vec<u8>, (u8, usize)>>)> = Vec::new();
+    let mut saved: isize = 0;
+    for (name, at_sites) in &sites {
+        if mentions.get(name.as_str()) != Some(&(2 * at_sites.len())) || smc.contains(name) {
+            continue;
+        }
+        let payload = &records[name].2;
+        let m = at_sites.len() as isize;
+        // Maximal runs, longest first, kept while each lowers the total.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < payload.len() {
+            let mut j = i;
+            while j < payload.len() && payload[j] == payload[i] {
+                j += 1;
+            }
+            if j - i >= PH327_MIN_RUN {
+                runs.push((i, j));
+            }
+            i = j;
+        }
+        runs.sort_by_key(|&(a, b)| std::cmp::Reverse(b - a));
+        let cost = |chosen: &[(usize, usize)]| -> isize {
+            let mut sorted = chosen.to_vec();
+            sorted.sort();
+            let (mut parts, mut texts, mut run_bytes, mut at) = (0isize, 0isize, 0isize, 0usize);
+            for &(a, b) in &sorted {
+                if a > at {
+                    parts += 1;
+                    texts += 1;
+                }
+                parts += 1;
+                run_bytes += (b - a) as isize;
+                at = b;
+            }
+            if at < payload.len() {
+                parts += 1;
+                texts += 1;
+            }
+            PH327_CALL * m * (parts - 1) + texts - 1 - run_bytes
+        };
+        let mut chosen: Vec<(usize, usize)> = Vec::new();
+        for run in runs {
+            let mut with = chosen.clone();
+            with.push(run);
+            if cost(&with) < cost(&chosen) {
+                chosen = with;
+            }
+        }
+        if chosen.is_empty() || cost(&chosen) >= 0 {
+            continue;
+        }
+        saved -= cost(&chosen);
+        chosen.sort();
+        let mut parts = Vec::new();
+        let mut at = 0;
+        for (a, b) in chosen {
+            if a > at {
+                parts.push(Ok(payload[at..a].to_vec()));
+            }
+            parts.push(Err((payload[a], b - a)));
+            at = b;
+        }
+        if at < payload.len() {
+            parts.push(Ok(payload[at..].to_vec()));
+        }
+        plans.push((name.clone(), parts));
+    }
+    let pool_start = items
+        .iter()
+        .position(|it| matches!(it, Item::Comment(c) if c.trim() == "; --- string pool (length-prefixed) ---"));
+    let pool_end = pool_start.map(|start| {
+        items[start + 1..]
+            .iter()
+            .position(|it| matches!(it, Item::Comment(c) if c.trim_start().starts_with("; ---")))
+            .map_or(items.len(), |off| start + 1 + off)
+    });
+    let Some(last_record_end) = pool_start.zip(pool_end).and_then(|(start, end)| {
+        records.values().filter(|r| r.0 > start && r.1 <= end).map(|r| r.1).max()
+    }) else {
+        return false;
+    };
+    // The loop itself has to pay too.
+    if plans.is_empty() || (!item_label_present(items, "__PRINT_RUN") && saved <= PH327_HELPER) {
+        return false;
+    }
+    plans.sort();
+    let mut by_bytes: HashMap<Vec<u8>, String> = records
+        .iter()
+        .filter(|(name, _)| !plans.iter().any(|(p, _)| p == *name))
+        .map(|(name, (_, _, b))| (b.clone(), name.clone()))
+        .collect();
+    let mut next = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Label(n) => n.strip_prefix('S')?.parse::<usize>().ok(),
+            _ => None,
+        })
+        .max()
+        .map_or(0, |n| n + 1);
+    let mut new_records: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut replace: HashMap<usize, Vec<Item>> = HashMap::new();
+    let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (name, parts) in &plans {
+        let mut labels: Vec<Result<String, (u8, usize)>> = Vec::new();
+        for part in parts {
+            labels.push(match part {
+                Ok(text) => Ok(by_bytes
+                    .entry(text.clone())
+                    .or_insert_with(|| {
+                        let label = format!("S{next}");
+                        next += 1;
+                        new_records.push((label.clone(), text.clone()));
+                        label
+                    })
+                    .clone()),
+                Err(run) => Err(*run),
+            });
+        }
+        for &(i, j, k) in &sites[name] {
+            let Item::Insn(call) = &items[k] else { unreachable!() };
+            let tail = call.mnem.clone();
+            let mut seq = Vec::new();
+            for (n, part) in labels.iter().enumerate() {
+                let mnem = if n + 1 == labels.len() { tail.as_str() } else { "JSR" };
+                match part {
+                    Ok(label) => {
+                        push_insn(&mut seq, "LDA", Some(format!("#<{label}")));
+                        push_insn(&mut seq, "LDY", Some(format!("#>{label}")));
+                        push_insn(&mut seq, mnem, Some("__STR_PRINT".to_string()));
+                    }
+                    Err((byte, len)) => {
+                        push_insn(&mut seq, "LDA", Some(format!("#${byte:02X}")));
+                        push_insn(&mut seq, "LDX", Some(format!("#${len:02X}")));
+                        push_insn(&mut seq, mnem, Some("__PRINT_RUN".to_string()));
+                    }
+                }
+            }
+            replace.insert(i, seq);
+            drop.insert(j);
+            drop.insert(k);
+        }
+        let (at, end, _) = records[name];
+        drop.extend(at..end);
+    }
+    let mut out = Vec::with_capacity(items.len() + 8 * new_records.len());
+    for (idx, it) in items.drain(..).enumerate() {
+        if let Some(seq) = replace.remove(&idx) {
+            out.extend(seq);
+        } else if !drop.contains(&idx) {
+            out.push(it);
+        }
+        if idx + 1 == last_record_end {
+            for (label, text) in &new_records {
+                out.push(Item::Label(label.clone()));
+                let mut prefixed = vec![text.len() as u8];
+                prefixed.extend_from_slice(text);
+                let list: Vec<String> = prefixed.iter().map(|b| format!("${b:02X}")).collect();
+                out.push(Item::Directive(format!("    .byte {}", list.join(","))));
+            }
+        }
+    }
+    *items = out;
+    if !item_label_present(items, "__PRINT_RUN") {
+        let mut helper = vec![Item::Label("__PRINT_RUN".to_string())];
+        push_insn(&mut helper, "JSR", Some("$FFD2".to_string()));
+        push_insn(&mut helper, "DEX", None);
+        push_insn(&mut helper, "BNE", Some("__PRINT_RUN".to_string()));
+        push_insn(&mut helper, "RTS", None);
+        append_helpers_before_heap(items, helper);
+    }
+    true
+}
+
 /// Store literal PRINT arguments after the call to reduce call-site size.
 fn ph114_str_print_inline_args(items: &mut Vec<Item>) -> bool {
     if !item_label_present(items, "__STR_PRINT_PTR") {
@@ -6435,8 +8927,6 @@ fn ph114_str_print_inline_args(items: &mut Vec<Item>) -> bool {
     if sites.len() < STR_PRINT_INLINE_MIN_SITES {
         return false;
     }
-    // Descending, so the rewrite of one site cannot move the indices of a site that has not
-    // been rewritten yet.
     for (start, mid, end, label) in sites.iter().rev() {
         items.remove(*end);
         items.remove(*mid);
@@ -6469,12 +8959,82 @@ fn is_plain_label(s: &str) -> bool {
 /// The label the inline-argument trampoline is reached by.
 pub const STR_PRINT_INLINE_ENTRY: &str = "__STR_PRINT_I";
 
+/// Find shared prefix entries leading to inline PRINT.
+fn str_print_inline_entries(items: &[Item]) -> (std::collections::HashMap<String, Vec<Insn>>, Option<usize>) {
+    let mut entries = std::collections::HashMap::new();
+    let Some(tramp) = items
+        .iter()
+        .position(|it| matches!(it, Item::Label(name) if name == STR_PRINT_INLINE_ENTRY))
+    else {
+        return (entries, None);
+    };
+    // The trampoline's own label run, then the entries' code in front of it.
+    let mut head = tramp;
+    while let Some(p) = prev_struct(items, head) {
+        if !matches!(&items[p], Item::Label(n) if !n.starts_with("__PH326_")) {
+            break;
+        }
+        head = p;
+    }
+    let mut start = head;
+    while let Some(p) = prev_struct(items, start) {
+        match &items[p] {
+            Item::Label(n) if n.starts_with("__PH326_") => start = p,
+            Item::Insn(insn) if !is_uncond_terminator(&insn.mnem) => start = p,
+            _ => break,
+        }
+    }
+    while start < head && !matches!(&items[start], Item::Label(n) if n.starts_with("__PH326_")) {
+        start += 1;
+    }
+    if start == head {
+        return (entries, None);
+    }
+    for k in start..head {
+        if let Item::Label(name) = &items[k] {
+            let run = items[k + 1..head]
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Insn(insn) => Some(insn.clone()),
+                    _ => None,
+                })
+                .collect();
+            entries.insert(name.clone(), run);
+        }
+    }
+    (entries, Some(start))
+}
+
+/// Names of shared prefix entries that accept inline PRINT arguments.
+pub fn str_print_inline_entry_names(asm: &str) -> std::collections::HashSet<String> {
+    if !asm.contains("__PH326_") || !asm.contains(STR_PRINT_INLINE_ENTRY) {
+        return std::collections::HashSet::new();
+    }
+    str_print_inline_entries(&parse(asm)).0.into_keys().collect()
+}
+
 /// Restore register-based PRINT arguments before reserved-range relocation.
 pub fn undo_str_print_inline_args(asm: &str) -> String {
+    undo_str_print_inline_args_at(asm, None)
+}
+
+/// Restore register arguments at selected inline PRINT calls.
+pub fn undo_str_print_inline_args_at(
+    asm: &str,
+    sites: Option<&std::collections::HashSet<usize>>,
+) -> String {
     if !asm.contains(STR_PRINT_INLINE_ENTRY) {
         return asm.to_string();
     }
     let items = parse(asm);
+    let (entries, entries_start) = str_print_inline_entries(&items);
+    let is_site = |it: &Item| {
+        matches!(it, Item::Insn(insn)
+            if insn.mnem == "JSR" && insn.operand.as_deref().is_some_and(
+                |op| op == STR_PRINT_INLINE_ENTRY || entries.contains_key(op)))
+    };
+    let total = items.iter().filter(|it| is_site(it)).count();
+    let undo_all = sites.is_none_or(|s| (0..total).all(|k| s.contains(&k)));
 
     let entry = items.iter().position(
         |it| matches!(it, Item::Label(name) if name == STR_PRINT_INLINE_ENTRY),
@@ -6493,25 +9053,33 @@ pub fn undo_str_print_inline_args(asm: &str) -> String {
         return asm.to_string();
     }
     let mut out: Vec<Item> = Vec::with_capacity(items.len() + 64);
+    let mut ordinal = 0usize;
     let mut i = 0usize;
     while i < items.len() {
-        if Some(i) == entry {
+        if undo_all && (Some(i) == entry || Some(i) == entries_start) {
             i = tramp_end.expect("checked above");
             continue;
         }
-        if let Item::Insn(insn) = &items[i]
-            && insn.mnem == "JSR"
-            && insn.operand.as_deref() == Some(STR_PRINT_INLINE_ENTRY)
+        let chosen = is_site(&items[i]) && {
+            ordinal += 1;
+            undo_all || sites.is_some_and(|s| s.contains(&(ordinal - 1)))
+        };
+        if chosen
             && let Some(k) = next_struct(&items, i)
             && let Item::Directive(d) = &items[k]
             && let Some(label) = d.trim().strip_prefix(".word ")
             && is_plain_label(label.trim())
         {
             let label = label.trim();
+            if let Item::Insn(call) = &items[i]
+                && let Some(run) = call.operand.as_deref().and_then(|op| entries.get(op))
+            {
+                out.extend(run.iter().cloned().map(Item::Insn));
+            }
             push_insn(&mut out, "LDA", Some(format!("#<{label}")));
             push_insn(&mut out, "LDY", Some(format!("#>{label}")));
             push_insn(&mut out, "JSR", Some("__STR_PRINT".to_string()));
-            // Anything decorative between the two (a blank line or a comment) is dropped with the pair it belonged to.
+            // Remove blanks and comments within the pair.
             i = k + 1;
             continue;
         }
@@ -6521,54 +9089,10 @@ pub fn undo_str_print_inline_args(asm: &str) -> String {
     render(&out)
 }
 
-/// PH301 — general sequence factoring (size-mode-leaning).
-///
-/// Find any 4-instruction window with byte-identical operands that
-/// repeats ≥ 4 times in the program, and factor into a shared helper:
-///
-/// ```text
-/// __SEQ_<n>:
-///     <inst-1>
-///     <inst-2>
-///     <inst-3>
-///     <inst-4>
-///     RTS
-/// ```
-///
-/// Each callsite drops from `4*N + per-instruction-cost` bytes down
-/// to 3 bytes. The helper is `<sequence-bytes> + 1` bytes (RTS = 1).
-/// Break-even depends on the original sequence length, but for a
-/// 4-instruction window of ~10-12 bytes it kicks in around 4
-/// occurrences.
-///
-/// Useful for repeated array-index prologues.
-///
-/// Safety constraints:
-///   * Window must not cross a label (a basic-block boundary). We
-///     scan only within straight-line stretches.
-///   * Window must not contain branches/JMP/JSR (a JSR itself is
-///     fine, but factoring sequences containing JSRs invites
-///     stack-balance pitfalls in fixpoint iterations — defer).
-///   * Window operands must be byte-identical strings between
-///     occurrences. We use the rendered text as the hash key.
-///   * Window must not contain RTS/RTI/BRK (terminates control —
-///     the factored helper would still RTS, so semantics OK, but
-///     PH002 is a better tool there).
-///   * We refuse to factor windows whose operands contain *any*
-///     label reference. Labels can be relocated by other passes;
-///     a peephole-introduced helper that captures `LDA #<L1` would
-///     break if L1 later moves. Pure hex / register operands only.
-///
-/// Cycle cost: each fired call adds ~12 cycles per execution
-/// (JSR + RTS overhead vs inline). The early pass is currently
-/// gated off; the late pass below (`ph301_factor_late_with_jsr`)
-/// is the only live caller path.
+/// Share repeated instruction sequences that preserve stack and control flow.
 #[allow(dead_code)]
 fn ph301_factor_repeated_sequences(items: &mut Vec<Item>) -> bool {
-    // Try windows of decreasing size. Larger windows are tried first
-    // so they claim sites before smaller ones (a 7-instr helper
-    // saves more per call than a 3-instr one). Each call is
-    // independent and uses disjoint scan internally.
+    // Factor larger windows first.
     let mut any = false;
     any |= ph301_with_window(items, 7, JsrPolicy::Refused);
     any |= ph301_with_window(items, 6, JsrPolicy::Refused);
@@ -6618,18 +9142,13 @@ fn ph301_window_3_is_size_only(profile: Profile) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsrPolicy {
-    /// Original PH301 behaviour — refuse any window containing a JSR.
-    /// Lets PH110/PH113 handle JSR sequences with their dedicated
-    /// pair/triple shapes.
+    /// Refuse windows containing calls.
     Refused,
     /// Allow declared integer and string storage during compact instruction factoring.
     CompactRefused,
-    /// Compact instruction windows containing exactly one call to a defined, inspected straight-line leaf ending in RTS.
+    /// Allow one call to an inspected leaf that ends in RTS.
     CompactLeafCalls,
-    /// Allow at most ONE JSR per window. Rules out JSR-only windows
-    /// (which PH110/PH113 collapses better) but admits the common
-    /// "address compute + helper call" pattern that mixes loads,
-    /// stores, and one helper invocation.
+    /// Allow one call per window.
     AllowOne,
     /// Size-only mixed instruction windows may contain three calls.
     AllowThree,
@@ -6693,17 +9212,6 @@ fn ph301_with_window_min_sites(
         compact.then(|| structured::compact_instruction_sites(items))
     };
 
-    // Collect candidate windows: indices where a window_size-long run
-    // of safe instructions starts. We index into the *condensed*
-    // instruction stream so adjacent non-Insn items (blank lines,
-    // comments) don't break a window — we scan over them via
-    // next_struct.
-    //
-    // For each candidate start, render the window's signature
-    // (joined `mnem operand`) and group by signature.
-    //
-    // Disjoint occurrences: once we pick a start `s`, the next legal
-    // start is at the position *after* the window (s + 4 insn-steps).
     let smc_targets = smc_patched_labels(items);
 
     let sensitive = frame_sensitive_labels(items);
@@ -6715,8 +9223,6 @@ fn ph301_with_window_min_sites(
         let mut probe = i;
         let mut ok = true;
         for step in 0..window_size {
-            // First step starts at `i` itself if it's an Insn;
-            // subsequent steps walk via next_struct.
             let cur = if step == 0 {
                 if matches!(items.get(i), Some(Item::Insn(_))) {
                     i
@@ -6789,11 +9295,7 @@ fn ph301_with_window_min_sites(
                 continue;
             }
         }
-        // Stack balance: the helper RTS pops the top of stack as the
-        // return address, so a window with non-zero net stack delta
-        // would jump somewhere unintended. Allow balanced PHA/PLA
-        // pairs inside the window — only refuse when push count
-        // doesn't match pop count.
+        // A shared helper must leave its return address on top of the stack.
         if !window_stack_balanced(items, &idxs) {
             i += 1;
             continue;
@@ -6827,14 +9329,11 @@ fn ph301_with_window_min_sites(
     if to_factor.is_empty() {
         return false;
     }
-    // Most profitable first; signature breaks ties so helper naming stays deterministic.
     to_factor.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
 
     let next_seq_id = peephole_next_seq_id(items);
     let mut helper_idx = next_seq_id;
     let mut emitted: Vec<(String, String)> = Vec::new(); // (sig, helper-label)
-// Per-site (start, last). We also remember the SIG for each so
-// the rewrite phase can look up the helper label.
     let mut chosen: Vec<(usize, usize, String)> = Vec::new();
     let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (sig, sites, _) in &to_factor {
@@ -6863,8 +9362,6 @@ fn ph301_with_window_min_sites(
         return false;
     }
 
-    // Apply rewrites in reverse order so removals don't disturb
-    // earlier indices.
     chosen.sort_by(|a, b| b.0.cmp(&a.0));
     for (start, last, sig) in &chosen {
         let helper_label = emitted
@@ -6881,9 +9378,6 @@ fn ph301_with_window_min_sites(
             insn.operand = Some(helper_label);
             insn.comment = None;
         }
-        // Drop the remaining 3 instructions. If structure shifted
-        // such that we can't find them (shouldn't happen, but
-        // defensive), skip the drop.
         let mut to_drop: Vec<usize> = Vec::new();
         let mut cur = *start;
         let mut ok = true;
@@ -6908,8 +9402,7 @@ fn ph301_with_window_min_sites(
         }
     }
 
-    // Emit helpers BEFORE `__HEAP_BOTTOM:` so the runtime string
-    // heap doesn't overwrite them.
+    // Place helpers before the runtime heap.
     let mut helpers: Vec<Item> = Vec::new();
     if !helper_section_present(items) {
         helpers.push(Item::Blank);
@@ -6917,9 +9410,6 @@ fn ph301_with_window_min_sites(
             "; --- peephole-factored helpers ---".to_string(),
         ));
     }
-    // Re-walk groups to emit each helper body. We have the signature
-    // → label mapping; we parse the signature back into the
-    // instruction stream and append an RTS.
     for (sig, label) in &emitted {
         helpers.push(Item::Label(label.clone()));
         for line in sig.split('\n') {
@@ -6946,35 +9436,13 @@ fn ph301_with_window_min_sites(
     true
 }
 
-/// True if `insn` is safe to include in a factored sequence: no
-/// control-flow effects, no JSR, and any label operands must be of
-/// "compiler-stable" kinds (array-data, var-slot, helper, etc.) —
-/// not BASIC line labels that downstream passes might relocate.
-///
-/// Currently kept only as documentation for the JSR-Refused policy
-/// — every active call site picks its policy explicitly via
-/// `is_factorable_insn_with_policy`.
+/// Whether an instruction is safe to move into a shared helper.
 #[allow(dead_code)]
 fn is_factorable_insn(insn: &Insn) -> bool {
     is_factorable_insn_with_policy(insn, JsrPolicy::Refused)
 }
 
-/// True iff the window's stack discipline is safe to wrap in JSR/RTS.
-/// PH301 wraps the window in `JSR helper; ...; RTS`, and the helper
-/// has no stack frame of its own beyond the return address pushed by
-/// the wrapping JSR. Two distinct hazards have to be ruled out:
-///
-///  1. **Net delta non-zero**: pushes and pops in the window must
-///     balance — otherwise the helper's terminating RTS pops the
-///     wrong bytes (caught by edge29 mid\$/left\$/right\$).
-///  2. **Running delta goes negative**: a PLA before any in-window
-///     PHA pops the JSR's own return address (which the wrapping
-///     `JSR helper` just pushed) — even if a later PHA balances the
-///     count. The helper's RTS at the end then jumps to garbage.
-///     Caught by edge167 (`a\$+b\$+c\$+a\$+b\$+c\$` chain factored
-///     PLA-...-PHA into `__SEQ_0` and broke at runtime).
-///
-/// Counts each PHA/PHP as +1, each PLA/PLP as −1.
+/// Require balanced stack use without reading the helper return address.
 fn window_stack_balanced(items: &[Item], idxs: &[usize]) -> bool {
     let mut delta: i32 = 0;
     for &idx in idxs {
@@ -7001,7 +9469,6 @@ fn frame_sensitive_labels(items: &[Item]) -> std::collections::HashSet<String> {
 
     set.insert("__SYS_EVAL_CHAIN".to_string());
     set.insert("__SYS_EVAL_RETURN".to_string());
-    // Fixpoint over frame-transparent `JMP`s.
     loop {
         let mut grew = false;
         let mut cur: Vec<&str> = Vec::new();
@@ -7009,7 +9476,6 @@ fn frame_sensitive_labels(items: &[Item]) -> std::collections::HashSet<String> {
         for it in items {
             match it {
                 Item::Label(name) => {
-                    // A label after a body starts a fresh region; stacked labels share one.
                     if saw_insn {
                         cur.clear();
                         saw_insn = false;
@@ -7055,36 +9521,20 @@ fn insn_adds_frame_to_sensitive(
             .is_some_and(|t| sensitive.contains(t))
 }
 
-/// True iff `insn` may appear inside a PH301 factor window. The
-/// JSR policy is a soft hint — `Refused` rejects every JSR; the
-/// caller-side window scan layers an extra "≤1 JSR per window"
-/// rule on top of `AllowOne`.
+/// Check instructions against the requested call policy.
 fn is_factorable_insn_with_policy(insn: &Insn, jsr: JsrPolicy) -> bool {
-    // Control flow ops: never factor. JMP/RTS/RTI break the
-    // sequential signature; conditional branches refer to local
-    // labels that wouldn't translate to a hoisted helper.
+    // Keep control flow outside shared instruction windows.
     if is_uncond_terminator(&insn.mnem) || is_cond_branch(&insn.mnem) {
         return false;
     }
     if insn.mnem == "JSR" && matches!(jsr, JsrPolicy::Refused | JsrPolicy::CompactRefused) {
         return false;
     }
-    // TSX/TXS rewrite SP itself — never factor.
+    // Keep stack pointer instructions outside shared windows.
     if matches!(insn.mnem.as_str(), "TSX" | "TXS") {
         return false;
     }
-    // PHA/PLA/PHP/PLP allowed at the per-instruction level — the
-    // window-level scan below also runs `window_stack_balanced` to
-    // refuse factoring any window whose net stack delta isn't zero.
-    // (An unbalanced window wrapped in JSR/RTS would let the helper's
-    // RTS pop whatever the window pushed instead of the caller's
-    // return address — caught by edge29 with mid$/left$/right$ on the
-    // same string, where `LDA V_X; LDY V_X+1; PHA; TYA; PHA` pushed
-    // a pointer that the caller's later PLA-PLA was supposed to
-    // consume; the wrap diverted into the pushed bytes as code.)
-    // Operand references: allow stable compiler labels (array data,
-    // variable slots, internal helpers), refuse BASIC line labels
-    // and unknown identifiers.
+    // Check stack balance across the entire window.
     if let Some(op) = insn.operand.as_deref()
         // A complete numeric operand has no label.
         && !(jsr == JsrPolicy::CompactLeafCalls
@@ -7103,8 +9553,7 @@ fn is_factorable_insn_with_policy(insn: &Insn, jsr: JsrPolicy) -> bool {
     true
 }
 
-/// True iff the operand names an absolute address in page one (`$0100`-`$01FF`), in any
-/// addressing form.
+/// Whether the operand addresses the hardware stack page.
 fn operand_addresses_stack_page(op: &str) -> bool {
     let base = op.split(',').next().unwrap_or(op).trim();
     let base = base.trim_start_matches('(').trim_end_matches(')');
@@ -7168,17 +9617,7 @@ fn insn_is_smc_target(
     false
 }
 
-/// True iff the operand references at least one identifier that
-/// isn't a "compiler-stable" label (`__*`, `V_*`, `FI_*`, `FU_*`,
-/// `FE_*`, `FS_*`, `S<digits>`, `F<digits>`, `T<digits>`).
-///
-/// Stable labels are emitted once at stable positions in the BSS /
-/// constant-pool section by codegen and aren't relocated by later
-/// passes. Capturing them in a peephole-introduced helper is safe.
-///
-/// Unstable labels (e.g. `L<digits>` for BASIC line numbers) are
-/// reachable via `GOTO`/`GOSUB` and could theoretically move; we
-/// refuse to factor any window that mentions them.
+/// Whether an operand mentions a label that cannot move safely.
 fn operand_has_unstable_label_with_policy(op: &str, compact: bool) -> bool {
     let bytes = op.as_bytes();
     let mut i = 0;
@@ -7221,30 +9660,16 @@ fn operand_has_unstable_label_with_policy(op: &str, compact: bool) -> bool {
     false
 }
 
-/// True iff `token` is a compiler-stable label name — one of the
-/// stable-position labels emitted by codegen / earlier peephole
-/// passes that won't be relocated. Examples:
-///   * `__ARR_<X>`, `__SBUF_<X>`, `__HEAP_*` — BSS data labels
-///   * `V_<X>`, `V_<X>I` — variable slots
-///   * `FI_<n>`, `FU_<n>`, `FE_<n>`, `FS_SIGN_<n>` — FOR-loop slots
-///   * `S<digits>` — string-pool entries
-///   * `F<digits>` — float-pool entries
-///   * `T<digits>` — int-temp slots
-///   * `__SEQ_<n>`, `__JSR2_<n>`, `__LDV_*`, `__CHROUT_*`,
-///     `__LD_*`, `__ST_*`, `__FADD_*`, `__FSUB_*`, `__FMULT_*`,
-///     `__FDIV_*` — peephole / codegen-emitted helpers
-///   * `__BNDS_<n>`, `__INTBY_OK_*`, `__POKE_*`, `__PEEK_*` — local
-///     helpers and self-modifying operand labels
-///
-/// Refused: bare `L<digits>` (BASIC line labels), unknown letter
-/// tokens (could be user-named labels via inline assembly, though we
-/// don't currently support that).
+/// Whether a generated storage or helper label can move safely.
 fn is_stable_compiler_label(token: &str) -> bool {
     if token.starts_with("__") {
         return true;
     }
     if let Some(rest) = token.strip_prefix("V_") {
         return !rest.is_empty();
+    }
+    if structured::is_integer_or_string_home(token) {
+        return true;
     }
     if let Some(rest) = token.strip_prefix("FI_") {
         return !rest.is_empty();
@@ -7258,17 +9683,13 @@ fn is_stable_compiler_label(token: &str) -> bool {
     if let Some(rest) = token.strip_prefix("FS_") {
         return !rest.is_empty();
     }
-    // ZP-promoted slots emitted as EQU at the top of the binary —
-    // bound to an absolute `$A?` byte address that can never relocate.
-    // Treated identically to BSS labels for peephole factorisation
-    // safety.
+    // Zero page equates keep their absolute addresses.
     if let Some(rest) = token.strip_prefix("ZSI_") {
         return !rest.is_empty();
     }
     if let Some(rest) = token.strip_prefix("ZARR_") {
         return !rest.is_empty();
     }
-    // Single-letter + digits patterns: S<n>, F<n>, T<n>.
     if let Some(rest) = token.strip_prefix(['S', 'F', 'T'])
         && !rest.is_empty()
         && rest.chars().all(|c| c.is_ascii_digit())
@@ -7278,9 +9699,7 @@ fn is_stable_compiler_label(token: &str) -> bool {
     false
 }
 
-/// Render a window's instructions as a deterministic signature
-/// (one line per instruction, no leading whitespace). Used both as
-/// hashmap key and to emit the helper body afterwards.
+/// Render a stable instruction signature for matching and helper emission.
 fn window_signature(items: &[Item], idxs: &[usize]) -> String {
     let mut sig = String::new();
     for (n, &idx) in idxs.iter().enumerate() {
@@ -7298,8 +9717,7 @@ fn window_signature(items: &[Item], idxs: &[usize]) -> String {
     sig
 }
 
-/// Estimate total byte cost of an N-instruction window starting at
-/// `start`. Used by PH301 to decide whether factoring nets bytes.
+/// Estimate instruction bytes to check whether sharing saves space.
 fn window_byte_estimate(
     items: &[Item],
     start: usize,
@@ -7338,8 +9756,7 @@ fn helper_anchor_index(items: &[Item]) -> Option<usize> {
     None
 }
 
-/// Splice helper items into `items` at [`helper_anchor_index`], or append when the program has
-/// no tail anchor at all.
+/// Insert helpers at the heap boundary or append without a boundary.
 fn append_helpers_before_heap(items: &mut Vec<Item>, helpers: Vec<Item>) {
     match helper_anchor_index(items) {
         Some(idx) => {
@@ -7356,8 +9773,7 @@ fn append_helpers_before_heap(items: &mut Vec<Item>, helpers: Vec<Item>) {
     }
 }
 
-/// True iff a peephole-factored helpers section header has already
-/// been emitted (so subsequent factoring rules don't add duplicates).
+/// Whether the helper section marker is present.
 fn helper_section_present(items: &[Item]) -> bool {
     items
         .iter()
@@ -7384,11 +9800,7 @@ fn item_label_referenced(items: &[Item], label: &str) -> bool {
     })
 }
 
-/// Late factoring can move the last direct call to a codegen-owned
-/// helper into a peephole helper body. If an older codegen path failed
-/// to mark the helper as used, the final asm can otherwise contain a
-/// dangling `JMP __FAC_TO_INT16`. Repair those dependencies right
-/// before rendering.
+/// Emit required helpers still referenced after factoring.
 fn ensure_referenced_codegen_helpers(items: &mut Vec<Item>) {
     let mut helpers = Vec::new();
     if item_label_referenced(items, "__FAC_TO_INT16")
@@ -7442,8 +9854,7 @@ fn append_fac_to_int16_notrap_helper(items: &mut Vec<Item>) {
     items.push(Item::Label("__FAC_TO_INT16_NOTRAP".to_string()));
     push_insn(items, "LDA", Some(format!("${:02X}", rt::FAC_EXP)));
     push_insn(items, "BEQ", Some("__FTIN_ZERO".to_string()));
-    push_insn(items, "CMP", Some("#$80".to_string()));
-    push_insn(items, "BCC", Some("__FTIN_ZERO".to_string()));
+    push_insn(items, "BPL", Some("__FTIN_ZERO".to_string()));
     push_insn(items, "CMP", Some("#$91".to_string()));
     push_insn(items, "BCS", Some("__FTIN_OVERFLOW".to_string()));
     push_insn(items, "LDA", Some(format!("${:02X}", rt::FAC_SIGN)));
@@ -7497,29 +9908,13 @@ fn peephole_next_seq_id(items: &[Item]) -> u32 {
     max
 }
 
-/// Markers resolved by name during linking, even without instruction references.
-const PINNED_MARKER_LABELS: [&str; 1] = ["__DATA_END"];
+/// Labels resolved by name during linking.
+const PINNED_MARKER_LABELS: [&str; 3] = ["__DATA_END", "__VARS_START", "__VARS_END"];
 
-/// PH303 — drop unreferenced compiler-internal trampolines.
-///
-/// After PH004 retargets jumps past a trampoline label like
-/// `__BNDS_RT_BAD_12: JMP __BAD_SUBSCRIPT`, the label may have zero
-/// remaining references. If so, the label + its trampoline body are
-/// dead code — strip them.
-///
-/// Restricted to:
-///   * Labels starting with `__` (compiler-owned, not user-visible).
-///   * Followed by exactly one `JMP`/`RTS`/`RTI`. Multi-instruction
-///     bodies need fuller dataflow before we can prove deadness, so
-///     we leave them alone.
+/// Remove unreachable internal trampolines.
 fn ph303_drop_unreferenced_trampolines(items: &mut Vec<Item>) -> bool {
     use std::collections::HashMap;
-    // Reference counts: label -> usage count.
-    //
-    // We have to scan every operand, not just JMP/JSR/Bxx — labels
-    // also flow through immediate forms like `LDA #<__HEAP_START`
-    // (high/low byte split for pointer setup) and zero-page-offset
-    // forms like `STA __NEW_PTR_LO`.
+    // Count references in instructions and data operands.
     let mut refs: HashMap<String, u32> = HashMap::new();
     let mut label_pos: HashMap<String, usize> = HashMap::new();
     for (idx, it) in items.iter().enumerate() {
@@ -7564,31 +9959,11 @@ fn ph303_drop_unreferenced_trampolines(items: &mut Vec<Item>) -> bool {
                         to_remove.push(i);
                         to_remove.push(j);
                     }
-                    // Stacked label — pure alias with no body of
-                    // its own. The next item is reached the same
-                    // way it would have been before.
+                    // Stacked labels share one address.
                     Item::Label(_) => {
                         to_remove.push(i);
                     }
-                    // Multi-instruction body. Per-var stubs
-                    // (\`__LD_X\` / \`__ST_X\` / \`__FADD_X\` /
-                    // \`__BNDS_<n>\` etc.) are loader-then-tail-call
-                    // shapes 2-3 instructions long that codegen emits
-                    // unconditionally based on a usage-count
-                    // threshold. When every call site collapses
-                    // away (e.g. the FAC cache lets `PRINT A` reuse
-                    // the LET's FAC value, dropping the
-                    // \`JSR __LD_A\`), the stub's def stays as dead
-                    // weight. Only fire when:
-                    //   * The body up to and including a terminator
-                    //     contains nothing branchy / no internal
-                    //     labels — a self-contained linear thunk.
-                    //   * The prior structural item is also an
-                    //     uncond terminator (no fall-through entry).
                     Item::Insn(_) if prev_terminator => {
-                        // Linear thunk first (cheap); then the general
-                        // self-contained region scan for branchy stubs
-                        // like `__LD_XI` (load + sign-extend branch).
                         let region_end = scan_dead_stub_body(items, j)
                             .or_else(|| scan_dead_region(items, i, &refs, &label_pos));
                         if let Some(stub_end) = region_end {
@@ -7617,26 +9992,13 @@ fn ph303_drop_unreferenced_trampolines(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// Scan a candidate dead stub body starting at `start` (index of the
-/// first instruction after the orphan label). Returns `Some(end)`
-/// where `end` is the inclusive index of the trailing terminator if
-/// the stub is safe to drop wholesale. Returns `None` when the body
-/// contains shapes that make wholesale drop unsound:
-///   * Conditional or short branches whose target may live OUTSIDE
-///     the stub. Their refs would otherwise count toward the parent
-///     ref-count tally and accidentally pin labels we later drop.
-///   * An interior label or directive — that's the start of a
-///     different routine and we'd be deleting code that follows.
-///   * No terminator before end-of-items — defensive guard.
+/// Find the end of a removable linear helper body.
 fn scan_dead_stub_body(items: &[Item], start: usize) -> Option<usize> {
     let mut i = start;
     let mut steps = 0usize;
     while i < items.len() {
         steps += 1;
         if steps > 8 {
-            // Realistic per-var stubs are 2–3 instructions; a body
-            // longer than that is more likely a real function we
-            // shouldn't risk deleting.
             return None;
         }
         match &items[i] {
@@ -7656,19 +10018,7 @@ fn scan_dead_stub_body(items: &[Item], start: usize) -> Option<usize> {
     None
 }
 
-/// Scan a dead, *self-contained* helper region starting at the entry
-/// label `label_idx` (whose external ref-count the caller has already
-/// confirmed is 0, with no fall-through entry). Unlike
-/// `scan_dead_stub_body`, this tolerates internal control flow — a
-/// branch (`BCC __X_SXT`) plus an internal label — as long as every
-/// label in the region is referenced *only* from within it and every
-/// conditional branch stays inside. Returns the inclusive index of the
-/// region's last item, or `None` when it can't prove the region is a
-/// safe, single-entry, unreachable unit.
-///
-/// Motivating case: `__LD_XI` (signed-byte int load) is a 2-label,
-/// branchy stub that `scan_dead_stub_body` rejects, so it lingered as
-/// dead weight whenever int promotion left it uncalled.
+/// Find the end of a helper region with no incoming references.
 fn scan_dead_region(
     items: &[Item],
     label_idx: usize,
@@ -7697,18 +10047,16 @@ fn scan_dead_region(
                     .as_deref()
                     .and_then(|op| label_pos.get(op).copied());
                 if is_cond_branch(&insn.mnem) {
-                    // A conditional branch must stay within the region
-                    // (target at/after the entry). Anything else and we
-                    // can't bound the region soundly.
+                    // Every branch must stay within the region.
                     match target {
                         Some(t) if t >= label_idx => frontier = frontier.max(t),
                         _ => return None,
                     }
                 } else if insn.mnem == "JMP" {
                     match target {
-                        // Internal forward jump — extend the frontier.
+                        // Extend the region through an internal forward jump.
                         Some(t) if t >= label_idx => frontier = frontier.max(t),
-                        // Tail call / external jump — a region exit.
+                        // A tail call or jump outside the region ends the path.
                         _ => {
                             if i >= frontier {
                                 end = Some(i);
@@ -7733,9 +10081,7 @@ fn scan_dead_region(
         i += 1;
     }
     let end = end?;
-    // Every label in the region must be referenced ONLY from inside it
-    // (otherwise external code can enter mid-region and the body is
-    // live). Compare total refs to refs originating within [entry..end].
+    // Every region label must have no references from outside it.
     for name in &region_labels {
         let total = refs.get(name).copied().unwrap_or(0);
         let mut internal = 0u32;
@@ -7756,8 +10102,7 @@ fn scan_dead_region(
     Some(end)
 }
 
-/// Does this instruction transfer control to the label named in its operand, as opposed to
-/// merely mentioning it?
+/// Direct control flow target of an instruction.
 fn insn_direct_target(insn: &Insn) -> Option<&str> {
     if !matches!(insn.mnem.as_str(), "JMP" | "JSR") && !is_cond_branch(&insn.mnem) {
         return None;
@@ -7767,16 +10112,13 @@ fn insn_direct_target(insn: &Insn) -> Option<&str> {
     if op.starts_with('(') || op.starts_with('$') {
         return None;
     }
-    // Anything with arithmetic or a byte-select in it is not a plain label target; let the
-    // address-taken rule handle those.
     if op.contains(['+', '-', '<', '>', ',', '#']) {
         return None;
     }
     Some(op)
 }
 
-/// Every label whose *address* is taken somewhere in the image, i.e. every label that some path
-/// could reach without any instruction in the stream naming it as a jump target.
+/// Labels whose addresses are taken by instructions or data.
 fn address_taken_labels(items: &[Item]) -> std::collections::HashSet<String> {
     let mut taken = std::collections::HashSet::new();
     for it in items {
@@ -7809,8 +10151,7 @@ fn address_taken_labels(items: &[Item]) -> std::collections::HashSet<String> {
     taken
 }
 
-/// Indices reachable from the program entry, closed over control flow and over every
-/// address-taken label.
+/// Find reachable items from entry and all address references.
 fn reachable_items(items: &[Item]) -> Vec<bool> {
     let mut label_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (i, it) in items.iter().enumerate() {
@@ -7820,11 +10161,11 @@ fn reachable_items(items: &[Item]) -> Vec<bool> {
     }
     let mut seen = vec![false; items.len()];
     let mut work: Vec<usize> = Vec::new();
-    // Root 1: the top of the image.
+    // Start at the image entry.
     if !items.is_empty() {
         work.push(0);
     }
-    // Root 2: every address-taken label.
+    // Include labels whose addresses are taken.
     for name in address_taken_labels(items) {
         if let Some(&idx) = label_at.get(name.as_str()) {
             work.push(idx);
@@ -7888,9 +10229,7 @@ fn ph306_drop_unreachable_code(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH013 — drop NOP. Our codegen never emits NOP currently, but it's
-/// trivial to support and future-proof. Don't fire if the comment
-/// flags it as intentional padding.
+/// Remove NOP unless timing is explicitly marked.
 fn ph013_drop_nop(items: &mut Vec<Item>) -> bool {
     let mut changed = false;
     items.retain(|it| {
@@ -7911,39 +10250,7 @@ fn ph013_drop_nop(items: &mut Vec<Item>) -> bool {
     changed
 }
 
-/// PH204 — fold `AND #$80 / Bxx` sign-bit test into `BMI/BPL`.
-///
-/// Pattern (next-structural between each insn):
-/// ```text
-///     LDA value
-///     AND #$80
-///     BNE tgt        ; or BEQ tgt
-/// ```
-///
-/// Becomes:
-/// ```text
-///     LDA value
-///     BMI tgt        ; if original was BNE
-///     BPL tgt        ; if original was BEQ
-/// ```
-///
-/// Saves 2 bytes (drops the AND #$80) and 2 cycles per execution.
-///
-/// Why correct:
-///   * `AND #$80` produces N = bit 7 of `value`, Z = (bit 7 == 0).
-///   * `LDA value` already produces N = bit 7 of `value`.
-///   * `BNE` after `AND #$80` fires when bit 7 set → BMI on LDA's N.
-///   * `BEQ` after `AND #$80` fires when bit 7 clear → BPL on LDA's N.
-///
-/// Safety gates:
-///   * `.A` must be dead at live-out of the branch — after the rewrite
-///     `.A` holds the original value, not the masked one.
-///   * The branch must be the very next structural insn after AND;
-///     anything between would consume AND's flags differently.
-///   * The LDA's source must be a register-load form (immediate,
-///     zp/abs, indexed). Indirect modes are still safe — they set N
-///     based on the loaded byte the same way — but we keep the rule
-///     narrow.
+/// Replace sign masks with BMI or BPL when A and flags are dead.
 fn ph204_and_signbit_to_branch(items: &mut Vec<Item>) -> bool {
     let cfg = liveness_config_with_helpers();
     let live = analyze_register_liveness_with_config(items, &cfg);
@@ -8005,32 +10312,7 @@ fn ph204_and_signbit_to_branch(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH207 — fold `LD{A,X,Y} #imm / B{EQ,NE} tgt` once `imm` is known.
-///
-/// The branch condition is fully decided by the immediate, so:
-///   * always-taken → rewrite the branch to `JMP tgt`.
-///   * never-taken  → drop the branch entirely.
-///
-/// In addition, when the load's destination register and Z/N flags
-/// are dead at the load's live-out, drop the now-pointless load too.
-///
-/// Pattern (next-structural between):
-/// ```text
-///     LDA #$NN          ; or LDX/LDY #$NN
-///     BEQ tgt           ; or BNE tgt
-/// ```
-///
-/// Why correct: LDA/LDX/LDY set Z based on the loaded byte and N on
-/// bit 7. With `imm` known, both flags are constants, so the branch
-/// outcome is constant and the destination register holds a known
-/// value the dataflow can fold elsewhere.
-///
-/// Safety gates:
-///   * Branch must be the next structural insn after the load.
-///   * Replacement uses `JMP` only when the operand is a label (not
-///     an absolute `$XXXX` literal that conditional branches accept
-///     via long-branch fix-up — JMP needs the same form, but be
-///     defensive against odd operands).
+/// Fold branches on immediate loads and remove dead loads.
 fn ph207_const_load_branch_fold(items: &mut Vec<Item>) -> bool {
     let cfg = liveness_config_with_helpers();
     let reg_live = analyze_register_liveness_with_config(items, &cfg);
@@ -8081,8 +10363,7 @@ fn ph207_const_load_branch_fold(items: &mut Vec<Item>) -> bool {
             }
         };
         let action = if always_taken {
-            // Validate the operand looks safe for JMP — labels and
-            // bare `$XXXX` absolutes are fine, indexed/indirect aren't.
+            // Require a direct jump target.
             let Some(target) = br.operand.as_deref() else {
                 i += 1;
                 continue;
@@ -8095,17 +10376,7 @@ fn ph207_const_load_branch_fold(items: &mut Vec<Item>) -> bool {
         } else {
             Action::Drop
         };
-        // Can the load itself be dropped?
-        //
-        // After rewrite, nothing between the load and the (possibly
-        // gone) branch reads the load's flags or register, so check
-        // liveness at the BRANCH's live-out, not the load's: that's
-        // the live state past the rewrite point.
-        //   * Drop case: branch removed → fallthrough live_in.
-        //   * ToJmp case: branch becomes JMP → target's live_in,
-        //     which is exactly the branch's live_out for an
-        //     always-taken conditional too (both successors merge to
-        //     the same target).
+        // Remove the load only when its register and flags are dead.
         let reg_dead = !reg_live.is_live_out(j, dest);
         let z_dead = !flag_live.is_live_out(j, Flag::Z);
         let n_dead = !flag_live.is_live_out(j, Flag::N);
@@ -8135,26 +10406,7 @@ fn ph207_const_load_branch_fold(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH205 — mask identities.
-///
-/// Drop instructions whose immediate operand is a no-op for the
-/// op:
-///   * `AND #$FF`  (or signed-equivalent `#-1`) — preserves .A
-///   * `ORA #$00`  — preserves .A
-///   * `EOR #$00`  — preserves .A
-///
-/// These appear from int-island lowerings where the high-byte AND
-/// mask is statically zero (`AND #$00 / STA dest+1` after the
-/// stride-truncation patterns) or from ConstantFold leaving an
-/// identity mask in place. None affect flags meaningfully for the
-/// downstream code we generate (we always re-test via a separate
-/// CMP/LDA before branches), so the elision is purely a size +
-/// cycle win.
-///
-/// Skips when the next structural insn is a conditional branch —
-/// the AND/ORA/EOR may be needed only to set Z/N flags. (Codegen
-/// doesn't currently emit identity-masks just for flag-setting,
-/// but be defensive.)
+/// Remove identity masks when N and Z are dead.
 fn ph205_mask_identity(items: &mut Vec<Item>) -> bool {
     let mut to_drop = Vec::new();
     for (idx, it) in items.iter().enumerate() {
@@ -8170,9 +10422,7 @@ fn ph205_mask_identity(items: &mut Vec<Item>) -> bool {
         if !identity {
             continue;
         }
-        // Don't drop when the next structural instruction is a
-        // conditional branch — even an identity op updates Z/N
-        // flags. Defensive; current codegen doesn't rely on this.
+        // Keep masks when the next branch reads their flags.
         if let Some(j) = next_struct(items, idx)
             && let Some(Item::Insn(next)) = items.get(j)
             && is_cond_branch(&next.mnem)
@@ -8190,11 +10440,7 @@ fn ph205_mask_identity(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH206 — drop an adjacent `PHA` / `PLA` roundtrip.
-///
-/// The pair restores .A to its original value, but `PLA` also sets
-/// N/Z. Removing it is safe only when those flags are overwritten
-/// before any conditional branch can read them.
+/// Remove adjacent PHA/PLA only when N and Z are dead.
 fn ph206_pha_pla_roundtrip(items: &mut Vec<Item>) -> bool {
     let mut to_drop = Vec::new();
     for (idx, it) in items.iter().enumerate() {
@@ -8370,7 +10616,6 @@ fn ph209_plan(
         return None;
     }
 
-    // Middle: everything up to the first `PLA`.
     let mut middle = Vec::new();
     let mut cur = pha2;
     let pla1 = loop {
@@ -8616,8 +10861,6 @@ fn sets_status_flags(mnem: &str) -> bool {
 
 /// Replace register-transfer/store pairs with direct index-register stores.
 fn ph211_transfer_store_to_index_store(items: &mut Vec<Item>) -> bool {
-    // Cheap gate: skip both liveness analyses when there is no accumulator-bound transfer in
-    // the stream at all.
     if !items.iter().any(|it| {
         matches!(it, Item::Insn(insn)
             if matches!(insn.mnem.as_str(), "TYA" | "TXA") && insn.operand.is_none())
@@ -8667,12 +10910,12 @@ fn ph211_transfer_store_to_index_store(items: &mut Vec<Item>) -> bool {
             i += 1;
             continue;
         }
-        // `.A` must be dead once the store has run: the rewrite never writes it.
+        // The rewrite does not set A, so A must be dead.
         if regs.is_live_out(j, Reg::A) {
             i += 1;
             continue;
         }
-        // N/Z must be dead too: `STY`/`STX` set neither.
+        // Stores do not set N and Z, so both must be dead.
         let live = flags.live_out_at(j);
         if live.contains(Flag::N) || live.contains(Flag::Z) {
             i += 1;
@@ -8873,7 +11116,6 @@ fn ph213_imm_load_to_bump(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// Test bit zero through carry when the accumulator and flags permit it.
 fn ph214_and_bit0_to_lsr_carry(items: &mut Vec<Item>) -> bool {
 
     if !items.iter().any(|it| {
@@ -8949,20 +11191,7 @@ fn ph214_and_bit0_to_lsr_carry(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// PH208 — hoist `LDY #$00` out of a straight-line self-loop.
-///
-/// Shape:
-/// ```text
-/// L:
-///     LDY #$00
-///     ...
-///     JMP L
-/// ```
-///
-/// If the loop body preserves Y as zero, move the load before the
-/// label so the back-edge skips it. This is intentionally narrow:
-/// exactly one back-edge, no interior labels/branches, and no helper
-/// calls unless their Y-preservation contract is known.
+/// Hoist zero Y loads from loops that preserve Y.
 fn ph208_hoist_ldy_zero_from_loop(items: &mut Vec<Item>) -> bool {
     for label_idx in 0..items.len() {
         let Item::Label(label) = &items[label_idx] else {
@@ -9070,8 +11299,7 @@ fn jsr_target_preserves_y(target: &str) -> bool {
     target == "$FFD2" || target.starts_with("__CHROUT_")
 }
 
-/// Parse `#$XX` or `#NNN` immediate to its byte value. Returns
-/// `None` for non-immediate operands.
+/// Parse hexadecimal or decimal byte immediates.
 fn parse_imm_byte(operand: &str) -> Option<u8> {
     let op = operand.trim();
     let body = op.strip_prefix('#')?;
@@ -9084,28 +11312,13 @@ fn parse_imm_byte(operand: &str) -> Option<u8> {
     }
 }
 
-/// PH101 — drop redundant `MOVFM X` after `MOVMF X`.
-///
-/// Pattern (6 instructions, possibly with intervening blank/comment):
-/// ```text
-///     LDX #<X      } MOVMF X (FAC -> X)
-///     LDY #>X      }  ↑ keep
-///     JSR $BBD4    }
-///     LDA #<X      } MOVFM X (X -> FAC)
-///     LDY #>X      }  ↓ drop, FAC already has the value
-///     JSR $BBA2    }
-/// ```
-///
-/// Bail out at any label between the two triplets — a branch in
-/// could enter at the MOVFM half without the FAC contract holding.
+/// Remove an immediate FAC reload after storing the same value.
 fn ph101_movmf_movfm(items: &mut Vec<Item>) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i + 5 < items.len() {
         if let Some(label) = match_movmf_movfm(&items[i..]) {
-            // Verify there's no intervening Label between i+2 (MOVMF
-            // JSR) and i+3 (LDA). next_struct from i+2 should return
-            // i+3 directly.
+            // No label may enter between the store and reload.
             if let Some(next) = next_struct(items, i + 2)
                 && next == i + 3
             {
@@ -9121,19 +11334,13 @@ fn ph101_movmf_movfm(items: &mut Vec<Item>) -> bool {
     changed
 }
 
-/// PH102 — FAC-aware MOVFM elision.
-///
-/// `MOVMF X` stores FAC to `X` without changing FAC. If a later
-/// straight-line `MOVFM X` reloads the same slot before anything can
-/// change FAC or `X`, the reload is redundant.
+/// Remove FAC reloads until the saved value or FAC changes.
 fn ph102_fac_movfm_elision(items: &mut Vec<Item>) -> bool {
     let reg_live = analyze_register_liveness_with_config(items, &liveness_config_with_helpers());
     let flag_live = analyze_flag_liveness_with_config(items, &peephole_flag_liveness_config());
     let mut plans: Vec<(usize, usize)> = Vec::new();
 
-    // Value-equivalent reload: after MOVMF, FAC still equals the
-    // stored slot. Stop at labels/control-flow/unknown calls so no
-    // branch can enter the reload with a different FAC.
+    // Stop at control flow boundaries and unknown calls.
     let mut i = 0;
     while i < items.len() {
         let Some((label, movmf_jsr_idx)) = match_movmf_at(items, i) else {
@@ -9215,34 +11422,7 @@ fn operand_mentions_label(op: &str, label: &str) -> bool {
         .any(|token| token == label)
 }
 
-/// PH150 — drop pure-FAC-def JSRs whose result is dead.
-///
-/// A handful of helpers exist solely to load the floating accumulator
-/// from somewhere else (memory, a 16-bit integer, a u8 byte). When
-/// the JSR's only observable effect is the FAC value AND the FAC
-/// value isn't read before the next FAC def, the entire JSR is
-/// dead — and the operand-loading LDA/LDY that preceded it become
-/// dead too on the next pass through PH017.
-///
-/// Targets are restricted to side-effect-free FAC defs:
-///   * `$BBA2 MOVFM` — memory → FAC
-///   * `$B391 GIVAYF` — i16 (.A=hi, .Y=lo) → FAC
-///   * `$B3A2 BYTEFAC` — u8 (.Y) → FAC
-///   * `__BOOL_TO_FAC` — basic-bool flag → FAC
-///   * `__LD_BYTE_FAC` and `__LDV_<imm>_FAC` — byte→FAC stub family
-///
-/// Routines that can raise `?ILLEGAL QUANTITY` / `?OVERFLOW` (the
-/// arithmetic and transcendental ROM entries) are EXCLUDED — even
-/// when the result is dead, the error trap is observable. Routines
-/// that touch other state (FOUT writes $0100, FACWORD writes LINNUM,
-/// FACARG writes ARG, MOVMF writes user memory, READ updates DATA
-/// pointer) are also excluded for the same reason.
-///
-/// We also require `.A`, `.X`, `.Y` to be dead-out at the JSR. The
-/// helpers clobber all three; if any is live, dropping the JSR
-/// would lose a value the caller still needs. (PH017's own
-/// register-liveness check handles the operand-load drops on the
-/// next iteration once this rule has removed the JSR.)
+/// Remove pure FAC loads only when all their outputs are dead.
 fn ph150_drop_dead_fac_def(items: &mut Vec<Item>) -> bool {
     let fac_live = analyze_fac_liveness(items);
     let reg_live = analyze_register_liveness_with_config(items, &liveness_config_with_helpers());
@@ -9258,9 +11438,7 @@ fn ph150_drop_dead_fac_def(items: &mut Vec<Item>) -> bool {
         if !is_pure_fac_def_target(target) {
             continue;
         }
-        // Must be safe to drop: the value FAC is computing isn't
-        // read before being overwritten, and the registers the JSR
-        // clobbers aren't observed downstream either.
+        // Both FAC and the clobbered registers must be dead.
         if fac_live.is_live_out(idx) {
             continue;
         }
@@ -9281,10 +11459,7 @@ fn ph150_drop_dead_fac_def(items: &mut Vec<Item>) -> bool {
     true
 }
 
-/// True iff a JSR target is a pure FAC-defining helper with no
-/// other observable side effects (no error trap, no memory write
-/// outside FAC, no DATA-pointer advance). Match must be conservative;
-/// when in doubt, keep the call.
+/// Helpers that only set FAC without traps or other side effects.
 fn is_pure_fac_def_target(target: &str) -> bool {
     matches!(
         target,
@@ -9292,12 +11467,7 @@ fn is_pure_fac_def_target(target: &str) -> bool {
     ) || target.starts_with("__LDV_")
 }
 
-/// PH104 — `LDA $66 / CMP #0 / BNE target` -> `LDA $66 / BMI target`.
-///
-/// FAC sign is stored as `$00` for non-negative and `$FF` for
-/// negative, so LDA already sets N exactly as the zero-compare's BNE
-/// would classify the value. Dropping CMP is only safe when its Carry
-/// result is dead.
+/// Test the FAC sign with BMI when comparison carry is dead.
 fn ph104_fac_sign_cmp_branch(items: &mut Vec<Item>) -> bool {
     let flag_live = analyze_flag_liveness_with_config(items, &peephole_flag_liveness_config());
     let mut plans = Vec::new();
@@ -9356,8 +11526,7 @@ fn is_zero_immediate(op: Option<&str>) -> bool {
     matches!(op.map(str::trim), Some("#0" | "#$00" | "#00"))
 }
 
-/// Matcher for the 6-instruction MOVMF/MOVFM pattern. Returns the
-/// shared label on match.
+/// Match a FAC store followed by a load of the same slot.
 fn match_movmf_movfm(window: &[Item]) -> Option<&str> {
     let a = as_imm_low(window.first()?, "LDX")?;
     let b = as_imm_high(window.get(1)?, "LDY")?;
@@ -9424,13 +11593,7 @@ fn as_jsr<'a>(item: &'a Item, target: &str) -> Option<&'a str> {
 
 // ----- Loop-index register promotion ---------------------------------------
 
-/// Register *inputs* of well-known C64 ROM entry points — the registers
-/// a routine reads as arguments. Only routines whose convention is
-/// textbook-certain are listed; everything else stays conservative
-/// (treated as reading every register). `defs` is intentionally left
-/// empty: under-approximating clobbers keeps the liveness sound (it can
-/// only ever keep a value live longer, never drop a live one), which is
-/// the safe direction for the consumer below.
+/// Known ROM register inputs. Unknown calls read every register.
 fn rom_call_effect(operand: &str) -> Option<RegEffect> {
     let addr = operand
         .strip_prefix('$')
@@ -9446,8 +11609,7 @@ fn rom_call_effect(operand: &str) -> Option<RegEffect> {
         || addr == rt::KERNAL_LOAD
         || addr == rt::KERNAL_SAVE
         || addr == rt::BASIC_ERROR;
-    // Recognised non-.X routines — known to read at most .A/.Y. (codegen
-    // emits a small set; anything not listed stays conservative.)
+    // Known routines that do not read X.
     let known_no_x = matches!(
         addr,
         rt::CHROUT
@@ -9488,17 +11650,13 @@ fn rom_call_effect(operand: &str) -> Option<RegEffect> {
             | rt::BASIC_WARM_START
             | rt::QINT
     );
-    // Routines that *return* a value in .X (so they definitely write it):
-    // modelling the def is what stops a later read of that produced value
-    // from looking like a read of the caller's .X. Under-approximating
-    // defs stays sound; we only list certain ones.
+    // Record routines that return a value in X.
     let defs_x = addr == rt::RDTIM; // returns the jiffy clock in .A/.X/.Y
     if uses_x {
-        // Reads .X; over-approximate the rest as ALL (we only reason
-        // precisely about .X for the loop-index pass).
+        // Keep all registers live when the routine reads X.
         Some(RegEffect::new(RegSet::ALL, RegSet::EMPTY))
     } else if known_no_x {
-        // Definitely doesn't read .X; conservatively keep .A/.Y as used.
+        // Keep A and Y live for routines that do not read X.
         let defs = if defs_x { RegSet::X } else { RegSet::EMPTY };
         Some(RegEffect::new(RegSet::A.union(RegSet::Y), defs))
     } else {
@@ -9506,25 +11664,14 @@ fn rom_call_effect(operand: &str) -> Option<RegEffect> {
     }
 }
 
-/// Build a liveness config in which every call (`JSR`) reads only the
-/// registers it actually consumes, rather than the conservative
-/// "everything". Compiler-owned helper effects are *derived* from their
-/// own emitted bodies via a call-graph fixpoint (sound by construction);
-/// known ROM routines come from [`rom_call_effect`]; anything still
-/// unknown stays conservative. `return_live_out` is empty because a
-/// SYS-entered program owes BASIC no particular register on return.
+/// Derive helper register inputs from their bodies and known ROM calls.
 fn build_precise_call_config(items: &[Item]) -> RegisterLivenessConfig {
     let labels = register_liveness_label_map(items);
 
-    // Seed: ROM routines (by operand text) get their known input set;
-    // everything else starts optimistic (reads nothing) and grows to a
-    // least fixpoint — over-approximating `uses` as we go keeps it sound.
+    // Seed known ROM inputs and grow helper inputs through the call graph.
     let mut known: std::collections::HashMap<String, RegEffect> = std::collections::HashMap::new();
 
-    // Fixpoint over helper bodies. On each round we run liveness with
-    // the current effect estimates and a `return_live_out` of EMPTY, so
-    // a label's `live_in` is exactly the registers its body reads before
-    // writing — i.e. its `uses`.
+    // Compute helper inputs until their effects stop changing.
     for _ in 0..16 {
         let mut config = RegisterLivenessConfig {
             default_jsr: RegEffect::new(RegSet::ALL, RegSet::EMPTY),
@@ -9533,9 +11680,7 @@ fn build_precise_call_config(items: &[Item]) -> RegisterLivenessConfig {
             external_jmp_uses: RegSet::ALL,
             return_live_out: RegSet::EMPTY,
         };
-        // ROM routines aren't labels, so the liveness sees them through
-        // `known_jsr` keyed by their operand string — add any not yet
-        // present so the first round already has them.
+        // Include ROM calls by their operand text.
         for item in items {
             if let Item::Insn(insn) = item
                 && matches!(insn.mnem.as_str(), "JSR" | "JMP")
@@ -9567,8 +11712,7 @@ fn build_precise_call_config(items: &[Item]) -> RegisterLivenessConfig {
         }
     }
 
-    // Final config used by consumers: derived helpers + ROM, conservative
-    // for anything still unknown.
+    // Use derived effects and keep unknown calls conservative.
     let mut config = RegisterLivenessConfig {
         default_jsr: RegEffect::new(RegSet::ALL, RegSet::EMPTY),
         known_jsr: known,
@@ -9613,12 +11757,7 @@ fn next_insn_idx(items: &[Item], from: usize) -> Option<usize> {
     (from..items.len()).find(|&k| matches!(items[k], Item::Insn(_)))
 }
 
-/// Loop-index register promotion. Keeps a counting loop's index variable in
-/// the X register across the body (`INC V`→`INX`, compare→`CPX`, `LDX V`
-/// reloads dropped, `STX V` to keep memory synced) when it's used purely
-/// as increment + compare + array index, and the *precise* call-effect
-/// liveness ([`build_precise_call_config`]) proves X is free. Bails
-/// (returns false) unless every guard holds.
+/// Keep counting loop indices in X when calls and exits preserve it.
 fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
     let labels = register_liveness_label_map(items);
     let config = build_precise_call_config(items);
@@ -9626,7 +11765,8 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
 
     for j in 0..items.len() {
         let Item::Insn(jmp) = &items[j] else { continue };
-        if jmp.mnem != "JMP" {
+        let conditional_back_edge = is_cond_branch(&jmp.mnem);
+        if jmp.mnem != "JMP" && !conditional_back_edge {
             continue;
         }
         let Some(head) = jmp.operand.clone() else {
@@ -9644,7 +11784,7 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
             continue;
         }
 
-        // Region [h..=j]: no JSR/data/extra-JMP; back-edge at j only.
+        // Require one back edge and no internal calls or extra jumps.
         let mut region_ok = true;
         for (k, it) in items.iter().enumerate().take(j).skip(h) {
             match it {
@@ -9665,8 +11805,7 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
         if !region_ok {
             continue;
         }
-        // Head targeted only by the back-edge; no external entry to an
-        // internal label.
+        // Internal labels must have no incoming control flow from outside.
         let internal: std::collections::HashSet<&str> = (h + 1..=j)
             .filter_map(|k| match &items[k] {
                 Item::Label(l) => Some(l.as_str()),
@@ -9691,8 +11830,7 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
             continue;
         }
 
-        // Index var V: exactly one `INC V`; every other mention is
-        // `LDX V` or `LDA V` immediately before a `CMP` whose A is dead.
+        // Require one increment and only index or comparison reads.
         let mut inc_var: Option<String> = None;
         let mut multi = false;
         for it in items.iter().take(j + 1).skip(h) {
@@ -9750,18 +11888,17 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
             continue;
         }
 
-        // X must be free: dead at head, only def'd by `LDX V`, only used
-        // as an index, and dead on every loop exit.
+        // X must be free at entry and dead on every exit.
         if liveness.is_live_in(h, Reg::X) {
+            continue;
+        }
+        if conditional_back_edge && liveness.is_live_out(j, Reg::X) {
             continue;
         }
         let mut x_ok = true;
         for k in h..=j {
             let Item::Insn(ins) = &items[k] else { continue };
-            // JMP / conditional branches are control flow — they read no
-            // data register (the default config's "external jump reads
-            // everything" is meaningless for an internal edge). Their
-            // exit targets are vetted by the liveness check below.
+            // Internal branches do not read data registers.
             let is_branch = ins.mnem == "JMP" || is_cond_branch(&ins.mnem);
             let eff = insn_register_effect(ins, &RegisterLivenessConfig::default());
             if !is_branch
@@ -9795,15 +11932,7 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
             continue;
         }
 
-        // The per-iteration `STX V` keeps V's memory current. It can be
-        // dropped only when BOTH hold:
-        //  (1) V's memory is never *read* outside the loop (so no
-        //      external code observes the loop-updated value), and
-        //  (2) the fall-through entry immediately before the head
-        //      stores V (`STA V`), so the inserted preheader `LDX V`
-        //      always reloads a fresh value on every (re-)entry rather
-        //      than a stale leftover from a prior run.
-        // Otherwise the sync stays (the safe default).
+        // Omit the counter store only when no outside read needs it and entry initializes it.
         let v_read_outside = items.iter().enumerate().any(|(k, it)| {
             if (h..=j).contains(&k) {
                 return false;
@@ -9882,12 +12011,12 @@ fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
 
 // ----- Driver --------------------------------------------------------------
 
-/// One bounded fixpoint of the branch-shaping rules.
 fn late_branch_fixpoint(items: &mut Vec<Item>) -> bool {
     let mut any = false;
     for _ in 0..8 {
         let mut changed = false;
         changed |= ph005_branch_around_jmp(items);
+        changed |= ph315_branch_over_jmp_past_dead_labels(items);
         changed |= ph004_jump_cascade(items);
         changed |= ph029_drop_dead_local_labels(items);
         changed |= ph001_dead_jump_to_next(items);
@@ -9901,7 +12030,7 @@ fn late_branch_fixpoint(items: &mut Vec<Item>) -> bool {
     any
 }
 
-/// Run the peephole pass to fixpoint and return the rewritten asm.
+/// Options for additional sequence sharing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
     /// Try additional factoring windows when the ordinary size layout cannot fit.
@@ -9912,7 +12041,7 @@ pub struct Options {
     pub inline_str_print_args: bool,
 }
 
-/// Back-compatible entry point: every optional rewrite off.
+/// Run with the default rewrite options.
 pub fn run(asm: &str, profile: Profile) -> String {
     run_with_options(asm, profile, Options::default())
 }
@@ -9936,11 +12065,11 @@ pub fn run_with_options(asm: &str, profile: Profile, opts: Options) -> String {
 
 fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
     let mut items = parse(asm);
+    canonicalize_zp_aliases(&mut items);
     if profile == Profile::Size && opts.compact_size_dedup {
         zp_stores::compact(&mut items);
     }
-    // Bound the iteration count — most realistic asm settles in 2-3
-    // rounds, but malformed input shouldn't be able to spin forever.
+    // Bound the number of optimization rounds.
     for _ in 0..8 {
         let mut changed = false;
         changed |= ph101_movmf_movfm(&mut items);
@@ -9948,6 +12077,7 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
         changed |= ph150_drop_dead_fac_def(&mut items);
         changed |= ph104_fac_sign_cmp_branch(&mut items);
         changed |= ph005_branch_around_jmp(&mut items);
+        changed |= ph315_branch_over_jmp_past_dead_labels(&mut items);
         changed |= ph004_jump_cascade(&mut items);
         changed |= ph029_drop_dead_local_labels(&mut items); // Threading can leave unreferenced labels.
         changed |= ph001_dead_jump_to_next(&mut items);
@@ -9958,25 +12088,22 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
         changed |= ph008_store_load_forward(&mut items);
         changed |= ph009_load_store_identity(&mut items);
         changed |= ph020_static_known_value_cleanup(&mut items);
-        // PH207 must run BEFORE PH021: PH021's broader fact analysis
-        // would happily fold the same branches PH207 targets, but it
-        // doesn't know to drop the now-pointless constant load. Give
-        // PH207 the first look so it can handle the load too.
+        // Fold immediate load branches before the broader flag pass.
         changed |= ph207_const_load_branch_fold(&mut items);
         changed |= ph021_constant_branch_fold(&mut items);
         changed |= ph022_jmp_to_rts(&mut items);
+        changed |= ph316_sec_lda_sbc_to_cmp(&mut items);
         changed |= ph024_drop_dead_cmp(&mut items);
         changed |= ph025_drop_redundant_store(&mut items);
         changed |= ph028_drop_lda_after_inc_dec(&mut items);
         changed |= ph026_simplify_alu_imm(&mut items);
         changed |= ph012_drop_cmp_zero(&mut items);
-        // Liveness-driven rules. They re-run the whole liveness
-        // analysis on each call (cheap relative to what they save);
-        // included in the fixpoint so each rewrite exposes new dead
-        // operations to the next iteration.
+        // Repeat liveness rules as rewrites expose dead operations.
         changed |= ph019_lda_to_index_load(&mut items);
         changed |= ph015_drop_dead_transfer(&mut items);
         changed |= ph017_drop_dead_load(&mut items);
+        // Remove loads whose values and flags are dead globally.
+        changed |= ph317_drop_dead_load_via_flag_liveness(&mut items);
         changed |= ph303_drop_unreferenced_trampolines(&mut items);
         changed |= ph013_drop_nop(&mut items);
         changed |= ph204_and_signbit_to_branch(&mut items);
@@ -10004,17 +12131,18 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
     ph111_factor_lda_ldy_jsr(&mut items);
     ph112_factor_varptr_jsr(&mut items);
 
-    for _ in 0..16 {
-        if !ph110_factor_jsr_pair(&mut items) {
-            break;
-        }
-    }
-
+    // Factor triples before overlapping pairs.
     if ph113_factor_jsr_triple(&mut items) {
         for _ in 0..8 {
             if !ph110_factor_jsr_pair(&mut items) {
                 break;
             }
+        }
+    }
+
+    for _ in 0..16 {
+        if !ph110_factor_jsr_pair(&mut items) {
+            break;
         }
     }
 
@@ -10037,9 +12165,7 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
             }
         }
     }
-    // Drop any helpers that ended up unreferenced after the factoring
-    // rounds (e.g. an inner pair-stub whose only caller got rewritten
-    // into a different helper by a later round).
+    // Remove helpers with no references after factoring.
     ph303_drop_unreferenced_trampolines(&mut items);
 
     for _ in 0..64 {
@@ -10105,21 +12231,55 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
         }
     }
 
+    // Fold carry after factoring so fresh labels do not prevent sharing.
+    ph319_carry_fold(&mut items);
+    ph320_merge_inc_runs(&mut items);
+    // Rewrite stores and pointer reads after shared sequences are settled.
+    ph321_store_forward_sink(&mut items);
+    ph322_const_deref_to_abs(&mut items);
+    ph323_const_index_store_to_abs(&mut items);
+    // Forward values after helper extraction and inlining.
+    for _ in 0..4 {
+        let mut changed = false;
+        changed |= ph324_hoist_reload_to_transfer(&mut items);
+        changed |= ph020_known_value_cleanup(&mut items, false);
+        changed |= ph008_store_load_forward(&mut items);
+        changed |= ph025_drop_redundant_store(&mut items);
+        changed |= ph015_drop_dead_transfer(&mut items);
+        changed |= ph017_drop_dead_load(&mut items);
+        changed |= ph317_drop_dead_load_via_flag_liveness(&mut items);
+        // Remove adjacent jumps before dead block removal.
+        changed |= late_branch_fixpoint(&mut items);
+        if !changed {
+            break;
+        }
+    }
+    ph328_thread_calls_through_trampolines(&mut items);
+    ph303_drop_unreferenced_trampolines(&mut items);
+
     for _ in 0..8 {
         if !ph306_drop_unreachable_code(&mut items) {
             break;
         }
         ph303_drop_unreferenced_trampolines(&mut items);
     }
+    if profile != Profile::Speed {
+        ph325_branch_via_shared_jmp(&mut items);
+    }
+    // Keep trap jumps after dead block removal.
     ensure_referenced_codegen_helpers(&mut items);
     if profile == Profile::Size && opts.compact_size_dedup {
         structured::factor(&mut items);
         short_pairs::compact(&mut items);
     }
 
+    ph327_split_print_runs(&mut items);
     if opts.inline_str_print_args {
         ph114_str_print_inline_args(&mut items);
     }
+    ph326_absorb_shared_call_prefix(&mut items);
+    ph330_drop_add_of_zero_with_known_carry(&mut items);
+    ph329_branch_straight_to_the_jmp_target(&mut items);
     render(&items)
 }
 
@@ -10147,6 +12307,173 @@ mod tests {
         assert!(matches!(&items[idx], Item::Label(n) if n == "__HEAP_BOTTOM"));
     }
 
+    fn ph329(src: &str) -> String {
+        let mut items = parse(src);
+        ph329_branch_straight_to_the_jmp_target(&mut items);
+        render(&items)
+    }
+
+    #[test]
+    fn a_label_one_forward_branch_enters_inherits_its_facts() {
+        let items = parse(concat!(
+            "    LDA $10\n    CMP #$01\n    BNE NEXT\n    JSR $FFD2\n    JMP OUT\n",
+            "NEXT:\n    LDA $10\n    RTS\nOUT:\n    RTS\n"
+        ));
+        let entries = labels_entered_by_one_forward_branch(&items);
+        let next = items.iter().position(|i| matches!(i, Item::Label(n) if n == "NEXT")).unwrap();
+        assert!(entries.contains_key(&next));
+        let facts = analyze_static_asm_facts(&items);
+        let reload = next + 1;
+        let Item::Insn(insn) = &items[reload] else { panic!() };
+        assert!(reg_fact_matches_load(&facts[reload], Reg::A, insn), "A still holds $10");
+    }
+
+    #[test]
+    fn a_label_reached_otherwise_starts_from_nothing() {
+        for src in [
+            // Falls in from above.
+            "    LDA $10\n    BNE NEXT\n    LDX #$00\nNEXT:\n    LDA $10\n    RTS\n",
+            // A second way in.
+            "    LDA $10\n    BNE NEXT\n    JMP NEXT\nNEXT:\n    LDA $10\n    RTS\n",
+            // Shares its address with another label.
+            "    LDA $10\n    BNE NEXT\n    RTS\nNEXT:\nOTHER:\n    LDA $10\n    RTS\n",
+            // Named in data.
+            "    LDA $10\n    BNE NEXT\n    RTS\nNEXT:\n    LDA $10\n    RTS\n    .word NEXT\n",
+            // Entered from below.
+            "    RTS\nNEXT:\n    LDA $10\n    RTS\n    LDA $10\n    BNE NEXT\n    RTS\n",
+        ] {
+            assert!(labels_entered_by_one_forward_branch(&parse(src)).is_empty(), "{src}");
+        }
+    }
+
+    fn canon(src: &str) -> String {
+        let mut items = parse(src);
+        canonicalize_zp_aliases(&mut items);
+        render(&items)
+    }
+
+    #[test]
+    fn zp_aliases_of_one_kind_take_the_first_name() {
+        let out = canon(
+            "VI_J = $A3\nVI_YF = $A3\nVI_K = $A5\n    STA VI_YF\n    LDA VI_YF+1\n    LDA (VI_YF),Y\n    STA VI_K\n    LDA #<VI_YF\n",
+        );
+        assert!(!out.contains("    STA VI_YF") && !out.contains("VI_YF+1") && !out.contains("(VI_YF)"), "{out}");
+        assert!(out.contains("STA VI_J\n") && out.contains("LDA VI_J+1") && out.contains("LDA (VI_J),Y"), "{out}");
+        assert!(out.contains("STA VI_K") && out.contains("LDA #<VI_J"), "{out}");
+        // The equates themselves stay.
+        assert!(out.contains("VI_YF = $A3"), "{out}");
+    }
+
+    #[test]
+    fn zp_aliases_of_different_kinds_keep_their_names() {
+        let src = "VI_J = $A3\nZSI_V_K = $A3\n    STA VI_J\n    STA ZSI_V_K\n";
+        assert_eq!(canon(src), render(&parse(src)));
+    }
+
+    #[test]
+    fn hex_and_non_zp_operands_are_left_alone() {
+        let src = "FU_0 = $02\nFU_1 = $02\n    LDA $FU1\n    STA __FU_1_X\n    JSR FU_1X\n";
+        assert_eq!(canon(src), render(&parse(src)));
+    }
+
+    fn ph330(src: &str) -> String {
+        let mut items = parse(src);
+        ph330_drop_add_of_zero_with_known_carry(&mut items);
+        render(&items)
+    }
+
+    #[test]
+    fn ph330_drops_an_add_of_zero_after_clc_and_a_subtract_after_sec() {
+        let out = ph330("    CLC\n    LDA $10\n    ADC #$00\n    STA $20\n    LDA $11\n    ADC #$C0\n    STA $21\n    RTS\n");
+        assert!(!out.contains("ADC #$00") && out.contains("ADC #$C0"), "{out}");
+        let out = ph330("    SEC\n    LDA $10\n    SBC #$00\n    STA $20\n    LDA $11\n    SBC #$01\n    STA $21\n    RTS\n");
+        assert!(!out.contains("SBC #$00"), "{out}");
+    }
+
+    #[test]
+    fn ph330_keeps_an_add_whose_flags_are_read() {
+        let src = "    CLC\n    LDA $10\n    LDX $11\n    ADC #$00\n    BEQ Z\n    RTS\nZ:\n    RTS\n";
+        assert!(ph330(src).contains("ADC #$00"));
+        let src = "    CLV\n    SEC\n    LDA $10\n    BIT $12\n    SBC #$00\n    STA $20\n    BVS O\n    RTS\nO:\n    RTS\n";
+        assert!(ph330(src).contains("SBC #$00"));
+    }
+
+    #[test]
+    fn ph330_keeps_an_add_whose_carry_is_not_known() {
+        for src in [
+            // A shift in between writes C.
+            "    CLC\n    LDA $10\n    ASL\n    ADC #$00\n    STA $20\n    RTS\n",
+            "    CLC\n    LDA $10\nIN:\n    ADC #$00\n    STA $20\n    RTS\n",
+            // The wrong one of CLC/SEC.
+            "    SEC\n    LDA $10\n    ADC #$00\n    STA $20\n    RTS\n",
+        ] {
+            assert!(ph330(src).contains("ADC #$00"), "{src}");
+        }
+    }
+
+    #[test]
+    fn ph329_branches_straight_to_the_jmp_target() {
+        let out = ph329("    LDA $10
+    BEQ SKIP
+    JMP FAR
+SKIP:
+    RTS
+FAR:
+    RTS
+");
+        assert!(out.contains("BNE FAR") && !out.contains("JMP FAR"), "{out}");
+        // The label stays for anything else that reaches it.
+        assert!(out.contains("SKIP:"), "{out}");
+    }
+
+    #[test]
+    fn ph329_finds_the_branch_target_among_the_labels_after_the_jmp() {
+        let out = ph329("    BCC B
+    JMP FAR
+A:
+B:
+    RTS
+FAR:
+    RTS
+");
+        assert!(out.contains("BCS FAR") && !out.contains("JMP"), "{out}");
+    }
+
+    #[test]
+    fn ph329_leaves_a_jmp_that_is_itself_a_target() {
+        let out = ph329("    BEQ SKIP
+HERE:
+    JMP FAR
+SKIP:
+    RTS
+FAR:
+    RTS
+");
+        assert!(out.contains("JMP FAR") && out.contains("BEQ SKIP"), "{out}");
+    }
+
+    #[test]
+    fn ph329_leaves_rom_indirect_and_unrelated_jumps() {
+        for jmp in ["JMP $A437", "JMP ($22)"] {
+            let src = format!("    BEQ SKIP
+    {jmp}
+SKIP:
+    RTS
+");
+            assert_eq!(ph329(&src), render(&parse(&src)));
+        }
+        // The branch goes somewhere other than past the JMP.
+        let src = "    BEQ ELSE
+    JMP FAR
+SKIP:
+    RTS
+ELSE:
+FAR:
+    RTS
+";
+        assert_eq!(ph329(src), render(&parse(src)));
+    }
+
     #[test]
     fn a_program_with_neither_anchor_appends() {
         let mut items = parse("    RTS\n");
@@ -10157,8 +12484,6 @@ mod tests {
 
     #[test]
     fn two_splices_both_land_before_the_anchor() {
-        // The anchor index MUST be re-derived: the first splice pushes `__BSS_START` down, and
-        // a cached index aims the second one past it.
         let mut items = parse("    RTS\n__BSS_START:\n    .byte $00\n__HEAP_BOTTOM:\n");
         append_helpers_before_heap(&mut items, vec![Item::Label("__A".to_string())]);
         append_helpers_before_heap(&mut items, vec![Item::Label("__B".to_string())]);
@@ -10173,8 +12498,6 @@ mod tests {
         assert!(pos("__A") < pos("__B"), "splices keep their relative order");
     }
 
-    /// N distinct `LDA #<S / LDY #>S / JSR __STR_PRINT` triples plus a minimal `__STR_PRINT`
-    /// body with the second entry point.
     fn str_print_program(sites: usize) -> String {
         let mut s = String::from("*=$080D\n");
         for i in 0..sites {
@@ -10260,6 +12583,161 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_undo_restores_only_the_named_sites() {
+        let mut items = parse(&str_print_program(20));
+        assert!(ph114_str_print_inline_args(&mut items));
+        let inline = render(&items);
+        let sites: std::collections::HashSet<usize> = [0, 7].into_iter().collect();
+        let partial = undo_str_print_inline_args_at(&inline, Some(&sites));
+        assert_eq!(partial.matches("JSR __STR_PRINT_I\n").count(), 18);
+        assert!(partial.contains("    LDA #<S0\n    LDY #>S0\n    JSR __STR_PRINT\n"));
+        assert!(partial.contains("    LDA #<S7\n    LDY #>S7\n    JSR __STR_PRINT\n"));
+        assert!(!partial.contains(".word S0\n") && !partial.contains(".word S7\n"));
+        assert!(partial.contains("__STR_PRINT_I:"), "18 sites still use the trampoline");
+        // Naming every site is the full undo, trampoline included.
+        let all: std::collections::HashSet<usize> = (0..20).collect();
+        assert_eq!(
+            undo_str_print_inline_args_at(&inline, Some(&all)),
+            undo_str_print_inline_args(&inline)
+        );
+        assert!(!undo_str_print_inline_args(&inline).contains("__STR_PRINT_I"));
+    }
+
+    #[test]
+    fn an_undo_puts_a_shared_stamp_back_in_front_of_its_site() {
+        let program = str_print_program(20).replace(
+            "    LDA #<S",
+            "    INC $39\n    LDA #<S",
+        );
+        let mut items = parse(&program);
+        assert!(ph114_str_print_inline_args(&mut items));
+        assert!(ph326_absorb_shared_call_prefix(&mut items));
+        let inline = render(&items);
+        assert_eq!(inline.matches("    INC $39\n").count(), 1, "{inline}");
+        let entries = str_print_inline_entry_names(&inline);
+        assert_eq!(entries.len(), 1, "{inline}");
+        let entry = entries.iter().next().unwrap();
+        assert_eq!(inline.matches(&format!("JSR {entry}\n    .word S")).count(), 20, "{inline}");
+
+        let sites: std::collections::HashSet<usize> = [3].into_iter().collect();
+        let partial = undo_str_print_inline_args_at(&inline, Some(&sites));
+        assert!(
+            partial.contains("    INC $39\n    LDA #<S3\n    LDY #>S3\n    JSR __STR_PRINT\n"),
+            "the undone site runs its stamp again:\n{partial}"
+        );
+        assert!(partial.contains(&format!("{entry}:\n    INC $39\n__STR_PRINT_I:")), "{partial}");
+
+        let plain = undo_str_print_inline_args(&inline);
+        assert!(!plain.contains("__STR_PRINT_I") && !plain.contains(entry.as_str()), "{plain}");
+        assert_eq!(plain.matches("    INC $39\n    LDA #<S").count(), 20, "{plain}");
+        let pool: String = (0..20).map(|i| format!("S{i}:\n    .byte $00\n")).collect();
+        asm6502::Assembler6502::new()
+            .assemble_bytes(&format!("{plain}{pool}"))
+            .expect("the register form assembles");
+    }
+
+    fn ph327_program(payload: &[u8], sites: usize, tail_jump: bool) -> String {
+        let mut s = String::from("*=$C000\n");
+        for n in 0..sites {
+            let call = if tail_jump && n + 1 == sites { "JMP" } else { "JSR" };
+            s.push_str(&format!("    LDA #<S0\n    LDY #>S0\n    {call} __STR_PRINT\n"));
+        }
+        if !tail_jump {
+            s.push_str("    RTS\n");
+        }
+        s.push_str("__STR_PRINT:\n    RTS\n; --- string pool (length-prefixed) ---\nS0:\n");
+        let mut bytes = vec![payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        let list: Vec<String> = bytes.iter().map(|b| format!("${b:02X}")).collect();
+        s.push_str(&format!("    .byte {}\n__HEAP_BOTTOM:\n", list.join(",")));
+        s
+    }
+
+    fn ph327_payload() -> Vec<u8> {
+        let mut p = b"AB".to_vec();
+        p.extend([0x20; 30]);
+        p.extend(b"CD\r");
+        p
+    }
+
+    #[test]
+    fn ph327_prints_a_long_run_with_a_loop() {
+        let (changed, got) = drive(ph327_split_print_runs, &ph327_program(&ph327_payload(), 1, false));
+        assert!(changed, "{got}");
+        assert!(
+            got.contains(concat!(
+                "    LDA #<S1\n    LDY #>S1\n    JSR __STR_PRINT\n",
+                "    LDA #$20\n    LDX #$1E\n    JSR __PRINT_RUN\n",
+                "    LDA #<S2\n    LDY #>S2\n    JSR __STR_PRINT\n",
+            )),
+            "{got}"
+        );
+        assert!(got.contains("S1:\n    .byte $02,$41,$42\n"), "{got}");
+        assert!(got.contains("S2:\n    .byte $03,$43,$44,$0D\n"), "{got}");
+        assert!(!got.contains("S0:"), "the whole string is gone:\n{got}");
+        assert!(got.contains("__PRINT_RUN:\n    JSR $FFD2\n    DEX\n    BNE __PRINT_RUN\n    RTS\n"), "{got}");
+    }
+
+    #[test]
+    fn ph327_adds_its_strings_inside_the_pool_not_after_a_later_record() {
+        let asm = ph327_program(&ph327_payload(), 1, false).replace(
+            "__HEAP_BOTTOM:\n",
+            "; --- variable slots ---\n__BSS_START:\nS9:\n    .byte $00\nV_A:\n    .byte $00\n__HEAP_BOTTOM:\n",
+        );
+        let (changed, got) = drive(ph327_split_print_runs, &asm);
+        assert!(changed, "{got}");
+        let slots = got.find("; --- variable slots ---").expect("slots");
+        for label in ["S10:", "S11:"] {
+            let at = got.find(label).unwrap_or_else(|| panic!("{label} missing:\n{got}"));
+            assert!(at < slots, "{label} landed past the pool:\n{got}");
+        }
+    }
+
+    #[test]
+    fn ph327_names_new_strings_past_a_record_it_cannot_read() {
+        let long: Vec<String> = std::iter::once(0xFFu8)
+            .chain(std::iter::repeat(0x41).take(260))
+            .map(|b| format!("${b:02X}"))
+            .collect();
+        let asm = ph327_program(&ph327_payload(), 1, false)
+            .replace("__HEAP_BOTTOM:\n", &format!("S1:\n    .byte {}\n__HEAP_BOTTOM:\n", long.join(",")));
+        let (changed, got) = drive(ph327_split_print_runs, &asm);
+        assert!(changed, "{got}");
+        assert_eq!(got.matches("\nS1:\n").count(), 1, "{got}");
+        assert!(got.contains("\nS2:\n") && got.contains("\nS3:\n"), "{got}");
+    }
+
+    #[test]
+    fn ph327_keeps_the_tail_jump_on_the_last_part() {
+        let (changed, got) = drive(ph327_split_print_runs, &ph327_program(&ph327_payload(), 1, true));
+        assert!(changed, "{got}");
+        assert!(got.contains("    JSR __PRINT_RUN\n    LDA #<S2\n    LDY #>S2\n    JMP __STR_PRINT\n"), "{got}");
+    }
+
+    #[test]
+    fn ph327_leaves_a_string_with_any_other_reference_whole() {
+        let asm = ph327_program(&ph327_payload(), 1, false).replace("    RTS\n__STR_PRINT:", "    LDA S0\n    RTS\n__STR_PRINT:");
+        let (changed, got) = drive(ph327_split_print_runs, &asm);
+        assert!(!changed, "{got}");
+    }
+
+    #[test]
+    fn ph327_splits_only_where_the_run_outweighs_the_calls() {
+        let (changed, _) = drive(ph327_split_print_runs, &ph327_program(&ph327_payload(), 3, false));
+        assert!(!changed);
+        let mut p = b"AB".to_vec();
+        p.extend([0x11; 40]);
+        let (changed, got) = drive(ph327_split_print_runs, &ph327_program(&p, 3, false));
+        assert!(changed, "{got}");
+        assert_eq!(got.matches("JSR __PRINT_RUN").count(), 3, "{got}");
+        // Seven of a kind never pays.
+        let mut p = b"AB".to_vec();
+        p.extend([0x20; 7]);
+        let (changed, _) = drive(ph327_split_print_runs, &ph327_program(&p, 1, false));
+        assert!(!changed);
+    }
+
+    #[test]
     fn ph114_declines_below_the_break_even_point() {
         for sites in [1, 5, STR_PRINT_INLINE_MIN_SITES - 1] {
             let mut items = parse(&str_print_program(sites));
@@ -10274,8 +12752,6 @@ mod tests {
 
     #[test]
     fn ph114_needs_the_second_entry_point() {
-        // An asm without `__STR_PRINT_PTR:` predates the convention; the trampoline would jump
-        // at a label that does not exist.
         let src = str_print_program(20).replace("__STR_PRINT_PTR:\n", "");
         let mut items = parse(&src);
         assert!(!ph114_str_print_inline_args(&mut items));
@@ -10283,8 +12759,6 @@ mod tests {
 
     #[test]
     fn ph114_leaves_the_register_convention_alone() {
-        // Pointer-in-a-variable calls (`LDA V / LDY V+1`) and computed string expressions
-        // cannot carry an inline argument.
         let mut src = String::from("*=$080D\n");
         for _ in 0..20 {
             src.push_str("    LDA V_A\n    LDY V_A+1\n    JSR __STR_PRINT\n");
@@ -10393,11 +12867,6 @@ mod tests {
 
     #[test]
     fn reg_liveness_handles_branch_to_external_target() {
-        // BNE to a literal $XXXX address (e.g. into ROM) has no
-        // matching label in the items list. The successor lookup
-        // can't capture that arm of the CFG, so the effect must
-        // pull in `external_jmp_uses` so registers stay
-        // conservatively live across the branch.
         let items = parse("    LDX #$01\n    BNE $A437\n    LDA #$00\n    RTS\n");
         let live = analyze_register_liveness(&items);
         assert!(
@@ -10408,8 +12877,6 @@ mod tests {
 
     #[test]
     fn ph017_drops_lda_immediately_overwritten() {
-        // LDA $14 / LDA $15 / STA dst — the first LDA is shadowed
-        // by the second (no read of A in between). Drop it.
         let input = "    LDA $14\n    LDA $15\n    STA dst\n    RTS\n";
         let got = run_default(input);
         assert!(!got.contains("LDA $14"), "shadowed LDA dropped:\n{got}");
@@ -10418,8 +12885,6 @@ mod tests {
 
     #[test]
     fn ph017_keeps_lda_when_io_volatile() {
-        // Reads from $D012 (VIC raster line) have side effects we
-        // can't see — refuse the drop.
         let input = "    LDA $D012\n    LDA $D013\n    STA dst\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("LDA $D012"), "I/O LDA preserved:\n{got}");
@@ -10427,8 +12892,6 @@ mod tests {
 
     #[test]
     fn ph017_keeps_lda_when_branch_uses_flags() {
-        // BNE follows the load — the BNE branches on the load's
-        // N/Z flags so we can't drop it.
         let input = "    LDA $14\n    BNE skip\n    LDA $15\nskip:\n    STA dst\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("LDA $14"), "flag-feeding LDA kept:\n{got}");
@@ -10436,11 +12899,6 @@ mod tests {
 
     #[test]
     fn ph019_lda_imm_tax_becomes_ldx_imm() {
-        // Body uses .X for STX, then redefines .A before RTS so the
-        // analyser can see that the LDA #$05 value never escapes.
-        // (Without the trailing redefinition, RTS is conservatively
-        // treated as observing all three registers and the rewrite
-        // is correctly refused.)
         let input = "    LDA #$05\n    TAX\n    STX dst\n    LDA #$00\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("LDX #$05"), "rewrite to LDX:\n{got}");
@@ -10458,8 +12916,6 @@ mod tests {
 
     #[test]
     fn ph019_refuses_indirect_addressing() {
-        // (zp),Y has no LDX equivalent — the rewrite would be
-        // illegal, so leave the pair intact.
         let input = "    LDA ($FD),Y\n    TAX\n    STX dst\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("LDA ($FD),Y"));
@@ -10468,9 +12924,6 @@ mod tests {
 
     #[test]
     fn reg_liveness_handles_branch_with_unknown_label() {
-        // Branch operand is a name but not in the label map (e.g.
-        // forward-declared / not yet emitted). Same conservative
-        // treatment as a literal address.
         let items = parse("    LDX #$01\n    BNE missing_label\n    LDA #$00\n    RTS\n");
         let live = analyze_register_liveness(&items);
         assert!(live.is_live_out(0, Reg::X));
@@ -10540,6 +12993,28 @@ mod tests {
         let input = "    BEQ L1\nL1:\n    RTS\n";
         let got = run_default(input);
         assert!(!got.contains("BEQ"), "BEQ to next label dropped:\n{got}");
+    }
+
+    #[test]
+    fn ph001_drops_jmp_past_a_label_run() {
+        let input = "    JMP __ON_DONE_4\n__ON_CASE_4_3:\n__ON_DONE_4:\n    RTS\n";
+        let got = run_default(input);
+        assert!(
+            !got.contains("JMP __ON_DONE_4"),
+            "JMP through a same-address label run dropped:\n{got}"
+        );
+        assert!(got.contains("RTS"), "body kept:\n{got}");
+    }
+
+    #[test]
+    fn ph001_keeps_jmp_when_instructions_precede_the_target() {
+        let input = "    JMP L1\n__OTHER:\n    LDA #$00\nL1:\n    INX\n    RTS\n    .word __OTHER\n";
+        let got = run_default(input);
+        assert!(
+            got.contains("JMP L1"),
+            "JMP kept when real code sits before the target:\n{got}"
+        );
+        assert!(got.contains("LDA #$00"), "referenced block kept:\n{got}");
     }
 
     #[test]
@@ -10658,10 +13133,13 @@ mod tests {
     fn ph020_keeps_redundant_imm_load_when_it_refreshes_branch_flags() {
         let input = "    LDA #$00\n    INX\n    LDA #$00\n    BEQ ok\n    RTS\nok:\n    RTS\n";
         let got = run_default(input);
-        assert_eq!(
-            got.matches("LDA #$00").count(),
-            2,
-            "second load must refresh Z for BEQ:\n{got}"
+        assert!(
+            got.contains("INX\n    LDA #$00"),
+            "the Z-refreshing load (after INX) must survive:\n{got}"
+        );
+        assert!(
+            !got.contains("LDA #$00\n    INX"),
+            "shadowed first load consumed by PH317:\n{got}"
         );
     }
 
@@ -10697,12 +13175,6 @@ mod tests {
 
     #[test]
     fn ph028_drops_lda_after_dec_when_a_dead_at_branch() {
-        // In `DEC m / LDA m / BEQ ...` the DEC already set Z from the
-        // new memory value, so the LDA is a 3-byte / 4-cycle redundancy
-        // that only re-fills A. With A dead at the BEQ (both branch
-        // targets redefine A before any read), drop the LDA. This is the
-        // shape `M=M-1: IF M=0 THEN 80` lowers to: `DEC VI_M` followed by
-        // `LDA VI_M / BEQ L80`.
         let input = "*=$0801\nL20:\n    DEC VI_M\n    LDA VI_M\n    BEQ L80\nL25:\n    LDA VI_S\n    JMP done\nL80:\n    LDA #$50\n    STA dst\ndone:\n    RTS\n";
         let got = run_default(input);
         assert_eq!(
@@ -10715,13 +13187,11 @@ mod tests {
 
     #[test]
     fn ph028_keeps_lda_when_a_used_downstream() {
-        // Same DEC/LDA pair but A is consumed before any redefine —
-        // the LDA must stay since A's loaded value is live out.
         let input = "*=$0801\nL1:\n    DEC VI_M\n    LDA VI_M\n    STA VI_C\n    RTS\n";
         let got = run_default(input);
         assert!(
             got.contains("LDA VI_M"),
-            "LDA VI_M must NOT be dropped — STA VI_C consumes A:\n{got}"
+            "STA VI_C reads A, so the load must stay.\n{got}"
         );
     }
 
@@ -10748,11 +13218,6 @@ mod tests {
 
     #[test]
     fn ph020_propagates_inx_dex_to_known_value() {
-        // LDX #$05 / INX → X is known to be 6, so a follow-up
-        // CPX #$06 / BEQ ok statically resolves; PH021 drops the
-        // BEQ (and the dead RTS that followed). The `INX` may also
-        // be dropped if X is dead — keep an explicit use to
-        // anchor the test to the comparison fold.
         let input = "    LDX #$05\n    INX\n    CPX #$06\n    BEQ ok\n    RTS\n    NOP\nok:\n    INX\n    RTS\n";
         let got = run_default(input);
         assert!(
@@ -10763,8 +13228,6 @@ mod tests {
 
     #[test]
     fn ph020_folds_and_immediate() {
-        // A=$F0, AND #$0F → A=$00, Z=true. BEQ becomes always-taken
-        // and eventually disappears via the PH021/PH001 chain.
         let input =
             "    LDA #$F0\n    AND #$0F\n    BEQ done\n    RTS\n    NOP\ndone:\n    INX\n    RTS\n";
         let got = run_default(input);
@@ -10777,13 +13240,8 @@ mod tests {
 
     #[test]
     fn ph020_propagates_mem_imm_through_store_load() {
-        // STA tmp records mem_imm[tmp]=$05; subsequent LDA tmp
-        // restores A.imm=$05 so a follow-up CMP can constant-fold.
         let input = "    LDA #$05\n    STA tmp\n    JSR helper\n    LDA tmp\n    CMP #$05\n    BEQ ok\n    RTS\nok:\n    RTS\n";
         let got = run_default(input);
-        // After JSR, mem_imm[tmp] is reset by reset(), so this
-        // negative test verifies we DON'T over-propagate across
-        // call barriers. The CMP must remain.
         assert!(
             got.contains("CMP #$05"),
             "JSR barrier prevents stale mem_imm:\n{got}"
@@ -10799,21 +13257,9 @@ mod tests {
         assert!(got.contains("INX"), "fall-through code preserved");
     }
 
-    // PH024 (drop dead CMP/CPX/CPY) intentionally uses the
-    // conservative liveness config that treats RTS and labels as
-    // flags-live boundaries. That means the rule only fires in
-    // narrow cases where another flag-defining op fully shadows
-    // the comparison BEFORE control reaches a barrier — rare in
-    // practice. The simpler-looking tests we tried for it kept
-    // running into the conservatism (label barrier, RTS barrier),
-    // so we don't assert on it here. The keep-when-live test
-    // below verifies we don't regress the safety side.
 
     #[test]
     fn ph025_drops_redundant_store_after_known_value() {
-        // First STA records mem_imm[tmp]=$05; the LDA #$05/STA tmp
-        // pair after it stores the same value, so the second STA
-        // is redundant.
         let input = "    LDA #$05\n    STA tmp\n    LDA #$05\n    STA tmp\n    RTS\n";
         let got = run_default(input);
         let stas: Vec<&str> = got.lines().filter(|l| l.contains("STA tmp")).collect();
@@ -10851,12 +13297,11 @@ mod tests {
     fn ph026_rewrites_and_zero_to_lda() {
         let input = "    LDA val\n    AND #$00\n    STA dst\n    RTS\n";
         let got = run_default(input);
-        assert!(got.contains("LDA #$00"), "AND #$00 → LDA #$00:\n{got}");
+        assert!(got.contains("LDA #$00"), "AND zero becomes LDA zero.\n{got}");
     }
 
     #[test]
     fn ph026_keeps_and_ff_when_z_is_live() {
-        // Z is read by the BEQ → AND #$FF must stay.
         let input = "    LDA val\n    AND #$FF\n    BEQ skip\n    INX\nskip:\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("AND #$FF"), "AND #$FF kept (Z live):\n{got}");
@@ -10876,7 +13321,7 @@ mod tests {
 
     #[test]
     fn ph024_keeps_bit_when_the_read_is_the_point() {
-        // `emit_poke_store_abs` emits `BIT $D01E` to reproduce the dummy read of the interpreter's own `STA ($14),Y`.
+        // BIT preserves the dummy read of $D01E.
         for hex in ["D01E", "D01F", "DC0D", "DD0B"] {
             let got = run_default(&poke_shape(hex));
             assert!(
@@ -10959,16 +13404,6 @@ mod tests {
         assert!(got.contains("CMP #$00"), "CMP kept after STA:\n{got}");
     }
 
-    /// `LDX` / `LDY` set Z based on the loaded byte in X/Y, NOT in A,
-    /// so a `CMP #$00 / BNE` after them must not be dropped. In
-    /// `__GET_STR`'s no-key path the helper runs
-    /// `JSR GETIN / STA __GET_HEAP+1 / LDX #$01 / CMP #$00 / BNE …`
-    /// where the CMP tests A (the key code) against zero; dropping it
-    /// would make BNE branch on Z-from-LDX instead of the key byte.
-    /// A BCC/BCS that sits TWO branches after the CMP must still gate
-    /// the drop: the intervening BEQ only reads Z (which LDA does set),
-    /// but the BCC reads carry, which only CMP sets. A single-step
-    /// look-ahead would see only the BEQ and drop the CMP too early.
     #[test]
     fn ph012_keeps_cmp_zero_when_bcc_follows_bne_or_beq() {
         let input = "    LDA value\n    CMP #$00\n    BEQ skip\n    BCC skip\n    RTS\n";
@@ -10976,7 +13411,48 @@ mod tests {
         assert!(
             got.contains("CMP #$00"),
             "CMP must NOT be dropped when a BCC/BCS sits past an \
-             intervening BEQ — the BCC needs the carry CMP set:\n{got}"
+             intervening BEQ. BCC needs the comparison carry.\n{got}"
+        );
+    }
+
+    #[test]
+    fn ph012_keeps_cmp_zero_when_sbc_consumes_the_carry() {
+        let input = "\
+    LDA value
+    CMP #$00
+    LDA value+1
+    SBC #$00
+    BVC nv
+    EOR #$80
+nv:
+    BPL done
+done:
+    RTS
+";
+        let got = run_default(input);
+        assert!(
+            got.contains("CMP #$00"),
+            "CMP must NOT be dropped when a later SBC consumes its carry:\n{got}"
+        );
+    }
+
+    #[test]
+    fn ph012_keeps_cmp_zero_when_rol_consumes_the_carry() {
+        let input = "    LDA value\n    CMP #$00\n    ROL\n    RTS\n";
+        let got = run_default(input);
+        assert!(
+            got.contains("CMP #$00"),
+            "CMP must NOT be dropped when a ROL samples its carry:\n{got}"
+        );
+    }
+
+    #[test]
+    fn ph012_drops_cmp_zero_when_carry_is_redefined_first() {
+        let input = "    LDA value\n    CMP #$00\n    CLC\n    SBC #$01\n    BNE done\ndone:\n    RTS\n";
+        let got = run_default(input);
+        assert!(
+            !got.contains("CMP #$00"),
+            "CMP is dead once CLC redefines carry before any reader:\n{got}"
         );
     }
 
@@ -10986,7 +13462,7 @@ mod tests {
         let got = run_default(input);
         assert!(
             got.contains("CMP #$00"),
-            "CMP after LDX must NOT be dropped — Z from LDX reflects X, not A:\n{got}"
+            "CMP must stay because LDX sets Z from X.\n{got}"
         );
     }
 
@@ -10996,7 +13472,7 @@ mod tests {
         let got = run_default(input);
         assert!(
             got.contains("CMP #$00"),
-            "CMP after LDY must NOT be dropped — Z from LDY reflects Y, not A:\n{got}"
+            "CMP must stay because LDY sets Z from Y.\n{got}"
         );
     }
 
@@ -11006,7 +13482,7 @@ mod tests {
         let got = run_default(input);
         assert!(
             got.contains("CMP #$00"),
-            "CMP after INX must NOT be dropped — Z from INX reflects X, not A:\n{got}"
+            "CMP must stay because INX sets Z from X.\n{got}"
         );
     }
 
@@ -11016,14 +13492,12 @@ mod tests {
         let got = run_default(input);
         assert!(
             got.contains("CMP #$00"),
-            "CMP after DEC <mem> must NOT be dropped — Z reflects memory, not A:\n{got}"
+            "CMP must stay because DEC sets Z from memory.\n{got}"
         );
     }
 
     #[test]
     fn ph012_drops_cmp_zero_after_implicit_asl() {
-        // `ASL` with no operand shifts A and sets Z on the result —
-        // safe to drop the redundant CMP.
         let input = "    LDA value\n    ASL\n    CMP #$00\n    BEQ ok\n";
         let got = run_default(input);
         assert!(
@@ -11034,8 +13508,6 @@ mod tests {
 
     #[test]
     fn ph012_keeps_cmp_zero_after_asl_memory() {
-        // `ASL <mem>` shifts memory; Z reflects the byte at <mem>,
-        // not A. CMP #$00 against A is still meaningful.
         let input = "    LDA value\n    ASL mem\n    CMP #$00\n    BEQ ok\n";
         let got = run_default(input);
         assert!(
@@ -11046,9 +13518,6 @@ mod tests {
 
     #[test]
     fn ph106_factors_intbyte_givayf_at_threshold() {
-        // 4 sites — at-threshold for the rule. Each FAC value is
-        // observed by `__PRINT_FAC` so PH150 doesn't drop dead defs
-        // before factoring sees the duplicates.
         let mut input = String::new();
         for v in ["#$01", "#$02", "#$03", "#$04"] {
             input.push_str("    LDA #$00\n");
@@ -11087,7 +13556,6 @@ mod tests {
 
     #[test]
     fn ph106_keeps_unrelated_lda() {
-        // High byte non-zero — different value, can't factor.
         let input = concat!(
             "    LDA #$01\n",
             "    LDY #$10\n",
@@ -11111,7 +13579,6 @@ mod tests {
 
     #[test]
     fn ph107_factors_chrout_byte_at_threshold() {
-        // 4 sites — at-threshold for PH107.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA #$0D\n");
@@ -11123,20 +13590,17 @@ mod tests {
             got.contains("JSR __CHROUT_0D"),
             "callsite rewritten:\n{got}"
         );
-        // Only the helper keeps the LDA; each rewritten site drops it.
         assert_eq!(
             got.matches("LDA #$0D").count(),
             1,
             "only the helper keeps LDA #$0D"
         );
-        // Original JSR $FFD2 only present in the helper's body.
         assert_eq!(got.matches("JSR $FFD2").count(), 0, "old JSR retargeted");
         assert!(got.contains("JMP $FFD2"), "helper falls through with JMP");
     }
 
     #[test]
     fn ph107_factors_per_byte_value() {
-        // Two distinct imm values — each gets its own helper.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA #$0D\n    JSR $FFD2\n");
@@ -11145,16 +13609,12 @@ mod tests {
         let got = run_default(&input);
         assert!(got.contains("__CHROUT_0D:"));
         assert!(got.contains("__CHROUT_12:"));
-        // Both helpers are referenced — either directly (`JSR __CHROUT_0D`)
-        // or via a downstream PH110 JSR-pair helper. Only require that
-        // each helper label is reached somewhere.
         assert!(got.contains("__CHROUT_0D"));
         assert!(got.contains("__CHROUT_12"));
     }
 
     #[test]
     fn ph107_skips_under_threshold() {
-        // 3 sites — under threshold, no helper.
         let mut input = String::new();
         for _ in 0..3 {
             input.push_str("    LDA #$0D\n    JSR $FFD2\n");
@@ -11170,8 +13630,6 @@ mod tests {
 
     #[test]
     fn ph107_doesnt_factor_label_target() {
-        // Target $FFD2 is the only one we factor. JSR to a label
-        // (e.g. our own helper) shouldn't fire.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA #$0D\n    JSR __OWN_HELPER\n");
@@ -11182,12 +13640,42 @@ mod tests {
 
     #[test]
     fn ph107_doesnt_factor_when_lda_isnt_byte_immediate() {
-        // `LDA <addr>` (no #) — not a byte-imm, skip.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA $0400\n    JSR $FFD2\n");
         }
         let got = run_default(&input);
+        assert!(!got.contains("__CHROUT_"));
+    }
+
+    #[test]
+    fn ph107_sweeps_chrout_tail_calls_through_existing_helpers() {
+        let mut input = String::new();
+        for _ in 0..4 {
+            input.push_str("    LDA #$0D\n    JSR $FFD2\n    NOP\n");
+        }
+        input.push_str("    JSR $FFE7\n    LDA #$0D\n    JMP $FFD2\nAFTER:\n    RTS\n");
+        let got = run_default(&input);
+        assert!(got.contains("__CHROUT_0D:"), "helper emitted:\n{got}");
+        assert!(
+            got.contains("JMP __CHROUT_0D\n"),
+            "the tail call jumps through the helper:\n{got}"
+        );
+        // The helper's own body is the one surviving LDA/JMP pair.
+        assert!(
+            got.contains("__CHROUT_0D:\n    LDA #$0D\n    JMP $FFD2\n"),
+            "helper body not self-swept:\n{got}"
+        );
+        assert_eq!(got.matches("LDA #$0D").count(), 1, "tail's LDA dropped");
+    }
+
+    #[test]
+    fn ph107_leaves_a_lone_tail_alone() {
+        let got = run_default("    JSR $FFE7\n    LDA #$0D\n    JMP $FFD2\nAFTER:\n    RTS\n");
+        assert!(
+            got.contains("LDA #$0D\n    JMP $FFD2"),
+            "lone tail untouched:\n{got}"
+        );
         assert!(!got.contains("__CHROUT_"));
     }
 
@@ -11369,7 +13857,6 @@ mod tests {
         assert_eq!(set, expected, "exactly the closure, no more");
     }
 
-    /// `JSR` adds a frame; `JMP` does not.
     #[test]
     fn only_a_jsr_adds_a_frame_to_a_sensitive_label() {
         let mut sensitive = std::collections::HashSet::new();
@@ -11454,7 +13941,6 @@ mod tests {
         }
     }
 
-    /// PH113's first two positions stay `JSR`s inside the stub, so both are frame-adding; only the third becomes the tail `JMP`.
     #[test]
     fn ph113_refuses_frame_sensitive_in_middle_position() {
         let mut input = String::new();
@@ -11507,7 +13993,6 @@ mod tests {
 
     #[test]
     fn ph111_skips_under_threshold() {
-        // Threshold is 3 sites — under 3 should not factor.
         let mut input = String::new();
         for _ in 0..2 {
             input.push_str("    LDA #<__VAR_X\n    LDY #>__VAR_X\n    JSR $BBA2\n    NOP\n");
@@ -11518,7 +14003,6 @@ mod tests {
 
     #[test]
     fn ph110_factors_jsr_pair_at_threshold() {
-        // 4 sites with same JSR pair → JSR2 helper.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    JSR __SEQ_A\n");
@@ -11567,9 +14051,6 @@ mod tests {
 
     #[test]
     fn ph110_recurses_on_own_helpers() {
-        // PH110 iterates to fixpoint, so pairs of factored helpers
-        // ARE captured by subsequent passes. Confirm a pair of
-        // existing __JSR2_* helpers gets a new __JSR2_2 wrapper.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    JSR __JSR2_0\n    JSR __JSR2_1\n    NOP\n");
@@ -11606,8 +14087,6 @@ mod tests {
 
     #[test]
     fn ph109_factors_per_imm_byte_fac() {
-        // 4 sites with same imm → per-imm helper. Observe FAC at each
-        // site so PH150 doesn't prune duplicates before factoring.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA #$00\n");
@@ -11621,31 +14100,22 @@ mod tests {
             "per-imm helper emitted:\n{got}"
         );
         assert!(got.contains("JSR __LDV_01_FAC"), "callsite rewritten");
-        // No naked LDY #$01 + JSR __LD_BYTE_FAC sequences should
-        // remain (all rolled into PH109).
         assert!(!got.contains("LDY #$01\n    JSR __LD_BYTE_FAC"));
     }
 
     #[test]
     fn ph109_skips_under_threshold_per_imm() {
-        // 2 sites with same imm, 2 with another — each below threshold.
         let mut input = String::new();
         for _ in 0..2 {
             input.push_str("    LDA #$00\n    LDY #$01\n    JSR $B391\n");
             input.push_str("    LDA #$00\n    LDY #$02\n    JSR $B391\n");
         }
         let got = run_default(&input);
-        // PH106 fired (it has 4 total triples, one per-LDY value but
-        // the imm varies, so PH106 still factors all 4 pairs into
-        // shared __LD_BYTE_FAC). PH109 should NOT fire because no
-        // single imm hits 4.
         assert!(!got.contains("__LDV_"), "no per-imm helper:\n{got}");
     }
 
     #[test]
     fn ph301_factors_repeated_4window() {
-        // 4 occurrences of the LINNUM→ARR copy pattern. Should
-        // produce a __SEQ_0 helper.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA $14\n");
@@ -11719,8 +14189,6 @@ mod tests {
 
     #[test]
     fn ph301_factors_stable_label_operand() {
-        // Stable compiler-internal labels (`__ARR_*`) ARE factorable
-        // because PH303 already ran and won't drop them later.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA #<__ARR_X\n");
@@ -11740,9 +14208,6 @@ mod tests {
 
     #[test]
     fn ph301_refuses_basic_line_label() {
-        // BASIC line labels (`L<digits>`) are GOTO-reachable and
-        // potentially relocatable; refuse to factor windows that
-        // mention them.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA L100\n");
@@ -11757,13 +14222,6 @@ mod tests {
 
     #[test]
     fn ph301_refuses_jsr_in_first_pass() {
-        // First PH301 pass refuses any JSR — those go through PH110/PH113
-        // first. The late pass with `JsrPolicy::AllowOne` picks up the
-        // mixed (load + helper-call + store) shape after PH110/PH113
-        // have settled. This test pins the first-pass behaviour by
-        // running a no-JSR window through the same harness and
-        // expecting __SEQ_; the existence of the late pass is covered
-        // by `ph301_late_pass_allows_single_jsr`.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA $14\n");
@@ -11811,11 +14269,6 @@ mod tests {
 
     #[test]
     fn ph301_late_pass_allows_single_jsr() {
-        // The late pass admits a single JSR per 4-window. This is the
-        // common "address load + helper call + landing store" pattern.
-        // Stub the same shape four times and verify a
-        // __SEQ_ helper is emitted. JSR __PRINT_FAC observes FAC so
-        // PH150 doesn't drop the MOVFM before factoring.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA $14\n");
@@ -11834,10 +14287,6 @@ mod tests {
 
     #[test]
     fn ph301_late_pass_rejects_two_jsr_window() {
-        // Even the late pass refuses a window with two or more JSRs
-        // — those are the patterns PH110/PH113 already collapse into
-        // tighter pair/triple stubs. We don't want PH301 wrapping
-        // them in __SEQ_n on top.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    JSR $BBA2\n");
@@ -11855,7 +14304,7 @@ mod tests {
 
     #[test]
     fn ph301_size_outlines_two_long_mixed_call_sites_without_changing_execution() {
-        // Two occurrences, twelve instructions, three interleaved calls, and a live value pushed across a call.
+        // Keep the pushed value live across the call.
         let body = concat!(
             "    LDA #$31\n    PHA\n    JSR __ADD\n    STA $0400\n",
             "    PLA\n    ADC #$01\n    JSR __ADD\n    EOR #$55\n",
@@ -11977,8 +14426,6 @@ mod tests {
         assert!(!got.contains("__SEQ_"));
     }
 
-    /// A label named only from a split `.byte <label` / `.byte >label` pointer
-    /// table must survive, even when stacked in front of another label.
     #[test]
     fn ph303_keeps_a_label_named_only_by_a_split_byte_pointer_table() {
         let input = concat!(
@@ -12022,8 +14469,6 @@ mod tests {
         );
     }
 
-    /// A word in a comment, or the directive's own mnemonic, is not a
-    /// label reference.
     #[test]
     fn a_comment_word_is_not_a_label_reference() {
         assert_eq!(
@@ -12042,11 +14487,6 @@ mod tests {
 
     #[test]
     fn ph303_drops_unreferenced_trampoline() {
-        // After PH004 retargets the JSR, __TRAMP becomes unreachable.
-        // We keep an external __REAL reference (via JSR) so the
-        // resolved target sticks around. __REAL has a non-trivial
-        // body so PH022 (jmp-to-rts) doesn't fold the trampoline
-        // into a bare RTS.
         let input = concat!(
             "    JMP __TRAMP\n",
             "    RTS\n",
@@ -12069,14 +14509,6 @@ mod tests {
 
     #[test]
     fn ph303_keeps_referenced_trampoline() {
-        // Trampoline still has a caller — must not strip the
-        // resolved target. (After PH003 + PH004, the original
-        // `JSR __TRAMP` cascades to `JMP __REAL` and __TRAMP itself
-        // becomes 0-ref. PH303 then drops the now-orphan label-plus-
-        // JMP since its previous structural item is the cascaded JMP
-        // — an unconditional terminator, so falling through into
-        // it isn't possible. We only need to verify the live target
-        // (__REAL) stays wired up.)
         let input = concat!(
             "    JSR __TRAMP\n",
             "    RTS\n",
@@ -12086,10 +14518,6 @@ mod tests {
             "    RTS\n",
         );
         let got = run_default(input);
-        // The whole snippet collapses after PH003 + PH004 (caller
-        // folds to nothing, both helpers become unreachable). What
-        // we want from PH303 here is simply that no \`JSR __TRAMP\`
-        // is left dangling against a label we already collapsed.
         assert!(
             !got.contains("JSR __TRAMP"),
             "JSR to absorbed trampoline must not survive:\n{got}"
@@ -12098,14 +14526,6 @@ mod tests {
 
     #[test]
     fn ph303_keeps_function_end_rts_after_inverted_branch() {
-        // PH005 turns `BCS X / JMP Y / X: / RTS` into
-        // `BCC Y / X: / RTS`, leaving X 0-ref. PH303 must NOT
-        // strip the X-label-plus-RTS while the function is still
-        // *live* (here `__BNDS_CHECK` is called from `L1`): the
-        // BCC falls through into the RTS, which is the function's
-        // only no-error return path. (When the whole helper is
-        // dead — no callers — removing it wholesale is fine; that
-        // case is covered by `ph303_drops_dead_branchy_stub`.)
         let input = concat!(
             "L1:\n",
             "    JSR __BNDS_CHECK\n",
@@ -12124,10 +14544,6 @@ mod tests {
             "    JMP __BNDS_CHECK\n",
         );
         let got = run_default(input);
-        // Whether __BC_OK survives doesn't matter — what matters
-        // is that __BNDS_CHECK still has a return path so a
-        // successful bounds check leaves the helper instead of
-        // falling into __BNDS_10's setup.
         assert!(
             got.lines().any(|l| l.trim() == "RTS"),
             "function-end RTS must survive PH303:\n{got}"
@@ -12136,10 +14552,6 @@ mod tests {
 
     #[test]
     fn ph303_drops_dead_branchy_stub() {
-        // A `__LD_XI`-style stub: unreferenced entry, an internal
-        // sign-extend branch + internal label, ending in a tail call.
-        // The whole self-contained region is dead and must be removed
-        // (the old linear-only scan left it as dead weight).
         let input = concat!(
             "L1:\n",
             "    LDA #$01\n",
@@ -12181,7 +14593,6 @@ mod tests {
 
     #[test]
     fn ph302_f3b_inlines_a_single_call_trampoline() {
-        // `__JSR2_0: JSR A / JMP B` with one `JSR` caller.
         let (changed, got) = drive(
             ph302_inline_single_call_helpers,
             "    JSR __JSR2_0\n    LDA #$01\n    RTS\n__JSR2_0:\n    JSR __FOO\n    JMP __BAR\n",
@@ -12263,7 +14674,6 @@ mod tests {
 
     #[test]
     fn ph308_refuses_a_body_that_does_not_balance() {
-        // PH308's arithmetic says inline (two sites, one-byte body); the stack says no.
         let (changed, got) = drive(
             ph308_inline_uneconomic_helpers,
             "    JSR __SEQ_0\n    NOP\n    JSR __SEQ_0\n    RTS\n\
@@ -12379,7 +14789,6 @@ mod tests {
 
     #[test]
     fn ph309_f3a_refuses_a_runtime_patched_operand_and_the_stack_page() {
-        // `$FFFF` is the tree-wide placeholder for an operand the program rewrites at run time: same text, different effect.
         for pred in ["STA $FFFF", "LDA $0100,Y"] {
             let (changed, got) = drive(ph309_absorb_common_pred, &absorb_pred_fixture(pred));
             assert!(!changed, "{pred} must not be absorbed:\n{got}");
@@ -12403,7 +14812,6 @@ mod tests {
 
     #[test]
     fn ph309_f3a_refuses_a_predecessor_that_is_a_branch_target() {
-        // `L1:` means something can jump straight at the `LDY`, so it does not run once per call and cannot move into the callee.
         let (changed, got) = drive(
             ph309_absorb_common_pred,
             "    BNE L1\n    LDY #$00\n    JSR __SEQ_0\nL1:\n    LDY #$00\n    JSR __SEQ_0\n\
@@ -12414,7 +14822,7 @@ mod tests {
 
     #[test]
     fn ph309_f3a_refuses_a_helper_reached_by_a_tail_jump() {
-        // A `JMP __SEQ_0` entry has no predecessor this pass looked at, so the site count and the reference count disagree.
+        // The jump reference has no call site to rewrite.
         let (changed, got) = drive(
             ph309_absorb_common_pred,
             "    LDY #$00\n    JSR __SEQ_0\n    LDY #$00\n    JSR __SEQ_0\n    LDY #$00\n\
@@ -12425,7 +14833,6 @@ mod tests {
 
     #[test]
     fn ph309_f3a_refuses_a_helper_that_can_be_fallen_into() {
-        // `LDA #$01` before the label, not a terminator: control reaches the body without passing a call site.
         let (changed, got) = drive(
             ph309_absorb_common_pred,
             "    LDY #$00\n    JSR __SEQ_0\n    LDY #$00\n    JSR __SEQ_0\n    LDA #$01\n\
@@ -12434,7 +14841,6 @@ mod tests {
         assert!(!changed, "a fall-through entry blocks absorption:\n{got}");
     }
 
-    /// Mirror of [`absorb_pred_fixture`]: `succ` sits after each site.
     fn absorb_succ_fixture(succ: &str) -> String {
         format!(
             "    JSR __SEQ_0\n    {succ}\n    LDA #$07\n    JSR __SEQ_0\n    {succ}\n    RTS\n\
@@ -12464,7 +14870,6 @@ mod tests {
 
     #[test]
     fn ph310_f4_refuses_a_successor_that_carries_a_label() {
-        // `L1:` means the successor can be reached without returning from the helper.
         let (changed, got) = drive(
             ph310_absorb_common_succ,
             "    JSR __SEQ_0\n    INY\n    LDA #$07\n    JSR __SEQ_0\nL1:\n    INY\n    RTS\n\
@@ -12568,7 +14973,7 @@ mod tests {
 
     #[test]
     fn ph311_refuses_a_word_captured_helper() {
-        // A name captured by a `.word` has a caller this pass cannot repoint, so references outnumber call sites.
+        // The word reference cannot be redirected by this pass.
         let (changed, got) = drive(
             ph311_merge_duplicate_helpers,
             &format!(
@@ -12595,7 +15000,7 @@ mod tests {
 
     #[test]
     fn ph312_replaces_a_shared_tail_with_a_jump() {
-        // `__SEQ_9` is exactly the last three instructions of `__SEQ_3`, and those three are 7 bytes against the 3 a JMP costs.
+        // Sharing the seven byte suffix replaces it with a three byte jump.
         let (changed, got) = drive(
             ph312_merge_helper_tails,
             "    JSR __SEQ_3\n    JSR __SEQ_9\n    RTS\n\
@@ -12757,10 +15162,6 @@ mod tests {
 
     #[test]
     fn ph102_keeps_movfm_after_fac_clobber() {
-        // GIVAYF clobbers FAC between MOVMF and MOVFM. The clobber's
-        // result is observed by `__PRINT_FAC` (so PH150 can't drop the
-        // GIVAYF), and PH102 must NOT eliminate the second MOVFM
-        // because FAC's been overwritten in between.
         let input = concat!(
             "    LDX #<T0\n",
             "    LDY #>T0\n",
@@ -12784,9 +15185,6 @@ mod tests {
 
     #[test]
     fn ph150_drops_movfm_when_fac_overwritten() {
-        // Two MOVFMs back-to-back: the first defines FAC, the second
-        // immediately redefines it before any use. The first JSR is
-        // dead and should be removed.
         let input = concat!(
             "    LDA #<F0\n",
             "    LDY #>F0\n",
@@ -12797,8 +15195,6 @@ mod tests {
             "    JSR __PRINT_FAC\n",
         );
         let got = run_default(input);
-        // Exactly one $BBA2 should remain (the second MOVFM whose
-        // result feeds __PRINT_FAC).
         assert_eq!(
             got.matches("JSR $BBA2").count(),
             1,
@@ -12809,7 +15205,6 @@ mod tests {
 
     #[test]
     fn ph150_keeps_movfm_when_fac_used_downstream() {
-        // FAC value from MOVFM is consumed by FOUT — must keep.
         let input = concat!(
             "    LDA #<F0\n",
             "    LDY #>F0\n",
@@ -12825,9 +15220,6 @@ mod tests {
 
     #[test]
     fn ph150_does_not_drop_fadd() {
-        // FADD can ?OVERFLOW even when the result is dead. Even if
-        // FAC becomes dead-out we must NOT drop the JSR — the error
-        // trap is observable.
         let input = concat!(
             "    LDA #<F0\n",
             "    LDY #>F0\n",
@@ -12849,8 +15241,6 @@ mod tests {
 
     #[test]
     fn ph150_drops_givayf_with_dead_result() {
-        // GIVAYF defines FAC; if the next instruction is another
-        // FAC define, the GIVAYF is dead.
         let input = concat!(
             "    LDA #$00\n",
             "    LDY #$2A\n",
@@ -12867,16 +15257,6 @@ mod tests {
 
     #[test]
     fn ph150_keeps_movfm_when_register_is_live() {
-        // After MOVFM, .Y is consumed by a downstream LDA absolute,Y.
-        // Even though FAC is dead, dropping the JSR would leave .Y
-        // holding the wrong value.
-        //
-        // Note: in practice MOVFM clobbers .A/.X/.Y so this scenario
-        // doesn't actually arise — the JSR's clobbers make register
-        // liveness say A/X/Y die at the JSR. We test the gate by
-        // wrapping the JSR in a way where Y has a known-live value
-        // after, ensuring the rule's reg-live check is exercised.
-        // The test is here to lock the conservative gate in place.
         let input = concat!(
             "    LDA #<F0\n",
             "    LDY #>F0\n",
@@ -12888,8 +15268,6 @@ mod tests {
             "    STA $0401\n",
         );
         let got = run_default(input);
-        // First MOVFM is dropped (FAC dead-out) — second MOVFM and
-        // the LDA $0400,Y both stay because Y is alive into the LDA.
         assert_eq!(got.matches("JSR $BBA2").count(), 1, "{got}");
         assert!(got.contains("LDA $0400,Y"));
     }
@@ -12911,9 +15289,6 @@ mod tests {
 
     #[test]
     fn ph004_collapses_trampoline() {
-        // REAL has a non-trivial body so PH022's jmp-to-rts
-        // collapse doesn't fire — we want to verify PH004's
-        // trampoline-cascade rewrite in isolation.
         let input = concat!(
             "    JMP TRAMP\n",
             "    RTS\n",
@@ -12924,10 +15299,9 @@ mod tests {
             "    RTS\n",
         );
         let got = run_default(input);
-        assert!(got.contains("JMP REAL"), "first JMP retargeted:\n{got}");
-        // After PH001, the outer "JMP REAL" right before REAL: drops too,
-        // but the trampoline label and its body remain (no dead-label pass).
-        assert!(got.contains("TRAMP:"));
+        assert!(!got.contains("JMP TRAMP"), "trampoline collapsed:\n{got}");
+        assert!(!got.contains("JMP REAL"), "cascade removed the jump:\n{got}");
+        assert!(got.contains("INX"));
     }
 
     #[test]
@@ -12972,9 +15346,6 @@ mod tests {
 
     #[test]
     fn ph005_refuses_jmp_to_rom_address() {
-        // Inverting would produce e.g. `BNE $AF08`, but BNE is 8-bit
-        // PC-relative and cannot reach an absolute ROM address. Must
-        // leave the pattern alone.
         let input = concat!("    BEQ L_t\n", "    JMP $AF08\n", "L_t:\n", "    RTS\n",);
         let got = run_default(input);
         assert!(
@@ -12986,9 +15357,6 @@ mod tests {
 
     #[test]
     fn ph004_refuses_to_retarget_branch_to_rom_address() {
-        // Trampoline label resolves to a ROM address. PH004 may
-        // rewrite the JMP, but a *branch* must stay pointed at the
-        // label so the assembler can route through the trampoline.
         let input = concat!(
             "    BEQ TRAMP\n",
             "    RTS\n",
@@ -13062,6 +15430,289 @@ mod tests {
         assert!(!got.contains("JMP L_far"), "the JMP is gone:\n{got}");
     }
 
+
+    #[test]
+    fn ph315_folds_the_heap_guard_shape() {
+        let input = concat!(
+            "    CPX #$02\n",
+            "    BCS __HGIL_NO\n",
+            "__HGIL_GC:\n",
+            "    JMP __GC_RUN\n",
+            "__HGIL_NO:\n",
+            "    RTS\n",
+            "__GC_RUN:\n",
+            "    LDA #<__HEAP_BOTTOM\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(
+            ph315_branch_over_jmp_past_dead_labels(&mut items),
+            "the orphan must not block the fold"
+        );
+        let got = render(&items);
+        assert!(got.contains("BCC __GC_RUN"), "branch inverted:\n{got}");
+        assert!(!got.contains("JMP __GC_RUN"), "trampoline JMP gone:\n{got}");
+        assert!(got.contains("__HGIL_GC:"), "orphan label left for PH029:\n{got}");
+        assert!(got.contains("__HGIL_NO:"), "branch target label kept:\n{got}");
+    }
+
+    #[test]
+    fn ph315_folds_the_for_back_edge_shape() {
+        let input = concat!(
+            "__FOR_TOP_0:\n",
+            "    INC $FB\n",
+            "    LDA $66\n",
+            "    BPL __FOR_EXIT_0\n",
+            "__FOR_CONT_0:\n",
+            "    JMP __FOR_TOP_0\n",
+            "__FOR_EXIT_0:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("BMI __FOR_TOP_0"), "branch inverted:\n{got}");
+        assert!(!got.contains("JMP __FOR_TOP_0"), "back-edge JMP gone:\n{got}");
+        assert!(got.contains("__FOR_CONT_0:"), "labels kept:\n{got}");
+        assert!(got.contains("__FOR_EXIT_0:"), "labels kept:\n{got}");
+    }
+
+    #[test]
+    fn ph315_takes_stacked_labels_after_the_jmp() {
+        let input = concat!(
+            "    BEQ L_true\n",
+            "    JMP L_false\n",
+            "L_OTHER:\n",
+            "L_true:\n",
+            "    LDA #<L_OTHER\n",
+            "    RTS\n",
+            "L_false:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(
+            ph315_branch_over_jmp_past_dead_labels(&mut items),
+            "a referenced alias may stack under the target"
+        );
+        let got = render(&items);
+        assert!(got.contains("BNE L_false"), "branch inverted:\n{got}");
+        assert!(!got.contains("JMP L_false"), "JMP gone:\n{got}");
+        assert!(got.contains("L_OTHER:"), "alias kept:\n{got}");
+        assert!(got.contains("L_true:"), "target kept:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_an_orphan_named_by_a_word_table() {
+        let input = concat!(
+            "    BCS L_NO\n",
+            "ORPH:\n",
+            "    JMP L_GC\n",
+            "L_NO:\n",
+            "    RTS\n",
+            "L_GC:\n",
+            "    .word ORPH\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("BCS L_NO"), "branch untouched:\n{got}");
+        assert!(got.contains("JMP L_GC"), "JMP untouched:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_an_orphan_named_by_an_immediate() {
+        let input = concat!(
+            "    BCS L_NO\n",
+            "ORPH:\n",
+            "    JMP L_GC\n",
+            "L_NO:\n",
+            "    RTS\n",
+            "L_GC:\n",
+            "    LDA #<ORPH\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("JMP L_GC"), "JMP untouched:\n{got}");
+    }
+
+    fn ph315_reach_probe(n: usize) -> String {
+        let mut filler = String::new();
+        for _ in 0..n {
+            filler.push_str("    LDA #$00\n    STA $39\n");
+        }
+        format!(
+            "    BEQ L_t\nORPH:\n    JMP L_far\nL_t:\n    RTS\nL_keep:\n{filler}L_far:\n    RTS\n"
+        )
+    }
+
+    #[test]
+    fn ph315_folds_when_the_jmp_target_is_in_reach() {
+        let mut items = parse(&ph315_reach_probe(30));
+        assert!(ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("BNE L_far"), "inverted to the JMP target:\n{got}");
+        assert!(!got.contains("JMP L_far"), "JMP gone:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_when_the_target_is_out_of_reach() {
+        let mut items = parse(&ph315_reach_probe(40));
+        assert!(
+            !ph315_branch_over_jmp_past_dead_labels(&mut items),
+            "the long-branch fix-up would cost more than the JMP saves"
+        );
+        let got = render(&items);
+        assert!(got.contains("BEQ L_t"), "branch left alone:\n{got}");
+        assert!(got.contains("JMP L_far"), "JMP left alone:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_a_directive_inside_the_window() {
+        let input = concat!(
+            "    BEQ L_t\n",
+            "ORPH:\n",
+            "    .byte $00\n",
+            "    JMP L_f\n",
+            "L_t:\n",
+            "    RTS\n",
+            "L_f:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("JMP L_f"), "JMP left alone:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_to_cross_a_sys_wrap_marker() {
+        let input = concat!(
+            "    BEQ L_t\n",
+            "    ; YAB_SYS_WRAP_IN\n",
+            "ORPH:\n",
+            "    JMP L_f\n",
+            "L_t:\n",
+            "    RTS\n",
+            "L_f:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("JMP L_f"), "JMP left alone:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_a_runtime_patched_branch() {
+        let input = concat!(
+            "PATCH:\n",
+            "    BEQ L_t\n",
+            "ORPH:\n",
+            "    JMP L_f\n",
+            "L_t:\n",
+            "    RTS\n",
+            "L_f:\n",
+            "    RTS\n",
+            "    STA PATCH+2\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("BEQ L_t"), "patched branch untouched:\n{got}");
+        assert!(got.contains("JMP L_f"), "JMP untouched:\n{got}");
+    }
+
+    #[test]
+    fn ph315_refuses_a_runtime_patched_jmp_target() {
+        let input = concat!(
+            "    BEQ L_t\n",
+            "ORPH:\n",
+            "    JMP L_f\n",
+            "L_t:\n",
+            "    RTS\n",
+            "L_f:\n",
+            "    RTS\n",
+            "    STA L_f+1\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph315_branch_over_jmp_past_dead_labels(&mut items));
+        let got = render(&items);
+        assert!(got.contains("JMP L_f"), "JMP untouched:\n{got}");
+    }
+
+    #[test]
+    fn ph315_leaves_the_adjacent_shape_to_ph005() {
+        let input = concat!(
+            "    BEQ L_true\n",
+            "    JMP L_false\n",
+            "L_true:\n",
+            "    LDA #$01\n",
+            "    RTS\n",
+            "L_false:\n",
+            "    LDA #$02\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(
+            !ph315_branch_over_jmp_past_dead_labels(&mut items),
+            "the adjacent shape is PH005's"
+        );
+        let got = render(&items);
+        assert!(got.contains("BEQ L_true"), "direct call left it alone:\n{got}");
+        let got = run_default(input);
+        assert!(got.contains("BNE L_false"), "PH005 took it:\n{got}");
+        assert!(!got.contains("JMP L_false"), "folded once, not twice:\n{got}");
+        assert!(got.contains("L_true:"), "label kept:\n{got}");
+    }
+
+    #[test]
+    fn ph315_leaves_a_target_first_stack_to_ph005() {
+        let input = concat!(
+            "    BEQ L_true\n",
+            "    JMP L_false\n",
+            "L_true:\n",
+            "L_OTHER:\n",
+            "    LDA #<L_OTHER\n",
+            "    RTS\n",
+            "L_false:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(
+            !ph315_branch_over_jmp_past_dead_labels(&mut items),
+            "PH005's adjacency check accepts this one"
+        );
+        let got = run_default(input);
+        assert!(got.contains("BNE L_false"), "PH005 took it:\n{got}");
+        assert!(!got.contains("JMP L_false"), "folded once:\n{got}");
+    }
+
+    #[test]
+    fn ph315_folds_the_heap_guard_in_the_pipeline() {
+        let input = concat!(
+            "    LDA $38\n",
+            "    SBC __HEAP_PTR+1\n",
+            "    BCC __GC_RUN\n",
+            "    CMP #$01\n",
+            "    BNE __HGIL_NO\n",
+            "    CPX #$02\n",
+            "    BCS __HGIL_NO\n",
+            "__HGIL_GC:\n",
+            "    JMP __GC_RUN\n",
+            "__HGIL_NO:\n",
+            "    RTS\n",
+            "__GC_RUN:\n",
+            "    LDA #<__HEAP_BOTTOM\n",
+            "    RTS\n",
+        );
+        let got = run_default(input);
+        assert!(got.contains("BCC __GC_RUN"), "guard branch inverted:\n{got}");
+        assert!(!got.contains("JMP __GC_RUN"), "trampoline JMP gone:\n{got}");
+    }
+
     // ZP equate table
 
     #[test]
@@ -13091,8 +15742,6 @@ mod tests {
         assert_eq!(approx_insn_bytes(zp_load, &none), 3);
     }
 
-    /// Indexed operands keep the 3-byte estimate: the 6502 has no zero-page,Y for `LDA`, and
-    /// guessing low would claim a branch reaches when it does not.
     #[test]
     fn zp_equates_refuse_indexed_and_immediate_forms() {
         let items = parse("VI_J = $A7\n");
@@ -13111,8 +15760,6 @@ mod tests {
         assert!(!zp.is_zp_operand("EDGE+1"), "$FF+1 = $0100, out of zp");
     }
 
-    /// The payoff: a target the naive 3-byte-per-operand estimate puts out of reach, but the
-    /// equate table proves is in reach.
     #[test]
     fn zp_equates_widen_ph005_reach() {
         // 32 pairs of `LDA VI_J / STA VI_T`.
@@ -13137,7 +15784,6 @@ mod tests {
         );
     }
 
-    // late branch fixpoint
     #[test]
     fn late_branch_fixpoint_clears_post_factoring_residue() {
         let mut items = parse(
@@ -13373,8 +16019,6 @@ __SEQ_9:
 
     #[test]
     fn ph305_never_sinks_across_a_label() {
-        // The would-be shared tail contains a label, so it is an entry point: deleting one copy
-        // would strand anything jumping there.
         let input = concat!(
             "    JSR A1\n",
             "    JMP B1\n",
@@ -13455,8 +16099,6 @@ __SEQ_9:
 
     #[test]
     fn ph304_refuses_block_reachable_by_fallthrough() {
-        // C1 is live (reached by the JMP) and falls straight into B1, so B1 is reachable
-        // without being named.
         let input = concat!(
             "    JSR A1\n",
             "    JMP C1\n",
@@ -13479,8 +16121,6 @@ __SEQ_9:
 
     #[test]
     fn ph304_refuses_when_a_reference_is_not_a_bare_operand() {
-        // `#<B1` is a compound operand; retargeting it would mean string surgery, so the merge
-        // is refused outright.
         let input = concat!(
             "    LDA #<B1\n",
             "    STA $FB\n",
@@ -13499,8 +16139,6 @@ __SEQ_9:
 
     #[test]
     fn ph302_inlines_helper_with_a_single_jsr_caller() {
-        // A hand-built helper with one caller: the body belongs at the call site, and the JSR +
-        // RTS detour should vanish.
         let input = concat!(
             "    LDA #$01\n",
             "    JSR __SEQ_9\n",
@@ -13667,8 +16305,6 @@ __SEQ_9:
 
     #[test]
     fn ph301_refuses_to_factor_stack_page_accesses() {
-        // `LDA $0100,Y` reads FOUT's digit buffer inside the hardware stack page; wrapping it
-        // in JSR/RTS pushes a return address toward that buffer.
         let mut input = String::new();
         for _ in 0..4 {
             input.push_str("    LDA $0100,Y\n    STA dst\n    INY\n    DEX\n    NOP\n");
@@ -13701,8 +16337,6 @@ __SEQ_9:
 
     #[test]
     fn ph031_drops_stamp_overwritten_before_any_read() {
-        // A CURLIN stamp for a line that compiled to nothing: the lo byte is re-stamped two
-        // instructions later with nothing in between that could read it or raise an error.
         let input = concat!(
             "    LDA #$0A\n",
             "    STA $39\n",
@@ -13792,7 +16426,9 @@ __SEQ_9:
             "    STA FU_0\n",
             "    RTS\n",
         );
-        let got = run_default(input);
+        let mut items = parse(input);
+        ph031_drop_overwritten_store(&mut items);
+        let got = render(&items);
         assert_eq!(
             got.matches("STA FU_0").count(),
             2,
@@ -13802,8 +16438,6 @@ __SEQ_9:
 
     #[test]
     fn ph020_forwards_zp_fact_across_screen_store() {
-        // `STA $0401,X` can't touch zero page, so the X-holds-FU_2 fact survives and the second
-        // reload is redundant.
         let input = concat!(
             "*=$080D\n",
             "FU_2 = $A9\n",
@@ -13849,8 +16483,6 @@ __SEQ_9:
 
     #[test]
     fn ph030_swaps_pairs_and_drops_reload() {
-        // The bubblesort compare shape: C and D loaded from screen memory, stored to ZP slots,
-        // C immediately reloaded for the CMP.
         let input = concat!(
             "*=$080D\n",
             "VI_C = $A8\n",
@@ -13901,8 +16533,6 @@ __SEQ_9:
 
     #[test]
     fn ph030_refuses_when_second_load_aliases_first_store() {
-        // c reads the same cell b stores to (via EQU): reordering would read the stale
-        // pre-store byte.
         let input = concat!(
             "*=$080D\n",
             "VB = $10\n",
@@ -13914,7 +16544,9 @@ __SEQ_9:
             "    STA out\n",
             "    RTS\n",
         );
-        let got = run_default(input);
+        let mut items = parse(input);
+        ph030_swap_indep_store_pairs(&mut items);
+        let got = render(&items);
         let v1 = got.find("LDA V1").expect("V1 load kept");
         let alias = got.find("LDA $10").expect("aliasing load kept");
         assert!(v1 < alias, "order untouched when c aliases b:\n{got}");
@@ -13941,8 +16573,6 @@ __SEQ_9:
 
     #[test]
     fn ph030_swaps_label_only_window_without_origin() {
-        // Distinct EQU-less labels are distinct storage even when no origin line is present; an
-        // immediate `a` trivially can't alias `d`.
         let input = concat!(
             "    LDA #$05\n",
             "    STA V1\n",
@@ -14027,8 +16657,6 @@ __SEQ_9:
         let got = run_default(&input);
         assert!(!got.contains("PHA"), "no push survives:\n{got}");
         assert!(!got.contains("PLA"), "no pop survives:\n{got}");
-        // `.A` held the low byte and `.Y` the high byte; the pops stored high into $04 and low
-        // into $03, so the stores have to land that way round.
         let sta = got.find("STA $03").expect("low byte stored");
         let sty = got.find("STY $04").expect("high byte stored");
         assert!(sta < sty, "low byte stored before .Y is clobbered:\n{got}");
@@ -14132,8 +16760,6 @@ __SEQ_9:
 
     #[test]
     fn ph209_refuses_an_indexed_pop_destination() {
-        // `STY` has no `abs,X` encoding, and the index register may not even hold the same
-        // value where the store would move to.
         let mut input = String::from("*=$0801\n    LDA VS_A\n    LDY VS_A+1\n");
         input.push_str("    PHA\n    TYA\n    PHA\n");
         input.push_str("    LDA #<S1\n    STA $05\n    STY $06\n");
@@ -14204,8 +16830,6 @@ __SEQ_9:
 
     #[test]
     fn ph204_folds_and80_bne_into_bmi() {
-        // Both successors of the branch redefine A immediately, so A
-        // is dead at the branch's live-out and the fold is safe.
         let input = concat!(
             "    LDA $1234\n",
             "    AND #$80\n",
@@ -14244,8 +16868,6 @@ __SEQ_9:
 
     #[test]
     fn ph204_keeps_and_when_a_live_after_branch() {
-        // Fallthrough uses A as the masked value via STA dst; rewrite
-        // would change A's contents, so refuse the fold.
         let input = concat!(
             "    LDA $1234\n",
             "    AND #$80\n",
@@ -14266,10 +16888,6 @@ __SEQ_9:
 
     #[test]
     fn ph207_lda_zero_beq_eliminates_branch() {
-        // Both arms re-define A. After PH207 (or PH021) the BEQ goes
-        // away — we don't care which exact JMP/fallthrough shape the
-        // fixpoint settles on, just that the conditional branch and
-        // the never-taken path are gone.
         let input = concat!(
             "    LDA #$00\n",
             "    BEQ tgt\n",
@@ -14323,11 +16941,6 @@ __SEQ_9:
 
     #[test]
     fn ph207_drops_load_when_dead() {
-        // BNE on nonzero LDA is always-taken. Both successors redefine
-        // A and its flags before any read, so PH207 should drop both
-        // the load and the now-redundant branch (after a JMP rewrite).
-        // Avoid the `Bxx tgt / tgt:` shape that PH001 would short-
-        // circuit before PH207 ever sees it.
         let input = concat!(
             "    LDA #$05\n",
             "    BNE tgt\n",
@@ -14429,8 +17042,6 @@ __SEQ_9:
 
     #[test]
     fn fixpoint_chains_rules() {
-        // JSR helper / RTS / dead code should reduce to JMP helper +
-        // the dead code dropped.
         let input = "    JSR __H\n    RTS\n    LDA #$00\nL1:\n    RTS\n";
         let got = run_default(input);
         assert!(got.contains("JMP __H"));
@@ -14446,8 +17057,6 @@ __SEQ_9:
 
     #[test]
     fn ph210_promotes_loop_index_to_x() {
-        // Counting loop using VI_X purely as INC + compare + array
-        // index, with X otherwise free and dead at the (RTS) end.
         let input = "    LDA #$FF\n    STA VI_X\n\
 L1:\n    INC VI_X\n    LDA VI_X\n    CMP VI_M\n    BEQ L2\n\
 L3:\n    LDX VI_X\n    LDA $0400,X\n    STA VI_D\n    JMP L1\n\
@@ -14460,9 +17069,6 @@ L2:\n    RTS\n";
 
     #[test]
     fn ph210_bails_when_x_used_otherwise() {
-        // Same shape but the body also does `TXA` (reads X for a
-        // non-index purpose) — promotion would clobber that, so the
-        // pass must leave the loop alone.
         let input = "    LDA #$FF\n    STA VI_X\n\
 L1:\n    INC VI_X\n    LDA VI_X\n    CMP VI_M\n    BEQ L2\n\
     LDX VI_X\n    TXA\n    STA VI_D\n    JMP L1\n\
@@ -14504,7 +17110,6 @@ L2:\n    RTS\n";
 
     #[test]
     fn ph211_keeps_transfer_when_flags_are_live_after() {
-        // The branch reads the N/Z the transfer set; `STY` sets none.
         let input = "*=$080D\n    LDY VS_A\n    TYA\n    STA VI_P\n    BEQ L1\n\
     LDA #$01\n    STA VI_R\nL1:\n    RTS\n";
         let got = run_default(input);
@@ -14527,7 +17132,6 @@ L2:\n    RTS\n";
 
     #[test]
     fn ph211_refuses_the_wrong_index_register() {
-        // `STY zp,Y` does not exist; `STX zp,Y` does.
         let got = run_default(&ph211_body("    LDY VS_A\n    TYA\n    STA $40,Y\n"));
         assert!(got.contains("    TYA\n"), "no STY zp,Y encoding:\n{got}");
         let got = run_default(&ph211_body("    LDX VS_A\n    TXA\n    STA $40,Y\n"));
@@ -14536,8 +17140,6 @@ L2:\n    RTS\n";
 
     #[test]
     fn ph211_takes_zero_page_indexed_only_when_the_base_is_proved() {
-        // `FU_0 = $A9` is zero page, so `STY FU_0,X` assembles; a label with no EQU could be
-        // anywhere and must be refused.
         let zp = format!("*=$080D\nFU_0 = $A9\n    LDY VS_A\n    TYA\n    STA FU_0,X\n{KILL_TAIL}");
         let got = run_default(&zp);
         assert!(got.contains("STY FU_0,X"), "proved ZP base folds:\n{got}");
@@ -14574,8 +17176,6 @@ __W:\n    TYA\n    STA VI_P\n{KILL_TAIL}"
 
     #[test]
     fn ph212_wraps_like_the_shift_it_replaces() {
-        // `ASL` on $C0 gives $80 and sets carry; the immediate keeps the low byte, which is all
-        // `TAX` ever transferred.
         let input = format!("*=$080D\n    LDA #$C0\n    ASL\n    TAX\n    STX VI_P\n{KILL_TAIL}");
         let got = run_default(&input);
         assert!(got.contains("LDX #$80"), "low byte of 2*$C0:\n{got}");
@@ -14635,7 +17235,6 @@ __W:\n    TYA\n    STA VI_P\n{KILL_TAIL}"
 
     #[test]
     fn ph213_wraps_at_both_ends() {
-        // $FF + 1 == $00 and $00 - 1 == $FF; `INX`/`DEX` agree, and so do the N/Z they set.
         let input = "*=$080D\n    LDX #$FF\n    STX VI_P\n    LDX #$00\n    STX VI_R\n    RTS\n";
         let got = run_default(&input);
         assert!(got.contains("    INX\n"), "$FF -> $00 is INX:\n{got}");
@@ -14678,8 +17277,6 @@ __W:\n    LDX #$06\n    STX VI_R\n    RTS\n";
         assert!(got.contains("LDX #$06"), "patched immediate kept:\n{got}");
     }
 
-    /// `AND #$01 / Bxx L1` where both arms immediately redefine `.A` and N/Z/C, which is what
-    /// the rule needs and what a bare `RTS` tail does not give (see [`KILL_TAIL`]).
     fn ph214_body(branch: &str) -> String {
         format!(
             "*=$080D\n    LDA VI_P\n    AND #$01\n    {branch} L1\n\
@@ -14713,7 +17310,6 @@ __W:\n    LDX #$06\n    STX VI_R\n    RTS\n";
 
     #[test]
     fn ph214_keeps_the_mask_when_carry_survives_the_branch() {
-        // `AND` preserves carry; `LSR` overwrites it.
         let input = format!(
             "*=$080D\n    LDA VI_P\n    AND #$01\n    BEQ L1\n\
     LDA #$01\n    STA VI_R\nL1:\n    BCS L2\n    LDA #$02\n    STA VI_S\n\
@@ -14933,7 +17529,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         );
     }
 
-    /// An `RTS` is an observer: the caller resumes with this value in the cell and can raise there.
     #[test]
     fn ph307_rts_observes_the_stamp() {
         let input = concat!(
@@ -14946,7 +17541,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         assert!(!ph307_dead_curlin_stamp(&mut items));
     }
 
-    /// An unresolved jump target ; `JSR $FFFF` is the self-modified `SYS` thunk, and the machine code behind it can do anything, including read `$39`.
     #[test]
     fn ph307_an_unknown_call_target_observes() {
         let input = concat!(
@@ -14967,7 +17561,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         );
     }
 
-    /// Liveness follows both arms of a branch: a stamp is live if either successor can read it.
     #[test]
     fn ph307_a_branch_keeps_a_stamp_live_through_one_arm() {
         let input = concat!(
@@ -15026,7 +17619,6 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         );
     }
 
-    /// The high byte is its own cell: a dead `STA $3A` goes without disturbing a live `STA $39` beside it.
     #[test]
     fn ph307_the_two_bytes_die_independently() {
         let input = concat!(
@@ -15065,5 +17657,1596 @@ __WAIT_TOP_0:\n__WAIT_LDA_0:\n    LDA $FFFF\n__WAIT_AND_0:\n    AND #$01\n\
         );
         let mut items = parse(input);
         assert!(!ph307_dead_curlin_stamp(&mut items));
+    }
+
+
+    #[test]
+    fn ph316_folds_the_gc_sixteen_bit_pair() {
+        let input = concat!(
+            "__GC_LOOP:\n",
+            "    SEC\n",
+            "    LDA __GC_LOW_LO\n",
+            "    SBC __HEAP_PTR\n",
+            "    LDA __GC_LOW_HI\n",
+            "    SBC __HEAP_PTR+1\n",
+            "    BCS __GC_DONE\n",
+            "    EOR #$80\n",
+            "__GC_DONE:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph316_sec_lda_sbc_to_cmp(&mut items));
+        let got = render(&items);
+        assert!(!got.contains("SEC"), "the SEC dies:\n{got}");
+        assert!(
+            got.contains("CMP __HEAP_PTR\n"),
+            "first SBC rewritten to CMP:\n{got}"
+        );
+        assert!(
+            got.contains("SBC __HEAP_PTR+1"),
+            "the borrow-chained second SBC stays a subtraction:\n{got}"
+        );
+        assert!(got.contains("BCS __GC_DONE"), "carry consumer intact:\n{got}");
+    }
+
+    #[test]
+    fn ph316_folds_a_single_site() {
+        let input = concat!(
+            "    SEC\n",
+            "    LDA #$05\n",
+            "    SBC ZSI_V_N\n",
+            "    LDA #$00\n",
+            "    SBC ZSI_V_N+1\n",
+            "    BVC NV\n",
+            "    EOR #$80\n",
+            "NV:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph316_sec_lda_sbc_to_cmp(&mut items));
+        let got = render(&items);
+        assert!(!got.contains("SEC"), "SEC dropped:\n{got}");
+        assert!(
+            got.contains("CMP ZSI_V_N\n"),
+            "SBC became CMP, operand verbatim:\n{got}"
+        );
+    }
+
+    #[test]
+    fn ph316_tolerates_blanks_and_comments_in_the_window() {
+        let input = concat!(
+            "    SEC\n",
+            "\n",
+            "    LDA T1\n",
+            "; keep the flags\n",
+            "    SBC T0\n",
+            "\n",
+            "    LDA T1+1\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph316_sec_lda_sbc_to_cmp(&mut items));
+        let got = render(&items);
+        assert!(got.contains("CMP T0"), "folded across filler:\n{got}");
+        assert!(!got.contains("SEC"), "SEC dropped:\n{got}");
+    }
+
+    #[test]
+    fn ph316_refuses_a_label_inside_the_window() {
+        let input = concat!(
+            "    SEC\n",
+            "MID:\n",
+            "    LDA T1\n",
+            "    SBC T0\n",
+            "    LDA T1+1\n",
+            "    JMP MID\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph316_sec_lda_sbc_to_cmp(&mut items));
+        let got = render(&items);
+        assert!(got.contains("SEC"), "SEC kept:\n{got}");
+        assert!(got.contains("SBC T0"), "SBC kept:\n{got}");
+    }
+
+    #[test]
+    fn ph316_refuses_when_sed_exists_anywhere() {
+        let input = concat!(
+            "    SEC\n",
+            "    LDA T1\n",
+            "    SBC T0\n",
+            "    LDA T1+1\n",
+            "    SED\n",
+            "    SBC #$01\n",
+            "    CLD\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph316_sec_lda_sbc_to_cmp(&mut items));
+        let got = render(&items);
+        assert!(got.contains("SBC T0"), "SBC kept:\n{got}");
+    }
+
+    #[test]
+    fn ph316_refuses_a_runtime_patched_sbc() {
+        let input = concat!(
+            "    SEC\n",
+            "    LDA T1\n",
+            "PATCH:\n",
+            "    SBC T0\n",
+            "    LDA T1+1\n",
+            "    RTS\n",
+            "    STA PATCH+1\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph316_sec_lda_sbc_to_cmp(&mut items));
+        let got = render(&items);
+        assert!(got.contains("SBC T0"), "patched SBC untouched:\n{got}");
+        assert!(got.contains("SEC"), "SEC kept with it:\n{got}");
+    }
+
+    #[test]
+    fn ph316_refuses_stack_io_and_indirect_operands() {
+        for op in ["$01FB", "$D012", "($FB),Y"] {
+            let input = format!(
+                concat!(
+                    "    SEC\n",
+                    "    LDA T1\n",
+                    "    SBC {op}\n",
+                    "    LDA T1+1\n",
+                    "    RTS\n",
+                ),
+                op = op
+            );
+            let mut items = parse(&input);
+            assert!(
+                !ph316_sec_lda_sbc_to_cmp(&mut items),
+                "{op} must be refused"
+            );
+            let got = render(&items);
+            assert!(got.contains("SEC"), "SEC kept for {op}:\n{got}");
+        }
+    }
+
+
+
+
+    fn ph319_tail() -> &'static str {
+        concat!(
+            "    CLC
+",
+            "    CLV
+",
+            "    LDA #$05
+",
+            "    RTS
+",
+        )
+    }
+
+    #[test]
+    fn ph319_folds_the_add_carry_shape() {
+        let input = format!(
+            concat!(
+                "    CLC\n",
+                "    LDA ZSI_V_K\n",
+                "    ADC ZSI_V_J\n",
+                "    STA ZSI_V_K\n",
+                "    LDA ZSI_V_K+1\n",
+                "    ADC #$00\n",
+                "    STA ZSI_V_K+1\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph319_carry_fold(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    BCC __PH319_0\n    INC ZSI_V_K+1\n__PH319_0:\n"),
+            "high half folded on the low add's carry:\n{got}"
+        );
+        assert!(
+            got.contains("    ADC ZSI_V_J\n"),
+            "the low half that produced the carry is untouched:\n{got}"
+        );
+        assert!(!got.contains("ADC #$00"), "zero-operand ALU gone:\n{got}");
+    }
+
+    #[test]
+    fn ph319_folds_the_sbc_borrow_shape() {
+        let input = format!(
+            concat!(
+                "    SEC\n",
+                "    LDA ZSI_V_K\n",
+                "    SBC ZSI_V_J\n",
+                "    STA ZSI_V_K\n",
+                "    LDA ZSI_V_K+1\n",
+                "    SBC #$00\n",
+                "    STA ZSI_V_K+1\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph319_carry_fold(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    BCS __PH319_0\n    DEC ZSI_V_K+1\n__PH319_0:\n"),
+            "high half folded on the low subtract's borrow:\n{got}"
+        );
+        assert!(!got.contains("SBC #$00"), "zero-operand ALU gone:\n{got}");
+    }
+
+    #[test]
+    fn ph319_folds_a_carry_from_a_compare() {
+        let input = format!(
+            concat!(
+                "    LDA ZSI_V_K\n",
+                "    CMP #$10\n",
+                "    LDA ZSI_V_K+1\n",
+                "    ADC #$00\n",
+                "    STA ZSI_V_K+1\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph319_carry_fold(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    BCC __PH319_0\n    INC ZSI_V_K+1\n__PH319_0:\n"),
+            "carry source is irrelevant:\n{got}"
+        );
+    }
+
+    #[test]
+    fn ph319_refuses_when_any_exit_state_is_live() {
+        for (consumer, what) in [
+            ("    TAX\n", "A"),
+            ("    BPL SKIP\nSKIP:\n", "N"),
+            ("    BEQ SKIP\nSKIP:\n", "Z"),
+            ("    BVC SKIP\nSKIP:\n", "V"),
+            ("    BCS SKIP\nSKIP:\n", "C"),
+        ] {
+            let input = format!(
+                concat!(
+                    "    CLC\n",
+                    "    LDA ZSI_V_K\n",
+                    "    ADC ZSI_V_J\n",
+                    "    STA ZSI_V_K\n",
+                    "    LDA ZSI_V_K+1\n",
+                    "    ADC #$00\n",
+                    "    STA ZSI_V_K+1\n",
+                    "{consumer}",
+                    "    CLC\n",
+                    "    CLV\n",
+                    "    LDA #$05\n",
+                    "    RTS\n",
+                ),
+                consumer = consumer
+            );
+            let mut items = parse(&input);
+            assert!(
+                !ph319_carry_fold(&mut items),
+                "a {what}-reading consumer must refuse the fold"
+            );
+            let got = render(&items);
+            assert!(got.contains("ADC #$00"), "{what} site kept:\n{got}");
+        }
+    }
+
+    #[test]
+    fn ph319_refuses_a_store_to_a_different_cell() {
+        let input = format!(
+            concat!(
+                "    CLC\n",
+                "    LDA ZSI_V_K\n",
+                "    ADC ZSI_V_J\n",
+                "    STA ZSI_V_I\n",
+                "    LDA ZSI_V_K+1\n",
+                "    ADC #$00\n",
+                "    STA ZSI_V_I+1\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(!ph319_carry_fold(&mut items));
+        let got = render(&items);
+        assert!(got.contains("ADC #$00"), "copy shape kept:\n{got}");
+    }
+
+    #[test]
+    fn ph319_refuses_a_label_inside_the_window() {
+        let input = format!(
+            concat!(
+                "    CLC\n",
+                "    LDA ZSI_V_K\n",
+                "    ADC ZSI_V_J\n",
+                "    STA ZSI_V_K\n",
+                "MID:\n",
+                "    LDA ZSI_V_K+1\n",
+                "    ADC #$00\n",
+                "    STA ZSI_V_K+1\n",
+                "    JMP MID\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(!ph319_carry_fold(&mut items));
+        let got = render(&items);
+        assert!(got.contains("ADC #$00"), "window kept:\n{got}");
+    }
+
+    #[test]
+    fn ph319_refuses_when_sed_or_php_exists_anywhere() {
+        for extra in ["    SED\n    CLD\n", "    PHP\n    PLA\n"] {
+            let input = format!(
+                concat!(
+                    "    CLC\n",
+                    "    LDA ZSI_V_K\n",
+                    "    ADC ZSI_V_J\n",
+                    "    STA ZSI_V_K\n",
+                    "    LDA ZSI_V_K+1\n",
+                    "    ADC #$00\n",
+                    "    STA ZSI_V_K+1\n",
+                    "{extra}",
+                    "{tail}",
+                ),
+                extra = extra,
+                tail = ph319_tail()
+            );
+            let mut items = parse(&input);
+            assert!(!ph319_carry_fold(&mut items));
+            let got = render(&items);
+            assert!(got.contains("ADC #$00"), "site kept:\n{got}");
+        }
+    }
+
+    #[test]
+    fn ph319_refuses_a_runtime_patched_window() {
+        let build = |patch: &str| {
+            format!(
+                concat!(
+                    "    CLC\n",
+                    "    LDA ZSI_V_K\n",
+                    "    ADC ZSI_V_J\n",
+                    "    STA ZSI_V_K\n",
+                    "    LDA ZSI_V_K+1\n",
+                    "    ADC #$00\n",
+                    "    STA ZSI_V_K+1\n",
+                    "{patch}",
+                    "{tail}",
+                ),
+                patch = patch,
+                tail = ph319_tail()
+            )
+        };
+        let mut items = parse(&build(""));
+        assert!(ph319_carry_fold(&mut items), "control folds");
+        let mut items = parse(&build(""));
+        let head = items
+            .iter()
+            .position(|it| matches!(it, Item::Insn(i) if i.mnem == "LDA" && i.operand.as_deref() == Some("ZSI_V_K+1")))
+            .expect("window head");
+        items.insert(head, Item::Label("PATCH".to_string()));
+        items.push(Item::Insn(Insn {
+            mnem: "STA".to_string(),
+            operand: Some("PATCH+1".to_string()),
+            comment: None,
+        }));
+        assert!(!ph319_carry_fold(&mut items), "patched insn refused");
+        let got = render(&items);
+        assert!(got.contains("ADC #$00"), "window kept:\n{got}");
+    }
+
+    #[test]
+    fn ph319_mints_unique_labels_and_settles() {
+        let one = concat!(
+            "    CLC\n",
+            "    LDA ZSI_V_K\n",
+            "    ADC ZSI_V_J\n",
+            "    STA ZSI_V_K\n",
+            "    LDA ZSI_V_K+1\n",
+            "    ADC #$00\n",
+            "    STA ZSI_V_K+1\n",
+        );
+        let input = format!(
+            concat!(
+                "{one}",
+                "    CLC\n",
+                "    CLV\n",
+                "    LDA #$05\n",
+                "{one}",
+                "{tail}",
+            ),
+            one = one,
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph319_carry_fold(&mut items));
+        let got = render(&items);
+        assert!(got.contains("__PH319_0:"), "first label:\n{got}");
+        assert!(got.contains("__PH319_1:"), "second label:\n{got}");
+        assert!(!ph319_carry_fold(&mut items), "settled");
+    }
+
+    #[test]
+    fn ph107_never_sweeps_its_own_body_behind_a_stacked_label() {
+        for extra in ["", "__OTHER:
+"] {
+            let input = format!(
+                concat!(
+                    "    LDA #$0D
+",
+                    "    JMP $FFD2
+",
+                    "__CHROUT_0D:
+",
+                    "{extra}",
+                    "    LDA #$0D
+",
+                    "    JMP $FFD2
+",
+                ),
+                extra = extra
+            );
+            let mut items = parse(&input);
+            ph107_sweep_chrout_tails(&mut items);
+            let got = render(&items);
+            let body = got.split("__CHROUT_0D:").nth(1).unwrap_or("");
+            assert!(
+                !body.contains("JMP __CHROUT_0D"),
+                "helper body jumps to itself (extra label {extra:?}):
+{got}"
+            );
+        }
+    }
+
+    #[test]
+    fn ph320_caps_a_run_at_two_hundred_fifty_five_blocks() {
+        let mut input = String::new();
+        for n in 0..260 {
+            input.push_str(&format!(
+                "    INC ZSI_V_K
+    BNE __A{n}
+    INC ZSI_V_K+1
+__A{n}:
+"
+            ));
+        }
+        input.push_str(ph319_tail());
+        let mut items = parse(&input);
+        assert!(ph320_merge_inc_runs(&mut items));
+        let got = render(&items);
+        // Every minted immediate stays a single byte.
+        for line in got.lines().filter(|l| l.trim_start().starts_with("ADC #$")) {
+            let imm = line.trim().trim_start_matches("ADC #$");
+            assert!(
+                imm.len() <= 2,
+                "immediate wider than one byte: {line}
+{got}"
+            );
+        }
+        assert!(
+            !got.contains("ADC #$104"),
+            "the run merged past a one-byte immediate:
+{got}"
+        );
+        assert!(got.contains("ADC #$05"), "the trailing five merge:
+{got}");
+    }
+
+
+    #[test]
+    fn ph320_merges_a_triple_inc_run() {
+        let input = format!(
+            concat!(
+                "    INC ZSI_V_K\n",
+                "    BNE __A1\n",
+                "    INC ZSI_V_K+1\n",
+                "__A1:\n",
+                "    INC ZSI_V_K\n",
+                "    BNE __A2\n",
+                "    INC ZSI_V_K+1\n",
+                "__A2:\n",
+                "    INC ZSI_V_K\n",
+                "    BNE __A3\n",
+                "    INC ZSI_V_K+1\n",
+                "__A3:\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph320_merge_inc_runs(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains(
+                "    CLC\n    LDA ZSI_V_K\n    ADC #$03\n    STA ZSI_V_K\n    BCC __PH320_0\n    INC ZSI_V_K+1\n__PH320_0:\n"
+            ),
+            "three blocks folded into one add-immediate:\n{got}"
+        );
+        assert!(!got.contains("BNE"), "block chain gone:\n{got}");
+    }
+
+    #[test]
+    fn ph320_merges_a_pair_run_and_settles() {
+        let input = format!(
+            concat!(
+                "    INC ZSI_V_K\n",
+                "    BNE __A1\n",
+                "    INC ZSI_V_K+1\n",
+                "__A1:\n",
+                "    INC ZSI_V_K\n",
+                "    BNE __A2\n",
+                "    INC ZSI_V_K+1\n",
+                "__A2:\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph320_merge_inc_runs(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    ADC #$02\n"),
+            "pair run folds with ADC #$02:\n{got}"
+        );
+        assert!(!ph320_merge_inc_runs(&mut items), "settled");
+    }
+
+    #[test]
+    fn ph320_leaves_a_single_block_alone() {
+        let input = format!(
+            concat!(
+                "    INC ZSI_V_K\n",
+                "    BNE __A1\n",
+                "    INC ZSI_V_K+1\n",
+                "__A1:\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(!ph320_merge_inc_runs(&mut items));
+        let got = render(&items);
+        assert!(got.contains("BNE __A1"), "lone block kept:\n{got}");
+    }
+
+    #[test]
+    fn ph320_refuses_an_externally_referenced_block_label() {
+        let input = format!(
+            concat!(
+                "    INC ZSI_V_K\n",
+                "    BNE __A1\n",
+                "    INC ZSI_V_K+1\n",
+                "__A1:\n",
+                "    INC ZSI_V_K\n",
+                "    BNE __A2\n",
+                "    INC ZSI_V_K+1\n",
+                "__A2:\n",
+                "    JMP __A1\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(!ph320_merge_inc_runs(&mut items));
+        let got = render(&items);
+        assert!(got.contains("ADC") == false || !got.contains("ADC #$02"), "run kept:\n{got}");
+    }
+
+    #[test]
+    fn ph320_refuses_when_any_exit_state_is_live() {
+        for (consumer, what) in [
+            ("    TAX\n", "A"),
+            ("    BPL SKIP\nSKIP:\n", "N"),
+            ("    BEQ SKIP\nSKIP:\n", "Z"),
+            ("    BVC SKIP\nSKIP:\n", "V"),
+            ("    BCS SKIP\nSKIP:\n", "C"),
+        ] {
+            let run = concat!(
+                "    INC ZSI_V_K\n    BNE __A1\n    INC ZSI_V_K+1\n__A1:\n",
+                "    INC ZSI_V_K\n    BNE __A2\n    INC ZSI_V_K+1\n__A2:\n",
+            );
+            let input = format!("{run}{consumer}    CLC\n    CLV\n    LDA #$05\n    RTS\n");
+            let mut items = parse(&input);
+            assert!(
+                !ph320_merge_inc_runs(&mut items),
+                "a {what}-reading consumer must refuse the merge"
+            );
+        }
+    }
+
+
+    #[test]
+    fn ph321_sinks_the_second_store_to_the_definition() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA __SRC\n",
+                "    STA __GC_TMP_HI\n",
+                "    LDA __GC_TMP_LO\n",
+                "    STA $FD\n",
+                "    LDA __GC_TMP_HI\n",
+                "    STA $FE\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph321_store_forward_sink(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    STA __GC_TMP_HI\n    STA $FE\n    LDA __GC_TMP_LO\n    STA $FD\n"),
+            "store moved up, reload gone:\n{got}"
+        );
+        assert_eq!(got.matches("LDA __GC_TMP_HI").count(), 0, "reload dropped");
+    }
+
+    #[test]
+    fn ph321_refuses_a_window_write_of_x() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA __SRC\n",
+                "    STA __GC_TMP_HI\n",
+                "    LDA __OTHER\n",
+                "    STA __GC_TMP_HI\n",
+                "    LDA __GC_TMP_HI\n",
+                "    STA $FE\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(ph321_store_forward_sink(&mut items));
+        let got = render(&items);
+        assert_eq!(got.matches("LDA __GC_TMP_HI").count(), 0, "reload dropped:\n{got}");
+        assert!(
+            got.contains("    STA __GC_TMP_HI\n    STA $FE\n"),
+            "the sink rides the second store:\n{got}"
+        );
+    }
+
+    #[test]
+    fn ph321_refuses_a_window_read_of_z() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA __SRC\n",
+                "    STA __GC_TMP_HI\n",
+                "    LDA $FE\n",
+                "    TAX\n",
+                "    LDA __GC_TMP_HI\n",
+                "    STA $FE\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(!ph321_store_forward_sink(&mut items));
+    }
+
+    #[test]
+    fn ph321_refuses_when_the_reloads_outputs_are_live() {
+        for (consumer, _what) in [
+            ("    TAX\n", "A"),
+            ("    BPL SKIP\nSKIP:\n", "N"),
+            ("    BEQ SKIP\nSKIP:\n", "Z"),
+        ] {
+            let input = format!(
+                concat!(
+                    "*=$C000\n",
+                    "    LDA __SRC\n",
+                    "    STA __GC_TMP_HI\n",
+                    "    LDA __GC_TMP_LO\n",
+                    "    STA $FD\n",
+                    "    LDA __GC_TMP_HI\n",
+                    "    STA $FE\n",
+                    "{consumer}",
+                    "    CLC\n    CLV\n    LDA #$05\n    RTS\n",
+                ),
+                consumer = consumer
+            );
+            let mut items = parse(&input);
+            assert!(
+                !ph321_store_forward_sink(&mut items),
+                "a live output must refuse the sink"
+            );
+        }
+    }
+
+    #[test]
+    fn ph321_refuses_when_z_aliases_x() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA __SRC\n",
+                "    STA __GC_TMP_HI\n",
+                "    LDA __GC_TMP_LO\n",
+                "    STA $FD\n",
+                "    LDA __GC_TMP_HI\n",
+                "    STA __GC_TMP_HI\n",
+                "{tail}",
+            ),
+            tail = ph319_tail()
+        );
+        let mut items = parse(&input);
+        assert!(!ph321_store_forward_sink(&mut items));
+    }
+
+
+    #[test]
+    fn ph323_folds_the_string_form() {
+        let input = concat!(
+            "*=$C000
+",
+            "    LDX #$04
+",
+            "    LDA #<__STR_7
+",
+            "    LDY #>__STR_7
+",
+            "    STA __ARR_N_S,X
+",
+            "    TYA
+",
+            "    STA __ARR_N_S+1,X
+",
+            "    LDX #$00
+",
+            "    LDA #$01
+",
+            "    RTS
+",
+        );
+        let mut items = parse(input);
+        assert!(ph323_const_index_store_to_abs(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains(
+                "    LDA #<__STR_7
+    STA __ARR_N_S+4
+    LDY #>__STR_7
+    STY __ARR_N_S+1+4
+"
+            ),
+            "both halves went absolute at the constant index:
+{got}"
+        );
+        assert!(!got.contains(",X"), "indexed stores gone:
+{got}");
+        assert!(!got.contains("TYA"), "the transfer is gone:
+{got}");
+    }
+
+    #[test]
+    fn ph323_folds_the_byte_form() {
+        let input = concat!(
+            "*=$C000
+",
+            "    LDX #$03
+",
+            "    LDA #$2A
+",
+            "    STA __ARR_N_S,X
+",
+            "    LDX #$00
+",
+            "    RTS
+",
+        );
+        let mut items = parse(input);
+        assert!(ph323_const_index_store_to_abs(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    LDA #$2A
+    STA __ARR_N_S+3
+"),
+            "byte store went absolute:
+{got}"
+        );
+    }
+
+    #[test]
+    fn ph323_refuses_when_x_is_live_after() {
+        let input = concat!(
+            "*=$C000
+",
+            "    LDX #$03
+",
+            "    LDA #$2A
+",
+            "    STA __ARR_N_S,X
+",
+            "    STA __ARR_W_S,X
+",
+            "    RTS
+",
+        );
+        let mut items = parse(input);
+        assert!(!ph323_const_index_store_to_abs(&mut items));
+        let got = render(&items);
+        assert!(got.contains("LDX #$03"), "window kept:
+{got}");
+    }
+
+    #[test]
+    fn ph323_refuses_a_zero_page_base() {
+        for base in ["$40", "ZPBASE"] {
+            let input = format!(
+                concat!(
+                    "ZPBASE = $40
+",
+                    "*=$C000
+",
+                    "    LDX #$03
+",
+                    "    LDA #$2A
+",
+                    "    STA {base},X
+",
+                    "    LDX #$00
+",
+                    "    RTS
+",
+                ),
+                base = base
+            );
+            let mut items = parse(&input);
+            assert!(
+                !ph323_const_index_store_to_abs(&mut items),
+                "zero-page base {base} must be refused"
+            );
+        }
+    }
+
+
+    #[test]
+    fn facts_a_store_through_an_aliased_equate_invalidates_the_cell() {
+        let input = concat!(
+            "FI_0 = $F7\n",
+            "FI_1 = $F7\n",
+            "*=$C000\n",
+            "    LDA #$00\n",
+            "    STA FI_0\n",
+            "    LDA #$05\n",
+            "    STA FI_1\n",
+            "    LDA #$00\n",
+            "    STA FI_0\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        ph025_drop_redundant_store(&mut items);
+        let got = render(&items);
+        assert_eq!(got.matches("STA FI_0").count(), 2, "{got}");
+    }
+
+    #[test]
+    fn facts_a_store_of_the_same_byte_through_an_alias_is_redundant() {
+        let input = concat!(
+            "FI_0 = $F7\n",
+            "FI_1 = $F7\n",
+            "*=$C000\n",
+            "    LDA #$00\n",
+            "    STA FI_0\n",
+            "    STA FI_0+1\n",
+            "    STA FI_1\n",
+            "    STA FI_1+1\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph025_drop_redundant_store(&mut items));
+        let got = render(&items);
+        assert!(!got.contains("STA FI_1"), "{got}");
+        assert!(got.contains("STA FI_0\n") && got.contains("STA FI_0+1\n"), "{got}");
+    }
+
+    #[test]
+    fn facts_a_load_through_an_alias_reads_the_known_byte() {
+        // `$F7` and FU_0 name one byte that A already holds.
+        let input = concat!(
+            "FU_0 = $F7\n",
+            "*=$C000\n",
+            "    LDA $0400\n",
+            "    STA FU_0\n",
+            "    LDA $F7\n",
+            "    STA $0401\n",
+            "    LDA #$01\n",
+            "    STA $0402\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph020_static_known_value_cleanup(&mut items));
+        assert!(!render(&items).contains("LDA $F7"));
+    }
+
+    #[test]
+    fn ph020_drops_a_reload_whose_flags_already_reflect_the_register() {
+        let input = concat!(
+            "*=$C000\n",
+            "    LDA V_A\n",
+            "    STA V_B\n",
+            "    LDA V_B\n",
+            "    BEQ L1\n",
+            "    RTS\n",
+            "L1:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph020_static_known_value_cleanup(&mut items));
+        assert!(!render(&items).contains("LDA V_B"));
+    }
+
+    #[test]
+    fn ph020_does_not_trust_adc_flags_in_a_program_with_sed() {
+        // Decimal-mode ADC leaves N/Z off the BCD result on NMOS.
+        let input = concat!(
+            "*=$C000\n",
+            "    SED\n",
+            "    CLD\n",
+            "    CLC\n",
+            "    LDA V_A\n",
+            "    ADC #$01\n",
+            "    STA V_B\n",
+            "    LDA V_B\n",
+            "    BEQ L1\n",
+            "    RTS\n",
+            "L1:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        ph020_static_known_value_cleanup(&mut items);
+        assert!(render(&items).contains("LDA V_B"));
+        // Without the SED the same reload goes.
+        let mut items = parse(&input.replace("    SED\n", ""));
+        assert!(ph020_static_known_value_cleanup(&mut items));
+        assert!(!render(&items).contains("LDA V_B"));
+    }
+
+    #[test]
+    fn ph020_keeps_a_reload_when_a_compare_set_the_flags() {
+        let input = concat!(
+            "*=$C000\n",
+            "    LDA V_A\n",
+            "    STA V_B\n",
+            "    CPX #$01\n",
+            "    LDA V_B\n",
+            "    BEQ L1\n",
+            "    RTS\n",
+            "L1:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        ph020_static_known_value_cleanup(&mut items);
+        assert!(render(&items).contains("LDA V_B"));
+    }
+
+    #[test]
+    fn ph015_keeps_a_transfer_whose_z_a_later_branch_reads() {
+        let input = concat!(
+            "*=$C000\n",
+            "    LDA V_A\n",
+            "    CMP #$05\n",
+            "    TAX\n",
+            "    STA V_B\n",
+            "    BEQ L1\n",
+            "    LDX #$00\n",
+            "    RTS\n",
+            "L1:\n",
+            "    LDX #$01\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        ph015_drop_dead_transfer(&mut items);
+        assert!(render(&items).contains("    TAX\n"));
+    }
+
+    #[test]
+    fn ph015_drops_a_transfer_whose_flags_already_reflect_the_byte() {
+        let input = concat!(
+            "*=$C000\n",
+            "    LDA V_A\n",
+            "    TAX\n",
+            "    STA V_B\n",
+            "    BEQ L1\n",
+            "    LDX #$00\n",
+            "    RTS\n",
+            "L1:\n",
+            "    LDX #$01\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph015_drop_dead_transfer(&mut items));
+        assert!(!render(&items).contains("TAX"));
+    }
+
+
+    #[test]
+    fn ph324_hoists_the_for_setup_reload_past_a_load() {
+        let input = concat!(
+            "FU_5 = $AB\n",
+            "*=$C000\n",
+            "    LDA #$33\n",
+            "    STA FU_5\n",
+            "    LDA #$00\n",
+            "    LDY FU_5\n",
+            "    JSR $B391\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph324_hoist_reload_to_transfer(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    STA FU_5\n    TAY\n    LDA #$00\n    JSR $B391\n"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn ph324_turns_an_adjacent_reload_into_a_transfer() {
+        for (store, load, copy) in [
+            ("STA", "LDX", "TAX"),
+            ("STA", "LDY", "TAY"),
+            ("STX", "LDA", "TXA"),
+            ("STY", "LDA", "TYA"),
+        ] {
+            let input = format!(
+                "*=$C000\n    {store} V_A\n    {load} V_A\n    BNE L1\nL1:\n    RTS\n"
+            );
+            let mut items = parse(&input);
+            assert!(ph324_hoist_reload_to_transfer(&mut items), "{store}/{load}");
+            let got = render(&items);
+            assert!(got.contains(&format!("    {store} V_A\n    {copy}\n    BNE L1\n")), "{got}");
+        }
+    }
+
+    #[test]
+    fn ph324_follows_a_call_into_a_helper_that_redefines_the_flags() {
+        let input = concat!(
+            "*=$C000\n",
+            "    LDA #$01\n",
+            "    STA V_A\n",
+            "    LDA #$00\n",
+            "    LDY V_A\n",
+            "    JSR __JSR2_1\n",
+            "    RTS\n",
+            "__JSR2_1:\n",
+            "    JSR $B391\n",
+            "    JMP $BBD4\n",
+        );
+        let mut items = parse(input);
+        assert!(ph324_hoist_reload_to_transfer(&mut items));
+        assert!(render(&items).contains("    STA V_A\n    TAY\n    LDA #$00\n"));
+    }
+
+    #[test]
+    fn ph324_refuses_when_the_reloads_flags_are_read() {
+        let input = concat!(
+            "*=$C000\n",
+            "    STA V_A\n",
+            "    LDA #$00\n",
+            "    LDY V_A\n",
+            "    BEQ L1\n",
+            "    RTS\n",
+            "L1:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph324_hoist_reload_to_transfer(&mut items));
+    }
+
+    #[test]
+    fn ph324_refuses_a_window_that_touches_the_register_or_the_cell() {
+        for middle in [
+            "    STA $0400,Y\n", // reads Y
+            "    INY\n",         // writes Y
+            "    INC $F7\n",     // writes the cell through its literal
+            "    STA FU_1\n",    // writes the cell through an alias
+            "    STA ($FB),Y\n", // could write anywhere
+            "    JSR $FFD2\n",   // call
+            "    STA $01\n",     // banks another byte in under the cell
+            "    SAX $F0\n",     // Unmodeled opcode effects.
+        ] {
+            let input = format!(
+                "FU_0 = $F7\nFU_1 = $F7\n*=$C000\n    STA FU_0\n{middle}    LDY FU_0\n    STY $0400\n    RTS\n"
+            );
+            let mut items = parse(&input);
+            assert!(
+                !ph324_hoist_reload_to_transfer(&mut items),
+                "window `{}` must block the hoist",
+                middle.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn ph324_refuses_the_processor_port_and_patched_operands() {
+        for (equate, cell) in [("BORDER = $D020\n", "BORDER"), ("SLOT = BASE+1\n", "SLOT")] {
+            let input = format!("{equate}*=$C000\n    STA {cell}\n    LDY {cell}\n    STY $0400\n    RTS\n");
+            let mut items = parse(&input);
+            assert!(!ph324_hoist_reload_to_transfer(&mut items), "{cell}");
+        }
+        // $01 does not read back the byte written to it.
+        let mut items = parse("*=$C000\n    STA $01\n    LDY $01\n    STY $0400\n    RTS\n");
+        assert!(!ph324_hoist_reload_to_transfer(&mut items));
+        let mut items = parse(concat!(
+            "*=$C000\n",
+            "    STA V_A\n",
+            "__P:\n",
+            "    LDY V_A\n",
+            "    STY $0400\n",
+            "    LDA #$10\n",
+            "    STA __P+1\n",
+            "    RTS\n",
+        ));
+        assert!(!ph324_hoist_reload_to_transfer(&mut items));
+    }
+
+
+    fn ph326_program(before: &str) -> String {
+        format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA #$01\n",
+                "    LDY #$02\n",
+                "    STA $05\n",
+                "    STY $06\n",
+                "    JSR __H\n",
+                "    LDA #$03\n",
+                "    STA $05\n",
+                "    STY $06\n",
+                "    JSR __H\n",
+                "    LDX #$00\n",
+                "    JSR __H\n",
+                "{}",
+                "__H:\n",
+                "    LDY #$00\n",
+                "    LDA ($05),Y\n",
+                "    RTS\n",
+            ),
+            before,
+        )
+    }
+
+    #[test]
+    fn ph326_moves_a_shared_call_prefix_into_a_new_entry() {
+        let (changed, got) = drive(ph326_absorb_shared_call_prefix, &ph326_program("    RTS\n"));
+        assert!(changed, "{got}");
+        assert_eq!(got.matches("    JSR __PH326_0\n").count(), 2, "{got}");
+        assert!(got.contains("    LDX #$00\n    JSR __H\n"), "the third call keeps its target:\n{got}");
+        assert!(
+            got.contains("    RTS\n__PH326_0:\n    STA $05\n    STY $06\n__H:\n"),
+            "the entry falls into the routine:\n{got}"
+        );
+        assert_eq!(got.matches("    STA $05\n").count(), 1, "{got}");
+    }
+
+    #[test]
+    fn ph326_gives_a_shared_label_run_one_entry() {
+        let src = concat!(
+            "*=$C000\n",
+            "    TAX\n",
+            "    JSR __A\n",
+            "    TAX\n",
+            "    JSR __A\n",
+            "    STA $05\n",
+            "    STY $06\n",
+            "    JSR __B\n",
+            "    STA $05\n",
+            "    STY $06\n",
+            "    JSR __B\n",
+            "    RTS\n",
+            "__A:\n",
+            "__B:\n",
+            "    LDA $05\n",
+            "    RTS\n",
+        );
+        let (changed, got) = drive(ph326_absorb_shared_call_prefix, src);
+        assert!(changed, "{got}");
+        for line in got.lines() {
+            if let Some(target) = line.trim().strip_prefix("JSR ") {
+                assert!(got.contains(&format!("\n{target}:\n")), "{target} is defined:\n{got}");
+            }
+        }
+        assert_eq!(got.matches("__PH326_").count(), 3, "one entry, two calls:\n{got}");
+        assert!(got.contains("    STA $05\n    STY $06\n__A:\n"), "the larger prefix wins:\n{got}");
+        assert_eq!(got.matches("    TAX\n    JSR __A\n").count(), 2, "{got}");
+    }
+
+    #[test]
+    fn ph326_needs_a_barrier_in_front_of_the_routine() {
+        let (changed, got) = drive(ph326_absorb_shared_call_prefix, &ph326_program("    INC $02\n"));
+        assert!(!changed, "{got}");
+        // Data in front may be a call's inline arguments, which return into `__H`.
+        let (changed, got) = drive(
+            ph326_absorb_shared_call_prefix,
+            &ph326_program("    RTS\n    JSR __P\n    .word $1234\n"),
+        );
+        assert!(!changed, "{got}");
+    }
+
+    #[test]
+    fn ph326_leaves_routines_with_inline_arguments_alone() {
+        let asm = ph326_program("    RTS\n").replace(
+            "    LDX #$00\n    JSR __H\n",
+            "    LDX #$00\n    JSR __H\n    .word $1234\n",
+        );
+        let (changed, got) = drive(ph326_absorb_shared_call_prefix, &asm);
+        assert!(!changed, "{got}");
+    }
+
+    #[test]
+    fn ph326_refuses_stack_patched_and_label_split_prefixes() {
+        // A stack-page store would land below the pushed return address.
+        let asm = ph326_program("    RTS\n").replace("    STY $06\n", "    STY $0105\n");
+        let (_, got) = drive(ph326_absorb_shared_call_prefix, &asm);
+        assert!(got.contains("    STY $0105\n    JSR"), "{got}");
+        let asm = ph326_program("    RTS\n").replacen("    STY $06\n", "M:\n    STY $06\n", 1);
+        let (changed, got) = drive(ph326_absorb_shared_call_prefix, &asm);
+        assert!(changed, "{got}");
+        assert!(got.contains("__PH326_0:\n    STY $06\n__H:\n"), "{got}");
+        assert!(got.contains("    STA $05\nM:\n    JSR __PH326_0\n"), "{got}");
+        let asm = ph326_program("    RTS\n").replace("    STY $06\n", "    STY $01\n");
+        let (_, got) = drive(ph326_absorb_shared_call_prefix, &asm);
+        assert!(got.contains("    STY $01\n    JSR"), "{got}");
+        let asm = ph326_program("    RTS\n").replace("    STA $05\n", "P:\n    STA $05\n") + "    STA P+1\n";
+        let (_, got) = drive(ph326_absorb_shared_call_prefix, &asm);
+        assert!(!got.contains("__PH326_0:\n    STA $05\n    STY"), "{got}");
+    }
+
+    #[test]
+    fn ph326_extends_its_entry_over_rounds_and_takes_tail_jumps() {
+        let asm = concat!(
+            "*=$C000\n",
+            "    LDA #$07\n    STA $05\n    STY $06\n    INC $39\n    JSR __H\n",
+            "    LDA #$07\n    STA $05\n    STY $06\n    INC $39\n    JMP __H\n",
+            "    RTS\n",
+            "__H:\n    RTS\n",
+        );
+        let (changed, got) = drive(ph326_absorb_shared_call_prefix, asm);
+        assert!(changed, "{got}");
+        assert!(got.contains("    JSR __PH326_"), "{got}");
+        assert!(got.contains("    JMP __PH326_"), "{got}");
+        assert_eq!(got.matches("    LDA #$07\n").count(), 1, "{got}");
+        assert_eq!(got.matches("    INC $39\n").count(), 1, "{got}");
+        assert!(
+            got.contains(
+                "__PH326_1:\n    LDA #$07\n__PH326_0:\n    STA $05\n    STY $06\n    INC $39\n__H:\n"
+            ),
+            "the second round's entry falls into the first's, in program order:\n{got}"
+        );
+    }
+
+    /// Two IF-style pairs jumping to a far `L100`, then 200 bytes of data.
+    fn ph325_program(between: &str) -> String {
+        format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA V_A\n",
+                "    BNE S1\n",
+                "    JMP L100\n",
+                "S1:\n",
+                "{}",
+                "    LDA V_B\n",
+                "    BEQ S2\n",
+                "    JMP L100\n",
+                "S2:\n",
+                "    RTS\n",
+                "{}",
+                "L100:\n",
+                "    RTS\n",
+            ),
+            between,
+            "    .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00\n".repeat(20),
+        )
+    }
+
+    #[test]
+    fn ph325_aims_a_branch_at_a_nearby_jmp_to_the_same_place() {
+        let mut items = parse(&ph325_program(""));
+        assert!(ph325_branch_via_shared_jmp(&mut items));
+        let got = render(&items);
+        // The first pair branches to the second's JMP, which stays.
+        assert!(got.contains("    LDA V_A\n    BEQ __PH325_0\nS1:\n"), "{got}");
+        assert!(got.contains("__PH325_0:\n    JMP L100\nS2:\n"), "{got}");
+        assert_eq!(got.matches("JMP L100").count(), 1, "{got}");
+    }
+
+    #[test]
+    fn ph325_aims_at_the_target_itself_when_it_is_close() {
+        let input = concat!(
+            "*=$C000\n",
+            "    LDA V_A\n",
+            "    BCC S1\n",
+            "    JMP L1\n",
+            "S1:\n",
+            "    RTS\n",
+            "L1:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph325_branch_via_shared_jmp(&mut items));
+        assert!(render(&items).contains("    BCS L1\nS1:\n"));
+    }
+
+    #[test]
+    fn ph325_refuses_an_anchor_past_a_directive_of_unknown_size() {
+        let mut items = parse(&ph325_program("    .text \"ABC\"\n"));
+        assert!(!ph325_branch_via_shared_jmp(&mut items));
+    }
+
+    #[test]
+    fn ph325_refuses_a_jmp_whose_operand_is_patched() {
+        let src = ph325_program("").replace(
+            "    LDA V_B\n    BEQ S2\n    JMP L100\n",
+            "    LDA V_B\n    BEQ S2\n__P:\n    JMP L100\n",
+        ) + "    LDA #$00\n    STA __P+1\n";
+        let mut items = parse(&src);
+        assert!(!ph325_branch_via_shared_jmp(&mut items));
+    }
+
+
+    #[test]
+    fn ph322_folds_the_store_window() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA #<(__ARR_B_I+92)\n",
+                "    STA $FD\n",
+                "    LDA #>(__ARR_B_I+92)\n",
+                "    STA $FE\n",
+                "    LDY #$00\n",
+                "    LDA #$C8\n",
+                "    STA ($FD),Y\n",
+                "    INY\n",
+                "    LDA #$00\n",
+                "    STA ($FD),Y\n",
+                "    LDA #$28\n",
+                "    STA $39\n",
+                "    LDY #$05\n",
+                "    RTS\n",
+            )
+        );
+        let mut items = parse(&input);
+        assert!(ph322_const_deref_to_abs(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    LDA #$C8\n    STA __ARR_B_I+92\n    LDA #$00\n    STA __ARR_B_I+93\n"),
+            "both halves went absolute at their offsets:\n{got}"
+        );
+        assert!(!got.contains("($FD),Y"), "indirect derefs gone:\n{got}");
+        assert!(!got.contains("#<"), "materialization gone:\n{got}");
+        assert!(!got.contains("INY"), "offset bumps gone:\n{got}");
+    }
+
+    #[test]
+    fn ph322_folds_the_load_window() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA #<(__ARR_B_I+100)\n",
+                "    STA $FD\n",
+                "    LDA #>(__ARR_B_I+100)\n",
+                "    STA $FE\n",
+                "    LDY #$00\n",
+                "    LDA ($FD),Y\n",
+                "    STA __ARRAY_INT_TMP\n",
+                "    INY\n",
+                "    LDA ($FD),Y\n",
+                "    LDY __ARRAY_INT_TMP\n",
+                "    JSR $B391\n",
+                "    RTS\n",
+            )
+        );
+        let mut items = parse(&input);
+        assert!(ph322_const_deref_to_abs(&mut items));
+        let got = render(&items);
+        assert!(
+            got.contains("    LDA __ARR_B_I+100\n") && got.contains("    LDA __ARR_B_I+101\n"),
+            "loads went absolute:\n{got}"
+        );
+        assert_eq!(got.matches("INY").count(), 0, "bumps gone:\n{got}");
+    }
+
+    #[test]
+    fn ph322_refuses_a_label_inside_the_window() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA #<(__ARR_B_I+4)\n",
+                "    STA $FD\n",
+                "    LDA #>(__ARR_B_I+4)\n",
+                "    STA $FE\n",
+                "    LDY #$00\n",
+                "MID:\n",
+                "    LDA ($FD),Y\n",
+                "    STA $06\n",
+                "    JMP MID\n",
+            )
+        );
+        let mut items = parse(&input);
+        assert!(!ph322_const_deref_to_abs(&mut items));
+        let got = render(&items);
+        assert!(got.contains("($FD),Y"), "window kept:\n{got}");
+    }
+
+    #[test]
+    fn ph322_refuses_when_y_is_live_after() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA #<(__ARR_B_I+4)\n",
+                "    STA $FD\n",
+                "    LDA #>(__ARR_B_I+4)\n",
+                "    STA $FE\n",
+                "    LDY #$00\n",
+                "    LDA ($FD),Y\n",
+                "    INY\n",
+                "    TYA\n",
+                "    RTS\n",
+            )
+        );
+        let mut items = parse(&input);
+        assert!(!ph322_const_deref_to_abs(&mut items));
+        let got = render(&items);
+        assert!(got.contains("($FD),Y"), "window kept:\n{got}");
+    }
+
+    #[test]
+    fn ph322_refuses_a_pointer_cell_write_in_the_body() {
+        let input = format!(
+            concat!(
+                "*=$C000\n",
+                "    LDA #<(__ARR_B_I+4)\n",
+                "    STA $FD\n",
+                "    LDA #>(__ARR_B_I+4)\n",
+                "    STA $FE\n",
+                "    LDY #$00\n",
+                "    LDA #$77\n",
+                "    STA $FE\n",
+                "    LDA ($FD),Y\n",
+                "    STA $06\n",
+                "    RTS\n",
+            )
+        );
+        let mut items = parse(&input);
+        assert!(!ph322_const_deref_to_abs(&mut items));
+        let got = render(&items);
+        assert!(got.contains("($FD),Y"), "window kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_drops_imm_load_across_flag_only_op() {
+        let input = concat!(
+            "    LDA #$32\n",
+            "    CLC\n",
+            "    LDA VI_I\n",
+            "    ADC #$01\n",
+            "    STA VI_I\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(!got.contains("#$32"), "dead immediate dropped:\n{got}");
+        assert!(got.contains("CLC"), "CLC stays because ADC reads carry.\n{got}");
+        assert!(got.contains("LDA VI_I"), "redefining load kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_keeps_imm_load_when_later_branch_reads_nz() {
+        let input = concat!(
+            "    LDA #$32\n",
+            "    BNE SKIP\n",
+            "SKIP:\n",
+            "    LDA VI_I\n",
+            "    ADC #$01\n",
+            "    STA VI_I\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(got.contains("LDA #$32"), "flag-feeding load kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_keeps_imm_load_when_a_live_out() {
+        let input = concat!(
+            "    LDA #$32\n",
+            "    CLC\n",
+            "    STA DST\n",
+            "    LDA VI_I\n",
+            "    ADC #$01\n",
+            "    STA OUT\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(got.contains("LDA #$32"), "load with live .A kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_keeps_imm_load_when_flags_cross_rts() {
+        let input = concat!(
+            "__H_RET:\n",
+            "    LDA #$32\n",
+            "    RTS\n",
+            "    JSR __H_RET\n",
+            "    BNE LATER\n",
+            "LATER:\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(got.contains("LDA #$32"), "load before RTS kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_drops_the_loop_head_stamp() {
+        let input = concat!(
+            "    LDA #$01\n",
+            "    STA VI_I\n",
+            "    TAX\n",
+            "TOP:\n",
+            "    LDA #$28\n",
+            "    CPX #$64\n",
+            "    BEQ EXIT\n",
+            "    INX\n",
+            "    JMP TOP\n",
+            "EXIT:\n",
+            "    LDA #$00\n",
+            "    STA OUT\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(!got.contains("#$28"), "loop-head stamp dropped:\n{got}");
+        assert!(got.contains("LDA #$01"), "stored init kept:\n{got}");
+        assert!(got.contains("CPX #$64"), "loop test kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_refuses_a_runtime_patched_imm_load() {
+        let input = concat!(
+            "PATCH:\n",
+            "    LDA #$32\n",
+            "    CLC\n",
+            "    LDA VI_I\n",
+            "    ADC #$01\n",
+            "    STA VI_I\n",
+            "    RTS\n",
+            "    STA PATCH+1\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(got.contains("LDA #$32"), "patched load kept:\n{got}");
+    }
+
+    #[test]
+    fn ph317_refuses_when_php_exists_anywhere() {
+        let input = concat!(
+            "    LDA #$32\n",
+            "    CLC\n",
+            "    PHP\n",
+            "    PLP\n",
+            "    LDA VI_I\n",
+            "    ADC #$01\n",
+            "    STA VI_I\n",
+            "    RTS\n",
+        );
+        let mut items = parse(input);
+        assert!(!ph317_drop_dead_load_via_flag_liveness(&mut items));
+        let got = render(&items);
+        assert!(got.contains("LDA #$32"), "load kept beside PHP:\n{got}");
     }
 }

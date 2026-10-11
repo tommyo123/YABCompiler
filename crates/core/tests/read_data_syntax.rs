@@ -21,7 +21,7 @@ fn build(src: &str, profile: Profile) -> Built {
     .unwrap_or_else(|e| panic!("compiles ({profile:?}): {e}\n{src}"));
     Built {
         prg_bytes: c.prg_bytes,
-        asm: c.asm,
+        asm: common::expand_call_entries(&c.asm),
     }
 }
 

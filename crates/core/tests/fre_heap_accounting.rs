@@ -136,8 +136,12 @@ fn fre_block(asm: &str) -> String {
         .find("    JSR __GC_RUN\n    SEC\n")
         .unwrap_or_else(|| panic!("no FRE sequence in:\n{asm}"));
     let tail = &asm[start..];
-    let end = tail.find("JSR $B391").expect("FRE ends in GIVAYF") + "JSR $B391".len();
-    tail[..end].to_string()
+    let (at, call) = ["JSR $B391", "JSR __GIVAYF"]
+        .iter()
+        .filter_map(|c| tail.find(c).map(|at| (at, c)))
+        .min()
+        .expect("FRE ends in GIVAYF");
+    tail[..at + call.len()].to_string()
 }
 #[test]
 fn fre_forces_a_collection() {

@@ -218,3 +218,32 @@ fn the_helper_still_assembles_to_the_emitted_machine_code() {
     );
     assert!(!c.machine_code.is_empty(), "no machine code");
 }
+
+#[test]
+fn an_array_element_copy_survives_the_next_append() {
+    assert_eq!(
+        text(
+            "10 DIM Z$(3):X$=\"A\"\n\
+             20 FOR I=0 TO 3:Z$(I)=X$:X$=X$+\"B\":NEXT\n\
+             30 FOR I=0 TO 3:PRINT LEN(Z$(I));Z$(I):NEXT\n\
+             40 END\n"
+        ),
+        " 1 A\n 2 AB\n 3 ABB\n 4 ABBB"
+    );
+    assert_eq!(
+        text("10 DIM Y$(2):X$=\"A\":X$=X$+\"B\":Y$(1)=X$+\"Q\":X$=X$+\"C\"\n20 PRINT X$;\" \";Y$(1)\n30 END\n"),
+        "ABC ABQ"
+    );
+}
+
+#[test]
+fn appending_still_happens_in_place_after_an_array_store() {
+    let base = insns(&grow(200));
+    let with_store = insns(
+        "10 DIM Z$(1):A$=\"\"\n20 FOR I=1 TO 200\n30 A$=A$+\"X\"\n40 NEXT I\n45 Z$(1)=A$\n50 PRINT A$\n60 PRINT LEN(A$)\n70 END\n",
+    );
+    assert!(
+        with_store < base * 11 / 10,
+        "one array store must not make the appends quadratic: {base} vs {with_store}"
+    );
+}

@@ -175,6 +175,7 @@ const SINKABLE_TAILS: &str = "\
 20 gosub 100
 30 next i
 40 gosub 200
+45 if i<0 then 120
 50 end
 100 print \"A\";i
 110 print \"B\";i*2

@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -148,7 +146,7 @@ fn vars_span_covers_every_slot_in_both_layouts() {
     }
 }
 #[test]
-fn state_reset_still_uses_one_memzero_over_the_label_difference() {
+fn state_reset_wipes_the_variable_block_exactly() {
     for extraram in [false, true] {
         let asm = build(MANY, Profile::Default, extraram).asm;
         let reset = asm
@@ -157,19 +155,11 @@ fn state_reset_still_uses_one_memzero_over_the_label_difference() {
             .unwrap_or_else(|| panic!("__STATE_RESET emitted (extraram={extraram}):\n{asm}"));
         // Only look at the routine body, up to its RTS.
         let body = reset.split("\n    RTS").next().unwrap();
-        assert!(
-            body.contains("LDA #<__VARS_START") && body.contains("LDA #>__VARS_START"),
-            "variable wipe still starts at __VARS_START (extraram={extraram}):\n{body}"
-        );
-        assert!(
-            body.contains("LDA #<(__VARS_END-__VARS_START)")
-                && body.contains("LDA #>(__VARS_END-__VARS_START)"),
-            "count is still the live label difference (extraram={extraram}):\n{body}"
-        );
+        let (bytes, _) = vars_span(&asm);
         assert_eq!(
-            body.matches("LDA #<__VARS_START").count(),
-            1,
-            "exactly one bulk wipe of the variable pool (extraram={extraram}):\n{body}"
+            common::zeroed_offsets(body, "__VARS_START"),
+            (0..bytes).collect(),
+            "(extraram={extraram}):\n{body}"
         );
     }
 }

@@ -12,6 +12,9 @@ path = "src/lib.rs"
 
 [dependencies]
 asm6502.workspace = true
+# Program compression.
+lzan-c64 = { git = "https://github.com/tommyo123/lzan.git", tag = "v1.0.4" }
+lzan = { git = "https://github.com/tommyo123/lzan.git", tag = "v1.0.4" }
 
 [dev-dependencies]
 # In-process C64 emulator used by integration tests.

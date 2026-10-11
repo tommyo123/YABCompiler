@@ -178,3 +178,23 @@ fn a_reaping_site_does_not_also_decrement_the_pointer() {
         "no fixed decrement in front of the reap:\n{before}"
     );
 }
+
+const POPPED: &str = "\
+10 FOR I=1 TO 3:PRINT I;:IF I=5 THEN 60\n\
+20 NEXT I\n\
+30 FOR I=7 TO 8:PRINT I;:NEXT I\n\
+40 FOR I=4 TO 5:PRINT I;:IF I=9 THEN 60\n\
+50 NEXT I:PRINT\"e\":NEXT I\n\
+60 PRINT\"x\";I:NEXT I\n";
+
+#[test]
+fn a_frame_popped_by_its_next_is_neither_reaped_nor_searched_for() {
+    let asm = asm_of(POPPED);
+    assert!(
+        asm.contains("__FOR_STACK"),
+        "lines 10 and 40 keep run-time frames:\n{asm}"
+    );
+    assert!(!asm.contains("JSR __FOR_DISCARD"), "line 30 reaps nothing:\n{asm}");
+    assert!(!asm.contains("__FOR_PUSH_SRCH"), "line 40 does not search:\n{asm}");
+    check_stops_with(POPPED, " 1  2  3  7  8  4  5 E\n");
+}

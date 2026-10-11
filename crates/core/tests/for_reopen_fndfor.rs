@@ -1,8 +1,17 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
+
+
+fn back_edges(asm: &str) -> usize {
+    asm.lines()
+        .filter_map(|l| l.trim().split_once(' '))
+        .filter(|(m, op)| {
+            (*m == "JMP" || (m.len() == 3 && m.starts_with('B') && *m != "BIT"))
+                && op.starts_with("__FOR_TOP")
+        })
+        .count()
+}
 
 fn build(src: &str, profile: Profile, extraram: bool) -> (Vec<u8>, String) {
     let prg = tokenize_program(src).expect("tokenizes");
@@ -128,7 +137,7 @@ fn reopening_the_inner_loop_keeps_both_tails_inline() {
          60 PRINT I;J\n",
     );
     assert_eq!(
-        asm.matches("JMP __FOR_TOP").count(),
+        back_edges(&asm),
         2,
         "the reopened inner loop and the outer loop each keep a \
          compile-time back edge:\n{asm}"
@@ -276,7 +285,7 @@ fn next_var_past_an_unconditional_frame_keeps_the_static_fast_path() {
         "no runtime FOR stack for a wholly static nest:\n{asm}"
     );
     assert_eq!(
-        asm.matches("JMP __FOR_TOP").count(),
+        back_edges(&asm),
         1,
         "`NEXT I` keeps its inline back edge:\n{asm}"
     );

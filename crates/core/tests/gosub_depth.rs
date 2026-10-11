@@ -19,7 +19,7 @@ const CEIL: u8 = 40;
 
 fn build(src: &str, profile: Profile, extraram: bool) -> yabcompiler_core::Compiled {
     let prg = tokenize_program(src).expect("tokenize");
-    compile_with_options(
+    let mut c = compile_with_options(
         &prg,
         CompileOptions {
             profile,
@@ -28,7 +28,9 @@ fn build(src: &str, profile: Profile, extraram: bool) -> yabcompiler_core::Compi
             ..CompileOptions::default()
         },
     )
-    .expect("compile")
+    .expect("compile");
+    c.asm = common::expand_call_entries(&c.asm);
+    c
 }
 
 fn run(prg: &[u8]) -> (bool, u64, String) {
@@ -126,10 +128,8 @@ fn every_gosub_site_bumps_and_bounds_the_depth() {
 
 #[test]
 fn the_guard_is_free_at_every_call_site() {
-    // The subroutine has to have an effect, or the whole call chain is (correctly) optimised
-    // away and there is nothing left to count.
     const MANY: &str = "10 GOSUB 100\n20 GOSUB 100\n30 GOSUB 100\n\
-                        40 PRINT T\n50 END\n100 T=T+1\n110 RETURN\n";
+                        40 PRINT T\n45 IF T<0 THEN 110\n50 END\n100 T=T+1\n110 RETURN\n";
     for profile in PROFILES {
         for extraram in [false, true] {
             let asm = build(MANY, profile, extraram).asm;
@@ -158,6 +158,7 @@ fn the_guard_is_free_at_every_call_site() {
 fn plain_recursion_gets_the_loose_budget() {
     const FORWARD_CHAIN: &str = "10 GOSUB 100\n\
                                  20 PRINT T\n\
+                                 25 IF T<0 THEN 110\n\
                                  30 END\n\
                                  100 T=T+1\n\
                                  110 RETURN\n";
@@ -192,6 +193,7 @@ fn a_forward_gosub_inside_nested_fors_keeps_the_loose_budget() {
                        50 NEXT J\n\
                        60 NEXT I\n\
                        70 PRINT \"T\";T\n\
+                       75 IF T<0 THEN 210\n\
                        80 END\n\
                        200 T=T+1\n\
                        210 RETURN\n";
@@ -215,7 +217,7 @@ fn the_budget_never_leaves_its_safe_window() {
     for src in [
         RECURSE,
         RECURSE_IN_FOR,
-        "10 GOSUB 100\n20 PRINT T\n30 END\n100 T=T+1\n110 RETURN\n",
+        "10 GOSUB 100\n20 PRINT T\n25 IF T<0 THEN 110\n30 END\n100 T=T+1\n110 RETURN\n",
         "10 FOR I=1 TO 2\n20 FOR J=1 TO 2\n30 FOR K=1 TO 2\n40 GOSUB 10\n50 NEXT K\n\
          60 NEXT J\n70 NEXT I\n80 PRINT T\n90 END\n",
     ] {
@@ -348,7 +350,7 @@ fn a_flat_gosub_loop_never_trips_the_guard() {
 /// `ON x GOSUB` lowers to the same statement and must be guarded too.
 #[test]
 fn on_gosub_is_guarded_as_well() {
-    const SRC: &str = "10 X=1\n20 ON X GOSUB 100,200\n30 PRINT \"D\";D\n40 END\n\
+    const SRC: &str = "10 X=1\n20 ON X GOSUB 100,200\n30 PRINT \"D\";D\n35 IF D<0 THEN 200\n40 END\n\
                        100 D=D+1\n110 RETURN\n200 RETURN\n";
     for profile in PROFILES {
         let built = build(SRC, profile, false);
@@ -364,25 +366,46 @@ fn on_gosub_is_guarded_as_well() {
 }
 
 #[test]
-fn a_gosub_without_a_return_still_gets_a_counter() {
+fn a_gosub_without_a_return_needs_no_counter() {
     const SRC: &str = "10 GOSUB 100\n20 END\n100 PRINT \"X\"\n";
     for profile in PROFILES {
         for extraram in [false, true] {
             let built = build(SRC, profile, extraram);
             assert!(
-                built.asm.contains("__GOSUB_DEPTH:"),
-                "the counter must be defined ({profile:?}, extraram={extraram}):\n{}",
-                built.asm
-            );
-            assert!(
-                built.asm.contains("JSR __GOSUB_CHK"),
-                "({profile:?}, extraram={extraram}):\n{}",
+                !built.asm.contains("__GOSUB_DEPTH") && !built.asm.contains("__GOSUB_CHK"),
+                "a bounded call tree needs no counter ({profile:?}, extraram={extraram}):\n{}",
                 built.asm
             );
             let (clean, _, out) = run(&built.prg_bytes);
             assert!(clean, "({profile:?}, extraram={extraram})");
             assert_eq!(out.trim_end(), "X", "({profile:?}, extraram={extraram})");
         }
+    }
+}
+
+#[test]
+fn a_subroutine_left_for_its_own_caller_keeps_the_counter() {
+    const SRC: &str = "10 GOSUB 100\n20 END\n100 PRINT \"X\";:IF T<3 THEN T=T+1:GOTO 10\n";
+    let built = build(SRC, Profile::Default, false);
+    assert!(built.asm.contains("JSR __GOSUB_CHK"), "{}", built.asm);
+    let (clean, _, out) = run(&built.prg_bytes);
+    assert!(clean);
+    assert_eq!(out.trim_end(), "XXXX");
+}
+
+#[test]
+fn a_bounded_call_tree_drops_the_counter_and_both_checks() {
+    const SRC: &str = "10 FOR I=1 TO 3:GOSUB 100:NEXT:PRINT:GOSUB 200:END\n\
+                       100 PRINT \"A\";:GOSUB 200:PRINT \"C\";:RETURN\n\
+                       200 PRINT \"B\";:RETURN\n";
+    for profile in PROFILES {
+        let built = build(SRC, profile, false);
+        for helper in ["__GOSUB_DEPTH", "__GOSUB_CHK", "__RET_CHK"] {
+            assert!(!built.asm.contains(helper), "{helper} ({profile:?}):\n{}", built.asm);
+        }
+        let (clean, _, out) = run(&built.prg_bytes);
+        assert!(clean, "({profile:?})");
+        assert_eq!(out, "ABCABCABC\nB", "({profile:?})");
     }
 }
 

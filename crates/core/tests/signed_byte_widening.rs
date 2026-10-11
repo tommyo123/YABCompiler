@@ -330,3 +330,69 @@ fn the_four_square_board_loop_does_not_raise() {
     // A(0) is 0 -> CHR$(0), which prints nothing and is legal.
     check_out(src, "..............DONE");
 }
+
+#[test]
+fn writes_that_fit_a_byte_apart_but_not_together() {
+    check_out(
+        "10 READ A,B:DATA 7,-2\n20 I%=A\n30 I%=255\n40 PRINT I%\n",
+        "255",
+    );
+}
+
+#[test]
+fn a_signed_byte_above_127_widens_by_its_own_threshold() {
+    check_out(
+        "10 READ A,B:DATA 7,-2\n\
+         20 I%=A*20:J%=I%+1:PRINT I%;J%;I%-B\n\
+         30 FOR K=1 TO 2:I%=I%-1:PRINT I%;:NEXT\n",
+        "140 141 142 139 138",
+    );
+}
+
+#[test]
+fn a_signed_byte_compares_by_value_against_a_literal() {
+    check_out(
+        "10 read b:a%=b\n20 a%=-1\n30 if a%<0 then print \"neg\"\n\
+         40 if a%=255 then print \"bad\"\n50 if 0>a% then print \"lt\"\n60 data 5\n",
+        "NEG LT",
+    );
+}
+
+#[test]
+fn a_signed_byte_compares_by_value_against_another_byte() {
+    check_out(
+        "10 read b:a%=b:c%=b\n20 a%=-1:c%=255\n30 if a%=c% then print \"bad\"\n\
+         40 if a%<c% then print \"lt\"\n60 data 5\n",
+        "LT",
+    );
+}
+
+#[test]
+fn a_signed_byte_window_compares_in_order_against_literals() {
+    check_out(
+        "10 dim c(9):for i=0 to 255:a%=asc(chr$(i))-64\n\
+         20 if a%<-1 then c(0)=c(0)+1\n\
+         21 if a%<=13 then c(1)=c(1)+1\n\
+         22 if a%>127 then c(2)=c(2)+1\n\
+         23 if a%>=128 then c(3)=c(3)+1\n\
+         24 if a%=-1 then c(4)=c(4)+1\n\
+         25 if a%<>191 then c(5)=c(5)+1\n\
+         26 if 0>a% then c(6)=c(6)+1\n\
+         27 if -64<a% then c(7)=c(7)+1\n\
+         30 next:for k=0 to 7:print c(k);:next\n",
+        "63 78 64 64 1 255 64 255",
+    );
+}
+
+#[test]
+fn an_i8_window_compares_in_order_against_literals() {
+    check_out(
+        "10 dim c(9):for i=0 to 255:a%=asc(chr$(i))-128\n\
+         20 if a%<0 then c(0)=c(0)+1\n\
+         21 if a%>=-1 then c(1)=c(1)+1\n\
+         22 if a%>100 then c(2)=c(2)+1\n\
+         23 if a%<=-128 then c(3)=c(3)+1\n\
+         30 next:for k=0 to 3:print c(k);:next\n",
+        "128 129 27 1",
+    );
+}

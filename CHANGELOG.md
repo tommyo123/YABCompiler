@@ -5,6 +5,13 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - Unreleased
+
+- `--compress=auto|on|off` writes a compressed `.prg` with its decoder. Auto compresses files that reach past `$CFFF`.
+- `--data-relocate=auto|on|off` moves DATA to RAM at `$D000` when the program starts. Auto does it when a program leaves the heap little room or does not fit.
+- Faster numeric operations, loops, array access and string handling.
+- Smaller programs with fewer repeated instructions and compact DATA and text storage.
+
 ## [1.0.1] - 2026-09-11
 
 - Integer promotion keeps every read of a promoted variable, and it leaves unbounded accumulators as floats.

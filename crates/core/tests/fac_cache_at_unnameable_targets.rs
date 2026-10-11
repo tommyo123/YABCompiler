@@ -1,5 +1,7 @@
 //! Member 3 of the FAC1-cache class: a reuse that survives an edge into a line the compiler cannot name.
 
+mod common;
+
 use yabcompiler_core::{CompileOptions, Dialect, compile_with_options, tokenize_program_with};
 
 fn asm_of(src: &str) -> String {
@@ -7,12 +9,13 @@ fn asm_of(src: &str) -> String {
         dialect: Dialect::Tsb,
         ..CompileOptions::default()
     };
-    compile_with_options(
+    let asm = compile_with_options(
         &tokenize_program_with(src, Dialect::Tsb).expect("tokenizes"),
         opts,
     )
     .expect("compiles")
-    .asm
+    .asm;
+    common::expand_call_entries(&asm)
 }
 
 fn line_block<'a>(asm: &'a str, label: &str) -> Vec<&'a str> {
@@ -35,7 +38,6 @@ fn line_block<'a>(asm: &'a str, label: &str) -> Vec<&'a str> {
     out
 }
 
-/// `ON ERROR GOTO 50`, so `__TSB_GOTO_LINE` emits `JMP L50`.
 const ON_ERROR: &str = "10 A=PEEK(197)/7\n\
                         20 ON ERROR GOTO 50\n\
                         25 D=A*100\n\
@@ -67,14 +69,15 @@ fn on_error_handler_line_loads_the_variable_instead_of_reusing_fac() {
     let joined = block.join("\n");
 
     assert!(
-        asm.lines().any(|l| l.trim() == "JMP L50"),
-        "precondition: __TSB_GOTO_LINE must emit `JMP L50`, else this test \
+        asm.lines()
+            .any(|l| matches!(l.trim(), "JMP L50" | "BEQ L50")),
+        "precondition: __TSB_GOTO_LINE must jump to L50, else this test \
          is vacuous.\n{asm}"
     );
 
     assert!(
         !joined.contains("; reuse FAC"),
-        "line 50 is entered by `JMP L50` from __TSB_GOTO_LINE, so FAC1 holds \
+        "line 50 is entered by a jump from __TSB_GOTO_LINE, so FAC1 holds \
          whatever the error path left. Reusing it stores that value into C \
          with no error banner.\nL50 block:\n{joined}"
     );

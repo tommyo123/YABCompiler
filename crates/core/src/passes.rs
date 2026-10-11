@@ -1895,9 +1895,8 @@ fn try_fold(e: &Expr) -> Option<f64> {
         }
         Expr::Not(inner) => {
             let v = try_fold(inner)?;
-            // `NOT` narrows through AYINT ($B1BF) exactly like AND/OR do, so it FLOORS and it
-            // TRAPS outside -32768..32767.
-            Some(!(ayint(crate::codegen::round_to_mflpt(v))? as i16) as f64)
+            let v = crate::romfloat::fac_of(v)?.to_f64();
+            Some(!(ayint(v)? as i16) as f64)
         }
         Expr::Bin(op, l, r) => {
             let lv = try_fold(l)?;
@@ -1925,34 +1924,37 @@ fn try_fold(e: &Expr) -> Option<f64> {
             }
         }
         Expr::Val(s) => {
-            // VAL of a literal string parses to a number per BASIC v2
-            // rules — skip leading whitespace, then parse the longest
-            // numeric prefix. Folding only the clean cases (parses
-            // fully) — partial-parse / parse-failure cases are left to
-            // the runtime so observable semantics stay identical.
+            // Fold VAL only when the exact parse result can be used.
             let bytes = try_fold_str(s)?;
             let text = std::str::from_utf8(&bytes).ok()?;
-            let trimmed = text.trim();
-            let n = trimmed.parse::<f64>().ok().filter(|n| n.is_finite())?;
-
-            if crate::codegen::mflpt_overflows(n) {
-                return None;
-            }
-            Some(crate::codegen::round_to_mflpt(n))
+            crate::romfloat::fin_value(text.trim().as_bytes())
         }
         _ => None,
     }
 }
 
-/// Constant-fold `l <op> r` the way the BASIC ROM would.
+/// Fold BASIC arithmetic with the left operand rounded and right operand in FAC.
 fn fold_bin(op: BinOp, l: f64, r: f64) -> Option<f64> {
-    let l = crate::codegen::round_to_mflpt(l);
-    let r = crate::codegen::round_to_mflpt(r);
-    let folded = fold_bin_exact(op, l, r)?;
-    if crate::codegen::mflpt_overflows(folded) {
-        return None;
-    }
-    Some(crate::codegen::round_to_mflpt(folded))
+    use crate::romfloat::Op;
+    let op = match op {
+        BinOp::Add => Op::Add,
+        BinOp::Sub => Op::Sub,
+        BinOp::Mul => Op::Mul,
+        BinOp::Div => Op::Div,
+        BinOp::Eq => Op::Eq,
+        BinOp::Ne => Op::Ne,
+        BinOp::Lt => Op::Lt,
+        BinOp::Le => Op::Le,
+        BinOp::Gt => Op::Gt,
+        BinOp::Ge => Op::Ge,
+        BinOp::And | BinOp::Or | BinOp::Xor => {
+            let l = crate::romfloat::rounded(l)?;
+            let r = crate::romfloat::fac_of(r)?.to_f64();
+            return fold_bin_exact(op, l, r);
+        }
+        BinOp::Pow => return fold_bin_exact(op, l, r),
+    };
+    crate::romfloat::binop(op, l, r)
 }
 
 fn fold_bin_exact(op: BinOp, l: f64, r: f64) -> Option<f64> {
@@ -2000,11 +2002,12 @@ fn ayint(v: f64) -> Option<u16> {
     (f >= i16::MIN as f64 && f <= i16::MAX as f64).then(|| f as i32 as u16)
 }
 
-/// Apply BASIC assignment conversion, returning None for a range error.
+/// Apply the rounding and range rules of the target variable.
 pub(crate) fn narrow_for_int_store(var: &VarName, v: f64) -> Option<f64> {
     if var.kind == VarKind::Integer && var.base != "TI" && var.base != "ST" {
-        let f = v.floor();
-        (-32768.0..=32767.0).contains(&f).then_some(f)
+        crate::romfloat::int_store(v)
+    } else if var.kind == VarKind::Float {
+        crate::romfloat::rounded(v)
     } else {
         Some(v)
     }
@@ -2016,20 +2019,16 @@ fn try_simplify_identity(e: &Expr) -> Option<Expr> {
     let Expr::Bin(op, l, r) = e else { return None };
     let l_lit = as_simple_literal(l);
     let r_lit = as_simple_literal(r);
+    // Removing an identity operation must preserve operand rounding.
+    let clean = |e: &Expr| crate::codegen::fac_rounding_byte_clear(e);
     match (op, l_lit, r_lit) {
-        // Add: x + 0  /  0 + x  -> x
-        (BinOp::Add, _, Some(0.0)) => Some((**l).clone()),
+        (BinOp::Add, _, Some(0.0)) if clean(l) => Some((**l).clone()),
         (BinOp::Add, Some(0.0), _) => Some((**r).clone()),
-        // Sub: x - 0 -> x ;  0 - x -> -x
-        (BinOp::Sub, _, Some(0.0)) => Some((**l).clone()),
+        (BinOp::Sub, _, Some(0.0)) if clean(l) => Some((**l).clone()),
         (BinOp::Sub, Some(0.0), _) => Some(Expr::Neg(r.clone())),
-        // Mul: x * 1  /  1 * x -> x ;  x * -1  /  -1 * x -> -x
-        (BinOp::Mul, _, Some(1.0)) => Some((**l).clone()),
-        (BinOp::Mul, Some(1.0), _) => Some((**r).clone()),
-        (BinOp::Mul, _, Some(-1.0)) => Some(Expr::Neg(l.clone())),
-        (BinOp::Mul, Some(-1.0), _) => Some(Expr::Neg(r.clone())),
-        // Div: x / 1 -> x  (NOT 0/x: x might be 0 -> ?DIVISION BY ZERO)
-        (BinOp::Div, _, Some(1.0)) => Some((**l).clone()),
+        (BinOp::Mul, _, Some(1.0)) if clean(l) => Some((**l).clone()),
+        (BinOp::Mul, _, Some(-1.0)) if clean(l) => Some(Expr::Neg(l.clone())),
+        (BinOp::Div, _, Some(1.0)) if clean(l) => Some((**l).clone()),
         // Or:  x | 0  /  0 | x -> x
         (BinOp::Or, _, Some(0.0)) if expr_is_ayint_narrowed(l) => Some((**l).clone()),
         (BinOp::Or, Some(0.0), _) if expr_is_ayint_narrowed(r) => Some((**r).clone()),
@@ -2093,9 +2092,12 @@ fn as_simple_literal(e: &Expr) -> Option<f64> {
 
 /// Fold a unary function only when its result matches BASIC floating-point behavior.
 fn fold_func1(f: Func1, v: f64) -> Option<f64> {
-    let v = crate::codegen::round_to_mflpt(v);
+    // The operand is FAC as its expression left it, rounding byte and all.
+    let fac = crate::romfloat::fac_of(v)?;
+    let v = fac.to_f64();
     let folded = match f {
         Func1::Abs => v.abs(),
+        Func1::Int if fac.exp >= 0xA0 => v,
         Func1::Int => v.floor(),
         Func1::Sgn => {
             // BASIC SGN: -1, 0, or 1. Use a direct compare so SGN(-0.0)
@@ -2119,10 +2121,7 @@ fn fold_func1(f: Func1, v: f64) -> Option<f64> {
         // RND is non-deterministic: never fold.
         Func1::Rnd => return None,
     };
-    if crate::codegen::mflpt_overflows(folded) {
-        return None;
-    }
-    Some(crate::codegen::round_to_mflpt(folded))
+    Some(folded)
 }
 
 /// Removes lines that no execution path can reach.
@@ -2362,25 +2361,9 @@ impl ir::Pass for IntForBodyAnalysis {
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
 
-        let mut pairs: Vec<((usize, usize), (usize, usize))> = Vec::new();
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        for (li, line) in module.lines.iter().enumerate() {
-            for (si, stmt) in line.stmts.iter().enumerate() {
-                match stmt {
-                    Stmt::For { .. } => stack.push((li, si)),
-                    Stmt::Next { vars } => {
-                        // Multi-var NEXT (`NEXT I, J, K`) closes one
-                        // open FOR per listed var.
-                        for _ in vars {
-                            if let Some(open) = stack.pop() {
-                                pairs.push((open, (li, si)));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // A FOR a NEXT abandons is as open-ended as one no NEXT closes.
+        let (pairs, mut stack, abandoned) = textual_for_next_pairs(module);
+        stack.extend(abandoned);
 
         // Step 2: scan each body for the safety flag and for whether it
         // ever reads the loop variable. Held in two HashSets so we can
@@ -2389,7 +2372,7 @@ impl ir::Pass for IntForBodyAnalysis {
         // writes the counter.
         let routines = build_routine_writes(module);
         // A Float counter cannot share its private integer slot with the variable's five-byte home.
-        let counter_writes = reachable_for_counter_writes(module);
+        let counter_writes = for_counters_written_while_live(module);
         let unmatched_positions: HashSet<(usize, usize)> = stack.into_iter().collect();
         let mut unsafe_positions = HashSet::new();
         for &(fli, fsi) in &unmatched_positions {
@@ -2476,30 +2459,17 @@ impl ir::Pass for IntForBodyAnalysis {
             }
         }
 
-        // Any FOR counter written outside its header, of any kind. Codegen
-        // exits on equality, so jumping past the limit wraps.
-        struct MutableCounters<'a>(&'a HashSet<VarName>);
-        impl crate::visit::MutVisitor for MutableCounters<'_> {
-            fn visit_stmt_mut(&mut self, line: u16, stmt: &mut Stmt) {
-                if let Stmt::For {
-                    var,
-                    body_int_safe,
-                    body_reads_loop_var,
-                    ..
-                } = stmt
-                {
-                    if self.0.contains(var) {
-                        *body_int_safe = false;
-                        *body_reads_loop_var = true;
-                    }
-                }
-                crate::visit::walk_stmt_mut(self, line, stmt);
+        for path in &counter_writes {
+            if let Stmt::For {
+                body_int_safe,
+                body_reads_loop_var,
+                ..
+            } = stmt_at_mut(module, path)
+            {
+                *body_int_safe = false;
+                *body_reads_loop_var = true;
             }
         }
-        crate::visit::MutVisitor::visit_module_mut(
-            &mut MutableCounters(&counter_writes),
-            module,
-        );
         Ok(())
     }
 }
@@ -2585,8 +2555,17 @@ impl ir::Pass for PokeLoopFusion {
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
 
         let reads = count_var_reads(module);
-        for line in &mut module.lines {
-            fuse_poke_loops(&mut line.stmts, &reads);
+        let lifetimes = crate::for_next_runtime::analyze(module);
+        for (line_idx, line) in module.lines.iter_mut().enumerate() {
+            let line_no = line.number;
+            let may_fuse = (0..line.stmts.len())
+                .map(|i| {
+                    lifetimes.for_tier(line_no, line_idx, &[i])
+                        == crate::for_next_runtime::ForTier::Static
+                        && !lifetimes.static_for_needs_discard(line_no, line_idx, &[i])
+                })
+                .collect();
+            fuse_poke_loops(&mut line.stmts, &reads, may_fuse);
         }
         Ok(())
     }
@@ -2610,9 +2589,14 @@ fn count_var_reads(module: &ir::Module) -> HashMap<VarName, u32> {
     c.counts
 }
 
-fn fuse_poke_loops(stmts: &mut Vec<Stmt>, reads: &HashMap<VarName, u32>) {
+/// `may_fuse[k]` says whether `stmts[k]`, when it is a FOR, may become a fill.
+fn fuse_poke_loops(stmts: &mut Vec<Stmt>, reads: &HashMap<VarName, u32>, mut may_fuse: Vec<bool>) {
     let mut i = 0;
     while i + 2 < stmts.len() {
+        if !may_fuse[i] {
+            i += 1;
+            continue;
+        }
         if let Some(fused) = match_poke_fill_triplet(&stmts[i..i + 3], reads) {
             // Replace 3 stmts with 1 PokeFill at position i.
             stmts[i] = Stmt::PokeFill {
@@ -2621,11 +2605,13 @@ fn fuse_poke_loops(stmts: &mut Vec<Stmt>, reads: &HashMap<VarName, u32>) {
                 value: fused.value,
             };
             stmts.drain(i + 1..i + 3);
+            may_fuse.drain(i + 1..i + 3);
             if let Some((var, exit)) = fused.loop_var_exit {
                 stmts.insert(i + 1, Stmt::Let {
                     var,
                     value: Expr::Number(exit),
                 });
+                may_fuse.insert(i + 1, true);
             }
             // Don't advance i — a previous fusion could have left
             // another candidate adjacent (e.g., two consecutive
@@ -2993,6 +2979,9 @@ fn try_hoist_loop(
     // hoisting once and reusing the temp is the whole point.
     let mut candidates: Vec<Expr> = Vec::new();
     licm_collect_candidates(module, fli, fsi, nli, nsi, &blocked, &mut candidates);
+    candidates.retain(|e| {
+        licm_infer_kind(e) != VarKind::Float || licm_every_use_is_rounded(module, fli, fsi, nli, nsi, e)
+    });
     if candidates.is_empty() {
         return;
     }
@@ -3266,25 +3255,27 @@ fn licm_collect_in_stmt(
     speculative: bool,
 ) {
     match stmt {
-        Stmt::Let { value, .. } => licm_collect_in_expr(value, blocked, out, speculative),
-        Stmt::ArrayLet { indices, value, .. } => {
+        Stmt::Let { var, value } => {
+            licm_collect_in_expr(value, blocked, out, speculative, var.kind == VarKind::Float)
+        }
+        Stmt::ArrayLet { name, indices, value } => {
             for e in indices {
-                licm_collect_in_expr(e, blocked, out, speculative);
+                licm_collect_in_expr(e, blocked, out, speculative, false);
             }
-            licm_collect_in_expr(value, blocked, out, speculative);
+            licm_collect_in_expr(value, blocked, out, speculative, name.kind == VarKind::Float);
         }
         Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
-            licm_collect_in_expr(addr, blocked, out, speculative);
-            licm_collect_in_expr(value, blocked, out, speculative);
+            licm_collect_in_expr(addr, blocked, out, speculative, false);
+            licm_collect_in_expr(value, blocked, out, speculative, false);
         }
         Stmt::PokeFill {
             dst_start,
             dst_end,
             value,
         } => {
-            licm_collect_in_expr(dst_start, blocked, out, speculative);
-            licm_collect_in_expr(dst_end, blocked, out, speculative);
-            licm_collect_in_expr(value, blocked, out, speculative);
+            licm_collect_in_expr(dst_start, blocked, out, speculative, false);
+            licm_collect_in_expr(dst_end, blocked, out, speculative, false);
+            licm_collect_in_expr(value, blocked, out, speculative, false);
         }
         Stmt::Print { items, .. } => {
             for p in items {
@@ -3293,13 +3284,13 @@ fn licm_collect_in_stmt(
                 | PrintPiece::TabTo(e)
                 | PrintPiece::Spc(e) = p
                 {
-                    licm_collect_in_expr(e, blocked, out, speculative);
+                    licm_collect_in_expr(e, blocked, out, speculative, false);
                 }
             }
         }
         Stmt::If { cond, then } => {
             // The condition runs whenever the IF is reached. The THEN body does not.
-            licm_collect_in_expr(cond, blocked, out, speculative);
+            licm_collect_in_expr(cond, blocked, out, speculative, false);
             if let ThenIr::Stmts(inner) = then {
                 for s in inner {
                     licm_collect_in_stmt(s, blocked, out, true);
@@ -3310,15 +3301,18 @@ fn licm_collect_in_stmt(
     }
 }
 
+/// Track whether BASIC rounds this expression before using it.
 fn licm_collect_in_expr(
     e: &Expr,
     blocked: &HashSet<VarName>,
     out: &mut Vec<Expr>,
     speculative: bool,
+    rounded: bool,
 ) {
     if licm_expr_invariant(e, blocked)
         && licm_expr_worth_hoisting(e)
         && (!speculative || expr_cannot_trap(e))
+        && (rounded || licm_infer_kind(e) != VarKind::Float)
     {
         // Maximal: don't descend. Dedupe so identical sub-expressions
         // share one temp.
@@ -3330,25 +3324,87 @@ fn licm_collect_in_expr(
     // Descend into children to find smaller invariant candidates.
     match e {
         Expr::Neg(inner) | Expr::Not(inner) => {
-            licm_collect_in_expr(inner, blocked, out, speculative);
+            licm_collect_in_expr(inner, blocked, out, speculative, false);
         }
         Expr::Bin(_, l, r) => {
-            licm_collect_in_expr(l, blocked, out, speculative);
-            licm_collect_in_expr(r, blocked, out, speculative);
+            licm_collect_in_expr(l, blocked, out, speculative, true);
+            licm_collect_in_expr(r, blocked, out, speculative, false);
         }
         Expr::Func1(_, arg) => {
-            licm_collect_in_expr(arg, blocked, out, speculative);
+            licm_collect_in_expr(arg, blocked, out, speculative, false);
         }
         Expr::Peek(addr) | Expr::MemPeek(addr) => {
-            licm_collect_in_expr(addr, blocked, out, speculative);
+            licm_collect_in_expr(addr, blocked, out, speculative, false);
         }
         Expr::ArrayRef(_, idx) => {
             for e in idx {
-                licm_collect_in_expr(e, blocked, out, speculative);
+                licm_collect_in_expr(e, blocked, out, speculative, false);
             }
         }
         _ => {}
     }
+}
+
+/// Hoist only when every use rounds the expression first.
+fn licm_every_use_is_rounded(
+    module: &ir::Module,
+    fli: usize,
+    fsi: usize,
+    nli: usize,
+    nsi: usize,
+    target: &Expr,
+) -> bool {
+    fn in_expr(e: &Expr, target: &Expr, rounded: bool) -> bool {
+        if e == target {
+            return rounded;
+        }
+        match e {
+            Expr::Neg(inner) | Expr::Not(inner) => in_expr(inner, target, false),
+            Expr::Bin(_, l, r) => in_expr(l, target, true) && in_expr(r, target, false),
+            Expr::Func1(_, arg) => in_expr(arg, target, false),
+            Expr::Peek(addr) | Expr::MemPeek(addr) => in_expr(addr, target, false),
+            Expr::ArrayRef(_, idx) => idx.iter().all(|e| in_expr(e, target, false)),
+            _ => true,
+        }
+    }
+    fn in_stmt(stmt: &Stmt, target: &Expr) -> bool {
+        match stmt {
+            Stmt::Let { var, value } => in_expr(value, target, var.kind == VarKind::Float),
+            Stmt::ArrayLet { name, indices, value } => {
+                indices.iter().all(|e| in_expr(e, target, false))
+                    && in_expr(value, target, name.kind == VarKind::Float)
+            }
+            Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
+                in_expr(addr, target, false) && in_expr(value, target, false)
+            }
+            Stmt::PokeFill {
+                dst_start,
+                dst_end,
+                value,
+            } => [dst_start, dst_end, value].iter().all(|e| in_expr(e, target, false)),
+            Stmt::Print { items, .. } => items.iter().all(|p| match p {
+                PrintPiece::Expr(e)
+                | PrintPiece::CharOut(e)
+                | PrintPiece::TabTo(e)
+                | PrintPiece::Spc(e) => in_expr(e, target, false),
+                _ => true,
+            }),
+            Stmt::If { cond, then } => {
+                in_expr(cond, target, false)
+                    && match then {
+                        ThenIr::Stmts(inner) => inner.iter().all(|s| in_stmt(s, target)),
+                        _ => true,
+                    }
+            }
+            _ => true,
+        }
+    }
+    let mut ok = true;
+    licm_walk_body(module, fli, fsi, nli, nsi, |stmt| {
+        ok &= in_stmt(stmt, target);
+        ok
+    });
+    ok
 }
 
 /// True iff every leaf in `e` is either a literal or a Var that's
@@ -3928,24 +3984,39 @@ impl<'a, 'b> crate::visit::Visitor for ArrayPtrExprWalker<'a, 'b> {
 /// `((for_line, for_stmt), (next_line, next_stmt))` pairs in source
 /// order, one per matched FOR/NEXT.
 fn collect_for_next_pairs(module: &ir::Module) -> Vec<((usize, usize), (usize, usize))> {
+    textual_for_next_pairs(module).0
+}
+
+/// Pair top level FOR and NEXT statements by frame search rules.
+fn textual_for_next_pairs(
+    module: &ir::Module,
+) -> (
+    Vec<((usize, usize), (usize, usize))>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+) {
+    let var_at = |&(li, si): &(usize, usize)| match &module.lines[li].stmts[si] {
+        Stmt::For { var, .. } => var.clone(),
+        _ => unreachable!("position came from FOR scan"),
+    };
     let mut pairs = Vec::new();
+    let mut abandoned = Vec::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
     for (li, line) in module.lines.iter().enumerate() {
         for (si, stmt) in line.stmts.iter().enumerate() {
             match stmt {
                 Stmt::For { .. } => stack.push((li, si)),
                 Stmt::Next { vars } => {
-                    for _ in vars {
-                        if let Some(open) = stack.pop() {
-                            pairs.push((open, (li, si)));
-                        }
-                    }
+                    let (closed, left) =
+                        crate::for_next_runtime::close_textual_frames(&mut stack, vars, var_at);
+                    pairs.extend(closed.into_iter().map(|open| (open, (li, si))));
+                    abandoned.extend(left);
                 }
                 _ => {}
             }
         }
     }
-    pairs
+    (pairs, stack, abandoned)
 }
 
 fn collect_induction_candidates(stmt: &Stmt, target: &VarName, counts: &mut Vec<(f64, usize)>) {
@@ -4896,21 +4967,11 @@ fn scan_for_counters_with_unsafe_body(module: &ir::Module) -> HashSet<VarName> {
     };
     crate::visit::Visitor::visit_module(&mut headers, module);
     let mut unsafe_counters = headers.unsafe_counters;
-    let mut pairs: Vec<((usize, usize), (usize, usize))> = Vec::new();
-    let mut stack: Vec<(usize, usize)> = Vec::new();
-    for (li, line) in module.lines.iter().enumerate() {
-        for (si, stmt) in line.stmts.iter().enumerate() {
-            match stmt {
-                Stmt::For { .. } => stack.push((li, si)),
-                Stmt::Next { vars } => {
-                    for _ in vars {
-                        if let Some(open) = stack.pop() {
-                            pairs.push((open, (li, si)));
-                        }
-                    }
-                }
-                _ => {}
-            }
+    let (pairs, _, abandoned) = textual_for_next_pairs(module);
+    // A loop a NEXT of an outer loop abandoned has no body to check.
+    for (fli, fsi) in abandoned {
+        if let Stmt::For { var, .. } = &module.lines[fli].stmts[fsi] {
+            unsafe_counters.insert(var.clone());
         }
     }
 
@@ -4951,67 +5012,116 @@ fn explicit_for_counter_writes(module: &ir::Module) -> HashSet<VarName> {
     writes.0
 }
 
-/// Writes before initialization or after a proved Static loop completes cannot mutate its live private counter.
-fn reachable_for_counter_writes(module: &ir::Module) -> HashSet<VarName> {
-    let mut writes = explicit_for_counter_writes(module);
-    if writes.is_empty()
-        || module.has_on_key()
-        || module.has_error_continuation()
-        || module.lines.iter().any(|line| {
-            line.stmts.iter().any(|stmt| effect_summary_for_stmt(stmt).opaque_write)
-        })
-    {
-        return writes;
+/// Whether a statement can write the variable through another route.
+fn stmt_opaquely_writes(
+    stmt: &Stmt,
+    var: &VarName,
+    fn_params: &HashMap<crate::ast::FnName, Vec<VarName>>,
+) -> bool {
+    use crate::visit::Visitor;
+    if !effect_summary_for_stmt(stmt).opaque_write {
+        return false;
     }
+    if matches!(
+        stmt,
+        Stmt::Clr | Stmt::Run(_) | Stmt::Load { .. } | Stmt::Verify { .. } | Stmt::Save { .. }
+    ) {
+        return true;
+    }
+    struct Calls<'a> {
+        var: &'a VarName,
+        fn_params: &'a HashMap<crate::ast::FnName, Vec<VarName>>,
+        explained: bool,
+        writes: bool,
+    }
+    impl Visitor for Calls<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            match e {
+                Expr::FnCall(name, _) => {
+                    self.explained = true;
+                    // An FN with no DEF in sight could be anything.
+                    self.writes |= self.fn_params.get(name).is_none_or(|params| params.contains(self.var));
+                }
+                Expr::Usr(_) => self.explained = true,
+                _ => {}
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut calls = Calls { var, fn_params, explained: matches!(stmt, Stmt::Sys { .. }), writes: false };
+    calls.visit_stmt(0, stmt);
+    calls.writes || !calls.explained
+}
+
+/// Find loops whose counters are written while their frames are live.
+fn for_counters_written_while_live(module: &ir::Module) -> Vec<crate::cfg::StmtPath> {
+    use crate::for_next_runtime::StmtId;
     let lifetimes = crate::for_next_runtime::analyze(module);
     let cfg = crate::cfg::Cfg::build_with(module, &lifetimes);
-    writes.retain(|var| {
-        let headers = (0..cfg.nodes.len())
-            .filter(|id| matches!(cfg.stmt_at(*id, module), Stmt::For { var: v, .. } if v == var))
-            .collect::<Vec<_>>();
-        for header in headers {
-            let node = &cfg.nodes[header];
-            let header_id = crate::for_next_runtime::StmtId {
-                line_no: node.line_no,
-                line_idx: node.stmt.line_idx,
-                path: node.stmt.path.clone(),
-            };
-            let mut completed_at = HashSet::new();
-            if lifetimes.for_tier(node.line_no, node.stmt.line_idx, &node.stmt.path)
-                == crate::for_next_runtime::ForTier::Static
-            {
-                for (id, next) in cfg.nodes.iter().enumerate() {
-                    let next_id = crate::for_next_runtime::StmtId {
-                        line_no: next.line_no,
-                        line_idx: next.stmt.line_idx,
-                        path: next.stmt.path.clone(),
-                    };
-                    if lifetimes.static_pairs.get(&next_id).is_some_and(|partners| {
-                        partners.iter().any(|partner| partner.as_ref() == Some(&header_id))
-                    }) {
-                        completed_at.insert(id);
-                    }
-                }
-            }
-            let mut pending = vec![header];
-            let mut seen = HashSet::new();
-            while let Some(id) = pending.pop() {
-
-                if completed_at.contains(&id) || !seen.insert(id) {
-                    continue;
-                }
-                let stmt = cfg.stmt_at(id, module);
-                if matches!(stmt, Stmt::Let { var: v, .. } if v == var)
-                    || (!matches!(stmt, Stmt::For { .. }) && stmt_counter_defs(stmt).contains(var))
-                {
-                    return true;
-                }
-                pending.extend(cfg.nodes[id].successors.iter().copied());
+    let headers = (0..cfg.nodes.len())
+        .filter(|id| matches!(cfg.stmt_at(*id, module), Stmt::For { .. }))
+        .collect::<Vec<_>>();
+    if module.has_on_key() || module.has_error_continuation() {
+        return headers.iter().map(|&h| cfg.nodes[h].stmt.clone()).collect();
+    }
+    let mut fn_params: HashMap<crate::ast::FnName, Vec<VarName>> = HashMap::new();
+    for line in &module.lines {
+        for stmt in &line.stmts {
+            if let Stmt::DefFn { name, param, .. } = stmt {
+                fn_params.entry(name.clone()).or_default().push(param.clone());
             }
         }
-        false
-    });
-    writes
+    }
+    let routines = build_routine_writes(module);
+    headers
+        .into_iter()
+        .filter(|&header| {
+            let Stmt::For { var, .. } = cfg.stmt_at(header, module) else {
+                unreachable!("headers are FOR statements")
+            };
+            let header_id = StmtId::of_node(&cfg.nodes[header]);
+            // (statement, the variable written since the push)
+            let mut pending: Vec<(usize, bool)> =
+                cfg.nodes[header].successors.iter().map(|&s| (s, false)).collect();
+            let mut seen = HashSet::new();
+            while let Some((id, written)) = pending.pop() {
+                if !seen.insert((id, written)) {
+                    continue;
+                }
+                let here = StmtId::of_node(&cfg.nodes[id]);
+                let stmt = cfg.stmt_at(id, module);
+                let mut uses = false;
+                if let Stmt::Next { vars } = stmt {
+                    if written && lifetimes.next_may_use_frame(&here, vars, &header_id, var) {
+                        return true;
+                    }
+                    uses = lifetimes.next_always_uses_frame(&here, vars, &header_id, var);
+                }
+                // A FOR of the variable drops the frame instead (`frame_successors`).
+                let written = written
+                    || matches!(stmt, Stmt::Let { var: v, .. } if v == var)
+                    || (!matches!(stmt, Stmt::For { .. }) && stmt_counter_defs(stmt).contains(var))
+                    || stmt_opaquely_writes(stmt, var, &fn_params);
+                let called: &[u16] = match stmt {
+                    Stmt::GoSub { target } => std::slice::from_ref(target),
+                    Stmt::OnBranch { kind: OnBranchKind::GoSub, targets, .. } => targets,
+                    _ => &[],
+                };
+                // A routine that cannot be summarised may write anything.
+                let call_writes = called.iter().any(|t| match routines.get(t) {
+                    Some(RoutineEffect::Writes(w)) => w.contains(var),
+                    _ => true,
+                });
+                pending.extend(
+                    cfg.frame_successors(module, header, id, var, uses)
+                        .into_iter()
+                        .map(|s| (s, written || call_writes)),
+                );
+            }
+            false
+        })
+        .map(|h| cfg.nodes[h].stmt.clone())
+        .collect()
 }
 
 fn unproved_mutated_for_counters(
@@ -6342,8 +6452,12 @@ impl ir::Pass for TailGosubRewrite {
             collect_gosub_call_sites(line.number, &line.stmts, &mut sites);
         }
         let recursive = crate::for_next_runtime::recursive_gosub_call_lines(module, sites);
+        let bare_returns = crate::gosub_depth::lines_returning_without_a_call(module);
         for line in &mut module.lines {
             let no = line.number;
+            if bare_returns.as_ref().is_none_or(|lines| lines.contains(&no)) {
+                continue;
+            }
             rewrite_tail_gosubs_in_stmts(
                 &mut line.stmts,
                 &inline_bodies,
@@ -7269,26 +7383,14 @@ pub fn run_const_var_prop(module: &mut ir::Module) -> bool {
     // "non-LET write" mechanism touches it, and use-line range.
     let mut scanner = ConstVarScanner::default();
     crate::visit::walk_module(&mut scanner, module);
-    if scanner.saw_var_reset {
-        return false;
-    }
     let info = scanner.info;
-    // Pre-compute the set of line numbers that may be reached only
-    // while inside a GOSUB body — those subs aren't guaranteed to
-    // run before some other call site reads the var, so a literal
-    // assignment inside one isn't a sound program-wide constant.
-    // A low-numbered subroutine can assign the only literal value,
-    // while the first read happens before that subroutine runs. In
-    // that shape, propagating the literal would turn the later branch
-    // into an unconditional jump.
-    let in_sub = compute_in_sub_lines(module);
     // Step 2: build the substitution map.
     let mut consts: HashMap<VarName, f64> = HashMap::new();
     for (var, vi) in &info {
         if var.kind == VarKind::String {
             continue;
         }
-        if vi.let_count != 1 {
+        if vi.let_count == 0 {
             continue;
         }
         if vi.has_nonlet_write {
@@ -7303,25 +7405,7 @@ pub fn run_const_var_prop(module: &mut ir::Module) -> bool {
         if vi.let_line > vi.first_use_line {
             continue;
         }
-        // The line-order check is only sound when the LET runs on
-        // every path that reaches a read. A LET inside a subroutine
-        // body can be skipped at runtime if some caller reads the var
-        // before that sub is ever entered. Disqualify those.
-        if in_sub.contains(&vi.let_line) {
-            continue;
-        }
-        // Skip vars whose only reads sit inside DIM size exprs.
-        // Promoting them forces static array allocation (the
-        // array bytes get baked into the PRG), which only pays
-        // off for small arrays — large ones would bloat the
-        // image past what the runtime-allocated path costs.
-        //
-        // The cap of 32 caps a worst-case `DIM A(32)` float
-        // array at 33 * 5 = 165 bytes vs ~50 bytes of
-        // allocator code, so even the worst float case
-        // costs <120 bytes; small int/string arrays are
-        // strictly cheaper. Above the cap we leave it as a
-        // runtime DIM.
+        // Line order alone does not prove assignment before use.
         if vi.non_dim_use_count == 0 && (!value.is_finite() || value < 0.0 || value > 32.0) {
             continue;
         }
@@ -7343,7 +7427,7 @@ pub fn run_const_var_prop(module: &mut ir::Module) -> bool {
     true
 }
 
-/// A candidate has one unconditional literal definition and no other writes.
+/// Keep constants only when their definition reaches every read.
 fn retain_initialized_constants<T>(module: &ir::Module, consts: &mut HashMap<VarName, T>) {
     if module.has_on_key() || module.has_error_continuation() {
         consts.clear();
@@ -7370,8 +7454,19 @@ fn retain_initialized_constants<T>(module: &ir::Module, consts: &mut HashMap<Var
         crate::visit::Visitor::visit_stmt(&mut r, cfg.nodes[id].line_no, cfg.stmt_at(id, module));
         r.names
     }).collect();
+    let mut roots = vec![cfg.entry];
+    for id in 0..cfg.nodes.len() {
+        match cfg.stmt_at(id, module) {
+            Stmt::Clr => roots.extend(cfg.nodes[id].successors.iter().copied()),
+            Stmt::Run(target) => roots.extend(match target {
+                Some(t) => cfg.line_first.get(t).copied(),
+                None => Some(cfg.entry),
+            }),
+            _ => {}
+        }
+    }
     consts.retain(|var, _| {
-        let mut pending = vec![cfg.entry];
+        let mut pending = roots.clone();
         let mut visited = vec![false; cfg.nodes.len()];
         while let Some(id) = pending.pop() {
             if std::mem::replace(&mut visited[id], true) { continue; }
@@ -7631,8 +7726,11 @@ impl crate::visit::Visitor for ConstVarScanner {
                     self.mark_nonlet_write(var);
                 } else {
                     let entry = self.info.entry(var.clone()).or_insert_with(VarInfo::new);
+                    let first = entry.let_count == 0;
                     entry.let_count = entry.let_count.saturating_add(1);
-                    entry.let_line = line_no;
+                    if first || line_no < entry.let_line {
+                        entry.let_line = line_no;
+                    }
                     let raw_value = match value {
                         Expr::Number(n) if n.is_finite() => Some(*n),
                         Expr::Neg(inner) => match inner.as_ref() {
@@ -7642,7 +7740,12 @@ impl crate::visit::Visitor for ConstVarScanner {
                         _ => None,
                     };
 
-                    entry.let_value = raw_value.and_then(|v| narrow_for_int_store(var, v));
+                    let stored = raw_value.and_then(|v| narrow_for_int_store(var, v));
+                    entry.let_value = match (first, entry.let_value, stored) {
+                        (true, _, v) => v,
+                        (false, Some(a), Some(b)) if a.to_bits() == b.to_bits() => Some(a),
+                        _ => None,
+                    };
                 }
             }
             Stmt::LetStr { var, .. } => {
@@ -7794,7 +7897,9 @@ fn is_promoted_const_let(stmt: &Stmt, consts: &HashMap<VarName, f64>) -> bool {
 #[derive(Default)]
 struct VarInfo {
     let_count: u32,
+    /// The value every top-level LET stores, when they all store the same literal.
     let_value: Option<f64>,
+    /// The first line with a top-level LET.
     let_line: u16,
     has_nonlet_write: bool,
     first_use_line: u16,
@@ -11020,7 +11125,7 @@ fn mirror_relop(op: BinOp) -> Option<BinOp> {
     })
 }
 
-fn negate_relop(op: BinOp) -> BinOp {
+pub(crate) fn negate_relop(op: BinOp) -> BinOp {
     match op {
         BinOp::Eq => BinOp::Ne,
         BinOp::Ne => BinOp::Eq,
@@ -12203,8 +12308,30 @@ impl ir::Pass for DeadStoreElim {
         // var is live at the OUT side of that node. If not — and
         // the RHS is pure — mark the line+stmt for removal.
         let mut to_remove: HashSet<(usize, Vec<usize>)> = HashSet::new();
+        let mut skipped_reads: Vec<(usize, Vec<usize>, usize)> = Vec::new();
         for (id, node) in cfg.nodes.iter().enumerate() {
             let stmt = cfg.stmt_at(id, module);
+            if let Stmt::Read(targets) = stmt {
+                let live_out = &live.per_node[id].1;
+                let skip = ir::read_skip_var();
+                for (k, t) in targets.iter().enumerate() {
+                    let ir::ReadTarget::Scalar(v) = t else { continue };
+                    let read_later = targets[k + 1..].iter().any(|later| match later {
+                        ir::ReadTarget::Array { indices, .. } => {
+                            indices.iter().any(|e| ir::expr_may_read_var(e, v))
+                        }
+                        ir::ReadTarget::Scalar(_) => false,
+                    });
+                    if v.kind == VarKind::String
+                        && *v != skip
+                        && !live_out.contains(v)
+                        && str_store_cannot_trap(v)
+                        && !read_later
+                    {
+                        skipped_reads.push((node.stmt.line_idx, node.stmt.path.clone(), k));
+                    }
+                }
+            }
             let drop = match stmt {
                 Stmt::Let { var, value } => {
                     let live_out = &live.per_node[id].1;
@@ -12229,6 +12356,11 @@ impl ir::Pass for DeadStoreElim {
                     || !floor_traps.contains(&(node.stmt.line_idx, node.stmt.path.clone())))
             {
                 to_remove.insert((node.stmt.line_idx, node.stmt.path.clone()));
+            }
+        }
+        for (line_idx, path, k) in skipped_reads {
+            if let Stmt::Read(targets) = stmt_at_path_mut(module, line_idx, &path) {
+                targets[k] = ir::ReadTarget::Scalar(ir::read_skip_var());
             }
         }
         if to_remove.is_empty() {
@@ -12325,6 +12457,36 @@ fn walk_stack_floor_then(
     if let ThenIr::Stmts(inner) = then {
         walk_stack_floor(inner, path, path_offset, line_idx, depth, out);
     }
+}
+
+fn stmt_at_path_mut<'a>(module: &'a mut ir::Module, line_idx: usize, path: &[usize]) -> &'a mut Stmt {
+    let mut s = &mut module.lines[line_idx].stmts[path[0]];
+    for &idx in &path[1..] {
+        s = match s {
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => &mut inner[idx],
+            Stmt::IfElse { then, else_then, .. } => {
+                let then_len = then_branch_len(then);
+                match (then, else_then) {
+                    (ThenIr::Stmts(inner), _) if idx < then_len => &mut inner[idx],
+                    (_, ThenIr::Stmts(inner)) => &mut inner[idx - then_len],
+                    _ => unreachable!("invalid CFG IF/ELSE path"),
+                }
+            }
+            Stmt::Rcomp { then, else_then } => {
+                let then_len = then_branch_len(then);
+                match (then, else_then) {
+                    (ThenIr::Stmts(inner), _) if idx < then_len => &mut inner[idx],
+                    (_, Some(ThenIr::Stmts(inner))) => &mut inner[idx - then_len],
+                    _ => unreachable!("invalid CFG RCOMP path"),
+                }
+            }
+            _ => unreachable!("invalid CFG path"),
+        };
+    }
+    s
 }
 
 fn drop_paths_in(
@@ -12780,7 +12942,8 @@ mod tests {
     fn fold_refuses_results_outside_the_mflpt_range() {
         assert_eq!(fold_bin(BinOp::Mul, 1e38, 1e38), None);
         assert_eq!(fold_bin(BinOp::Add, 1.7e38, 1.7e38), None);
-        assert!(fold_bin(BinOp::Mul, 1e19, 1e19).is_some());
+        assert_eq!(fold_bin(BinOp::Mul, 1e19, 1e19), None);
+        assert!(fold_bin(BinOp::Mul, 1e18, 1e19).is_some());
     }
 
     /// The ROM keeps a 32-bit mantissa and rounds after every op, so `0.1+0.2` and `0.3` really
@@ -13380,8 +13543,7 @@ mod tests {
             Box::new(Expr::Number(1.0)),
             Box::new(Expr::Var(ivar("X"))),
         );
-        let simplified = try_simplify_identity(&e).unwrap();
-        assert!(matches!(&simplified, Expr::Var(v) if v == &ivar("X")));
+        assert!(try_simplify_identity(&e).is_none());
     }
 
     #[test]
@@ -14143,26 +14305,65 @@ mod tests {
 
     #[test]
     fn tail_gosub_rewrite_turns_gosub_return_into_goto() {
+        // Line 100 runs only as line 10's routine, so its RETURN always has a frame to pop.
         let mut module = Module {
-            lines: vec![Line {
-                number: 100,
-                stmts: vec![Stmt::GoSub { target: 200 }, Stmt::Return],
-            }],
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::GoSub { target: 100 }, Stmt::End],
+                },
+                Line {
+                    number: 100,
+                    stmts: vec![Stmt::GoSub { target: 200 }, Stmt::Return],
+                },
+                Line {
+                    number: 200,
+                    stmts: vec![Stmt::Return],
+                },
+            ],
+        };
+
+        TailGosubRewrite.run(&mut module).unwrap();
+
+        assert!(matches!(
+            module.lines[1].stmts.as_slice(),
+            [Stmt::Goto { target: 200 }]
+        ));
+    }
+
+    #[test]
+    fn tail_gosub_rewrite_keeps_a_call_main_code_returns_from() {
+        let mut module = Module {
+            lines: vec![
+                Line {
+                    number: 100,
+                    stmts: vec![Stmt::GoSub { target: 200 }, Stmt::Return],
+                },
+                Line {
+                    number: 200,
+                    stmts: vec![Stmt::Return],
+                },
+            ],
         };
 
         TailGosubRewrite.run(&mut module).unwrap();
 
         assert!(matches!(
             module.lines[0].stmts.as_slice(),
-            [Stmt::Goto { target: 200 }]
+            [Stmt::GoSub { target: 200 }, Stmt::Return]
         ));
     }
 
     #[test]
     fn tail_gosub_inlines_single_use_if_body() {
         let a = fvar("A");
+        // Line 10 runs only as line 5's routine.
         let mut module = Module {
             lines: vec![
+                Line {
+                    number: 5,
+                    stmts: vec![Stmt::GoSub { target: 10 }, Stmt::End],
+                },
                 Line {
                     number: 10,
                     stmts: vec![
@@ -14191,7 +14392,7 @@ mod tests {
         let Stmt::If {
             then: ThenIr::Stmts(inner),
             ..
-        } = &module.lines[0].stmts[0]
+        } = &module.lines[1].stmts[0]
         else {
             panic!("expected IF with stmt body");
         };

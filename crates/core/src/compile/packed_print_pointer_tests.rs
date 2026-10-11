@@ -11,7 +11,7 @@ fn source(opaque_sys: bool) -> String {
         source.push_str(&format!(
             "{} PRINT \"{}AB{letter}\";\n",
             10 + u32::from(i) * 10,
-            letter.to_string().repeat(177)
+            (0..177).map(|k| if k % 8 == 7 { '.' } else { letter }).collect::<String>()
         ));
     }
     source.push_str("500 A$=\"UNCHANGED\":PRINT A$;CHR$(253);CHR$(254):END\n");

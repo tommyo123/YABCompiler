@@ -147,8 +147,8 @@ fn the_older_reserve_rules_still_fire() {
 fn the_reserved_block_really_is_a_hole_in_the_image() {
 
     let mut src = String::from("10 POKE2040,132\n");
-    for n in 0..1400 {
-        src.push_str(&format!("{} PRINT\"AAAAAAAAAAAAAAAAAAAAAAAA\"\n", 100 + n));
+    for n in 0..400 {
+        src.push_str(&format!("{} PRINT\"AAAAAAAAAAAAAAAAAAAA{n:04}\"\n", 100 + n));
     }
     src.push_str("60000 END\n");
     let tok = tokenize_program(&src).unwrap();

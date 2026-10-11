@@ -29,9 +29,15 @@ fn banner(prg: &[u8]) -> Option<String> {
 
 fn check_sites(asm: &str) -> usize {
     let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+    let loaders: Vec<String> = (2..lines.len())
+        .filter(|&i| lines[i] == "RTS" && lines[i - 1] == "LDA __GOSUB_DEPTH")
+        .filter_map(|i| (0..i).rev().map(|k| lines[k]).find(|l| l.ends_with(':')))
+        .map(|l| format!("JSR {}", l.trim_end_matches(':')))
+        .collect();
     let mut n = 0;
     for i in 0..lines.len() {
-        if lines[i] == "LDA __GOSUB_DEPTH"
+        let loads = lines[i] == "LDA __GOSUB_DEPTH" || loaders.iter().any(|j| j == lines[i]);
+        if loads
             && lines.get(i + 1).is_some_and(|l| l.starts_with("CMP #$"))
             && lines.get(i + 2) == Some(&"BCS __FOR_OOM")
             && (i == 0 || lines[i - 1] != "INC __GOSUB_DEPTH")

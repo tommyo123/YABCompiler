@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -185,8 +183,9 @@ fn still_reads_the_counter_slot_when_the_body_is_closed() {
          100 for i=8 to 9:print \"e\";i;:next:return\n\
          200 print \"o\";i;\"q\";:return\n",
     );
+    let l100 = block(&asm, "L100");
     assert!(
-        block(&asm, "L100").contains("LDY FU_0"),
+        l100.contains("LDY FU_0") || l100.contains("STA FU_0\n    TAY\n"),
         "line 100's own body still reads I out of the u8 counter slot:\n{asm}"
     );
     assert!(

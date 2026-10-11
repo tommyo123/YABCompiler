@@ -38,7 +38,7 @@ fn failed_val_copy_lifts_the_heap_with_real_linked_bytes() {
         };
         let built = compile_with_options(&input, options).unwrap();
         assert!(built.diagnostics.extraram.is_on());
-        assert!(built.asm.contains("JSR __VAL_HELPER"));
+        assert!(built.asm.contains("__VAL_HELPER:"));
         assert!(!built.asm.contains("__VAL_COPY:"));
         assert!(built.asm.contains("Linked fill keeps VAL"));
         assert!(!built.asm.contains("whole DATA pool before string constants"),

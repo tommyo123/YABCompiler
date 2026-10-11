@@ -6,15 +6,16 @@ const BODY: &str = "\
 10 DEF FN A(X)=X*X
 20 DEF FN B(X)=X/2
 30 DEF FN C(X)=X+3
-40 PRINT FN A(5)
-50 PRINT FN B(10)
-60 PRINT FN C(7)
+40 PRINT FN A(5);FN A(2);FN A(9)
+50 PRINT FN B(10);FN B(4);FN B(6)
+60 PRINT FN C(7);FN C(1);FN C(8)
 70 PRINT FN A(FN C(2))
 80 FOR I=1 TO 5
-90 PRINT FN A(I);
+90 PRINT FN A(I);FN B(I);FN C(I);
 100 NEXT
 110 PRINT
 ";
+
 
 /// Widest pad that fits comfortably inside a 255-byte BASIC line.
 const PER_LINE: usize = 200;
@@ -223,3 +224,15 @@ fn a_non_layout_failure_is_not_retried() {
     );
 }
 
+
+#[test]
+fn def_fn_bodies_build_at_their_own_profile() {
+    let prg = tokenize_program(BODY).expect("tokenizes");
+    for profile in [Profile::Default, Profile::Speed, Profile::Size] {
+        let c = compile_with_options(&prg, opts(profile)).expect("compiles");
+        assert!(
+            !c.diagnostics.size_profile_fallback,
+            "{profile:?} fell back to Size"
+        );
+    }
+}

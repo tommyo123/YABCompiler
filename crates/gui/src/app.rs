@@ -8,7 +8,22 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use egui::{Color32, RichText};
-use yabcompiler_core::config;
+use yabcompiler_core::{AutoMode, config};
+
+fn auto_mode_combo(ui: &mut egui::Ui, id: &str, mode: &mut AutoMode) {
+    let label = |m: AutoMode| match m {
+        AutoMode::Auto => "Auto",
+        AutoMode::On => "On",
+        AutoMode::Off => "Off",
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label(*mode))
+        .show_ui(ui, |ui| {
+            for m in [AutoMode::Auto, AutoMode::On, AutoMode::Off] {
+                ui.selectable_value(mode, m, label(m));
+            }
+        });
+}
 
 use crate::pipeline::{
     self, BuildArtifact, BuildRequest, Profile, default_asm_for, default_output_for,
@@ -110,6 +125,8 @@ pub struct YabApp {
     output_path: PathBuf,
     asm_path: PathBuf,
     write_asm: bool,
+    compress: AutoMode,
+    data_relocate: AutoMode,
 
     // Compile options
     profile: ProfileChoice,
@@ -152,6 +169,8 @@ impl Default for YabApp {
             output_path: PathBuf::new(),
             asm_path: PathBuf::new(),
             write_asm: false,
+            compress: AutoMode::Auto,
+            data_relocate: AutoMode::Auto,
             profile: ProfileChoice::default(),
             dialect: DialectChoice::default(),
             extraram: false,
@@ -513,6 +532,17 @@ impl YabApp {
 
         ui.add_space(8.0);
 
+        ui.horizontal(|ui| {
+            ui.label("Compression");
+            auto_mode_combo(ui, "compress", &mut self.compress);
+        })
+        .response
+        .on_hover_text(
+            "Write a compressed .prg with its decoder.\n\
+             Auto compresses files that reach past $CFFF.",
+        );
+        ui.add_space(4.0);
+
         // ASM file (optional)
         ui.checkbox(&mut self.write_asm, "Write assembly listing")
             .on_hover_text("Save the generated 6502 assembly alongside the .prg");
@@ -629,6 +659,14 @@ impl YabApp {
                     .small(),
             );
         }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Move DATA");
+            auto_mode_combo(ui, "data_relocate", &mut self.data_relocate);
+        })
+        .response
+        .on_hover_text("Move DATA to RAM at $D000 when the program starts.");
 
         ui.add_space(8.0);
         ui.checkbox(&mut self.custom_start_enabled, "Custom start address")
@@ -884,6 +922,8 @@ impl YabApp {
             self.custom_start_enabled = false;
             self.custom_start_address = "$C000".to_string();
             self.write_asm = false;
+            self.compress = AutoMode::Auto;
+            self.data_relocate = AutoMode::Auto;
             self.last_diagnostics = None;
             self.last_asm.clear();
             self.log.clear();
@@ -1007,6 +1047,8 @@ impl YabApp {
             rem_hint_dialect: self.rem_hint_dialect,
             reserved_text: &self.reserved_ranges,
             custom_start_text: custom_start,
+            compress: self.compress,
+            data_relocate: self.data_relocate,
         };
 
         match pipeline::build(&request) {
@@ -1061,12 +1103,21 @@ impl YabApp {
             }
         }
 
-        let summary = format!(
-            "compiled {} ({} bytes machine code, {} bytes total .prg)",
-            out_path.display(),
-            artifact.machine_code_len,
-            artifact.prg_bytes.len(),
-        );
+        let summary = match artifact.diagnostics.compressed_from {
+            None => format!(
+                "compiled {} ({} bytes machine code, {} bytes total .prg)",
+                out_path.display(),
+                artifact.machine_code_len,
+                artifact.prg_bytes.len(),
+            ),
+            Some(plain) => format!(
+                "compiled {} ({} bytes machine code, {} bytes .prg compressed to {})",
+                out_path.display(),
+                artifact.machine_code_len,
+                plain,
+                artifact.prg_bytes.len(),
+            ),
+        };
         let diagnostics_text = format_diagnostics(&artifact.diagnostics);
         self.log = format!("{summary}\n{diagnostics_text}");
         self.last_asm = artifact.asm;
@@ -1090,6 +1141,9 @@ fn format_diagnostics(d: &yabcompiler_core::Diagnostics) -> String {
         ));
     }
     out.push_str(&format!("  extraram: {}\n", d.extraram));
+    if d.data_relocated > 0 {
+        out.push_str(&format!("  DATA {} bytes moved to $D000 at start\n", d.data_relocated));
+    }
     if !d.effective_reserved.is_empty() {
         let source = match (d.auto_reserved.is_empty(), d.manual_reserved.is_empty()) {
             (true, true) => "",

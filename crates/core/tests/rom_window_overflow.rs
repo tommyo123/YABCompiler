@@ -2,14 +2,13 @@
 
 use yabcompiler_core::{CompileOptions, compile_with_options, tokenize_program};
 
-/// A string-free program plus `items` unread numeric DATA entries.
 fn padded(items: usize) -> String {
     let mut s = String::from(
         "\
 10 FOR K=1 TO 3:READ V:PRINT V;:NEXT
 20 PRINT
 30 END
-300 DATA 11,22,33
+300 DATA 11,22,33,999
 ",
     );
     s.push_str(&format!("310 DATA {}\n", vec!["7"; items].join(",")));

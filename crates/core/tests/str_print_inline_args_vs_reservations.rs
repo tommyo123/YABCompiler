@@ -128,10 +128,15 @@ fn the_inline_convention_is_smaller_than_the_register_convention() {
         undone.diagnostics.inline_str_args_undone,
         "fixture must actually take the fallback"
     );
-    assert_eq!(inline_sites(&undone), 0, "the fallback removes every site");
+    let left = inline_sites(&undone);
     assert!(
-        !undone.asm.contains("__STR_PRINT_I"),
-        "the trampoline must go with the sites that used it"
+        left < inline_sites(&inline),
+        "the split site goes back to the register convention"
+    );
+    assert_eq!(
+        undone.asm.contains("__STR_PRINT_I:"),
+        left > 0,
+        "the trampoline stays exactly as long as a site still uses it"
     );
 
     assert!(
@@ -155,6 +160,18 @@ fn forced_fallback() -> Compiled {
 }
 
 #[test]
+fn a_split_backs_out_only_the_sites_it_separates() {
+    let want = inline_sites(&compile_reserved(Vec::new()));
+    let c = forced_fallback();
+    let left = inline_sites(&c);
+    assert!(
+        left + 2 >= want,
+        "a one-byte reservation should cost at most a couple of sites: \
+         {left} of {want} still inline"
+    );
+}
+
+#[test]
 fn the_fallback_still_prints_the_right_text() {
     let c = forced_fallback();
     assert_eq!(
@@ -175,7 +192,7 @@ fn every_single_byte_reservation_inside_the_image_still_prints_the_right_text() 
     for addr in SWEEP_LO..end {
         let c = compile_reserved(vec![(addr, addr)]);
         if c.diagnostics.inline_str_args_undone {
-            assert_eq!(inline_sites(&c), 0);
+            assert!(inline_sites(&c) < want_sites);
             fell_back += 1;
         } else {
             assert_eq!(inline_sites(&c), want_sites);

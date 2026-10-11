@@ -208,7 +208,7 @@ fn the_jsr_pair_factorer_still_factors_ordinary_pairs() {
     src.push_str("200 PRINT A(0);A(1);A(2);A(3)\n");
     let asm = build_with(&src, false).asm;
     assert!(
-        asm.contains("__JSR2_0:"),
+        asm.lines().any(|l| l.starts_with("__JSR2_")),
         "no JSR pair was factored at all — the barrier is over-firing, or this \
          fixture no longer produces recurring pairs:\n{asm}"
     );

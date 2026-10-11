@@ -103,6 +103,17 @@ const FN_STACK_FLOOR: u8 = 0x20;
 
 /// Line `finish()` rewrites into the fill loop (or deletes).
 const BSS_FILL_MARKER: &str = "; @@BSS_TAIL_FILL@@";
+/// Last line of the fill block.
+const BSS_FILL_CLOSE: &str = "; --- end BSS zero-fill ---";
+/// Marker replaced with variable and array clearing code.
+const STATE_ZERO_MARKER: &str = "; @@STATE_ZERO@@";
+/// Entry state initialization markers.
+const STATE_INIT_OPEN: &str = "; @@STATE_INIT@@";
+const STATE_INIT_CLOSE: &str = "; @@END_STATE_INIT@@";
+/// Marker replaced with state clearing code.
+const STATE_RESET_ZERO_MARKER: &str = "; @@STATE_RESET_ZERO@@";
+/// Clearing code used when the zero fill is removed.
+pub(crate) const IF_NO_FILL_PREFIX: &str = ";@@IF_NO_FILL@@ ";
 /// DATA cursor storage for programs that use SYS or USR.
 const DATA_CUR_LABEL: &str = "__DATA_CUR";
 /// Markers for the alternative VAL helpers and their buffer.
@@ -122,6 +133,28 @@ const BSS_FILL_MIN_BYTES: usize = 64;
 
 /// End marker for the contiguous DATA pool.
 pub const DATA_POOL_CLOSE: &str = "__DATA_END:";
+
+/// DATA address in RAM under I/O and KERNAL ROM.
+pub const DATA_RUN_ADDR: u16 = 0xD000;
+/// A relocated pool ends below the CPU vectors, which hold its NMI stub's address.
+pub const DATA_RUN_LIMIT: u32 = 0xFFFA;
+/// Load address set after linking.
+pub const DATA_LOAD_LABEL: &str = "__DATA_LOAD";
+/// The page a READ of a relocated pool copies its item into.
+pub const DATA_BUF_LABEL: &str = "D__DATA_BUF";
+/// Letter prefix for relocated DATA equates.
+pub const RELOCATED_PREFIX: &str = "D";
+/// Marker for DATA bytes appended to the output.
+pub const DATA_BLOB_MARKER: &str = "; @@DATA_BLOB@@ ";
+
+/// Where READ copies an item from a relocated DATA pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataBuf {
+    /// A free page outside the image.
+    At(u16),
+    /// A page of BSS.
+    Bss,
+}
 
 #[derive(Debug)]
 pub enum CodegenError {
@@ -294,6 +327,182 @@ pub fn emit_with_profile_at_opts_diag(
     )
 }
 
+/// Key for shared integer equality code.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EqTailKey {
+    /// `v = k`.
+    VarConst(VarName, i32),
+    /// `v = w`.
+    VarVar(VarName, VarName),
+}
+
+impl EqTailKey {
+    fn of(a: &Expr, b: &Expr) -> Option<Self> {
+        match (a, b) {
+            (Expr::Var(v), Expr::Number(n)) if n.fract() == 0.0 => {
+                Some(Self::VarConst(v.clone(), *n as i32))
+            }
+            (Expr::Var(v), Expr::Var(w)) => Some(Self::VarVar(v.clone(), w.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// Counts the `=`/`<>` expressions per [`EqTailKey`].
+#[derive(Default)]
+struct EqualityTailSites(HashMap<EqTailKey, usize>);
+
+impl crate::visit::Visitor for EqualityTailSites {
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Bin(BinOp::Eq | BinOp::Ne, a, b) = expr
+            && let Some(key) = EqTailKey::of(a, b)
+        {
+            *self.0.entry(key).or_default() += 1;
+        }
+        crate::visit::walk_expr(self, expr);
+    }
+}
+
+impl EqualityTailSites {
+    fn count(module: &ir::Module) -> HashMap<EqTailKey, usize> {
+        let mut sites = Self::default();
+        crate::visit::walk_module(&mut sites, module);
+        sites.0
+    }
+}
+
+/// Counts the targets of every READ statement.
+#[derive(Default)]
+struct ReadTargets(usize);
+
+impl crate::visit::Visitor for ReadTargets {
+    fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+        if let Stmt::Read(targets) = stmt {
+            self.0 += targets.len();
+        }
+        crate::visit::walk_stmt(self, line_no, stmt);
+    }
+}
+
+impl ReadTargets {
+    fn count(module: &ir::Module) -> usize {
+        let mut targets = Self::default();
+        crate::visit::walk_module(&mut targets, module);
+        targets.0
+    }
+}
+
+/// Track scalar writes to estimate runtime DIM sizes.
+#[derive(Default)]
+struct RuntimeDimDemand {
+    latest: HashMap<VarName, Option<f64>>,
+    /// Largest element count each array is DIMed with, and its rank.
+    per_array: HashMap<VarName, (f64, usize)>,
+}
+
+impl crate::visit::Visitor for RuntimeDimDemand {
+    fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+        let mut opaque = |var: &VarName| {
+            self.latest.insert(var.clone(), None);
+        };
+        match stmt {
+            Stmt::Let { var, value } => {
+                let n = if let Expr::Number(n) = value { Some(*n) } else { None };
+                self.latest.insert(var.clone(), n);
+            }
+            Stmt::For { var, start: Expr::Number(a), end: Expr::Number(b), .. } => {
+                self.latest.insert(var.clone(), Some(a.max(*b)));
+            }
+            Stmt::Get { indices, .. } if !indices.is_empty() => {}
+            Stmt::Fetch { target_indices, .. } if !target_indices.is_empty() => {}
+            Stmt::For { var, .. } | Stmt::Get { var, .. } | Stmt::KeyGet { var } => opaque(var),
+            Stmt::Fetch { target, .. } => opaque(target),
+            Stmt::GetFile { vars, .. } => vars.iter().for_each(opaque),
+            Stmt::Read(targets) | Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+                for target in targets {
+                    if let ReadTarget::Scalar(var) = target {
+                        opaque(var);
+                    }
+                }
+            }
+            Stmt::Dim(specs) => {
+                for spec in specs {
+                    if spec.dims.iter().all(|d| matches!(d, Expr::Number(_))) {
+                        continue;
+                    }
+                    let mut elements = 1.0;
+                    for dim in &spec.dims {
+                        match self.value(dim) {
+                            Some(n) if (0.0..=65535.0).contains(&n) => elements *= n.floor() + 1.0,
+                            _ => {
+                                elements = 0.0;
+                                break;
+                            }
+                        }
+                    }
+                    let entry = self.per_array.entry(spec.name.clone()).or_insert((0.0, 0));
+                    *entry = (entry.0.max(elements), spec.dims.len());
+                }
+            }
+            _ => {}
+        }
+        crate::visit::walk_stmt(self, line_no, stmt);
+    }
+}
+
+impl RuntimeDimDemand {
+    fn value(&self, expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Number(n) => Some(*n),
+            Expr::Var(var) => self.latest.get(var).copied().flatten(),
+            Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
+                let (l, r) = (self.value(l)?, self.value(r)?);
+                Some(match op {
+                    BinOp::Add => l + r,
+                    BinOp::Sub => l - r,
+                    _ => l * r,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Array heap estimate for layout selection, not a runtime bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeDimEstimate {
+    /// Heap bytes in this compiler's layout.
+    pub compiled: u32,
+    /// Array heap use in BASIC.
+    pub stock: u32,
+}
+
+pub(crate) fn runtime_dim_estimate(
+    module: &ir::Module,
+    source: &SourceIntegerVars,
+) -> RuntimeDimEstimate {
+    let mut demand = RuntimeDimDemand::default();
+    crate::visit::walk_module(&mut demand, module);
+    let (mut compiled, mut stock) = (0.0, 0.0);
+    for (name, &(elements, rank)) in &demand.per_array {
+        if elements == 0.0 {
+            continue;
+        }
+        compiled += elements * Codegen::array_elem_size(name) as f64;
+        let stock_elem = match name.kind {
+            VarKind::String => 3.0,
+            VarKind::Integer if source.arrays.contains(name) => 2.0,
+            _ => 5.0,
+        };
+        stock += elements * stock_elem + 5.0 + 2.0 * rank as f64;
+    }
+    let clamp = |v: f64| v.min(f64::from(u32::MAX)) as u32;
+    RuntimeDimEstimate {
+        compiled: clamp(compiled),
+        stock: clamp(stock),
+    }
+}
+
 /// Original scalar and array namespaces are separate: `A%` does not make a demoted source `A()` an explicitly integer array, or conversely.
 #[derive(Clone, Default)]
 pub(crate) struct SourceIntegerVars {
@@ -341,7 +550,7 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_source_types(
 ) -> Result<(String, ZpPressure), CodegenError> {
     emit_with_profile_at_opts_diag_and_data_rescue(
         module, profile, origin, safe_sys_calls, hints, poisoned_fns,
-        source_integer_vars, false, false,
+        source_integer_vars, false, false, None,
     )
 }
 
@@ -357,6 +566,7 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_data_rescue(
     compact_data_metadata: bool,
     // TSB dialect: boot like TSB, not a stock C64.
     tsb_target: bool,
+    data_relocate: Option<DataBuf>,
 ) -> Result<(String, ZpPressure), CodegenError> {
     let analysis = CodegenAnalysis::from_module(module);
     let orphan_for_next = crate::for_next_runtime::analyze(module);
@@ -377,6 +587,7 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_data_rescue(
         cg.code_origin = origin;
         cg.safe_sys_calls = safe_sys_calls;
         cg.tsb_target = tsb_target;
+        cg.data_relocate = data_relocate;
         cg.forced_byte_bases = hints.byte_vars.clone();
         cg.forced_zp_bases = hints.zp_vars.clone();
         cg.poisoned_fns = poisoned_fns.clone();
@@ -423,6 +634,8 @@ pub struct ZpPressure {
     pub pairs_unresolved: u32,
     /// The program's own `POKE`/`PEEK`/`WAIT` may reach MEMSIZ at `$37`/`$38`.
     pub program_touches_memsiz: bool,
+    /// Runtime array demand beyond the string heap floor.
+    pub runtime_dim_demand: u32,
 }
 
 impl ZpPressure {
@@ -467,6 +680,8 @@ struct Codegen {
     /// re-emit loop continuation code rather than hitting an
     /// `UnmatchedNext` compile error.
     last_popped_for: Option<ForFrame>,
+    /// Give each NEXT exit its own label.
+    emitted_for_exits: HashSet<String>,
     /// The one frame a later stack-underflowing `NEXT` is allowed to re-emit.
     shared_next_candidate: Option<ForFrame>,
     /// Where each emitted `FOR` came from, keyed by its `__FOR_TOP_<n>` label (unique per
@@ -508,6 +723,8 @@ struct Codegen {
     /// 2-byte `__FOR_DIFF_LO`/`__FOR_DIFF_HI` shared scratch used by
     /// the signed-16-bit compare at NEXT.
     used_int_for: bool,
+    /// Count equality sites that can share a subtraction.
+    equality_tail_sites: HashMap<EqTailKey, usize>,
     /// Track whether we ever needed BOOL_TO_FAC, so we only emit the
     /// helper when something refers to it.
     used_bool_to_fac: bool,
@@ -693,6 +910,17 @@ struct Codegen {
     used_illegal_qty: bool,
     /// True iff any READ emitted the end-of-pool check.
     used_data_chk: bool,
+    /// Destination buffer for relocated DATA reads.
+    data_relocate: Option<DataBuf>,
+    /// Whether the DATA pool is relocated.
+    data_relocated: bool,
+    /// Bytes in the DATA pool.
+    data_pool_len: usize,
+    /// `__READ_STR_COPY` copies a buffered text item onto the heap.
+    used_read_str_copy: bool,
+    read_targets: usize,
+    /// Some READ advanced the DATA cursor through `__DATA_ADVANCE`.
+    used_data_advance: bool,
     /// True iff any orphan NEXT can find the runtime FOR stack empty.
     used_next_no_for: bool,
     /// True iff a runtime FOR-stack push or a GOSUB emitted a depth check.
@@ -704,6 +932,22 @@ struct Codegen {
     uses_gosub: bool,
     /// True iff a GOSUB site emitted `JSR __GOSUB_CHK`.
     used_gosub_chk: bool,
+    /// True iff an `ON n GOSUB` table calls through `__JMP22` (`JMP ($22)`).
+    used_jmp22: bool,
+    /// Use tagged binary integers when they save space.
+    data_ints_tagged: bool,
+    /// True iff a numeric READ enters through `__READ_TAGGED`.
+    used_read_tagged: bool,
+    /// The entry `__READ_TAGGED` hands a text item to.
+    read_tagged_text_entry: &'static str,
+    /// Whether digit reads repay the helper size.
+    read_digits: bool,
+    /// Whether numeric READ needs the digit helper.
+    used_read_digits: bool,
+    /// True iff `VAL` enters through `__VAL_DIGITS`, the same shortcut in front of FIN.
+    used_val_digits: bool,
+    /// Whether GOSUB and RETURN checks are proved unnecessary.
+    gosub_depth_free: bool,
     /// True iff a runtime FOR-stack push emitted `JSR __FOR_BYTES_CHK`.
     used_for_bytes_chk: bool,
     /// True iff a static-tier `FOR` emitted `JSR __FOR_DISCARD`.
@@ -712,6 +956,8 @@ struct Codegen {
     used_for_walk_mark: bool,
     /// Page-1 floors for which a shared GOSUB-marker push helper (`__FOR_MARK_<floor>`) has to be emitted.
     for_mark_floors: std::collections::BTreeSet<u8>,
+    /// Table identifiers and targets for ON GOTO.
+    on_tables: Vec<(usize, Vec<String>)>,
     /// GOSUB depth that raises OUT OF MEMORY.
     gosub_depth_limit: u8,
 
@@ -741,6 +987,7 @@ struct Codegen {
     /// operand. Each used_op_t0 flag pulls in its own stub.
     used_fadd_t0: bool,
     used_fsub_t0: bool,
+    used_fcmp_t0: bool,
     used_fmult_t0: bool,
     used_fdiv_t0: bool,
     /// Float-var load/store usage counts (separate buckets so we can
@@ -807,6 +1054,10 @@ struct Codegen {
     logic_byte_max_depth: usize,
     /// Whether signed 16-bit conversion with BASIC range checks is needed.
     used_ayint: bool,
+    /// Whether integer stores need ROUND before AYINT.
+    used_ayint_rnd: bool,
+    /// Whether AND and OR need rounding before AYINT.
+    used_ayint_psh: bool,
     /// Whether internal signed 16-bit conversion without range checks is needed.
     used_fac_to_int16: bool,
     /// Whether unsigned 16-bit values need conversion to FAC.
@@ -840,14 +1091,10 @@ struct Codegen {
     /// stash the pre-shift value when the plan needs to add or
     /// subtract `var` back after shifting.
     used_smul_tmp: bool,
-    /// True iff `TI` (the system jiffy counter) was read anywhere —
-    /// pulls in the `__READ_TI` helper plus the byte slots and FAC
-    /// stash it needs.
     used_hardcopy: bool,
+    /// Whether TI needs its read helper.
     used_read_ti: bool,
-    /// True iff `TI$` was read anywhere — pulls in the
-    /// `__READ_TI_STR` helper, the binary divide-by-60 routine,
-    /// the divide-by-10 routine, plus the 7-byte `__TI_HEAP` slot.
+    /// Whether TI$ needs its read helper and string slot.
     used_read_ti_str: bool,
 
     used_stop: bool,
@@ -1130,9 +1377,6 @@ struct Codegen {
     /// Defaults to [`CODE_ORIGIN`]; the custom-start-address path
     /// overrides it after construction via [`emit_with_profile_at`].
     code_origin: u16,
-    /// True iff anything needs the shared `__DIV_BY_10` byte-mod-10
-    /// helper. Multiple call sites (TI$ formatter, PRINT-comma).
-    used_div_by_10: bool,
     /// Float scalars that range analysis proved are always int16. In
     /// Speed profile we keep a 2-byte shadow slot beside the normal
     /// 5-byte BASIC float slot so int-island paths can read them
@@ -1218,7 +1462,7 @@ struct Codegen {
     /// Line number to restore on entry to the current FOR body.
     for_top_curlin: Option<u16>,
 
-    for_top_restamp_sites: HashSet<(usize, usize)>,
+    for_top_restamp_sites: HashSet<(usize, Vec<usize>)>,
     /// When true, every emitted `SYS` PHA-saves $FB-$FE and the bytes
     /// in `zp_claimed`, restoring them after the JSR.
     safe_sys_calls: bool,
@@ -1251,6 +1495,9 @@ struct Codegen {
     zp_int_for_assignments: HashMap<usize, u8>,
     /// `for_u8_slots` IDs whose FU_<n> slot landed in zero page.
     zp_u8_for_assignments: HashMap<usize, u8>,
+    /// Counter identifiers tied to their FOR statements.
+    planned_int_for_ids: HashMap<crate::cfg::StmtPath, usize>,
+    planned_u8_for_ids: HashMap<crate::cfg::StmtPath, usize>,
     /// FOR-counter ZP slots handed out so far, available for reuse by a
     /// later FOR counter whose loop variable doesn't interfere with any
     /// current owner. A FOR loop always initialises its counter at loop
@@ -1304,6 +1551,8 @@ struct CodegenAnalysis {
     defined_before_use: std::collections::HashSet<VarName>,
     /// Zero-page bytes accessed by the program through POKE, PEEK or WAIT.
     zp_reach: ZpProgramReach,
+    /// Whether a loop prints numbers often enough to use fast helpers.
+    prints_numbers_in_a_loop: bool,
 }
 
 impl CodegenAnalysis {
@@ -1323,6 +1572,7 @@ impl CodegenAnalysis {
             .clone();
         let cfg = registry.get(module, &crate::cfg::CfgBuild).clone();
         let zp_reach = scan_zp_program_reach(module, &cfg, &numeric_facts);
+        let prints_numbers_in_a_loop = prints_numbers_in_a_loop(module, &cfg);
         Self {
             numeric_facts,
             literal_for_bounds: crate::passes::literal_scalar_i16_ranges(module),
@@ -1330,6 +1580,7 @@ impl CodegenAnalysis {
             interference,
             defined_before_use,
             zp_reach,
+            prints_numbers_in_a_loop,
         }
     }
 
@@ -1557,6 +1808,7 @@ enum DataPoolLayout {
     BinaryI16,
     /// Five-byte BASIC floating-point entries for numeric DATA that does not fit i16.
     BinaryMflpt,
+    BinaryU8,
 }
 
 /// Where the int-FOR's end value lives at runtime. Keeps the
@@ -1669,6 +1921,14 @@ impl ForFrame {
         }
     }
 
+    fn exit_label(&self) -> &str {
+        match self {
+            ForFrame::Float(f) => &f.exit_label,
+            ForFrame::Int(f) => &f.exit_label,
+            ForFrame::U8(f) => &f.exit_label,
+        }
+    }
+
     fn with_fresh_exit(&self, exit_label: String) -> ForFrame {
         match self {
             ForFrame::Float(f) => {
@@ -1706,6 +1966,7 @@ impl Codegen {
             fn_temp_base: 0,
             for_stack: Vec::new(),
             last_popped_for: None,
+            emitted_for_exits: HashSet::new(),
             shared_next_candidate: None,
             for_origin_by_top_label: HashMap::new(),
             externally_entered_for_tops: HashSet::new(),
@@ -1719,6 +1980,7 @@ impl Codegen {
             for_induction_slots: 0,
             for_array_ptr_slots: 0,
             used_int_for: false,
+            equality_tail_sites: HashMap::new(),
             used_bool_to_fac: false,
             used_get_num: false,
             used_str_print: false,
@@ -1786,15 +2048,30 @@ impl Codegen {
             used_bad_subscript: false,
             used_illegal_qty: false,
             used_data_chk: false,
+            data_relocate: None,
+            data_relocated: false,
+            data_pool_len: 0,
+            used_read_str_copy: false,
+            read_targets: 0,
+            used_data_advance: false,
             used_next_no_for: false,
             used_for_oom: false,
             used_ret_chk: false,
             uses_gosub: false,
             used_gosub_chk: false,
+            used_jmp22: false,
+            data_ints_tagged: false,
+            used_read_tagged: false,
+            read_tagged_text_entry: "__VAL_HELPER",
+            read_digits: false,
+            used_read_digits: false,
+            used_val_digits: false,
+            gosub_depth_free: false,
             used_for_bytes_chk: false,
             used_for_discard: false,
             used_for_walk_mark: false,
             for_mark_floors: std::collections::BTreeSet::new(),
+            on_tables: Vec::new(),
             gosub_depth_limit: GOSUB_DEPTH_CEIL,
             page1_stmt_check: false,
             for_stack_bound: ForStackBound::worst_case(),
@@ -1806,6 +2083,7 @@ impl Codegen {
             used_st_t0: false,
             used_fadd_t0: false,
             used_fsub_t0: false,
+            used_fcmp_t0: false,
             used_fmult_t0: false,
             used_fdiv_t0: false,
             float_var_loads: HashMap::new(),
@@ -1826,6 +2104,8 @@ impl Codegen {
             used_logic_byte: false,
             logic_byte_max_depth: 0,
             used_ayint: false,
+            used_ayint_rnd: false,
+            used_ayint_psh: false,
             used_fac_to_int16: false,
             used_givayf_u16: false,
             used_fac_to_int16_notrap: false,
@@ -1849,7 +2129,6 @@ impl Codegen {
             used_input_file: false,
             used_set_ti: false,
             used_print_comma: false,
-            used_div_by_10: false,
             used_input_field: false,
             used_input_redo: false,
             used_input_extra: false,
@@ -1973,6 +2252,8 @@ impl Codegen {
             forced_zp_bases: std::collections::HashSet::new(),
             zp_int_for_assignments: HashMap::new(),
             zp_u8_for_assignments: HashMap::new(),
+            planned_int_for_ids: HashMap::new(),
+            planned_u8_for_ids: HashMap::new(),
             zp_for_reuse_slots: Vec::new(),
             zp_int_reuse_slots: Vec::new(),
             analysis,
@@ -2289,7 +2570,17 @@ impl Codegen {
         }
     }
 
-    /// Emit a `__STR_PRINT` call for a pooled string label.
+    /// Copy the string in A/Y into the destination buffer.
+    fn emit_sbuf_copy(&mut self, buf: &str) {
+        writeln!(self.code, "    STA ${:02X}", rt::ARRAY_ADDR_LO).unwrap();
+        writeln!(self.code, "    STY ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
+        writeln!(self.code, "    LDA #<{buf}").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
+        writeln!(self.code, "    LDA #>{buf}").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
+        writeln!(self.code, "    JSR __SBUF_COPY").unwrap();
+    }
+
     fn emit_str_print_pooled(&mut self, label: &str) {
         writeln!(self.code, "    LDA #<{label}").unwrap();
         writeln!(self.code, "    LDY #>{label}").unwrap();
@@ -2359,6 +2650,18 @@ impl Codegen {
 
     fn invalidate_fac_cache(&mut self) {
         self.fac_cache.clear();
+    }
+
+    /// Whether the cached FAC value has a clear rounding byte.
+    fn fac_rounding_clear(&self) -> bool {
+        self.fac_cache.iter().any(fac_rounding_byte_clear)
+    }
+
+    /// Discard cached expressions changed by rounding during a store.
+    fn note_fac_rounded_by_store(&mut self, was_clear: bool) {
+        if !was_clear {
+            self.fac_cache.clear();
+        }
     }
 
     fn fac_cache_contains(&self, expr: &Expr) -> bool {
@@ -2464,13 +2767,24 @@ impl Codegen {
             // `__SI_<var>` style for grouping with other generated
             // helpers — peephole label-name guards expect that
             // prefix shape.
-            let zp_addr = if shadow_quota > 0 {
+            let fresh = if shadow_quota > 0 {
                 self.alloc_zp_word()
             } else {
                 None
             };
-            let label = if let Some(addr) = zp_addr {
+            if let Some(addr) = fresh {
                 shadow_quota -= 1;
+                // Reuse slots only for variables with separate lifetimes.
+                if self.analysis.defined_before_use.contains(&var) {
+                    self.zp_int_reuse_slots.push(ZpReuseSlot {
+                        addr,
+                        size: 2,
+                        vars: vec![var.clone()],
+                    });
+                }
+            }
+            let zp_addr = fresh.or_else(|| self.alloc_zp_int_shared(&var, 2));
+            let label = if let Some(addr) = zp_addr {
                 let l = format!("ZSI_{}", var.label());
                 self.zp_promotions.push((l.clone(), addr, 2));
                 l
@@ -2676,11 +2990,7 @@ impl Codegen {
         }
     }
 
-    /// `for_int_slots` / `for_u8_slots` counter IDs predicted here
-    /// match the ones `emit_for_int` / `emit_for_u8` will use at
-    /// emission time. Whatever ZP capacity is left after shadow-int
-    /// and Integer-var promotion goes here — FOR counters only get
-    /// slots when the pool isn't already full.
+    /// Assign counter slots from the remaining zero page.
     fn collect_zp_for_counters(&mut self, module: &ir::Module) {
         let mut int_id: usize = 0;
         let mut u8_id: usize = 0;
@@ -2694,6 +3004,8 @@ impl Codegen {
                 &mut u8_id,
             );
         }
+        self.for_int_slots = int_id;
+        self.for_u8_slots = u8_id;
     }
 
     fn collect_zp_for_counters_in_stmts(
@@ -2745,6 +3057,13 @@ impl Codegen {
                             if self.for_counter_aliases_var(var, false) {
                                 self.promote_aliased_for_counter(var, 1);
                             } else {
+                                self.planned_u8_for_ids.insert(
+                                    crate::cfg::StmtPath {
+                                        line_idx,
+                                        path: path.clone(),
+                                    },
+                                    *u8_id,
+                                );
                                 if let Some(addr) = self.alloc_zp_for_counter(var, 1) {
                                     let label = format!("FU_{u8_id}");
                                     self.zp_promotions.push((label, addr, 1));
@@ -2783,6 +3102,7 @@ impl Codegen {
                                 if self.for_counter_aliases_var(var, true) {
                                     self.promote_aliased_for_counter(var, 2);
                                 } else {
+                                    self.planned_int_for_ids.insert(stmt_path, *int_id);
                                     if let Some(addr) = self.alloc_zp_for_counter(var, 2) {
                                         let label = format!("FI_{int_id}");
                                         self.zp_promotions.push((label, addr, 2));
@@ -2803,6 +3123,28 @@ impl Codegen {
             }
             path.pop();
         }
+    }
+
+    /// Use the planned counter identifier or allocate a new one.
+    fn take_for_counter_id(&mut self, int: bool) -> usize {
+        let planned = self.current_stmt_path.as_ref().and_then(|path| {
+            if int {
+                self.planned_int_for_ids.get(path).copied()
+            } else {
+                self.planned_u8_for_ids.get(path).copied()
+            }
+        });
+        if let Some(id) = planned {
+            return id;
+        }
+        let slots = if int {
+            &mut self.for_int_slots
+        } else {
+            &mut self.for_u8_slots
+        };
+        let id = *slots;
+        *slots += 1;
+        id
     }
 
     /// Promote a loop variable whose storage also holds its FOR counter.
@@ -2853,7 +3195,22 @@ impl Codegen {
             );
         }
         candidates.retain(|v| !rejected.contains(v));
-        signed.retain(|v, _| candidates.contains(v));
+        // The combined write range must fit one byte.
+        let mut bounds = std::mem::take(&mut signed);
+        for (var, (min, max)) in bounds.drain() {
+            if !candidates.contains(&var) {
+                continue;
+            }
+            match range_fits_byte(crate::dataflow::IntRange { min, max }) {
+                Some(ByteSign::Unsigned) => {}
+                Some(ByteSign::Signed) => {
+                    signed.insert(var, (min, max));
+                }
+                None => {
+                    candidates.remove(&var);
+                }
+            }
+        }
         // REM-hint force-promotion: every integer scalar whose base
         // the user marked `\BYTE` (or `@b=`) goes in regardless of
         // the range proof. The user takes the wrap risk; the source
@@ -2892,10 +3249,7 @@ impl Codegen {
                         .numeric_facts
                         .expr_int_range_before_path(&stmt_path, value);
                     match range.and_then(range_fits_byte) {
-                        Some(ByteSign::Unsigned) => {}
-                        Some(ByteSign::Signed) => {
-                            merge_signed_byte_bound(signed, var, range);
-                        }
+                        Some(_) => merge_byte_write_bound(signed, var, range),
                         None => {
                             rejected.insert(var.clone());
                         }
@@ -2923,10 +3277,7 @@ impl Codegen {
                         facts.expr_int_range_before_path(&stmt_path, step),
                     );
                     match range.and_then(range_fits_byte) {
-                        Some(ByteSign::Unsigned) => {}
-                        Some(ByteSign::Signed) => {
-                            merge_signed_byte_bound(signed, var, range);
-                        }
+                        Some(_) => merge_byte_write_bound(signed, var, range),
                         None => {
                             rejected.insert(var.clone());
                         }
@@ -2974,7 +3325,7 @@ impl Codegen {
                         inner, line_idx, path, candidates, rejected, signed,
                     );
                 }
-                _ => {}
+                _ => reject_unranged_int_writes(stmt, candidates, rejected),
             }
             path.pop();
         }
@@ -3288,7 +3639,61 @@ impl Codegen {
         id
     }
 
+    /// Clear each owned zero page byte once. A is zero and X is free.
+    fn emit_zp_promotion_clears(&mut self) {
+        let mut cleared = [false; 256];
+        let mut stores: Vec<(usize, String)> = Vec::new();
+        for (label, addr, size) in &self.zp_promotions {
+            for i in 0..*size {
+                let byte = usize::from(*addr) + i;
+                if byte < cleared.len() {
+                    if cleared[byte] {
+                        continue;
+                    }
+                    cleared[byte] = true;
+                }
+                let operand = if i == 0 { label.clone() } else { format!("{label}+{i}") };
+                stores.push((byte, operand));
+            }
+        }
+        const LOOP_FROM: usize = 6;
+        let mut looped = [false; 256];
+        if self.profile != Profile::Speed {
+            let mut start = 1;
+            while start < cleared.len() {
+                if !cleared[start] {
+                    start += 1;
+                    continue;
+                }
+                let mut end = start;
+                while end < cleared.len() && cleared[end] {
+                    end += 1;
+                }
+                let len = end - start;
+                if len >= LOOP_FROM {
+                    let lp = format!("__ZP_CLEAR_{}", self.fresh_id());
+                    writeln!(self.code, "    LDX #${:02X}", end - 1).unwrap();
+                    writeln!(self.code, "{lp}:").unwrap();
+                    writeln!(self.code, "    STA $00,X").unwrap();
+                    writeln!(self.code, "    DEX").unwrap();
+                    writeln!(self.code, "    CPX #${:02X}", start - 1).unwrap();
+                    writeln!(self.code, "    BNE {lp}").unwrap();
+                    looped[start..end].iter_mut().for_each(|b| *b = true);
+                }
+                start = end;
+            }
+        }
+        for (byte, operand) in stores {
+            if byte < looped.len() && looped[byte] {
+                continue;
+            }
+            writeln!(self.code, "    STA {operand}").unwrap();
+        }
+    }
+
     fn run(&mut self, module: &ir::Module) -> Result<(), CodegenError> {
+        self.equality_tail_sites = EqualityTailSites::count(module);
+        self.read_targets = ReadTargets::count(module);
         writeln!(self.code, "*=${:04X}", self.code_origin).unwrap();
         writeln!(self.code).unwrap();
 
@@ -3397,8 +3802,12 @@ impl Codegen {
         }
 
         writeln!(self.code, "    CLD").unwrap();
-        // Placeholder for the BSS zero-fill.
+        if self.data_relocated {
+            self.emit_data_relocation();
+        }
+        // Reserve clearing code for later RUN calls.
         writeln!(self.code, "{BSS_FILL_MARKER}").unwrap();
+        writeln!(self.code, "{STATE_ZERO_MARKER}").unwrap();
         writeln!(self.code).unwrap();
         count_fac_op_var_uses(module, &mut self.float_var_op_uses);
         count_fac_op_const_uses(module, &mut self.float_const_op_uses);
@@ -3569,6 +3978,14 @@ impl Codegen {
         if self.page1_stmt_check {
             self.gosub_depth_limit = page1_gosub_push_limit();
         }
+        // Remove checks only when all GOSUB frames are proved safe.
+        self.gosub_depth_free = !self.page1_stmt_check
+            && !self.used_on_key_gosub
+            && crate::gosub_depth::prove(module)
+                .is_some_and(|d| d.max_depth < u32::from(self.gosub_depth_limit));
+        if self.gosub_depth_free {
+            self.used_ret_chk = false;
+        }
         // Sized here, ahead of every push site and of the BSS block, so the bound check and the
         // array definition can never disagree.
         self.for_stack_bound = for_stack_bound(module, &self.orphan_for_next);
@@ -3588,13 +4005,6 @@ impl Codegen {
             writeln!(self.code, "    STX __SAVED_SP").unwrap();
             writeln!(self.code).unwrap();
         }
-        if self.needs_gosub_depth() {
-            // BSS init zeroes this on load, but RUN re-entry does not come back through here,
-            // so `__STATE_RESET` clears it too.
-            writeln!(self.code, "    LDA #$00").unwrap();
-            writeln!(self.code, "    STA __GOSUB_DEPTH").unwrap();
-            writeln!(self.code).unwrap();
-        }
         // Whole-module CURLIN high byte: when every line shares one, stamp `$3A` here and let
         // every line below skip it.
         self.curlin_observable = scan_module_observes_curlin(module);
@@ -3609,24 +4019,6 @@ impl Codegen {
             writeln!(self.code, "    STA ${:02X}", rt::CURLIN_HI).unwrap();
             writeln!(self.code).unwrap();
         }
-        // ZP-promoted slots aren't covered by `__MEMZERO` (which
-        // walks the contiguous BSS region), and the assembler can't
-        // pre-fill ZP bytes the way `.byte` directives do for BSS.
-        // Clear them inline at program start so the user sees BASIC
-        // v2's "all variables zero on first run" semantics.
-        if !self.zp_promotions.is_empty() {
-            writeln!(self.code, "    LDA #$00").unwrap();
-            for (label, _, size) in &self.zp_promotions {
-                for i in 0..*size {
-                    if i == 0 {
-                        writeln!(self.code, "    STA {label}").unwrap();
-                    } else {
-                        writeln!(self.code, "    STA {label}+{i}").unwrap();
-                    }
-                }
-            }
-            writeln!(self.code).unwrap();
-        }
         // Runtime-DIM allocator floor lives alongside the string heap
         // bookkeeping in __HEAP_INIT, so force that prelude in even
         // when the program doesn't otherwise touch the string heap.
@@ -3634,18 +4026,30 @@ impl Codegen {
             self.used_runtime_dim = true;
             self.heap_init_needed = true;
         }
+        if self.heap_init_needed && self.used_runtime_dim && self.memsiz_may_be_lowered {
+            writeln!(self.code, "    LDA ${:02X}", rt::MEMSIZ_LO).unwrap();
+            writeln!(self.code, "    STA __ARR_HEAP_BOOT").unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::MEMSIZ_HI).unwrap();
+            writeln!(self.code, "    STA __ARR_HEAP_BOOT+1").unwrap();
+            writeln!(self.code).unwrap();
+        }
+        writeln!(self.code, "{STATE_INIT_OPEN}").unwrap();
+        if self.needs_gosub_depth() {
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA __GOSUB_DEPTH").unwrap();
+            writeln!(self.code).unwrap();
+        }
+        // Clear zero page variables at program entry.
+        if !self.zp_promotions.is_empty() {
+            writeln!(self.code, "    LDA #$00").unwrap();
+            self.emit_zp_promotion_clears();
+            writeln!(self.code).unwrap();
+        }
         if !self.data_values.is_empty() {
             writeln!(self.code, "    JSR __DATA_INIT").unwrap();
             writeln!(self.code).unwrap();
         }
         if self.heap_init_needed {
-            // Capture the machine's own MEMSIZ once, here, before any user statement runs.
-            if self.used_runtime_dim && self.memsiz_may_be_lowered {
-                writeln!(self.code, "    LDA ${:02X}", rt::MEMSIZ_LO).unwrap();
-                writeln!(self.code, "    STA __ARR_HEAP_BOOT").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::MEMSIZ_HI).unwrap();
-                writeln!(self.code, "    STA __ARR_HEAP_BOOT+1").unwrap();
-            }
             writeln!(self.code, "    JSR __HEAP_INIT").unwrap();
             writeln!(self.code).unwrap();
         }
@@ -3654,6 +4058,7 @@ impl Codegen {
             writeln!(self.code, "    STA __FOR_STACK_PTR").unwrap();
             writeln!(self.code).unwrap();
         }
+        writeln!(self.code, "{STATE_INIT_CLOSE}").unwrap();
 
         let mut last_curlin_hi: Option<u8> = self.curlin_hi_invariant;
         let mut last_curlin_lo: Option<u8> = None;
@@ -3835,7 +4240,7 @@ impl Codegen {
 
     /// True when `__GOSUB_DEPTH` is defined.
     fn needs_gosub_depth(&self) -> bool {
-        self.uses_gosub || self.used_ret_chk
+        (self.uses_gosub || self.used_ret_chk) && !self.gosub_depth_free
     }
 
     /// FOR slots that need a `.byte` definition in the BSS block: `(FE_ count, FI_ ids, FU_
@@ -3858,6 +4263,23 @@ impl Codegen {
             || !fi.is_empty()
             || !fu.is_empty()
             || !self.dispatched_vector_labels().is_empty()
+    }
+
+    /// Collect state labels cleared by RUN and CLR.
+    fn state_zero_labels(&self) -> Vec<String> {
+        let mut labels = Vec::new();
+        if self.has_vars_block() {
+            labels.push("__VARS_START".to_string());
+        }
+        for name in &self.arrays_order {
+            if name.kind != VarKind::String || !self.heap_init_needed {
+                labels.push(Self::array_label(name));
+            }
+        }
+        if self.used_error_continuation {
+            labels.push("__TSB_IN_HANDLER".to_string());
+        }
+        labels
     }
 
     /// Return emitted function-vector labels in sorted order.
@@ -3932,6 +4354,15 @@ impl Codegen {
         {
             self.used_ayint = true;
         }
+        if self.used_st_arr_int
+            || self.code.contains("JSR __AYINT_RND")
+            || self.code.contains("JMP __AYINT_RND")
+        {
+            self.used_ayint_rnd = true;
+        }
+        if self.code.contains("JSR __AYINT_PSH") || self.code.contains("JMP __AYINT_PSH") {
+            self.used_ayint_psh = true;
+        }
         if self.code.contains("JSR __FAC_TO_INT16") || self.code.contains("JMP __FAC_TO_INT16") {
             self.used_fac_to_int16 = true;
         }
@@ -3944,16 +4375,21 @@ impl Codegen {
         // Helper subroutines, only those referenced.
         writeln!(self.code).unwrap();
         writeln!(self.code, "; --- helper subroutines ---").unwrap();
-        // FOUT produces "<sign><digits>" (a leading space stands in for the missing minus when the value is non-negative).
-        if self.used_print_int16 {
-            writeln!(self.code, "__PRINT_INT16:").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+        let fast_number_print = self.profile == Profile::Speed
+            || (self.profile == Profile::Default && self.analysis.prints_numbers_in_a_loop);
+        if fast_number_print {
+            self.emit_fast_number_print();
+        } else {
+            if self.used_print_int16 {
+                writeln!(self.code, "__PRINT_INT16:").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+            }
+            // Print the number and its trailing space.
+            writeln!(self.code, "__PRINT_FAC:").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::FOUT).unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::STROUT).unwrap();
+            writeln!(self.code, "    JMP ${:04X}", rt::PRINT_GAP).unwrap();
         }
-        // Byte-for-byte the ROM's own PRINT-a-number tail: $AABC does `JSR FOUT / JSR $B487 / JSR STRPRT / JSR $AB3B`.
-        writeln!(self.code, "__PRINT_FAC:").unwrap();
-        writeln!(self.code, "    JSR ${:04X}", rt::FOUT).unwrap();
-        writeln!(self.code, "    JSR ${:04X}", rt::STROUT).unwrap();
-        writeln!(self.code, "    JMP ${:04X}", rt::PRINT_GAP).unwrap();
         if self.used_tab {
             // TAB(.X = target column): advance cursor to column .X without overwriting screen content.
             writeln!(self.code, "__TAB:").unwrap();
@@ -4007,6 +4443,9 @@ impl Codegen {
             writeln!(self.code, "    LDX #${:02X}", rt::ERR_ILLEGAL_QUANTITY).unwrap();
             self.emit_jmp_basic_error();
         }
+        if self.used_read_str_copy {
+            self.emit_read_str_copy();
+        }
         if self.used_data_chk {
 
             if !self.data_values.is_empty() {
@@ -4024,8 +4463,21 @@ impl Codegen {
             self.emit_jmp_basic_error();
             if !self.data_values.is_empty() {
                 writeln!(self.code, "__DATA_CHK_OK:").unwrap();
-                writeln!(self.code, "    RTS").unwrap();
+                if self.data_relocated {
+                    writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
+                    writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
+                    writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
+                    writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
+                    self.emit_data_fetch();
+                } else {
+                    writeln!(self.code, "    RTS").unwrap();
+                }
             }
+        }
+        if self.used_data_advance {
+            writeln!(self.code, "__DATA_ADVANCE:").unwrap();
+            self.emit_data_advance_body();
+            writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_next_no_for {
             writeln!(self.code, "__NEXT_NO_FOR:").unwrap();
@@ -4037,6 +4489,11 @@ impl Codegen {
             writeln!(self.code, "__FOR_OOM:").unwrap();
             writeln!(self.code, "    LDX #${:02X}", rt::ERR_OUT_OF_MEMORY).unwrap();
             self.emit_jmp_basic_error();
+        }
+        if self.used_jmp22 {
+            // Return from the selected GOSUB target to the caller.
+            writeln!(self.code, "__JMP22:").unwrap();
+            writeln!(self.code, "    JMP (${:02X})", rt::INDEX1_LO).unwrap();
         }
         if self.used_gosub_chk {
 
@@ -4144,6 +4601,12 @@ impl Codegen {
             writeln!(self.code, "    LDY #>T0").unwrap();
             writeln!(self.code, "    JMP ${:04X}", rt::FSUB).unwrap();
         }
+        if self.used_fcmp_t0 {
+            writeln!(self.code, "__FCMP__T0:").unwrap();
+            writeln!(self.code, "    LDA #<T0").unwrap();
+            writeln!(self.code, "    LDY #>T0").unwrap();
+            writeln!(self.code, "    JMP ${:04X}", rt::FCOMP).unwrap();
+        }
         if self.used_fmult_t0 {
             writeln!(self.code, "__FMULT__T0:").unwrap();
             writeln!(self.code, "    LDA #<T0").unwrap();
@@ -4170,7 +4633,8 @@ impl Codegen {
             writeln!(self.code, "    PHA").unwrap();
             writeln!(self.code, "    LDA ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
             writeln!(self.code, "    PHA").unwrap();
-            writeln!(self.code, "    JSR __AYINT").unwrap();
+            // Every store through here is a LET, READ or INPUT, which round first.
+            writeln!(self.code, "    JSR __AYINT_RND").unwrap();
             writeln!(self.code, "    PLA").unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
             writeln!(self.code, "    PLA").unwrap();
@@ -4275,8 +4739,9 @@ impl Codegen {
                     // need a fresh_id (which would conflict with the
                     // outer `shadow_only` borrow on `self`).
                     let done = format!("__LD_{}I_SXT", var.base);
+                    let carry_if_negative = self.signed_byte_carry_if_negative(var);
                     writeln!(self.code, "    TYA").unwrap();
-                    writeln!(self.code, "    ASL").unwrap();
+                    writeln!(self.code, "{carry_if_negative}").unwrap();
                     writeln!(self.code, "    LDA #$00").unwrap();
                     writeln!(self.code, "    BCC {done}").unwrap();
                     writeln!(self.code, "    LDA #$FF").unwrap();
@@ -4489,87 +4954,29 @@ impl Codegen {
             self.used_str_print = true;
         }
         if self.used_state_reset {
-            // Shared state-reset routine used by both RUN and CLR.
-            // Zeros every variable, every array, every BSS string-buf
-            // length byte; re-runs __HEAP_INIT (which re-points string
-            // vars at __EMPTY_STR / __SBUF_*); resets the DATA pointer;
-            // invalidates LASTVAR. Returns cleanly so CLR can call it
-            // mid-program; RUN's wrapper also rolls SP back and JMPs
-            // to L<first> after this returns.
+            // Reset variables, arrays, strings and the DATA cursor.
             writeln!(self.code, "__STATE_RESET:").unwrap();
-            // Wipe the whole variable region in one __MEMZERO call.
-            // Cheaper than per-byte STAs once you have more than ~5 vars.
-            if self.has_vars_block() {
-                writeln!(self.code, "    LDA #<__VARS_START").unwrap();
-                writeln!(self.code, "    STA __MEMZERO_PTR_LO").unwrap();
-                writeln!(self.code, "    LDA #>__VARS_START").unwrap();
-                writeln!(self.code, "    STA __MEMZERO_PTR_HI").unwrap();
-                writeln!(self.code, "    LDA #<(__VARS_END-__VARS_START)").unwrap();
-                writeln!(self.code, "    STA __MEMZERO_CNT_LO").unwrap();
-                writeln!(self.code, "    LDA #>(__VARS_END-__VARS_START)").unwrap();
-                writeln!(self.code, "    STA __MEMZERO_CNT_HI").unwrap();
-                writeln!(self.code, "    JSR __MEMZERO").unwrap();
-            }
-            // Clear zero-page slot promotions inline. They live
-            // outside __VARS_START..__VARS_END so MEMZERO doesn't
-            // touch them. Pair the LDA with the existing #$00 below
-            // when we have any so the cost is just one STA per byte.
-            if !self.zp_promotions.is_empty() {
+            writeln!(self.code, "{STATE_RESET_ZERO_MARKER}").unwrap();
+            let gosub_depth = self.needs_gosub_depth();
+            let for_stack = self.orphan_for_next.needs_runtime_stack();
+            if !self.zp_promotions.is_empty() || gosub_depth || for_stack {
                 writeln!(self.code, "    LDA #$00").unwrap();
-                for (label, _, size) in &self.zp_promotions {
-                    for i in 0..*size {
-                        if i == 0 {
-                            writeln!(self.code, "    STA {label}").unwrap();
-                        } else {
-                            writeln!(self.code, "    STA {label}+{i}").unwrap();
-                        }
-                    }
-                }
             }
-            writeln!(self.code, "    LDA #$00").unwrap();
-            for name in self.arrays_order.clone() {
-                let dims = self.arrays[&name].clone();
-                let elem_size = Self::array_elem_size(&name);
-                let count: usize = dims.iter().map(|d| *d as usize + 1).product();
-                let bytes = count * elem_size;
-                let label = Self::array_label(&name);
-                writeln!(self.code, "    LDA #<{label}").unwrap();
-                writeln!(self.code, "    STA __MEMZERO_PTR_LO").unwrap();
-                writeln!(self.code, "    LDA #>{label}").unwrap();
-                writeln!(self.code, "    STA __MEMZERO_PTR_HI").unwrap();
-                writeln!(self.code, "    LDA #${:02X}", (bytes & 0xFF) as u8).unwrap();
-                writeln!(self.code, "    STA __MEMZERO_CNT_LO").unwrap();
-                writeln!(self.code, "    LDA #${:02X}", ((bytes >> 8) & 0xFF) as u8).unwrap();
-                writeln!(self.code, "    STA __MEMZERO_CNT_HI").unwrap();
-                writeln!(self.code, "    JSR __MEMZERO").unwrap();
-            }
-
-            let mut bss_clr: Vec<VarName> = self.bss_str_vars.keys().cloned().collect();
-            bss_clr.sort_by(|a, b| a.label().cmp(&b.label()));
-            for var in bss_clr {
-                writeln!(self.code, "    LDA #$00").unwrap();
-                writeln!(self.code, "    STA __SBUF_{}", var.label()).unwrap();
-            }
-            if self.needs_gosub_depth() {
+            // Zero-page slot promotions lie outside the variable block.
+            self.emit_zp_promotion_clears();
+            if gosub_depth {
                 // RUN/CLR abandon any pending GOSUB frames, so the ?RETURN WITHOUT GOSUB depth
                 // counter restarts at 0.
-                writeln!(self.code, "    LDA #$00").unwrap();
                 writeln!(self.code, "    STA __GOSUB_DEPTH").unwrap();
+            }
+            if for_stack {
+                writeln!(self.code, "    STA __FOR_STACK_PTR").unwrap();
             }
             if self.heap_init_needed {
                 writeln!(self.code, "    JSR __HEAP_INIT").unwrap();
             }
             if !self.data_values.is_empty() {
                 writeln!(self.code, "    JSR __DATA_INIT").unwrap();
-            }
-            if self.orphan_for_next.needs_runtime_stack() {
-                writeln!(self.code, "    LDA #$00").unwrap();
-                writeln!(self.code, "    STA __FOR_STACK_PTR").unwrap();
-            }
-            if self.used_error_continuation {
-                // CLR/RUN abandon the saved continuation with the call stack.
-                writeln!(self.code, "    LDA #$00").unwrap();
-                writeln!(self.code, "    STA __TSB_IN_HANDLER").unwrap();
             }
             writeln!(self.code, "    RTS").unwrap();
         }
@@ -4584,11 +4991,8 @@ impl Codegen {
             writeln!(self.code, "    JSR __STATE_RESET").unwrap();
             writeln!(self.code, "    JMP L{}", self.first_line).unwrap();
         }
-        if self.used_state_reset || self.used_runtime_dim {
-            // __MEMZERO: zero `__MEMZERO_CNT` bytes starting at
-            // `__MEMZERO_PTR`. Page-at-a-time loop for the high byte,
-            // then a tail loop for the remainder. Used by RUN/CLR's
-            // state reset and by runtime DIM's zero-init.
+        if self.used_runtime_dim {
+            // Clear whole pages, then the remaining bytes.
             writeln!(self.code, "__MEMZERO:").unwrap();
             writeln!(self.code, "    LDA __MEMZERO_PTR_LO").unwrap();
             writeln!(self.code, "    STA $FD").unwrap();
@@ -4682,7 +5086,19 @@ impl Codegen {
             self.emit_jmp_basic_error();
         }
         if self.used_ayint {
-
+            if self.used_ayint_psh {
+                // Round the left operand of AND or OR and clear the rounding byte.
+                writeln!(self.code, "__AYINT_PSH:").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::ROUND).unwrap();
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    STA ${:02X}", rt::FAC_ROUNDING).unwrap();
+                writeln!(self.code, "    BEQ __AYINT").unwrap();
+            }
+            if self.used_ayint_rnd {
+                // Round integer stores before AYINT.
+                writeln!(self.code, "__AYINT_RND:").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::ROUND).unwrap();
+            }
             writeln!(self.code, "__AYINT:").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::AYINT).unwrap();
             writeln!(self.code, "    LDA ${:02X}", rt::QINT_RESULT_LO).unwrap();
@@ -4745,8 +5161,7 @@ impl Codegen {
             writeln!(self.code, "__FAC_TO_INT16_NOTRAP:").unwrap();
             writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
             writeln!(self.code, "    BEQ __FTIN_ZERO").unwrap();
-            writeln!(self.code, "    CMP #$80").unwrap();
-            writeln!(self.code, "    BCC __FTIN_ZERO").unwrap();
+            writeln!(self.code, "    BPL __FTIN_ZERO").unwrap();
             writeln!(self.code, "    CMP #$91").unwrap();
             writeln!(self.code, "    BCS __FTIN_OVERFLOW").unwrap();
             writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
@@ -4965,7 +5380,15 @@ impl Codegen {
             writeln!(self.code, "__CHK_BYTE_OK:").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
-        if self.used_fac_byte {
+        if (self.used_fac_byte || self.used_fac_byte_ok) && self.profile != Profile::Size {
+            if self.used_fac_byte_ok {
+                writeln!(self.code, "__FAC_BYTE_OK:").unwrap();
+            }
+            writeln!(self.code, "__FAC_BYTE:").unwrap();
+            self.code.push_str(FAST_FAC_BYTE);
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_ILLEGAL_QUANTITY).unwrap();
+            self.emit_jmp_basic_error();
+        } else if self.used_fac_byte {
             // The combined FAC→byte helper: turn the FAC value into a
             // byte in .A, raising ?ILL QTY if it doesn't fit. Replaces
             // the recurring `JSR FACWORD; JSR __CHK_BYTE; LDA $14`
@@ -4992,7 +5415,7 @@ impl Codegen {
             writeln!(self.code, "    LDX #${:02X}", rt::ERR_ILLEGAL_QUANTITY).unwrap();
             self.emit_jmp_basic_error();
         }
-        if self.used_fac_byte_ok {
+        if self.used_fac_byte_ok && self.profile == Profile::Size {
             // No-check FAC→byte: caller already proved the value
             // fits u8 (range analysis), so the high-byte BNE+error
             // arm of `__FAC_BYTE` would be dead code. 6 bytes vs
@@ -8736,147 +9159,30 @@ impl Codegen {
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_read_ti {
-            // FAC = TI = $A0*65536 + $A1*256 + $A2, computed
-            // incrementally so we never need a 24-bit integer→FAC
-            // primitive. The bytes are read atomically via KERNAL RDTIM
-            // so we don't catch a half-tick update mid-read.
-            //
-            //   FAC = high * 65536; stash → __TI_TMP
-            //   FAC = mid  * 256 + __TI_TMP; stash again
-            //   FAC = low + __TI_TMP
-            let f256 = self.intern_float(256.0);
-            let f65536 = self.intern_float(65536.0);
+            // Read TI into FAC with carry set for normalization.
             writeln!(self.code, "__READ_TI:").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::RDTIM).unwrap();
-            writeln!(self.code, "    STY __TI_HI").unwrap();
-            writeln!(self.code, "    STX __TI_MID").unwrap();
-            writeln!(self.code, "    STA __TI_LO").unwrap();
-            writeln!(self.code, "    LDY __TI_HI").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
-            writeln!(self.code, "    LDA #<{f65536}").unwrap();
-            writeln!(self.code, "    LDY #>{f65536}").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::FMULT).unwrap();
-            writeln!(self.code, "    LDX #<__TI_TMP").unwrap();
-            writeln!(self.code, "    LDY #>__TI_TMP").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
-            writeln!(self.code, "    LDY __TI_MID").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
-            writeln!(self.code, "    LDA #<{f256}").unwrap();
-            writeln!(self.code, "    LDY #>{f256}").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::FMULT).unwrap();
-            writeln!(self.code, "    LDA #<__TI_TMP").unwrap();
-            writeln!(self.code, "    LDY #>__TI_TMP").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::FADD).unwrap();
-            writeln!(self.code, "    LDX #<__TI_TMP").unwrap();
-            writeln!(self.code, "    LDY #>__TI_TMP").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
-            writeln!(self.code, "    LDY __TI_LO").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
-            writeln!(self.code, "    LDA #<__TI_TMP").unwrap();
-            writeln!(self.code, "    LDY #>__TI_TMP").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::FADD).unwrap();
-            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::GETTIM).unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    LDX #$A0").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    JMP ${:04X}", rt::FLOATB).unwrap();
         }
         if self.used_read_ti_str {
-            // TI$ = "HHMMSS". Three binary divide-by-60s extract H/M/S
-            // from the 24-bit jiffy count; one divide-by-10 per nibble
-            // turns each into two ASCII digits. The output buffer lives
-            // at __TI_HEAP and is rebuilt on every TI$ read — there's no
-            // heap allocation involved, just a stable string slot.
+            // Convert the jiffy count to six HHMMSS digits.
             writeln!(self.code, "__READ_TI_STR:").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::RDTIM).unwrap();
-            writeln!(self.code, "    STY __TI_HI").unwrap();
-            writeln!(self.code, "    STX __TI_MID").unwrap();
-            writeln!(self.code, "    STA __TI_LO").unwrap();
-            // jiffies / 60 = total_seconds; remainder discarded.
-            writeln!(self.code, "    JSR __DIV_TI_60").unwrap();
-            // total_seconds / 60 = minutes_total; remainder = seconds.
-            writeln!(self.code, "    JSR __DIV_TI_60").unwrap();
-            writeln!(self.code, "    LDA __TI_REM").unwrap();
-            writeln!(self.code, "    STA __TI_SS").unwrap();
-            // minutes_total / 60 = hours; remainder = minutes.
-            writeln!(self.code, "    JSR __DIV_TI_60").unwrap();
-            writeln!(self.code, "    LDA __TI_REM").unwrap();
-            writeln!(self.code, "    STA __TI_MM").unwrap();
-            writeln!(self.code, "    LDA __TI_LO").unwrap();
-            writeln!(self.code, "    STA __TI_HH").unwrap();
-            // Length byte stays at 6 (set in the data block).
-            // After __DIV_BY_10: .X = quotient (tens), .A = remainder
-            // (ones). The PHA stash lets us emit the tens digit first
-            // (it goes to the lower address) and the ones second.
-            writeln!(self.code, "    LDA __TI_HH").unwrap();
-            writeln!(self.code, "    JSR __DIV_BY_10").unwrap();
-            writeln!(self.code, "    PHA").unwrap();
-            writeln!(self.code, "    TXA").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$30").unwrap();
-            writeln!(self.code, "    STA __TI_HEAP+1").unwrap();
-            writeln!(self.code, "    PLA").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$30").unwrap();
-            writeln!(self.code, "    STA __TI_HEAP+2").unwrap();
-            writeln!(self.code, "    LDA __TI_MM").unwrap();
-            writeln!(self.code, "    JSR __DIV_BY_10").unwrap();
-            writeln!(self.code, "    PHA").unwrap();
-            writeln!(self.code, "    TXA").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$30").unwrap();
-            writeln!(self.code, "    STA __TI_HEAP+3").unwrap();
-            writeln!(self.code, "    PLA").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$30").unwrap();
-            writeln!(self.code, "    STA __TI_HEAP+4").unwrap();
-            writeln!(self.code, "    LDA __TI_SS").unwrap();
-            writeln!(self.code, "    JSR __DIV_BY_10").unwrap();
-            writeln!(self.code, "    PHA").unwrap();
-            writeln!(self.code, "    TXA").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$30").unwrap();
-            writeln!(self.code, "    STA __TI_HEAP+5").unwrap();
-            writeln!(self.code, "    PLA").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$30").unwrap();
-            writeln!(self.code, "    STA __TI_HEAP+6").unwrap();
-            writeln!(self.code, "    RTS").unwrap();
-            // 24-bit divide by 60. Operates in place on __TI_HI/MID/LO
-            // (quotient comes back there); 8-bit remainder lands in
-            // __TI_REM. Standard shift-and-subtract loop.
-            writeln!(self.code, "__DIV_TI_60:").unwrap();
-            writeln!(self.code, "    LDA #$00").unwrap();
-            writeln!(self.code, "    STA __TI_REM").unwrap();
-            writeln!(self.code, "    LDX #$18").unwrap();
-            writeln!(self.code, "__DIV_TI_60_LOOP:").unwrap();
-            writeln!(self.code, "    ASL __TI_LO").unwrap();
-            writeln!(self.code, "    ROL __TI_MID").unwrap();
-            writeln!(self.code, "    ROL __TI_HI").unwrap();
-            writeln!(self.code, "    ROL __TI_REM").unwrap();
-            writeln!(self.code, "    LDA __TI_REM").unwrap();
-            writeln!(self.code, "    CMP #60").unwrap();
-            writeln!(self.code, "    BCC __DIV_TI_60_SKIP").unwrap();
-            writeln!(self.code, "    SBC #60").unwrap();
-            writeln!(self.code, "    STA __TI_REM").unwrap();
-            writeln!(self.code, "    INC __TI_LO").unwrap();
-            writeln!(self.code, "__DIV_TI_60_SKIP:").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::GETTIM).unwrap();
+            writeln!(self.code, "    STY $5E").unwrap();
+            writeln!(self.code, "    STY $71").unwrap();
+            writeln!(self.code, "    LDY #$06").unwrap();
+            writeln!(self.code, "    STY $5D").unwrap();
+            writeln!(self.code, "    LDY #$24").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::FOUTIM).unwrap();
+            writeln!(self.code, "    LDX #$05").unwrap();
+            writeln!(self.code, "__READ_TI_STR_COPY:").unwrap();
+            writeln!(self.code, "    LDA $0100,X").unwrap();
+            writeln!(self.code, "    STA __TI_HEAP+1,X").unwrap();
             writeln!(self.code, "    DEX").unwrap();
-            writeln!(self.code, "    BNE __DIV_TI_60_LOOP").unwrap();
-            writeln!(self.code, "    RTS").unwrap();
-        }
-        if self.used_div_by_10 {
-            // 8-bit divide by 10. Input .A; output: .X=quotient, .A=remainder.
-            // Final CMP #$00 leaves Z reflecting the remainder so the
-            // caller can BEQ on "is zero" — without it, the loop's last
-            // CMP #10 sets Z based on A==10 (always false on the BCC
-            // path), masking a true zero remainder.
-            writeln!(self.code, "__DIV_BY_10:").unwrap();
-            writeln!(self.code, "    LDX #$00").unwrap();
-            writeln!(self.code, "__DIV_BY_10_LOOP:").unwrap();
-            writeln!(self.code, "    CMP #10").unwrap();
-            writeln!(self.code, "    BCC __DIV_BY_10_DONE").unwrap();
-            writeln!(self.code, "    SBC #10").unwrap();
-            writeln!(self.code, "    INX").unwrap();
-            writeln!(self.code, "    JMP __DIV_BY_10_LOOP").unwrap();
-            writeln!(self.code, "__DIV_BY_10_DONE:").unwrap();
-            writeln!(self.code, "    CMP #$00").unwrap();
+            writeln!(self.code, "    BPL __READ_TI_STR_COPY").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_print_comma {
@@ -9283,10 +9589,9 @@ impl Codegen {
             writeln!(self.code, "__GET_STR:").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::GETIN).unwrap();
             writeln!(self.code, "    STA __GET_HEAP+1").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    BEQ __GET_STR_OK").unwrap();
             writeln!(self.code, "    LDX #$01").unwrap();
-            writeln!(self.code, "    CMP #$00").unwrap();
-            writeln!(self.code, "    BNE __GET_STR_OK").unwrap();
-            writeln!(self.code, "    LDX #$00").unwrap();
             writeln!(self.code, "__GET_STR_OK:").unwrap();
             writeln!(self.code, "    STX __GET_HEAP").unwrap();
             writeln!(self.code, "    RTS").unwrap();
@@ -9380,11 +9685,15 @@ impl Codegen {
                     }
                 }
             }
-            // Point each BSS-eligible string var at its dedicated
-            // buffer. The buffer's length byte is already $00 (zero-
-            // init), so the var starts as the empty string.
+            // Clear string buffers before assigning their pointers.
             let mut bss_vars: Vec<&VarName> = self.bss_str_vars.keys().collect();
             bss_vars.sort_by(|a, b| a.label().cmp(&b.label()));
+            if !bss_vars.is_empty() {
+                writeln!(self.code, "    LDA #$00").unwrap();
+            }
+            for var in &bss_vars {
+                writeln!(self.code, "    STA __SBUF_{}", var.label()).unwrap();
+            }
             for var in bss_vars {
                 let label = var.label();
                 writeln!(self.code, "    LDA #<__SBUF_{label}").unwrap();
@@ -9526,42 +9835,17 @@ impl Codegen {
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_sbuf_copy {
-            // Copy a [len, chars...] string from (__SBUF_SRC) to
-            // (__SBUF_DST). Caller has staged both pointers and chosen
-            // a destination buffer large enough to hold the source.
-            // The source pointer goes through ($FD)/($FE) and the dest
-            // through ($03)/($04) — both are zero-page slots reserved
-            // for the string-op family. Y indexes the copy.
+            // Copy from the last character to the length byte. Buffers must not overlap.
             writeln!(self.code, "__SBUF_COPY:").unwrap();
-            writeln!(self.code, "    LDA __SBUF_SRC_LO").unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::ARRAY_ADDR_LO).unwrap();
-            writeln!(self.code, "    LDA __SBUF_SRC_HI").unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
-            writeln!(self.code, "    LDA __SBUF_DST_LO").unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
-            writeln!(self.code, "    LDA __SBUF_DST_HI").unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$01").unwrap();
-            writeln!(self.code, "    BEQ __SBUF_COPY_256").unwrap();
-            writeln!(self.code, "    STA __SBUF_TMP_LEN").unwrap();
+            writeln!(self.code, "    TAY").unwrap();
             writeln!(self.code, "__SBUF_COPY_LOOP:").unwrap();
             writeln!(self.code, "    LDA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
             writeln!(self.code, "    STA (${:02X}),Y", rt::STR_OP_LHS_LO).unwrap();
-            writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    DEC __SBUF_TMP_LEN").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    CPY #$FF").unwrap();
             writeln!(self.code, "    BNE __SBUF_COPY_LOOP").unwrap();
-            writeln!(self.code, "    RTS").unwrap();
-            // Cold path: source has the maximum-allowed length 255, so
-            // total bytes to copy is 256 (the length byte plus 255
-            // chars). Run the loop until Y wraps back to $00.
-            writeln!(self.code, "__SBUF_COPY_256:").unwrap();
-            writeln!(self.code, "    LDA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-            writeln!(self.code, "    STA (${:02X}),Y", rt::STR_OP_LHS_LO).unwrap();
-            writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    BNE __SBUF_COPY_256").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_fill_empty_str {
@@ -9661,6 +9945,12 @@ impl Codegen {
             writeln!(self.code, "__STR_ASSIGN_OWNED:").unwrap();
             writeln!(self.code, "    STA __GC_LOW_LO").unwrap();
             writeln!(self.code, "    STY __GC_LOW_HI").unwrap();
+            if self.used_lastvar_str {
+                // Clear LASTVAR when the new chunk has a different owner.
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    STA __LAST_STR_VAR_LO").unwrap();
+                writeln!(self.code, "    STA __LAST_STR_VAR_HI").unwrap();
+            }
             writeln!(self.code, "    LDA __HEAP_PTR").unwrap();
             writeln!(self.code, "    STA __GC_NEW_TOP_LO").unwrap();
             writeln!(self.code, "    LDA __HEAP_PTR+1").unwrap();
@@ -9695,21 +9985,13 @@ impl Codegen {
             writeln!(self.code, "__SAO_OWNER_HI:").unwrap();
             writeln!(self.code, "    LDA __STR_OWNER_HI").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
-            writeln!(self.code, "    LDA __GC_NEW_TOP_LO").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC __GC_CHUNK_SIZE_LO").unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    ADC $FD").unwrap();
             writeln!(self.code, "    STA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    LDA __GC_NEW_TOP_HI").unwrap();
-            writeln!(self.code, "    ADC __GC_CHUNK_SIZE_HI").unwrap();
+            writeln!(self.code, "    LDA $FE").unwrap();
+            writeln!(self.code, "    ADC #$00").unwrap();
             writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __SAO_INC2").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__SAO_INC2:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __SAO_DONE").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__SAO_DONE:").unwrap();
             writeln!(self.code, "    LDA __GC_NEW_TOP_LO").unwrap();
             writeln!(self.code, "    LDY __GC_NEW_TOP_HI").unwrap();
             writeln!(self.code, "    RTS").unwrap();
@@ -9747,57 +10029,41 @@ impl Codegen {
             writeln!(self.code, "    STA __GC_NEW_TOP_HI").unwrap();
             writeln!(self.code, "    STA __GC_LOW_HI").unwrap();
             writeln!(self.code, "__GC_LOOP:").unwrap();
-            writeln!(self.code, "    SEC").unwrap();
-            writeln!(self.code, "    LDA __GC_LOW_LO").unwrap();
-            writeln!(self.code, "    SBC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    LDA __GC_LOW_HI").unwrap();
-            writeln!(self.code, "    SBC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    BCS __GC_DONE").unwrap();
+            // Stop at the heap top. Pointer stores preserve carry.
             writeln!(self.code, "    LDA __GC_LOW_LO").unwrap();
             writeln!(self.code, "    STA $FD").unwrap();
+            writeln!(self.code, "    CMP __HEAP_PTR").unwrap();
             writeln!(self.code, "    LDA __GC_LOW_HI").unwrap();
             writeln!(self.code, "    STA $FE").unwrap();
+            writeln!(self.code, "    SBC __HEAP_PTR+1").unwrap();
+            writeln!(self.code, "    BCS __GC_DONE").unwrap();
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA ($FD),Y").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
             writeln!(self.code, "    CLC").unwrap();
             writeln!(self.code, "    ADC #$03").unwrap();
             writeln!(self.code, "    STA __GC_CHUNK_SIZE_LO").unwrap();
             writeln!(self.code, "    LDA #$00").unwrap();
             writeln!(self.code, "    ADC #$00").unwrap();
             writeln!(self.code, "    STA __GC_CHUNK_SIZE_HI").unwrap();
-            // TMP = owner-field address = LOW + chunk_size - 2.
-            writeln!(self.code, "    LDA __GC_LOW_LO").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC __GC_CHUNK_SIZE_LO").unwrap();
-            writeln!(self.code, "    STA __GC_TMP_LO").unwrap();
-            writeln!(self.code, "    LDA __GC_LOW_HI").unwrap();
-            writeln!(self.code, "    ADC __GC_CHUNK_SIZE_HI").unwrap();
-            writeln!(self.code, "    STA __GC_TMP_HI").unwrap();
+            // Advance past the length byte and text to the owner field.
+            writeln!(self.code, "    TXA").unwrap();
             writeln!(self.code, "    SEC").unwrap();
-            writeln!(self.code, "    LDA __GC_TMP_LO").unwrap();
-            writeln!(self.code, "    SBC #$02").unwrap();
-            writeln!(self.code, "    STA __GC_TMP_LO").unwrap();
-            writeln!(self.code, "    LDA __GC_TMP_HI").unwrap();
-            writeln!(self.code, "    SBC #$00").unwrap();
-            writeln!(self.code, "    STA __GC_TMP_HI").unwrap();
-            writeln!(self.code, "    LDA __GC_TMP_LO").unwrap();
+            writeln!(self.code, "    ADC $FD").unwrap();
             writeln!(self.code, "    STA $FD").unwrap();
-            writeln!(self.code, "    LDA __GC_TMP_HI").unwrap();
-            writeln!(self.code, "    STA $FE").unwrap();
-            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    BCC __GC_OWNER").unwrap();
+            writeln!(self.code, "    INC $FE").unwrap();
+            writeln!(self.code, "__GC_OWNER:").unwrap();
             writeln!(self.code, "    LDA ($FD),Y").unwrap();
-            writeln!(self.code, "    STA __GC_SLOT_LO").unwrap();
+            writeln!(self.code, "    TAX").unwrap();
             writeln!(self.code, "    INY").unwrap();
             writeln!(self.code, "    LDA ($FD),Y").unwrap();
-            writeln!(self.code, "    STA __GC_SLOT_HI").unwrap();
-            writeln!(self.code, "    ORA __GC_SLOT_LO").unwrap();
+            writeln!(self.code, "    STX $FD").unwrap();
+            writeln!(self.code, "    STA $FE").unwrap();
+            writeln!(self.code, "    ORA $FD").unwrap();
             writeln!(self.code, "    BEQ __GC_DEAD").unwrap();
             // Live only if *(owner_slot) still equals the current chunk.
-            writeln!(self.code, "    LDA __GC_SLOT_LO").unwrap();
-            writeln!(self.code, "    STA $FD").unwrap();
-            writeln!(self.code, "    LDA __GC_SLOT_HI").unwrap();
-            writeln!(self.code, "    STA $FE").unwrap();
-            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
             writeln!(self.code, "    LDA ($FD),Y").unwrap();
             writeln!(self.code, "    CMP __GC_LOW_LO").unwrap();
             writeln!(self.code, "    BNE __GC_DEAD").unwrap();
@@ -9813,10 +10079,6 @@ impl Codegen {
             writeln!(self.code, "    BEQ __GC_BUMP_NEW").unwrap();
             writeln!(self.code, "__GC_MOVE:").unwrap();
             writeln!(self.code, "    JSR __HEAP_COPY_SMC").unwrap();
-            writeln!(self.code, "    LDA __GC_SLOT_LO").unwrap();
-            writeln!(self.code, "    STA $FD").unwrap();
-            writeln!(self.code, "    LDA __GC_SLOT_HI").unwrap();
-            writeln!(self.code, "    STA $FE").unwrap();
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA __GC_NEW_TOP_LO").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
@@ -9880,25 +10142,6 @@ impl Codegen {
             writeln!(self.code, "__CONCAT_LEN_OK:").unwrap();
             writeln!(self.code, "    STA __CONCAT_TOTAL_LEN").unwrap();
             writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-            // Advance __HEAP_PTR by 3 + total (len + data + owner).
-            writeln!(self.code, "    LDA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC __CONCAT_TOTAL_LEN").unwrap();
-            writeln!(self.code, "    STA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    LDA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    ADC #$00").unwrap();
-            writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __CONCAT_HEAP_INC2").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__CONCAT_HEAP_INC2:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __CONCAT_HEAP_INC3").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__CONCAT_HEAP_INC3:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __CONCAT_HEAP_DONE").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
             writeln!(self.code, "__CONCAT_HEAP_DONE:").unwrap();
 
             if self.concat_appends_in_place {
@@ -9959,81 +10202,52 @@ impl Codegen {
             writeln!(self.code, "    INC ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
             writeln!(self.code, "__CONCAT_OWNER2:").unwrap();
             writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    ADC ${:02X}", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    STA __HEAP_PTR").unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
+            writeln!(self.code, "    ADC #$00").unwrap();
+            writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
             writeln!(self.code, "    LDA __CONCAT_RESULT").unwrap();
             writeln!(self.code, "    LDY __CONCAT_RESULT+1").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_str_from_number {
-            // STR$(n): convert FAC to a PETSCII string in BASIC's
-            // floating-point output buffer ($0100, null-terminated by
-            // FOUT), then copy it into the heap with a length prefix.
+            // Copy the number text into a new heap chunk.
             writeln!(self.code, "__STR_FROM_NUMBER:").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::FOUT).unwrap();
-            // Scan $0100... for the null terminator to find length.
-            writeln!(self.code, "    LDY #$00").unwrap();
-            writeln!(self.code, "__SFN_SCAN:").unwrap();
-            writeln!(self.code, "    LDA $0100,Y").unwrap();
-            writeln!(self.code, "    BEQ __SFN_FOUND").unwrap();
-            writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    BNE __SFN_SCAN").unwrap();
-            writeln!(self.code, "__SFN_FOUND:").unwrap();
-            // Y = length. Stash for the copy loop, then allocate.
-            writeln!(self.code, "    STY __HEAP_COPY_LEN").unwrap();
             writeln!(self.code, "    LDA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    STA __HEAP_RESULT").unwrap();
             writeln!(self.code, "    STA $FD").unwrap();
             writeln!(self.code, "    LDA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    STA __HEAP_RESULT+1").unwrap();
             writeln!(self.code, "    STA $FE").unwrap();
-            // Write the length byte at dest[0] and bump __HEAP_PTR by
-            // 3 + length so the next allocation lands above us.
-            writeln!(self.code, "    LDY #$00").unwrap();
-            writeln!(self.code, "    LDA __HEAP_COPY_LEN").unwrap();
-            writeln!(self.code, "    STA ($FD),Y").unwrap();
-            writeln!(self.code, "    LDA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC __HEAP_COPY_LEN").unwrap();
-            writeln!(self.code, "    STA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    LDA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    ADC #$00").unwrap();
-            writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __SFN_INC2").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__SFN_INC2:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __SFN_INC3").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__SFN_INC3:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __SFN_AFTER_ALLOC").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__SFN_AFTER_ALLOC:").unwrap();
-            // Copy from $0100,Y to dest[1..1+len].
-            writeln!(self.code, "    LDX __HEAP_COPY_LEN").unwrap();
-            writeln!(self.code, "    BEQ __SFN_DONE").unwrap();
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "__SFN_COPY:").unwrap();
             writeln!(self.code, "    LDA $0100,Y").unwrap();
+            writeln!(self.code, "    BEQ __SFN_DONE").unwrap();
             writeln!(self.code, "    INY").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
-            writeln!(self.code, "    DEX").unwrap();
             writeln!(self.code, "    BNE __SFN_COPY").unwrap();
             writeln!(self.code, "__SFN_DONE:").unwrap();
-            writeln!(self.code, "    LDY __HEAP_COPY_LEN").unwrap();
+            // Store the length and owner bytes around the text.
             writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    BNE __SFN_OWNER").unwrap();
-            writeln!(self.code, "    INC $FE").unwrap();
-            writeln!(self.code, "__SFN_OWNER:").unwrap();
-            writeln!(self.code, "    LDA #$00").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
             writeln!(self.code, "    INY").unwrap();
-            writeln!(self.code, "    BNE __SFN_OWNER2").unwrap();
-            writeln!(self.code, "    INC $FE").unwrap();
-            writeln!(self.code, "__SFN_OWNER2:").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
-            writeln!(self.code, "    LDA __HEAP_RESULT").unwrap();
-            writeln!(self.code, "    LDY __HEAP_RESULT+1").unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    ADC $FD").unwrap();
+            writeln!(self.code, "    STA __HEAP_PTR").unwrap();
+            writeln!(self.code, "    LDA $FE").unwrap();
+            writeln!(self.code, "    ADC #$00").unwrap();
+            writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    DEY").unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    STA ($FD),Y").unwrap();
+            writeln!(self.code, "    LDA $FD").unwrap();
+            writeln!(self.code, "    LDY $FE").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_str_left {
@@ -11409,24 +11623,6 @@ impl Codegen {
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA __HEAP_COPY_LEN").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
-            writeln!(self.code, "    LDA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC __HEAP_COPY_LEN").unwrap();
-            writeln!(self.code, "    STA __HEAP_PTR").unwrap();
-            writeln!(self.code, "    LDA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    ADC #$00").unwrap();
-            writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __HAWL_INC2").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__HAWL_INC2:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __HAWL_INC3").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
-            writeln!(self.code, "__HAWL_INC3:").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR").unwrap();
-            writeln!(self.code, "    BNE __HAWL_OWNER_PREP").unwrap();
-            writeln!(self.code, "    INC __HEAP_PTR+1").unwrap();
             writeln!(self.code, "__HAWL_OWNER_PREP:").unwrap();
             writeln!(self.code, "    LDY __HEAP_COPY_LEN").unwrap();
             writeln!(self.code, "    INY").unwrap();
@@ -11440,12 +11636,19 @@ impl Codegen {
             writeln!(self.code, "    INC $FE").unwrap();
             writeln!(self.code, "__HAWL_OWNER2:").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    ADC $FD").unwrap();
+            writeln!(self.code, "    STA __HEAP_PTR").unwrap();
+            writeln!(self.code, "    LDA $FE").unwrap();
+            writeln!(self.code, "    ADC #$00").unwrap();
+            writeln!(self.code, "    STA __HEAP_PTR+1").unwrap();
             writeln!(self.code, "    LDA __HEAP_RESULT+1").unwrap();
             writeln!(self.code, "    STA $FE").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_input {
-            // Read a CR-terminated line into `__INPUT_BUF` as a length- prefixed string, one character per `CHRIN` ($FFCF) call.
+            // Read a line and return its length in A. Z marks an empty line.
             writeln!(self.code, "__INPUT_LINE:").unwrap();
             writeln!(self.code, "    LDA #$00").unwrap();
             writeln!(self.code, "    STA __INPUT_LEN").unwrap();
@@ -11469,6 +11672,9 @@ impl Codegen {
             writeln!(self.code, "    LDA #$0D").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
             writeln!(self.code, "__INPUT_NOCR:").unwrap();
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __INPUT_POS").unwrap();
+            writeln!(self.code, "    LDA __INPUT_BUF").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_input_file {
@@ -11497,6 +11703,9 @@ impl Codegen {
             writeln!(self.code, "__ILF_DONE:").unwrap();
             writeln!(self.code, "    LDA __INPUT_LEN").unwrap();
             writeln!(self.code, "    STA __INPUT_BUF").unwrap();
+            // The field cursor, as `__INPUT_LINE` sets it.
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA __INPUT_POS").unwrap();
             writeln!(self.code, "    RTS").unwrap();
             // __INPUT_FILE_FIELD: like __EXTRACT_FIELD but the refill
             // path reads another line from the file (reopening the
@@ -11522,8 +11731,6 @@ impl Codegen {
             writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
             writeln!(self.code, "    JSR __INPUT_LINE_FILE").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
-            writeln!(self.code, "    LDA #$01").unwrap();
-            writeln!(self.code, "    STA __INPUT_POS").unwrap();
             writeln!(self.code, "    JMP __IFF_SKIP_WS").unwrap();
             writeln!(self.code, "__IFF_EMPTY:").unwrap();
             writeln!(self.code, "    LDY #$00").unwrap();
@@ -11599,8 +11806,6 @@ impl Codegen {
             writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
             writeln!(self.code, "__EF_NOPROMPT:").unwrap();
             writeln!(self.code, "    JSR __INPUT_LINE").unwrap();
-            writeln!(self.code, "    LDA #$01").unwrap();
-            writeln!(self.code, "    STA __INPUT_POS").unwrap();
             writeln!(self.code, "    JMP __EF_SKIP_WS").unwrap();
             // Empty field: length-0 string at __FIELD_BUF, pos left as-is
             // so any further variables on the same empty line also read
@@ -11708,6 +11913,12 @@ impl Codegen {
             writeln!(self.code, "    JMP __DSL_LOOP").unwrap();
             writeln!(self.code, "__DSL_DONE:").unwrap();
             writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_read_tagged {
+            self.emit_read_tagged();
+        }
+        if self.used_read_digits || self.used_val_digits {
+            self.emit_digits_fac();
         }
         if self.used_val {
             // Caller passes a length-prefixed source pointer in
@@ -12046,17 +12257,16 @@ impl Codegen {
 
             let saved_temp_used = std::mem::take(&mut self.temp_used);
             self.temp_used = vec![true; self.fn_temp_base];
-            for name in static_bodies {
-                let info = self.def_fns[&name].clone();
-                writeln!(self.code, "{}:", name.label()).unwrap();
-                self.emit_fn_recursion_guard(&name);
-                self.reset_entry_caches();
-                self.emit_expr_to_fac(&info.body)?;
-                self.seal_fn_body_temps();
-                writeln!(self.code, "    RTS").unwrap();
-            }
-
-            for (label, name, param, body) in self.dispatched_bodies.clone() {
+            let static_bodies: Vec<(String, FnName, VarName, Expr)> = static_bodies
+                .into_iter()
+                .map(|name| {
+                    let info = self.def_fns[&name].clone();
+                    (name.label(), name, info.param, info.body)
+                })
+                .collect();
+            for (label, name, param, body) in
+                static_bodies.into_iter().chain(self.dispatched_bodies.clone())
+            {
                 let param_label = self.intern_var(param.clone());
                 writeln!(self.code, "{label}:").unwrap();
                 self.emit_fn_recursion_guard(&name);
@@ -12146,6 +12356,19 @@ impl Codegen {
             }
         }
 
+        // Initialised data, so it goes with the pools and ahead of the zeroed slots.
+        if !self.on_tables.is_empty() {
+            writeln!(self.code).unwrap();
+            writeln!(self.code, "; --- ON GOTO dispatch tables ---").unwrap();
+            for (id, entries) in std::mem::take(&mut self.on_tables) {
+                for (part, label) in [("<", "LO"), (">", "HI")] {
+                    let row: Vec<String> = entries.iter().map(|e| format!("{part}{e}")).collect();
+                    writeln!(self.code, "__ON_{label}_{id}:").unwrap();
+                    writeln!(self.code, "    .byte {}", row.join(",")).unwrap();
+                }
+            }
+        }
+
         let (fe_slots, fi_bss_ids, fu_bss_ids) = self.for_slot_bss_ids();
         if self.has_vars_block() {
             writeln!(self.code).unwrap();
@@ -12205,11 +12428,18 @@ impl Codegen {
             }
         }
 
-        // Temp slots.
-        if self.temp_max > 0 {
+        // Reserve T0 for expression helpers even without allocated temporaries.
+        let t0_stub = self.used_st_t0
+            || self.used_fadd_t0
+            || self.used_fsub_t0
+            || self.used_fmult_t0
+            || self.used_fdiv_t0
+            || self.used_fcmp_t0;
+        let temp_slots = if t0_stub { self.temp_max.max(1) } else { self.temp_max };
+        if temp_slots > 0 {
             writeln!(self.code).unwrap();
             writeln!(self.code, "; --- temporary float slots ---").unwrap();
-            for i in 0..self.temp_max {
+            for i in 0..temp_slots {
                 writeln!(self.code, "T{i}:").unwrap();
                 emit_byte_run(&mut self.code, &[0u8; 5], false);
             }
@@ -12305,56 +12535,56 @@ impl Codegen {
                 DataPoolLayout::AsciiTagged => "ASCII length-prefixed",
                 DataPoolLayout::BinaryI16 => "binary i16, 2 bytes/entry",
                 DataPoolLayout::BinaryMflpt => "binary MFLPT, 5 bytes/entry",
+                DataPoolLayout::BinaryU8 => "binary u8, 1 byte/entry",
             };
-            writeln!(self.code, "; --- DATA pool ({layout_note}) ---").unwrap();
-            writeln!(self.code, "__DATA:").unwrap();
-            // Offset -> DATA lines that start there. data_line_offsets follows
-            // module.lines, which is not always sorted by offset.
-            let mut labels_at: HashMap<usize, Vec<u16>> = HashMap::new();
-            for (line_no, off) in &self.data_line_offsets {
-                labels_at.entry(*off).or_default().push(*line_no);
-            }
-            let mut emitted: HashSet<u16> = HashSet::new();
-            for (i, v) in self.data_values.iter().enumerate() {
-                if let Some(lines) = labels_at.get(&i) {
-                    for line_no in lines {
-                        writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
-                        emitted.insert(*line_no);
-                    }
+            if self.data_relocated {
+                self.emit_relocated_data_pool(layout_note);
+            } else {
+                writeln!(self.code, "; --- DATA pool ({layout_note}) ---").unwrap();
+                writeln!(self.code, "__DATA:").unwrap();
+                let mut labels_at: HashMap<usize, Vec<u16>> = HashMap::new();
+                for (line_no, off) in &self.data_line_offsets {
+                    labels_at.entry(*off).or_default().push(*line_no);
                 }
-                // Anchors for the `__DATA_BAD` range that covers this entry ; emitted only when a numeric READ exists to consult the table.
-                if self.used_read_num && self.compact_data_bad.is_none() {
-                    if self.data_bad.iter().any(|(first, _, _)| *first == i) {
-                        writeln!(self.code, "__DBAD_S{i}:").unwrap();
+                let mut emitted: HashSet<u16> = HashSet::new();
+                for (i, v) in self.data_values.iter().enumerate() {
+                    if let Some(lines) = labels_at.get(&i) {
+                        for line_no in lines {
+                            writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
+                            emitted.insert(*line_no);
+                        }
                     }
-                    if i > 0 && self.data_bad.iter().any(|(_, last, _)| *last + 1 == i) {
-                        writeln!(self.code, "__DBAD_E{}:", i - 1).unwrap();
+                    if self.used_read_num && self.compact_data_bad.is_none() {
+                        if self.data_bad.iter().any(|(first, _, _)| *first == i) {
+                            writeln!(self.code, "__DBAD_S{i}:").unwrap();
+                        }
+                        if i > 0 && self.data_bad.iter().any(|(_, last, _)| *last + 1 == i) {
+                            writeln!(self.code, "__DBAD_E{}:", i - 1).unwrap();
+                        }
                     }
+                    let bytes = self.data_item_bytes(v);
+                    write!(self.code, "    .byte ").unwrap();
+                    for b in &bytes {
+                        write!(self.code, "${b:02X},").unwrap();
+                    }
+                    self.code.pop();
+                    writeln!(self.code, "  ; #{i} = {}", data_value_label(v)).unwrap();
                 }
-                let bytes = data_value_pool_bytes(v, self.data_pool_layout);
-                write!(self.code, "    .byte ").unwrap();
-                for b in &bytes {
-                    write!(self.code, "${b:02X},").unwrap();
-                }
-                self.code.pop();
-                writeln!(self.code, "  ; #{i} = {}", data_value_label(v)).unwrap();
-            }
 
-            if self.used_read_num && self.compact_data_bad.is_none() {
-                let last_idx = self.data_values.len() - 1;
-                if self.data_bad.iter().any(|(_, last, _)| *last == last_idx) {
-                    writeln!(self.code, "__DBAD_E{last_idx}:").unwrap();
+                if self.used_read_num && self.compact_data_bad.is_none() {
+                    let last_idx = self.data_values.len() - 1;
+                    if self.data_bad.iter().any(|(_, last, _)| *last == last_idx) {
+                        writeln!(self.code, "__DBAD_E{last_idx}:").unwrap();
+                    }
                 }
-            }
-            // Label any DATA line the walk missed, at the end of the pool.
-            // RESET tables name every entry, and a READ from here is ?OUT OF DATA.
-            for (line_no, _) in &self.data_line_offsets {
-                if emitted.insert(*line_no) {
-                    writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
+                for (line_no, _) in &self.data_line_offsets {
+                    if emitted.insert(*line_no) {
+                        writeln!(self.code, "__DATA_LINE_{line_no}:").unwrap();
+                    }
                 }
+                // Mark the DATA bound used by reads and layout passes.
+                writeln!(self.code, "{DATA_POOL_CLOSE}").unwrap();
             }
-            // End-of-pool marker: `__DATA_CHK`'s ?OUT OF DATA bound, and the layout marker every later pass keys off.
-            writeln!(self.code, "{DATA_POOL_CLOSE}").unwrap();
             if self.used_read_num && self.compact_data_bad.is_some() {
                 let plan = self.compact_data_bad.as_ref().unwrap();
                 writeln!(self.code, "; --- Compact DATA rejection metadata ---").unwrap();
@@ -12549,27 +12779,9 @@ impl Codegen {
             writeln!(self.code, "__DIM_BYTES_HI:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
-        if self.used_sbuf_copy {
-            // Source/dest pointers for the BSS-buffer copy helper, plus
-            // the per-call iteration counter.
-            writeln!(self.code, "__SBUF_SRC_LO:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__SBUF_SRC_HI:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__SBUF_DST_LO:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__SBUF_DST_HI:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__SBUF_TMP_LEN:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-        }
 
-        if self.used_state_reset || self.used_fill_empty_str || self.used_runtime_dim {
-            // Pointer/count slots shared between __MEMZERO (state-
-            // reset array clear, used by both RUN/CLR and runtime
-            // DIM zero-init) and __FILL_EMPTY_STR (string-array slot
-            // initialiser, used at startup and at runtime DIM time
-            // for string arrays).
+        if self.used_fill_empty_str || self.used_runtime_dim {
+            // Share pointer and count slots between array clearing helpers.
             writeln!(self.code, "__MEMZERO_PTR_LO:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__MEMZERO_PTR_HI:").unwrap();
@@ -12630,17 +12842,9 @@ impl Codegen {
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__GC_LOW_HI:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__GC_TMP_LO:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__GC_TMP_HI:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__GC_CHUNK_SIZE_LO:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__GC_CHUNK_SIZE_HI:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__GC_SLOT_LO:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__GC_SLOT_HI:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
         if self.used_str_assign_owned {
@@ -12862,19 +13066,6 @@ impl Codegen {
                 writeln!(self.code, "    .byte $00").unwrap();
             }
         }
-        // TI scratch: 3 byte slots for the atomic RDTIM read plus a
-        // 5-byte FAC stash used while combining the bytes into a float.
-        // TI$ reuses the HI/MID/LO bytes (its first action is also
-        // RDTIM) but needs additional slots for the formatted output
-        // and the binary-divide remainder.
-        if self.used_read_ti || self.used_read_ti_str {
-            writeln!(self.code, "__TI_HI:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__TI_MID:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__TI_LO:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-        }
         if self.used_hardcopy {
             // Row pointer is $FB/$FC. Only the two counters live here.
             writeln!(self.code, "__HC_ROW:").unwrap();
@@ -12882,19 +13073,7 @@ impl Codegen {
             writeln!(self.code, "__HC_COL:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
-        if self.used_read_ti {
-            writeln!(self.code, "__TI_TMP:").unwrap();
-            writeln!(self.code, "    .byte $00,$00,$00,$00,$00").unwrap();
-        }
         if self.used_read_ti_str {
-            writeln!(self.code, "__TI_REM:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__TI_HH:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__TI_MM:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            writeln!(self.code, "__TI_SS:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
             // Length-prefixed string: [6, '0','0','0','0','0','0'].
             writeln!(self.code, "__TI_HEAP:").unwrap();
             writeln!(self.code, "    .byte $06,$30,$30,$30,$30,$30,$30").unwrap();
@@ -13714,6 +13893,13 @@ impl Codegen {
             writeln!(self.code, "{VAL_BUF_CLOSE}").unwrap();
         }
 
+        if self.data_relocated && self.data_relocate == Some(DataBuf::Bss) {
+            writeln!(self.code, "{DATA_BUF_LABEL}:").unwrap();
+            for _ in 0..256 / 8 {
+                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
+            }
+        }
+
         // Mark the start of the string heap. The label stays at offset
         // "end of program" — the .prg file ends right after it, but at
         // RUN time the address is valid RAM all the way up to MEMSIZ.
@@ -13725,8 +13911,13 @@ impl Codegen {
         // Everything is emitted: find the trailing run of stored zeros, bracket it, and trade
         // it for a fill loop at entry.
         install_bss_tail_fill(&mut self.code, rt::DATA_PTR_LO);
+        let state = self.state_zero_labels();
+        install_state_zero(&mut self.code, &state, rt::DATA_PTR_LO);
 
         // Assembly peephole optimization runs after this function returns.
+        if self.data_relocated {
+            self.code = rename_relocated_pool_labels(&self.code);
+        }
         if self.zp_plan.is_identity() {
             Ok(self.code.clone())
         } else {
@@ -13947,6 +14138,15 @@ impl Codegen {
                 return false;
             }
         }
+        if matches!(s, Stmt::GoSub { .. })
+            && (self.needs_gosub_depth() || !self.orphan_for_next.runtime_gosubs.is_empty())
+        {
+            return false;
+        }
+        // A RETURN fails only without a frame to pop.
+        if matches!(s, Stmt::Return) && self.gosub_depth_free {
+            return true;
+        }
         if stmt_cannot_error(s) {
             return true;
         }
@@ -13954,6 +14154,7 @@ impl Codegen {
             Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
                 self.poke_arg_safe(addr) && self.poke_value_safe(value)
             }
+            Stmt::Print { items, .. } => items.iter().all(print_piece_cannot_error),
             Stmt::If { cond, then } => {
                 if !self.cond_cannot_error(cond) {
                     return false;
@@ -13963,12 +14164,18 @@ impl Codegen {
                     ThenIr::Stmts(inner) => inner.iter().all(|s| self.stmt_cannot_error(s)),
                 }
             }
-            // Integer LET with a non-trapping RHS. u8-storage vars
-            // take the existing `poke_value_safe` byte-only path
-            // (it also accepts byte-only Neg(literal)). For i16
-            // storage, `int_let_value_safe` opens up `PEEK(addr)`
-            // and integer add/sub chains — they lower to inline
-            // 6502 ALU with no FAC trap.
+            // Integer loads and safe arithmetic cannot trap here.
+            Stmt::Let { var, value } if var.kind == VarKind::Float => {
+                !is_pseudo_var(var)
+                    && if self.shadow_int_label(var).is_none() {
+                        plain_number(value)
+                    } else {
+                        matches!(value, Expr::Number(n) if i16_split_if_integral(*n).is_some())
+                    }
+            }
+            Stmt::LetStr { var, value } => {
+                var.base != "TI" && (plain_string(value) || matches!(value, StrExpr::GetKey))
+            }
             Stmt::Let { var, value } => {
                 if var.kind != VarKind::Integer || var.base == "TI" || var.base == "ST" {
                     return false;
@@ -14015,7 +14222,8 @@ impl Codegen {
             Expr::Neg(inner) => self.int_let_value_safe(inner),
             // An integer ALU address can still be an invalid ROM address: -1 is a legal LET value, but emit_peek traps it through emit_addr_range_trap.
             Expr::Peek(addr) => {
-                !self.addr_literal_out_of_rom_range(addr) && self.int_let_value_safe(addr)
+                !self.addr_literal_out_of_rom_range(addr)
+                    && (self.int_let_value_safe(addr) || address_literal(addr))
             }
             _ => false,
         }
@@ -14036,8 +14244,11 @@ impl Codegen {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                 ) =>
             {
-                self.int_let_value_safe(l) && self.int_let_value_safe(r)
+                (self.int_let_value_safe(l) && self.int_let_value_safe(r))
+                    || (plain_number(l) && plain_number(r))
             }
+            // A string compare of literals and variables is __STRCMP over two pointers.
+            Expr::StrCompare(_, l, r) => plain_string(l) && plain_string(r),
             Expr::Bin(op, l, r) if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor) => {
                 self.cond_cannot_error(l) && self.cond_cannot_error(r)
             }
@@ -14093,6 +14304,25 @@ impl Codegen {
         self.signed_byte_int_vars.contains(var)
     }
 
+    /// Set carry when the stored byte represents a negative value.
+    fn signed_byte_carry_if_negative(&self, var: &VarName) -> String {
+        match self.signed_byte_negative_from(var) {
+            Some(threshold) => format!("    CMP #${threshold:02X}"),
+            None => "    ASL".to_string(),
+        }
+    }
+
+    /// First negative byte pattern, or None when bit 7 is the sign.
+    fn signed_byte_negative_from(&self, var: &VarName) -> Option<u8> {
+        match self.signed_byte_int_bounds.get(var) {
+            Some(&(_, max)) if max > 127 => Some(
+                self.signed_byte_neg_threshold(var)
+                    .expect("a signed byte's bounds fit one byte"),
+            ),
+            _ => None,
+        }
+    }
+
     /// First byte pattern that represents a negative signed-byte value.
     fn signed_byte_neg_threshold(&self, var: &VarName) -> Option<u8> {
         let (min, max) = *self.signed_byte_int_bounds.get(var)?;
@@ -14116,8 +14346,9 @@ impl Codegen {
                 // 2-byte storage that would otherwise be needed.
                 let id = self.fresh_id();
                 let done = format!("__SXT_{id}");
+                let carry_if_negative = self.signed_byte_carry_if_negative(var);
                 writeln!(self.code, "    LDA {label}").unwrap();
-                writeln!(self.code, "    ASL").unwrap();
+                writeln!(self.code, "{carry_if_negative}").unwrap();
                 writeln!(self.code, "    LDA #$00").unwrap();
                 writeln!(self.code, "    BCC {done}").unwrap();
                 writeln!(self.code, "    LDA #$FF").unwrap();
@@ -14323,10 +14554,8 @@ impl Codegen {
                 self.mark_static_arrays_undimmed();
             }
             Stmt::Clr => {
-                if self.used_on_key || self.used_error_continuation {
-
-                    self.emit_restore_saved_sp();
-                }
+                // CLR discards GOSUB frames and resets their depth.
+                self.emit_restore_saved_sp();
                 writeln!(self.code, "    JSR __STATE_RESET").unwrap();
                 self.used_state_reset = true;
                 // Same as RUN — the reset routine touches HEAP_PTR and
@@ -14371,14 +14600,25 @@ impl Codegen {
                 array_inductions,
             } => {
                 let runtime_id = self.current_runtime_for_id(line_no);
-                let needs_search =
-                    runtime_id.is_some() && self.current_for_push_needs_search(line_no);
+                // Search runtime frames when the static stack cannot identify the open loop.
+                let open_runtime_frame = self
+                    .for_stack
+                    .iter()
+                    .rposition(|frame| frame.var() == var)
+                    .is_some_and(|pos| {
+                        self.runtime_for_top_labels
+                            .contains(self.for_stack[pos].top_label())
+                    });
+                let needs_search = runtime_id.is_some()
+                    && (open_runtime_frame || self.current_for_push_needs_search(line_no));
 
                 let static_discard_var = runtime_id
                     .is_none()
                     .then(|| self.orphan_for_next.var_id(var))
                     .flatten()
-                    .filter(|_| self.current_static_for_needs_discard(line_no))
+                    .filter(|_| {
+                        open_runtime_frame || self.current_static_for_needs_discard(line_no)
+                    })
                     .filter(|var_id| {
                         self.orphan_for_next
                             .runtime_fors
@@ -14406,10 +14646,7 @@ impl Codegen {
                 let entered = self.current_for_is_externally_entered(line_no);
 
                 let restamp_site = self.current_stmt_path.as_ref().is_some_and(|p| {
-                    p.path.len() == 1
-                        && self
-                            .for_top_restamp_sites
-                            .contains(&(p.line_idx, p.path[0]))
+                    self.for_top_restamp_sites.contains(&(p.line_idx, p.path.clone()))
                 });
                 self.for_top_curlin = (self.curlin_observable || restamp_site).then_some(line_no);
                 self.emit_for(
@@ -14962,6 +15199,10 @@ impl Codegen {
             Stmt::OnError { target } => self.emit_on_error(*target),
             Stmt::ErrorRaise { code } => self.emit_error_raise(code)?,
         }
+        // Invalidate array addresses after writes to their index variables.
+        for var in crate::dataflow::stmt_defs(stmt) {
+            self.invalidate_array_addr_cache_for_var(&var);
+        }
         if self.stmt_invalidates_fac_cache_after_emit(stmt) {
             self.invalidate_fac_cache();
         }
@@ -14996,24 +15237,7 @@ impl Codegen {
         self.invalidate_array_addr_cache();
     }
 
-    /// If the dest string var is the SAME one stored to last time
-    /// round, the previous chunk is
-    /// reclaimable — rewind `__HEAP_PTR` to its start so the new
-    /// allocation overwrites it in place. Used by [`emit_let_str`]
-    /// just before evaluating `value` so the eventual `__STR_CONCAT`
-    /// (or any other heap-helper) writes the new chunk at the same
-    /// address as the OLD one. Combined with the LHS == result
-    /// short-circuit baked into `__STR_CONCAT`, that turns
-    /// `var$ = var$ + rhs$` inner loops into an in-place append
-    /// (drops `O(N²)` LHS-copy cost).
-    ///
-    /// Soundness: relies on `__LAST_STR_VAR_LO/HI` only being set
-    /// after a string var write — temps allocated within an
-    /// expression don't update it, so a mid-statement comparison
-    /// temp doesn't accidentally make a later same-var LET rewind
-    /// past it. (Temps from previous statements are dead by the
-    /// time the next statement runs; overwriting their data is
-    /// fine.)
+    /// Reuse the last string chunk when assigning to its owner.
     fn emit_lastvar_check_and_rewind(&mut self, label: &str) {
         self.used_lastvar_str = true;
         self.heap_init_needed = true;
@@ -15176,11 +15400,8 @@ impl Codegen {
         writeln!(self.code, "    LDA #$1D").unwrap(); // CHR$(29), cursor right
         writeln!(self.code, "    JSR ${:04X}", rt::CHROUT).unwrap();
         writeln!(self.code, "{no_prompt}:").unwrap();
+        // Also sets the field cursor to the line's first character, and Z for an empty line.
         writeln!(self.code, "    JSR __INPUT_LINE").unwrap();
-        // Initialise field cursor at the first character (offset 1
-        // since byte 0 is the length).
-        writeln!(self.code, "    LDA #$01").unwrap();
-        writeln!(self.code, "    STA __INPUT_POS").unwrap();
         self.used_input = true;
         self.used_input_field = true;
 
@@ -15189,7 +15410,6 @@ impl Codegen {
         {
 
             let have = format!("__IN_HAVE_{}", self.fresh_id());
-            writeln!(self.code, "    LDA __INPUT_BUF").unwrap();
             writeln!(self.code, "    BNE {have}").unwrap();
             writeln!(self.code, "    JMP {empty_label}").unwrap();
             writeln!(self.code, "{have}:").unwrap();
@@ -15263,7 +15483,7 @@ impl Codegen {
             }
             VarKind::Integer => {
                 self.emit_input_numeric_parse(redo);
-                writeln!(self.code, "    JSR __AYINT").unwrap();
+                writeln!(self.code, "    JSR __AYINT_RND").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
                 writeln!(self.code, "    STA {label}").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
@@ -15359,8 +15579,22 @@ impl Codegen {
         self.emit_fac_byte_for_value(value);
         let id = self.fresh_id();
         let done = format!("__ON_DONE_{id}");
+        // Use tables when they improve the selected size or speed profile.
+        let table_from = if self.profile == Profile::Size { 5 } else { 10 };
+        if matches!(kind, OnBranchKind::Goto) && targets.len() >= table_from {
+            self.emit_on_goto_table(targets, id, &done);
+            return Ok(());
+        }
         let push_marker =
             matches!(kind, OnBranchKind::GoSub) && self.current_is_runtime_gosub(line_no);
+        // Share GOSUB frame setup before table dispatch.
+        if matches!(kind, OnBranchKind::GoSub)
+            && targets.len() >= table_from
+            && targets.iter().all(|t| self.line_numbers.contains(t))
+        {
+            self.emit_on_gosub_table(value, targets, id, &done, push_marker);
+            return Ok(());
+        }
         for (idx, target) in targets.iter().enumerate() {
             let case = format!("__ON_CASE_{id}_{}", idx + 1);
             writeln!(self.code, "    CMP #${:02X}", (idx + 1) as u8).unwrap();
@@ -15384,6 +15618,85 @@ impl Codegen {
         }
         writeln!(self.code, "{done}:").unwrap();
         Ok(())
+    }
+
+    /// Dispatch ON GOTO through INDEX1. A holds the selector.
+    fn emit_on_goto_table(&mut self, targets: &[u16], id: usize, done: &str) {
+        let lo = format!("__ON_LO_{id}");
+        let hi = format!("__ON_HI_{id}");
+        let undef = format!("__ON_UNDEF_{id}");
+        writeln!(self.code, "    TAX").unwrap();
+        writeln!(self.code, "    BEQ {done}").unwrap();
+        writeln!(self.code, "    CPX #${:02X}", targets.len() + 1).unwrap();
+        writeln!(self.code, "    BCS {done}").unwrap();
+        writeln!(self.code, "    LDA {lo}-1,X").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::INDEX1_LO).unwrap();
+        writeln!(self.code, "    LDA {hi}-1,X").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::INDEX1_HI).unwrap();
+        writeln!(self.code, "    JMP (${:02X})", rt::INDEX1_LO).unwrap();
+        let entries: Vec<String> = targets
+            .iter()
+            .map(|t| {
+                if self.line_numbers.contains(t) {
+                    format!("L{t}")
+                } else {
+                    undef.clone()
+                }
+            })
+            .collect();
+        if targets.iter().any(|t| !self.line_numbers.contains(t)) {
+            writeln!(self.code, "{undef}:").unwrap();
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_UNDEF_STATEMENT).unwrap();
+            self.emit_jmp_basic_error();
+        }
+        self.on_tables.push((id, entries));
+        writeln!(self.code, "{done}:").unwrap();
+        self.invalidate_fac_cache();
+        self.invalidate_array_addr_cache();
+    }
+
+    /// Dispatch ON GOSUB through INDEX1 after pushing its frame.
+    fn emit_on_gosub_table(
+        &mut self,
+        value: &Expr,
+        targets: &[u16],
+        id: usize,
+        done: &str,
+        push_marker: bool,
+    ) {
+        let lo = format!("__ON_LO_{id}");
+        let hi = format!("__ON_HI_{id}");
+        writeln!(self.code, "    TAX").unwrap();
+        writeln!(self.code, "    BEQ {done}").unwrap();
+        writeln!(self.code, "    CPX #${:02X}", targets.len() + 1).unwrap();
+        writeln!(self.code, "    BCS {done}").unwrap();
+        let depth = self.needs_gosub_depth();
+        if push_marker || depth {
+            writeln!(self.code, "    STX ${:02X}", rt::INDEX1_LO).unwrap();
+            if push_marker {
+                self.emit_for_stack_push_marker(basic_stack_floor(
+                    HOST_COST_ON,
+                    expr_stack_cost(value, &self.def_fns),
+                ));
+            }
+            if depth {
+                writeln!(self.code, "    JSR __GOSUB_CHK").unwrap();
+                self.used_gosub_chk = true;
+                self.used_for_oom = true;
+            }
+            writeln!(self.code, "    LDX ${:02X}", rt::INDEX1_LO).unwrap();
+        }
+        writeln!(self.code, "    LDA {lo}-1,X").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::INDEX1_LO).unwrap();
+        writeln!(self.code, "    LDA {hi}-1,X").unwrap();
+        writeln!(self.code, "    STA ${:02X}", rt::INDEX1_HI).unwrap();
+        writeln!(self.code, "    JSR __JMP22").unwrap();
+        self.used_jmp22 = true;
+        self.on_tables
+            .push((id, targets.iter().map(|t| format!("L{t}")).collect()));
+        writeln!(self.code, "{done}:").unwrap();
+        self.invalidate_fac_cache();
+        self.invalidate_array_addr_cache();
     }
 
     /// Store string values and update FRETOP when the program can observe it.
@@ -15459,13 +15772,7 @@ impl Codegen {
             writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
             self.invalidate_fac_cache();
             self.emit_strexpr_pointer_to_ay(value)?;
-            writeln!(self.code, "    STA __SBUF_SRC_LO").unwrap();
-            writeln!(self.code, "    STY __SBUF_SRC_HI").unwrap();
-            writeln!(self.code, "    LDA #<{buf}").unwrap();
-            writeln!(self.code, "    STA __SBUF_DST_LO").unwrap();
-            writeln!(self.code, "    LDA #>{buf}").unwrap();
-            writeln!(self.code, "    STA __SBUF_DST_HI").unwrap();
-            writeln!(self.code, "    JSR __SBUF_COPY").unwrap();
+            self.emit_sbuf_copy(&buf);
             writeln!(self.code, "    JSR __HEAP_END_NONLET").unwrap();
             self.invalidate_fac_cache();
             self.used_sbuf_copy = true;
@@ -15569,7 +15876,6 @@ impl Codegen {
                     writeln!(self.code, "    LDA #<__TI_HEAP").unwrap();
                     writeln!(self.code, "    LDY #>__TI_HEAP").unwrap();
                     self.used_read_ti_str = true;
-                    self.used_div_by_10 = true;
                 } else {
                     let label = self.intern_var(v.clone());
                     writeln!(self.code, "    LDA {label}").unwrap();
@@ -16337,13 +16643,7 @@ impl Codegen {
         self.emit_byte_expr_to_a(tempo)?;
         writeln!(self.code, "    STA __MUSIC_TEMPO").unwrap();
         self.emit_strexpr_pointer_to_ay(tune)?;
-        writeln!(self.code, "    STA __SBUF_SRC_LO").unwrap();
-        writeln!(self.code, "    STY __SBUF_SRC_HI").unwrap();
-        writeln!(self.code, "    LDA #<__MUSIC_BUF").unwrap();
-        writeln!(self.code, "    STA __SBUF_DST_LO").unwrap();
-        writeln!(self.code, "    LDA #>__MUSIC_BUF").unwrap();
-        writeln!(self.code, "    STA __SBUF_DST_HI").unwrap();
-        writeln!(self.code, "    JSR __SBUF_COPY").unwrap();
+        self.emit_sbuf_copy("__MUSIC_BUF");
         // Store a pointer to the tune body, not the length byte.
         // __SBUF_COPY copied `[len, c0, c1, ...]` to __MUSIC_BUF.
         writeln!(self.code, "    LDA __MUSIC_BUF").unwrap();
@@ -16814,12 +17114,72 @@ impl Codegen {
                 }
             }
         }
+        if self.data_pool_layout == DataPoolLayout::AsciiTagged {
+            // Every text item has to leave the tags $C0..$FF free.
+            let texts_fit = self.data_values.iter().all(|v| match v {
+                DataValue::Float(n) => format_data_float(*n).len() < 0xC0,
+                DataValue::String(b) | DataValue::Quoted(b) => b.len() < 0xC0,
+            });
+            let saving: usize = self
+                .data_values
+                .iter()
+                .filter_map(|v| {
+                    let tagged = tagged_int_bytes(v)?;
+                    Some(data_value_pool_bytes(v, DataPoolLayout::AsciiTagged).len() - tagged.len())
+                })
+                .sum();
+            let string_reads = string_read_target_count(module);
+            let mut cost = READ_TAGGED_COST + READ_TAGGED_STRING_COST * string_reads;
+            if self.profile == Profile::Speed {
+                cost += READ_TAGGED_ADVANCE_COST * self.read_targets.saturating_sub(1);
+            }
+            if string_reads > 0 {
+                if !module_uses_str_and_mid(module) {
+                    cost += READ_TAGGED_TEXT_COST;
+                }
+                if !(scan_needs_heap(module) || scan_reads_string_storage(module)) {
+                    cost += READ_TAGGED_HEAP_COST;
+                }
+            }
+            self.data_ints_tagged = texts_fit && saving > cost;
+            if self.data_ints_tagged && string_reads > 0 {
+                // A string READ of a binary item makes its text on the heap.
+                self.heap_init_needed = true;
+            }
+        }
+        if self.data_pool_layout == DataPoolLayout::AsciiTagged && self.profile != Profile::Size {
+            let tagged = self.data_ints_tagged;
+            let short_digits = |v: &DataValue| {
+                if tagged && tagged_int_bytes(v).is_some() {
+                    return false;
+                }
+                let text = data_value_pool_bytes(v, DataPoolLayout::AsciiTagged);
+                (2..=1 + DIGITS_FAC_MAX).contains(&text.len())
+                    && text[1..].iter().all(u8::is_ascii_digit)
+            };
+            let digit_items = self.data_values.iter().filter(|v| short_digits(v)).count();
+            let from = if self.profile == Profile::Speed { 1 } else { READ_DIGITS_FROM };
+            let bad_digits = self
+                .data_bad
+                .iter()
+                .any(|&(first, last, _)| self.data_values[first..=last].iter().any(short_digits));
+            self.read_digits = digit_items >= from && !bad_digits;
+        }
         if self.compact_data_metadata && self.data_pool_layout == DataPoolLayout::AsciiTagged {
             let lengths: Vec<_> = self.data_values.iter()
-                .map(|v| data_value_pool_bytes(v, self.data_pool_layout).len()).collect();
+                .map(|v| self.data_item_bytes(v).len()).collect();
             self.compact_data_bad = crate::compact_data_bad::CompactDataBad::new(
                 &lengths, &self.data_bad,
             );
+        }
+        self.data_pool_len = self.data_values.iter().map(|v| self.data_item_bytes(v).len()).sum();
+        self.data_relocated = self.data_relocate.is_some()
+            && self.data_pool_len > 0
+            && self.code_origin == CODE_ORIGIN
+            && self.data_pool_len as u32 <= DATA_RUN_LIMIT - u32::from(DATA_RUN_ADDR);
+        if self.data_relocated && string_read_target_count(module) > 0 {
+            // A string READ copies the item onto the heap.
+            self.heap_init_needed = true;
         }
     }
 
@@ -16935,6 +17295,7 @@ impl Codegen {
                 &mut self.used_fsub_t0,
                 &mut self.used_fmult_t0,
                 &mut self.used_fdiv_t0,
+                &mut self.used_fcmp_t0,
             );
         }
         Ok(())
@@ -17041,19 +17402,14 @@ impl Codegen {
         // The float slot must stay current so FAC ops that take this
         // var as a memory operand read a valid MFLPT.
         let preserves_fac = self.shadow_int_label(var).is_none();
+        let was_clear = self.fac_rounding_clear();
         self.emit_store_fac_to_float_var_raw(var, label);
         self.emit_sync_shadow_from_fac(var);
         if preserves_fac {
-            // FAC still holds the just-stored value AND the source
-            // expression that produced it. Add `var` as a fresh
-            // alias instead of clearing — keeps the source
-            // expression cached so a later \`PRINT same-expr\` /
-            // sibling read can reuse the same FAC contents.
-            //
-            // \`emit_store_fac_to_float_var_raw\` is just MOVMF
-            // (or a per-var stub that ends in JMP MOVMF), and the
-            // sync helper returned early because there's no shadow
-            // slot, so neither path touched FAC.
+            // Keep cached expressions that do not read the stored variable.
+            self.fac_cache
+                .retain(|cached| !fac_expr_reads_var(cached, var));
+            self.note_fac_rounded_by_store(was_clear);
             self.note_fac_contains_var(var);
         }
     }
@@ -17940,12 +18296,15 @@ impl Codegen {
             for (k, dim_expr) in dims.iter().enumerate() {
                 let dim_lbl = Self::runtime_array_dim_label(&spec.name, k);
                 self.emit_expr_to_fac(dim_expr)?;
-                // Inspect FAC's sign byte before FACWORD eats it; a
-                // negative value means ?ILLEGAL QUANTITY.
                 let neg_id = self.fresh_id();
                 let neg_ok = format!("__DIM_NN_{neg_id}");
+                let bad = format!("__DIM_IQ_{neg_id}");
                 writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {neg_ok}").unwrap();
+                writeln!(self.code, "    BMI {bad}").unwrap();
+                writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
+                writeln!(self.code, "    CMP #$90").unwrap();
+                writeln!(self.code, "    BCC {neg_ok}").unwrap();
+                writeln!(self.code, "{bad}:").unwrap();
                 writeln!(self.code, "    LDX #${:02X}", rt::ERR_ILLEGAL_QUANTITY).unwrap();
                 self.emit_jmp_basic_error();
                 writeln!(self.code, "{neg_ok}:").unwrap();
@@ -17992,6 +18351,9 @@ impl Codegen {
             writeln!(self.code, "    LDA #<{elem_label}").unwrap();
             writeln!(self.code, "    LDY #>{elem_label}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::FMULT).unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
+            writeln!(self.code, "    CMP #$91").unwrap();
+            writeln!(self.code, "    BCS __DIM_OOM").unwrap();
             // Convert to 16-bit byte count.
             self.emit_facword_rom();
             writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
@@ -18094,9 +18456,14 @@ impl Codegen {
         }
         match name.kind {
             VarKind::Float => {
+                let was_clear = self.fac_rounding_clear();
                 writeln!(self.code, "    JSR __ST_ARR").unwrap();
                 self.used_st_arr = true;
-                self.note_fac_expr(value);
+                if was_clear {
+                    self.note_fac_expr(value);
+                } else {
+                    self.invalidate_fac_cache();
+                }
             }
             VarKind::Integer => {
                 writeln!(self.code, "    JSR __ST_ARR_INT").unwrap();
@@ -18193,7 +18560,7 @@ impl Codegen {
 
     /// Zero-page pair to use as the `(zp),Y` base when reading the entry the cursor points at.
     fn data_ind_base(&self) -> u8 {
-        if self.data_cursor_bss {
+        if self.data_cursor_bss || self.data_relocated {
             rt::STR_OP_LHS_LO
         } else {
             rt::DATA_PTR_LO
@@ -18218,16 +18585,15 @@ impl Codegen {
                 self.used_datlin = true;
                 writeln!(self.code, "    JSR __DATA_SETLINE").unwrap();
             }
-            // Stage DATA_PTR in STR_OP_LHS for indirect (),Y access
-            // used by the type-specific consumer and (for the ASCII
-            // layout) the post-advance length-byte read. The binary
-            // layouts know their entry size at compile time and
-            // advance with a fixed `CLC + ADC #N`.
-            writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
-            writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
-            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
+            // Stage the DATA cursor for indirect reads.
+            if !self.data_relocated {
+                writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
+                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
+                writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
+                writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
+            }
             match tgt {
+                ir::ReadTarget::Scalar(v) if *v == ir::read_skip_var() => {}
                 ir::ReadTarget::Scalar(v) => {
                     let label = self.intern_var(v.clone());
                     self.emit_read_scalar(v, &label);
@@ -18241,21 +18607,293 @@ impl Codegen {
         Ok(())
     }
 
+    /// Move DATA with all RAM visible, then restore the memory bank and interrupts.
+    fn emit_data_relocation(&mut self) {
+        let len = self.data_pool_len;
+        let pages = (len >> 8) as u8;
+        let rest = (len & 0xFF) as u8;
+        let dst_hi = (DATA_RUN_ADDR >> 8) as u8 + pages;
+        // The assembler sizes an absolute operand only from an equate it has already seen.
+        if let Some(DataBuf::At(page)) = self.data_relocate {
+            writeln!(self.code, "{DATA_BUF_LABEL} = ${page:04X}").unwrap();
+        }
+        let code = format!(
+            "; Move DATA to ${run:04X}
+    LDA {load}+1
+    BEQ __DREL_END
+    LDA #<__DATA_NMI
+    STA $FFFA
+    LDA #>__DATA_NMI
+    STA $FFFB
+    SEI
+    LDA $01
+    PHA
+    LDA #$30
+    STA $01
+    LDA {load}
+    STA $FB
+    LDA {load}+1
+    CLC
+    ADC #${pages:02X}
+    STA $FC
+    LDA #$00
+    STA $FD
+    LDA #${dst_hi:02X}
+    STA $FE
+    LDY #${rest:02X}
+    BEQ __DREL_PAGES
+__DREL_PART:
+    DEY
+    LDA ($FB),Y
+    STA ($FD),Y
+    TYA
+    BNE __DREL_PART
+__DREL_PAGES:
+    LDX #${pages:02X}
+    BEQ __DREL_DONE
+__DREL_PAGE:
+    DEC $FC
+    DEC $FE
+__DREL_BYTE:
+    DEY
+    LDA ($FB),Y
+    STA ($FD),Y
+    TYA
+    BNE __DREL_BYTE
+    DEX
+    BNE __DREL_PAGE
+__DREL_DONE:
+    PLA
+    STA $01
+    CLI
+    LDA #$00
+    STA {load}
+    STA {load}+1
+    JMP __DREL_END
+__DATA_NMI:
+    RTI
+{load}:
+    .byte $FF,$FF
+__DREL_END:
+",
+            run = DATA_RUN_ADDR,
+            load = DATA_LOAD_LABEL,
+        );
+        self.code.push_str(&code);
+    }
+
+    /// Emit relocated addresses and DATA byte markers.
+    fn emit_relocated_data_pool(&mut self, layout_note: &str) {
+        let run = u32::from(DATA_RUN_ADDR);
+        writeln!(self.code, "; --- DATA pool ({layout_note}), runs at ${run:04X} ---").unwrap();
+        writeln!(self.code, "__DATA = ${run:04X}").unwrap();
+        let bad_anchors = self.used_read_num && self.compact_data_bad.is_none();
+        let mut labels_at: HashMap<usize, Vec<u16>> = HashMap::new();
+        for (line_no, off) in &self.data_line_offsets {
+            labels_at.entry(*off).or_default().push(*line_no);
+        }
+        let mut emitted: HashSet<u16> = HashSet::new();
+        let mut blob: Vec<u8> = Vec::with_capacity(self.data_pool_len);
+        for (i, v) in self.data_values.iter().enumerate() {
+            let at = run + blob.len() as u32;
+            for line_no in labels_at.get(&i).into_iter().flatten() {
+                if emitted.insert(*line_no) {
+                    writeln!(self.code, "__DATA_LINE_{line_no} = ${at:04X}").unwrap();
+                }
+            }
+            if bad_anchors {
+                if self.data_bad.iter().any(|(first, _, _)| *first == i) {
+                    writeln!(self.code, "__DBAD_S{i} = ${at:04X}").unwrap();
+                }
+                if i > 0 && self.data_bad.iter().any(|(_, last, _)| *last + 1 == i) {
+                    writeln!(self.code, "__DBAD_E{} = ${at:04X}", i - 1).unwrap();
+                }
+            }
+            blob.extend(self.data_item_bytes(v));
+        }
+        let end = run + blob.len() as u32;
+        if bad_anchors {
+            let last_idx = self.data_values.len() - 1;
+            if self.data_bad.iter().any(|(_, last, _)| *last == last_idx) {
+                writeln!(self.code, "__DBAD_E{last_idx} = ${end:04X}").unwrap();
+            }
+        }
+        for (line_no, _) in &self.data_line_offsets {
+            if emitted.insert(*line_no) {
+                writeln!(self.code, "__DATA_LINE_{line_no} = ${end:04X}").unwrap();
+            }
+        }
+        writeln!(self.code, "__DATA_END = ${end:04X}").unwrap();
+        for chunk in blob.chunks(64) {
+            write!(self.code, "{DATA_BLOB_MARKER}").unwrap();
+            for b in chunk {
+                write!(self.code, "{b:02X}").unwrap();
+            }
+            writeln!(self.code).unwrap();
+        }
+    }
+
+    /// Copy a relocated DATA item into its read buffer with all RAM visible.
+    fn emit_data_fetch(&mut self) {
+        let lhs = rt::STR_OP_LHS_LO;
+        let lhs_hi = rt::STR_OP_LHS_HI;
+        let extra = match self.data_pool_layout {
+            DataPoolLayout::BinaryU8 => String::new(),
+            DataPoolLayout::BinaryI16 => "    LDX #$01\n".to_string(),
+            DataPoolLayout::BinaryMflpt => "    LDX #$04\n".to_string(),
+            DataPoolLayout::AsciiTagged if self.data_ints_tagged => {
+                "    CMP #$C0\n    BCC __DF_LEN\n    SBC #$FD\n    BCS __DF_LEN\n    LDA #$00\n__DF_LEN:\n    TAX\n    BEQ __DF_DONE\n"
+                    .to_string()
+            }
+            DataPoolLayout::AsciiTagged => "    TAX\n    BEQ __DF_DONE\n".to_string(),
+        };
+        let copy = if self.data_pool_layout == DataPoolLayout::BinaryU8 {
+            String::new()
+        } else {
+            format!(
+                "{extra}__DF_COPY:
+    INY
+    LDA (${lhs:02X}),Y
+    STA {buf},Y
+    DEX
+    BNE __DF_COPY
+__DF_DONE:
+",
+                buf = DATA_BUF_LABEL,
+            )
+        };
+        let code = format!(
+            "__DATA_FETCH:
+    PHP
+    SEI
+    LDA $01
+    PHA
+    LDA #$30
+    STA $01
+    LDY #$00
+    LDA (${lhs:02X}),Y
+    STA {buf}
+{copy}
+    PLA
+    STA $01
+    PLP
+    LDA #<{buf}
+    STA ${lhs:02X}
+    LDA #>{buf}
+    STA ${lhs_hi:02X}
+    RTS
+",
+            buf = DATA_BUF_LABEL,
+        );
+        self.code.push_str(&code);
+    }
+
+    fn use_read_str_copy(&mut self) {
+        self.used_read_str_copy = true;
+        self.used_array_let_str = true;
+        self.use_str_assign_owned();
+        self.invalidate_fac_cache();
+    }
+
+    /// Copy buffered DATA text into the owning heap string.
+    fn emit_read_str_copy(&mut self) {
+        writeln!(self.code, "__READ_STR_COPY:").unwrap();
+        writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
+        writeln!(self.code, "__READ_STR_OWNED:").unwrap();
+        writeln!(self.code, "    LDA #<{DATA_BUF_LABEL}").unwrap();
+        writeln!(self.code, "    LDY #>{DATA_BUF_LABEL}").unwrap();
+        writeln!(self.code, "    JSR __STR_ASSIGN_OWNED").unwrap();
+        self.emit_store_ay_to_owner_slot();
+        self.emit_restage_data_item();
+        writeln!(self.code, "    RTS").unwrap();
+    }
+
+    /// Point STR_OP_LHS at the current DATA item or its buffer copy.
+    fn emit_restage_data_item(&mut self) {
+        if self.data_relocated {
+            writeln!(self.code, "    LDA #<{DATA_BUF_LABEL}").unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
+            writeln!(self.code, "    LDA #>{DATA_BUF_LABEL}").unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
+        } else {
+            writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
+            writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_HI).unwrap();
+        }
+    }
+
+    /// The current item's address in .A/.Y for MOVFM.
+    fn emit_data_item_to_ay(&mut self) {
+        if self.data_relocated {
+            writeln!(self.code, "    LDA #<{DATA_BUF_LABEL}").unwrap();
+            writeln!(self.code, "    LDY #>{DATA_BUF_LABEL}").unwrap();
+        } else {
+            writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
+            writeln!(self.code, "    LDY {}", self.data_cur_hi()).unwrap();
+        }
+    }
+
+    /// The hidden string a relocated text item is copied out of the buffer through.
+    fn data_buf_string_var() -> VarName {
+        VarName {
+            base: "__DSTR".to_string(),
+            kind: VarKind::String,
+        }
+    }
+
+    fn emit_data_buf_string(&mut self) -> StrExpr {
+        let var = Self::data_buf_string_var();
+        let label = self.intern_var(var.clone());
+        writeln!(self.code, "    LDA #<{DATA_BUF_LABEL}").unwrap();
+        writeln!(self.code, "    STA {label}").unwrap();
+        writeln!(self.code, "    LDA #>{DATA_BUF_LABEL}").unwrap();
+        writeln!(self.code, "    STA {label}+1").unwrap();
+        StrExpr::Var(var)
+    }
+
     /// Advance DATA_PTR past the entry just consumed. ASCII layout
     /// reads the length byte at STR_OP_LHS (which the caller staged
     /// pre-read) and adds `length + 1`; binary layouts know the
     /// fixed entry size at compile time and add it directly.
     fn emit_data_advance(&mut self) {
+        if self.profile != Profile::Speed && self.read_targets >= 2 {
+            writeln!(self.code, "    JSR __DATA_ADVANCE").unwrap();
+            self.used_data_advance = true;
+            return;
+        }
+        self.emit_data_advance_body();
+    }
+
+    fn emit_data_advance_body(&mut self) {
         match self.data_pool_layout {
             DataPoolLayout::AsciiTagged => {
                 writeln!(self.code, "    LDY #$00").unwrap();
                 writeln!(self.code, "    LDA (${:02X}),Y", rt::STR_OP_LHS_LO).unwrap();
+                if self.data_ints_tagged {
+                    let id = self.fresh_id();
+                    let text = format!("__DA_TEXT_{id}");
+                    writeln!(self.code, "    CMP #$C0").unwrap();
+                    writeln!(self.code, "    BCC {text}").unwrap();
+                    writeln!(self.code, "    SBC #$FD").unwrap();
+                    writeln!(self.code, "    BCS {text}").unwrap();
+                    writeln!(self.code, "    LDA #$00").unwrap();
+                    writeln!(self.code, "{text}:").unwrap();
+                }
                 writeln!(self.code, "    SEC").unwrap();
                 writeln!(self.code, "    ADC {}", self.data_cur_lo()).unwrap();
                 writeln!(self.code, "    STA {}", self.data_cur_lo()).unwrap();
                 let id = self.fresh_id();
                 let no_carry = format!("__READ_NC_{id}");
                 writeln!(self.code, "    BCC {no_carry}").unwrap();
+                writeln!(self.code, "    INC {}", self.data_cur_hi()).unwrap();
+                writeln!(self.code, "{no_carry}:").unwrap();
+            }
+            DataPoolLayout::BinaryU8 => {
+                let id = self.fresh_id();
+                let no_carry = format!("__READ_NC_{id}");
+                writeln!(self.code, "    INC {}", self.data_cur_lo()).unwrap();
+                writeln!(self.code, "    BNE {no_carry}").unwrap();
                 writeln!(self.code, "    INC {}", self.data_cur_hi()).unwrap();
                 writeln!(self.code, "{no_carry}:").unwrap();
             }
@@ -18278,15 +18916,206 @@ impl Codegen {
         }
     }
 
+    /// Convert short digit strings to FAC. Set carry on unsupported input.
+    fn emit_digits_fac(&mut self) {
+        let text = rt::STR_OP_LHS_LO;
+        let (lo, hi) = (rt::LINNUM_LO, rt::LINNUM_HI);
+        let (digit, old_hi) = (rt::INDEX1_LO, rt::INDEX1_HI);
+        if self.used_read_digits {
+            let slow = if self.used_read_num { "__READ_NUM" } else { "__VAL_HELPER" };
+            writeln!(self.code, "__READ_DIGITS:").unwrap();
+            writeln!(self.code, "    JSR __DIGITS_FAC").unwrap();
+            writeln!(self.code, "    BCC __DIGITS_DONE").unwrap();
+            writeln!(self.code, "    JMP {slow}").unwrap();
+        }
+        if self.used_val_digits {
+            writeln!(self.code, "__VAL_DIGITS:").unwrap();
+            writeln!(self.code, "    JSR __DIGITS_FAC").unwrap();
+            writeln!(self.code, "    BCC __DIGITS_DONE").unwrap();
+            writeln!(self.code, "    JMP __VAL_HELPER").unwrap();
+        }
+        let code = format!(
+            "__DIGITS_FAC:
+    LDY #$00
+    LDA (${text:02X}),Y
+    BEQ __DIGITS_NO
+    CMP #${too_long:02X}
+    BCS __DIGITS_NO
+    TAX
+    STY ${lo:02X}
+    STY ${hi:02X}
+__DIGITS_LOOP:
+    INY
+    LDA (${text:02X}),Y
+    EOR #$30
+    CMP #$0A
+    BCS __DIGITS_NO
+    STA ${digit:02X}
+    LDA ${hi:02X}
+    STA ${old_hi:02X}
+    LDA ${lo:02X}
+    ASL
+    ROL ${hi:02X}
+    ASL
+    ROL ${hi:02X}
+    ADC ${lo:02X}
+    STA ${lo:02X}
+    LDA ${hi:02X}
+    ADC ${old_hi:02X}
+    ASL ${lo:02X}
+    ROL
+    STA ${hi:02X}
+    LDA ${lo:02X}
+    ADC ${digit:02X}
+    STA ${lo:02X}
+    BCC __DIGITS_NEXT
+    INC ${hi:02X}
+__DIGITS_NEXT:
+    DEX
+    BNE __DIGITS_LOOP
+    LDY ${lo:02X}
+    LDA ${hi:02X}
+    JSR ${givayf:04X}
+    CLC
+__DIGITS_DONE:
+    RTS
+__DIGITS_NO:
+    SEC
+    RTS
+",
+            too_long = DIGITS_FAC_MAX + 1,
+            givayf = rt::GIVAYF,
+        );
+        self.code.push_str(&code);
+    }
+
     /// The entry point a numeric ASCII `READ` calls to turn the pool entry at DATA_PTR into a value in FAC.
     fn read_num_entry(&mut self) -> &'static str {
         self.used_val = true;
-        if self.data_bad.is_empty() {
+        if !self.data_bad.is_empty() {
+            self.used_read_num = true;
+        }
+        let text = if self.read_digits {
+            self.used_read_digits = true;
+            "__READ_DIGITS"
+        } else if self.data_bad.is_empty() {
             "__VAL_HELPER"
         } else {
-            self.used_read_num = true;
             "__READ_NUM"
+        };
+        if self.data_ints_tagged {
+            self.used_read_tagged = true;
+            self.read_tagged_text_entry = text;
+            return "__READ_TAGGED";
         }
+        text
+    }
+
+    /// An item's bytes in the DATA pool.
+    fn data_item_bytes(&self, v: &DataValue) -> Vec<u8> {
+        if self.data_ints_tagged && self.data_pool_layout == DataPoolLayout::AsciiTagged {
+            if let Some(bytes) = tagged_int_bytes(v) {
+                return bytes;
+            }
+        }
+        data_value_pool_bytes(v, self.data_pool_layout)
+    }
+
+    /// Read tagged integers directly and parse text through the fallback.
+    fn emit_read_tagged(&mut self) {
+        let text = rt::STR_OP_LHS_LO;
+        let fallback = self.read_tagged_text_entry;
+        let givayf = rt::GIVAYF;
+        let code = format!(
+            "__READ_TAGGED:
+    LDY #$00
+    LDA (${text:02X}),Y
+    CMP #$C0
+    BCS __READ_TAGGED_BIN
+    JMP {fallback}
+__READ_TAGGED_BIN:
+    CMP #$FE
+    BCS __READ_TAGGED_WIDE
+    SBC #$BF
+    TAY
+    LDA #$00
+    JMP ${givayf:04X}
+__READ_TAGGED_WIDE:
+    BNE __READ_TAGGED_WORD
+    INY
+    LDA (${text:02X}),Y
+    TAY
+    LDA #$00
+    JMP ${givayf:04X}
+__READ_TAGGED_WORD:
+    INY
+    LDA (${text:02X}),Y
+    TAX
+    INY
+    LDA (${text:02X}),Y
+    PHA
+    TXA
+    TAY
+    PLA
+    JMP ${givayf:04X}
+"
+        );
+        self.code.push_str(&code);
+    }
+
+    /// The hidden float a string READ of a binary item floats its value into.
+    fn data_text_var() -> VarName {
+        VarName {
+            base: "__DTXT".to_string(),
+            kind: VarKind::Float,
+        }
+    }
+
+    /// Read text directly or format a tagged integer as a string.
+    fn emit_tagged_string_read(
+        &mut self,
+        text: &mut dyn FnMut(&mut Self) -> Result<(), CodegenError>,
+        bin: &mut dyn FnMut(&mut Self, StrExpr) -> Result<(), CodegenError>,
+    ) -> Result<(), CodegenError> {
+        let id = self.fresh_id();
+        let bin_label = format!("__RDS_BIN_{id}");
+        let done = format!("__RDS_DONE_{id}");
+        writeln!(self.code, "    LDY #$00").unwrap();
+        writeln!(self.code, "    LDA (${:02X}),Y", rt::STR_OP_LHS_LO).unwrap();
+        writeln!(self.code, "    CMP #$C0").unwrap();
+        writeln!(self.code, "    BCS {bin_label}").unwrap();
+        let saved_runtime_validated = self.runtime_array_base_validated.clone();
+        let saved_static_undimmed = self.static_arrays_undimmed.clone();
+        let saved_last_array_addr = self.last_array_addr.clone();
+        text(self)?;
+        writeln!(self.code, "    JMP {done}").unwrap();
+        writeln!(self.code, "{bin_label}:").unwrap();
+        self.runtime_array_base_validated = saved_runtime_validated.clone();
+        self.static_arrays_undimmed = saved_static_undimmed.clone();
+        self.last_array_addr = saved_last_array_addr.clone();
+        self.invalidate_fac_cache();
+        self.used_read_tagged = true;
+        self.used_val = true;
+        // Settles the text entry `__READ_TAGGED` falls back to and marks it used.
+        let _ = self.read_num_entry();
+        writeln!(self.code, "    JSR __READ_TAGGED").unwrap();
+        let dtxt = Self::data_text_var();
+        let label = self.intern_var(dtxt.clone());
+        self.emit_store_fac_to_float_var(&dtxt, &label);
+        let value = StrExpr::Mid(
+            Box::new(StrExpr::Str(Box::new(Expr::Var(dtxt)))),
+            Box::new(Expr::Number(2.0)),
+            None,
+        );
+        bin(self, value)?;
+        self.emit_restage_data_item();
+        writeln!(self.code, "{done}:").unwrap();
+        self.runtime_array_base_validated = saved_runtime_validated;
+        self.static_arrays_undimmed = saved_static_undimmed;
+        self.last_array_addr = saved_last_array_addr;
+        self.invalidate_fac_cache();
+        self.invalidate_array_addr_cache();
+        Ok(())
     }
 
     /// Read the next DATA entry into a scalar variable slot. Caller
@@ -18296,10 +19125,42 @@ impl Codegen {
         match (self.data_pool_layout, var.kind) {
             // String layout entries can only feed string targets.
             (DataPoolLayout::AsciiTagged, VarKind::String) => {
-                writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                writeln!(self.code, "    STA {label}").unwrap();
-                writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
-                writeln!(self.code, "    STA {label}+1").unwrap();
+                let target = var.clone();
+                let point = |cg: &mut Self| {
+                    if cg.data_relocated && target.base == "TI" {
+                        // The clock takes its text through LET.
+                        let text = cg.emit_data_buf_string();
+                        cg.emit_let_str(&target, &text).expect("a string LET emits");
+                        cg.emit_restage_data_item();
+                        return;
+                    }
+                    if cg.data_relocated {
+                        writeln!(cg.code, "    LDA #<{label}").unwrap();
+                        writeln!(cg.code, "    STA __STR_OWNER_LO").unwrap();
+                        writeln!(cg.code, "    LDA #>{label}").unwrap();
+                        writeln!(cg.code, "    STA __STR_OWNER_HI").unwrap();
+                        writeln!(cg.code, "    JSR __READ_STR_COPY").unwrap();
+                        cg.use_read_str_copy();
+                        return;
+                    }
+                    writeln!(cg.code, "    LDA {}", cg.data_cur_lo()).unwrap();
+                    writeln!(cg.code, "    STA {label}").unwrap();
+                    writeln!(cg.code, "    LDA {}", cg.data_cur_hi()).unwrap();
+                    writeln!(cg.code, "    STA {label}+1").unwrap();
+                };
+                if self.data_ints_tagged {
+                    let var = var.clone();
+                    self.emit_tagged_string_read(
+                        &mut |cg| {
+                            point(cg);
+                            Ok(())
+                        },
+                        &mut |cg, value| cg.emit_let_str(&var, &value),
+                    )
+                    .expect("a string READ of a scalar emits");
+                } else {
+                    point(self);
+                }
             }
             (DataPoolLayout::AsciiTagged, VarKind::Float) => {
                 let entry = self.read_num_entry();
@@ -18310,7 +19171,7 @@ impl Codegen {
             (DataPoolLayout::AsciiTagged, VarKind::Integer) => {
                 let entry = self.read_num_entry();
                 writeln!(self.code, "    JSR {entry}").unwrap();
-                writeln!(self.code, "    JSR __AYINT").unwrap();
+                writeln!(self.code, "    JSR __AYINT_RND").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
                 writeln!(self.code, "    STA {label}").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
@@ -18344,17 +19205,31 @@ impl Codegen {
                 self.emit_inline_fac_mirror(var, label);
                 self.emit_sync_shadow_from_fac(var);
             }
+            (DataPoolLayout::BinaryU8, VarKind::Integer) => {
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", self.data_ind_base()).unwrap();
+                writeln!(self.code, "    STA {label}").unwrap();
+                writeln!(self.code, "    TYA").unwrap();
+                writeln!(self.code, "    STA {label}+1").unwrap();
+            }
+            (DataPoolLayout::BinaryU8, VarKind::Float) => {
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", self.data_ind_base()).unwrap();
+                writeln!(self.code, "    TAY").unwrap();
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+                self.emit_inline_fac_mirror(var, label);
+                self.emit_sync_shadow_from_fac(var);
+            }
             // Binary MFLPT: 5-byte MOVFM-style load.
             (DataPoolLayout::BinaryMflpt, VarKind::Float) => {
-                writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                writeln!(self.code, "    LDY {}", self.data_cur_hi()).unwrap();
+                self.emit_data_item_to_ay();
                 writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
                 self.emit_inline_fac_mirror(var, label);
                 self.emit_sync_shadow_from_fac(var);
             }
             (DataPoolLayout::BinaryMflpt, VarKind::Integer) => {
-                writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                writeln!(self.code, "    LDY {}", self.data_cur_hi()).unwrap();
+                self.emit_data_item_to_ay();
                 writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
                 writeln!(self.code, "    JSR __AYINT").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
@@ -18367,8 +19242,40 @@ impl Codegen {
             // already excluded this, but keep an emit-nothing arm
             // for defensiveness in case future passes inject reads.
             (DataPoolLayout::BinaryI16, VarKind::String)
-            | (DataPoolLayout::BinaryMflpt, VarKind::String) => {}
+            | (DataPoolLayout::BinaryMflpt, VarKind::String)
+            | (DataPoolLayout::BinaryU8, VarKind::String) => {}
         }
+    }
+
+    /// The pool pointer of the DATA item into a string array element.
+    fn emit_read_string_array_pointer(&mut self, name: &VarName, indices: &[Expr]) -> Result<(), CodegenError> {
+        if self.data_relocated {
+            writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
+            self.invalidate_fac_cache();
+            self.emit_array_address(name, indices)?;
+            writeln!(self.code, "    LDA ${:02X}", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    STA __STR_OWNER_LO").unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
+            writeln!(self.code, "    STA __STR_OWNER_HI").unwrap();
+            writeln!(self.code, "    JSR __READ_STR_OWNED").unwrap();
+            self.use_read_str_copy();
+            return Ok(());
+        }
+        if let Some(label) = self.try_emit_absx_str_array_slot_to_x(name, indices) {
+            writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
+            writeln!(self.code, "    STA {label},X").unwrap();
+            writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
+            writeln!(self.code, "    STA {label}+1,X").unwrap();
+        } else {
+            self.emit_array_address(name, indices)?;
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
+            writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
+            writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+        }
+        Ok(())
     }
 
     /// Read the next DATA entry into one element of an array. The
@@ -18379,23 +19286,16 @@ impl Codegen {
     /// once the address is known, bypassing VAL and the FAC stash.
     fn emit_read_array(&mut self, name: &VarName, indices: &[Expr]) -> Result<(), CodegenError> {
         match (self.data_pool_layout, name.kind) {
+            (DataPoolLayout::AsciiTagged, VarKind::String) if self.data_ints_tagged => {
+                let (name, indices) = (name.clone(), indices.to_vec());
+                let (name2, indices2) = (name.clone(), indices.clone());
+                self.emit_tagged_string_read(
+                    &mut |cg| cg.emit_read_string_array_pointer(&name, &indices),
+                    &mut |cg, value| cg.emit_array_let_str(&name2, &indices2, &value),
+                )?;
+            }
             (DataPoolLayout::AsciiTagged, VarKind::String) => {
-                // abs,X: the DATA entry's pool pointer goes straight into the slot, no
-                // `$FD/$FE` involvement.
-                if let Some(label) = self.try_emit_absx_str_array_slot_to_x(name, indices) {
-                    writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                    writeln!(self.code, "    STA {label},X").unwrap();
-                    writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
-                    writeln!(self.code, "    STA {label}+1,X").unwrap();
-                } else {
-                    self.emit_array_address(name, indices)?;
-                    writeln!(self.code, "    LDY #$00").unwrap();
-                    writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                    writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-                    writeln!(self.code, "    INY").unwrap();
-                    writeln!(self.code, "    LDA {}", self.data_cur_hi()).unwrap();
-                    writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
-                }
+                self.emit_read_string_array_pointer(name, indices)?;
             }
             (DataPoolLayout::AsciiTagged, VarKind::Float) => {
                 self.emit_array_address(name, indices)?;
@@ -18440,25 +19340,43 @@ impl Codegen {
                 writeln!(self.code, "    JSR __ST_ARR").unwrap();
                 self.used_st_arr = true;
             }
+            (DataPoolLayout::BinaryU8, VarKind::Integer) => {
+                self.emit_array_address(name, indices)?;
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", self.data_ind_base()).unwrap();
+                writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+                writeln!(self.code, "    TYA").unwrap();
+                writeln!(self.code, "    INY").unwrap();
+                writeln!(self.code, "    STA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
+            }
+            (DataPoolLayout::BinaryU8, VarKind::Float) => {
+                self.emit_array_address(name, indices)?;
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    LDA (${:02X}),Y", self.data_ind_base()).unwrap();
+                writeln!(self.code, "    TAY").unwrap();
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+                writeln!(self.code, "    JSR __ST_ARR").unwrap();
+                self.used_st_arr = true;
+            }
             (DataPoolLayout::BinaryMflpt, VarKind::Float) => {
                 self.emit_array_address(name, indices)?;
-                writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                writeln!(self.code, "    LDY {}", self.data_cur_hi()).unwrap();
+                self.emit_data_item_to_ay();
                 writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
                 writeln!(self.code, "    JSR __ST_ARR").unwrap();
                 self.used_st_arr = true;
             }
             (DataPoolLayout::BinaryMflpt, VarKind::Integer) => {
                 self.emit_array_address(name, indices)?;
-                writeln!(self.code, "    LDA {}", self.data_cur_lo()).unwrap();
-                writeln!(self.code, "    LDY {}", self.data_cur_hi()).unwrap();
+                self.emit_data_item_to_ay();
                 writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
                 writeln!(self.code, "    JSR __ST_ARR_INT").unwrap();
                 self.used_ayint = true;
                 self.used_st_arr_int = true;
             }
             (DataPoolLayout::BinaryI16, VarKind::String)
-            | (DataPoolLayout::BinaryMflpt, VarKind::String) => {
+            | (DataPoolLayout::BinaryMflpt, VarKind::String)
+            | (DataPoolLayout::BinaryU8, VarKind::String) => {
                 // Layout choice excluded any string READ; reaching
                 // here would be a compiler bug, so leave the slot
                 // unchanged rather than emit incoherent code.
@@ -18673,10 +19591,17 @@ impl Codegen {
             // — anything else needs FAC anyway.
             if self.profile == Profile::Speed {
                 if let Expr::Var(src) = value {
+                    let plain = |v: &VarName| {
+                        !self.omitted_float_slots.contains(v)
+                            && !self.analysis.numeric_facts.shadow_only_vars.contains(v)
+                    };
                     if src.kind == VarKind::Float
                         && src.base != "TI"
                         && src.base != "ST"
                         && src != var
+                        && self.shadow_int_label(var).is_none()
+                        && plain(var)
+                        && plain(src)
                     {
                         let dst = self.intern_var(var.clone());
                         let src_label = self.intern_var(src.clone());
@@ -18693,7 +19618,7 @@ impl Codegen {
             VarKind::Integer => {
                 // FAC → signed 16-bit at LINNUM, then store the two
                 // bytes into the variable slot.
-                self.emit_ayint(Some(value));
+                self.emit_ayint_for_store(value);
                 self.emit_linnum_to_int_var(var, &label);
             }
             _ => {
@@ -19946,6 +20871,115 @@ impl Codegen {
         true
     }
 
+    /// Emit fast number printers for Speed and loops in Default.
+    fn emit_fast_number_print(&mut self) {
+        let lo = rt::INDEX1_LO;
+        let hi = rt::INDEX1_HI;
+        let trial = rt::FAC_EXP + 3;
+        let seen = rt::FAC_EXP + 4;
+        let mut c = String::new();
+        let mut out = |line: String| {
+            c.push_str(&line);
+            c.push('\n');
+        };
+        if self.used_print_int16 {
+            // .A = high byte, .Y = low byte, signed.
+            out("__PRINT_INT16:".into());
+            out(format!("    STY ${lo:02X}"));
+            out(format!("    STA ${hi:02X}"));
+            out("    LDX #$20".into());
+            out(format!("    BIT ${hi:02X}"));
+            out("    BPL __PN_SIGN".into());
+            out("    LDX #$2D".into());
+            out("    SEC".into());
+            out("    LDA #$00".into());
+            out(format!("    SBC ${lo:02X}"));
+            out(format!("    STA ${lo:02X}"));
+            out("    LDA #$00".into());
+            out(format!("    SBC ${hi:02X}"));
+            out(format!("    STA ${hi:02X}"));
+            out("    JMP __PN_SIGN".into());
+        }
+        out("__PRINT_FAC:".into());
+        out(format!("    LDX ${:02X}", rt::FAC_EXP));
+        out("    BEQ __PN_FZERO".into());
+        out("    CPX #$91".into());
+        out("    BCS __PN_SLOW".into());
+        out(format!("    LDA ${trial:02X}"));
+        out(format!("    ORA ${seen:02X}"));
+        out("    BNE __PN_SLOW".into());
+        out(format!("    LDA ${:02X}", rt::FAC_EXP + 1));
+        out(format!("    STA ${hi:02X}"));
+        out(format!("    LDA ${:02X}", rt::FAC_EXP + 2));
+        out(format!("    STA ${lo:02X}"));
+        out("__PN_SHIFT:".into());
+        out("    CPX #$90".into());
+        out("    BEQ __PN_FSIGN".into());
+        out(format!("    LSR ${hi:02X}"));
+        out(format!("    ROR ${lo:02X}"));
+        out("    BCS __PN_SLOW".into());
+        out("    INX".into());
+        out("    BNE __PN_SHIFT".into());
+        out("__PN_FSIGN:".into());
+        out("    LDX #$20".into());
+        out(format!("    BIT ${:02X}", rt::FAC_SIGN));
+        out("    BPL __PN_SIGN".into());
+        out("    LDX #$2D".into());
+        out("    BNE __PN_SIGN".into());
+        // Zero prints " 0" whatever FAC's sign byte says.
+        out("__PN_FZERO:".into());
+        out(format!("    STX ${lo:02X}"));
+        out(format!("    STX ${hi:02X}"));
+        out("    LDX #$20".into());
+        out("__PN_SIGN:".into());
+        out("    TXA".into());
+        out("    JSR $AB47".into());
+        out("    LDX #$00".into());
+        out(format!("    STX ${seen:02X}"));
+        out("__PN_DIGIT:".into());
+        out("    LDY #$2F".into());
+        out("__PN_SUB:".into());
+        out("    INY".into());
+        out(format!("    LDA ${lo:02X}"));
+        out("    SEC".into());
+        out("    SBC __PN_TLO,X".into());
+        out(format!("    STA ${trial:02X}"));
+        out(format!("    LDA ${hi:02X}"));
+        out("    SBC __PN_THI,X".into());
+        out("    BCC __PN_PLACE".into());
+        out(format!("    STA ${hi:02X}"));
+        out(format!("    LDA ${trial:02X}"));
+        out(format!("    STA ${lo:02X}"));
+        out("    BCS __PN_SUB".into());
+        // Leading zeros stay silent until a digit has gone out.
+        out("__PN_PLACE:".into());
+        out("    CPY #$30".into());
+        out("    BNE __PN_EMIT".into());
+        out(format!("    LDA ${seen:02X}"));
+        out("    BEQ __PN_NEXT".into());
+        out("__PN_EMIT:".into());
+        out(format!("    STY ${seen:02X}"));
+        out("    TYA".into());
+        out("    JSR $AB47".into());
+        out("__PN_NEXT:".into());
+        out("    INX".into());
+        out("    CPX #$04".into());
+        out("    BNE __PN_DIGIT".into());
+        out(format!("    LDA ${lo:02X}"));
+        out("    ORA #$30".into());
+        out("    JSR $AB47".into());
+        out(format!("    JMP ${:04X}", rt::PRINT_GAP));
+        out("__PN_SLOW:".into());
+        out(format!("    JSR ${:04X}", rt::FOUT));
+        out(format!("    JSR ${:04X}", rt::STROUT));
+        out(format!("    JMP ${:04X}", rt::PRINT_GAP));
+        out("__PN_TLO:".into());
+        out("    .byte <10000,<1000,<100,<10".into());
+        out("__PN_THI:".into());
+        out("    .byte >10000,>1000,>100,>10".into());
+        self.code.push_str(&c);
+    }
+
     /// Fast path for `PRINT <int16-leaf>`: load the value into
     /// (.A=hi, .Y=lo) — i.e., GIVAYF's input convention — and tail
     /// through `__PRINT_INT16` (which itself does GIVAYF + JMP
@@ -20518,8 +21552,9 @@ impl Codegen {
         let id = self.fresh_id();
         let scratch = format!("__SXT_TMP_{id}");
         let done = format!("__SXT_PRE_DONE_{id}");
+        let carry_if_negative = self.signed_byte_carry_if_negative(v);
         writeln!(self.code, "    LDA {label}").unwrap();
-        writeln!(self.code, "    ASL").unwrap();
+        writeln!(self.code, "{carry_if_negative}").unwrap();
         writeln!(self.code, "    LDA #$00").unwrap();
         writeln!(self.code, "    BCC {done}").unwrap();
         writeln!(self.code, "    LDA #$FF").unwrap();
@@ -20558,12 +21593,63 @@ impl Codegen {
         add: bool,
         sxt_scratch: Option<&str>,
     ) {
+        self.emit_int16_alu_byte_with_sxt(operand, hi, if add { "ADC" } else { "SBC" }, sxt_scratch);
+    }
+
+    fn emit_int16_alu_byte_with_sxt(
+        &mut self,
+        operand: &Int16Operand,
+        hi: bool,
+        mnem: &str,
+        sxt_scratch: Option<&str>,
+    ) {
         if hi && let Some(scratch) = sxt_scratch {
-            let mnem = if add { "ADC" } else { "SBC" };
             writeln!(self.code, "    {mnem} {scratch}").unwrap();
             return;
         }
-        self.emit_int16_op_byte(operand, hi, add);
+        self.emit_int16_alu_byte(operand, hi, mnem);
+    }
+
+    /// Choose subtraction when equality sites can share its code.
+    fn equality_prefers_shared_subtract(&mut self, a: &Expr, b: &Expr, _lhs: &Int16Operand) -> bool {
+        EqTailKey::of(a, b)
+            .and_then(|key| self.equality_tail_sites.get(&key).copied())
+            .is_some_and(|sites| sites >= 4)
+    }
+
+    /// Compare the low bytes, then the high bytes if they match.
+    fn emit_int16_equality_branch(
+        &mut self,
+        lhs: &Int16Operand,
+        rhs: &Int16Operand,
+        lhs_sxt: Option<&str>,
+        rhs_sxt: Option<&str>,
+        on_equal: Option<&str>,
+        on_unequal: Option<&str>,
+    ) {
+        self.emit_int16_load_byte(lhs, false);
+        self.emit_int16_alu_byte(rhs, false, "CMP");
+        let fall = match on_unequal {
+            Some(target) => {
+                writeln!(self.code, "    BNE {target}").unwrap();
+                None
+            }
+            None => {
+                let label = format!("__IF_NE_{}", self.fresh_id());
+                writeln!(self.code, "    BNE {label}").unwrap();
+                Some(label)
+            }
+        };
+        self.emit_int16_load_byte_with_sxt(lhs, true, lhs_sxt);
+        self.emit_int16_alu_byte_with_sxt(rhs, true, "CMP", rhs_sxt);
+        match (on_equal, on_unequal) {
+            (Some(target), None) => writeln!(self.code, "    BEQ {target}").unwrap(),
+            (None, Some(target)) => writeln!(self.code, "    BNE {target}").unwrap(),
+            _ => unreachable!("exactly one branch target"),
+        }
+        if let Some(label) = fall {
+            writeln!(self.code, "{label}:").unwrap();
+        }
     }
 
     /// 16-bit bitwise op (AND or ORA) — parallel to
@@ -20661,7 +21747,11 @@ impl Codegen {
     }
 
     fn emit_int16_op_byte(&mut self, operand: &Int16Operand, hi: bool, add: bool) {
-        let mnem = if add { "ADC" } else { "SBC" };
+        self.emit_int16_alu_byte(operand, hi, if add { "ADC" } else { "SBC" });
+    }
+
+    /// Apply an ALU instruction to one byte of a 16 bit operand.
+    fn emit_int16_alu_byte(&mut self, operand: &Int16Operand, hi: bool, mnem: &str) {
         match operand {
             Int16Operand::Imm(n) => {
                 let v = (*n as u16) >> if hi { 8 } else { 0 };
@@ -21076,11 +22166,53 @@ impl Codegen {
         Ok(true)
     }
 
-    /// Emit code that jumps to `skip_label` when `cond` evaluates to
-    /// false (BASIC's "0" — exp byte is 0). Falls through otherwise.
-    /// Recursive: AND chains accumulate skip-on-false at the same
-    /// label; OR chains use a local fail label so the lhs's "true"
-    /// outcome can leap past the rhs check.
+    /// Allow short circuit evaluation only for expressions without side effects.
+    fn short_circuit_ok(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Bin(BinOp::And | BinOp::Or | BinOp::Xor, l, r) if is_basic_bool(e) => {
+                self.short_circuit_ok(l) && self.short_circuit_ok(r)
+            }
+            Expr::Not(inner) if is_basic_bool(e) => self.short_circuit_ok(inner),
+            _ => self.skippable_value(e),
+        }
+    }
+
+    fn skippable_value(&self, e: &Expr) -> bool {
+        match e {
+            Expr::ArrayRef(name, indices) => self.static_array_read_cannot_trap(name, indices),
+            // FCOMP yields -1/0 and cannot overflow.
+            Expr::Bin(BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, l, r) => {
+                self.skippable_value(l) && self.skippable_value(r)
+            }
+            _ => crate::passes::expr_is_pure(e) && crate::passes::expr_cannot_trap(e),
+        }
+    }
+
+    fn static_array_read_cannot_trap(&self, name: &VarName, indices: &[Expr]) -> bool {
+        if self.runtime_arrays.contains_key(name) {
+            return false;
+        }
+        let Some(dims) = self.arrays.get(name) else {
+            return false;
+        };
+        if indices.len() != dims.len() {
+            return false;
+        }
+        let bounds = self.effective_bounds(name, dims);
+        indices.iter().zip(&bounds).all(|(idx, &bound)| {
+            crate::passes::expr_is_pure(idx)
+                && crate::passes::expr_cannot_trap(idx)
+                && self.index_provably_in_bounds(idx, bound)
+        })
+    }
+
+    /// Forget addresses from an operand that may have been skipped.
+    fn forget_skipped_array_address(&mut self, skipped: &Expr) {
+        if crate::compile::expr_reads_an_array(skipped) {
+            self.invalidate_array_addr_cache();
+        }
+    }
+
     fn emit_branch_skip_on_false(
         &mut self,
         cond: &Expr,
@@ -21099,17 +22231,18 @@ impl Codegen {
         if let Expr::Bin(BinOp::And, lhs, rhs) = cond
             && is_basic_bool(lhs)
             && is_basic_bool(rhs)
-            && short_circuit_operand_ok(rhs)
+            && self.short_circuit_ok(rhs)
         {
             self.emit_branch_skip_on_false(lhs, skip_label)?;
             self.emit_branch_skip_on_false(rhs, skip_label)?;
+            self.forget_skipped_array_address(rhs);
             return Ok(());
         }
 
         if let Expr::Bin(BinOp::Or, lhs, rhs) = cond
             && is_basic_bool(lhs)
             && is_basic_bool(rhs)
-            && short_circuit_operand_ok(rhs)
+            && self.short_circuit_ok(rhs)
         {
             let id = self.fresh_id();
             let lhs_failed = format!("__IF_OR_FAIL_{id}");
@@ -21119,6 +22252,7 @@ impl Codegen {
             writeln!(self.code, "{lhs_failed}:").unwrap();
             self.emit_branch_skip_on_false(rhs, skip_label)?;
             writeln!(self.code, "{after_or}:").unwrap();
+            self.forget_skipped_array_address(rhs);
             return Ok(());
         }
 
@@ -21140,6 +22274,9 @@ impl Codegen {
         // u8 range, FOR counter). Same shape as PEEK fast path,
         // ~10 bytes vs ~24 for the 16-bit SBC chain.
         if self.try_emit_if_u8_var_compare(cond, skip_label) {
+            return Ok(());
+        }
+        if self.try_emit_if_signed_byte_compare(cond, skip_label) {
             return Ok(());
         }
         // Byte var-vs-var compare: `IF A <op> B` where both sides
@@ -21281,7 +22418,7 @@ impl Codegen {
             // Left operand first: FRMEVL evaluates left to right and either side can trap.
             let (slot_lo, slot_hi) = self.logic_slot();
             self.emit_expr_to_fac(lhs)?;
-            self.emit_ayint(Some(lhs));
+            self.emit_ayint_for_pushed(lhs);
             writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
             writeln!(self.code, "    STA {slot_lo}").unwrap();
             writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
@@ -21720,6 +22857,90 @@ impl Codegen {
         true
     }
 
+    /// Compare a signed byte variable with a literal in its storage range.
+    fn try_emit_if_signed_byte_compare(&mut self, cond: &Expr, skip_label: &str) -> bool {
+        let Expr::Bin(op, a, b) = cond else {
+            return false;
+        };
+        let cmp = match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => *op,
+            _ => return false,
+        };
+        let signed_byte = |e: &Expr| match e {
+            Expr::Var(v)
+                if v.kind == VarKind::Integer
+                    && self.int_var_is_u8_storage(v)
+                    && self.int_var_byte_is_signed(v)
+                    && self.for_counter_label_when_v_var_stale(v).is_none() =>
+            {
+                Some(v.clone())
+            }
+            _ => None,
+        };
+        let (var, k, eff_op) = if let (Some(v), Some(k)) = (signed_byte(a), small_int_literal(b)) {
+            (v, k, cmp)
+        } else if let (Some(v), Some(k)) = (signed_byte(b), small_int_literal(a)) {
+            let flipped = match cmp {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Le => BinOp::Ge,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Ge => BinOp::Le,
+                other => other,
+            };
+            (v, k, flipped)
+        } else {
+            return false;
+        };
+        let Some(&(min, _)) = self.signed_byte_int_bounds.get(&var) else {
+            return false;
+        };
+        if k < min || k > min + 255 {
+            return false;
+        }
+        if k == 0 && !matches!(eff_op, BinOp::Eq | BinOp::Ne) {
+            let _ = self.intern_var(var.clone());
+            let x = Int16Operand::Var(var);
+            self.emit_branch_if_int16_vs_zero(crate::passes::negate_relop(eff_op), &x, skip_label);
+            return true;
+        }
+        let label = self.intern_var(var);
+        writeln!(self.code, "    LDA {label}").unwrap();
+        if matches!(eff_op, BinOp::Eq | BinOp::Ne) {
+            let byte = k.rem_euclid(256);
+            if byte != 0 {
+                writeln!(self.code, "    CMP #${byte:02X}").unwrap();
+            }
+            let skip = if eff_op == BinOp::Eq { "BNE" } else { "BEQ" };
+            writeln!(self.code, "    {skip} {skip_label}").unwrap();
+            return true;
+        }
+        let shift = min.rem_euclid(256);
+        if shift == 0x80 {
+            writeln!(self.code, "    EOR #$80").unwrap();
+        } else {
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    SBC #${shift:02X}").unwrap();
+        }
+        writeln!(self.code, "    CMP #${:02X}", k - min).unwrap();
+        // Skip when the requested relation fails, unsigned on the shifted bytes.
+        match eff_op {
+            BinOp::Lt => writeln!(self.code, "    BCS {skip_label}").unwrap(),
+            BinOp::Ge => writeln!(self.code, "    BCC {skip_label}").unwrap(),
+            BinOp::Gt => {
+                writeln!(self.code, "    BEQ {skip_label}").unwrap();
+                writeln!(self.code, "    BCC {skip_label}").unwrap();
+            }
+            BinOp::Le => {
+                let keep = format!("__IF_SB_KEEP_{}", self.fresh_id());
+                writeln!(self.code, "    BEQ {keep}").unwrap();
+                writeln!(self.code, "    BCS {skip_label}").unwrap();
+                writeln!(self.code, "{keep}:").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        true
+    }
+
     /// Return the assembler label whose byte is the low byte of `e`'s
     /// i16 representation, but only when range analysis (or storage
     /// width) proves the high byte is statically zero — i.e. the
@@ -21750,8 +22971,10 @@ impl Codegen {
                 _ => None,
             };
         }
-        // `%`-var in 1-byte storage: by construction in u8.
-        if v.kind == VarKind::Integer && self.int_var_is_u8_storage(v) {
+        if v.kind == VarKind::Integer
+            && self.int_var_is_u8_storage(v)
+            && !self.int_var_byte_is_signed(v)
+        {
             return Some(v.label());
         }
         // Range analysis pins the read to u8.
@@ -21807,6 +23030,12 @@ impl Codegen {
                 return false;
             }
         };
+        if let Some((x, x_op)) = Self::int16_compare_with_zero(*op, &a_op, &b_op) {
+            self.emit_branch_if_int16_vs_zero(crate::passes::negate_relop(x_op), x, skip_label);
+            self.release_int16_operand(b_op);
+            self.release_int16_operand(a_op);
+            return true;
+        }
 
         let transpose = matches!(op, BinOp::Gt | BinOp::Le)
             && self.int16_operand_roles_interchangeable(&a_op)
@@ -21823,6 +23052,23 @@ impl Codegen {
 
         let lhs_sxt = self.precompute_signed_u8_hi(sub_lhs);
         let rhs_sxt = self.precompute_signed_u8_hi(sub_rhs);
+        if is_equality && !self.equality_prefers_shared_subtract(a, b, sub_lhs) {
+            let (on_equal, on_unequal) = match op {
+                BinOp::Eq => (None, Some(skip_label)),
+                _ => (Some(skip_label), None),
+            };
+            self.emit_int16_equality_branch(
+                sub_lhs,
+                sub_rhs,
+                lhs_sxt.as_deref(),
+                rhs_sxt.as_deref(),
+                on_equal,
+                on_unequal,
+            );
+            self.release_int16_operand(b_op);
+            self.release_int16_operand(a_op);
+            return true;
+        }
         writeln!(self.code, "    SEC").unwrap();
         self.emit_int16_load_byte(sub_lhs, false);
         self.emit_int16_op_byte(sub_rhs, false, false);
@@ -21896,6 +23142,119 @@ impl Codegen {
         true
     }
 
+    /// Normalize a comparison with zero to put its variable on the left.
+    fn int16_compare_with_zero<'o>(
+        op: BinOp,
+        a: &'o Int16Operand,
+        b: &'o Int16Operand,
+    ) -> Option<(&'o Int16Operand, BinOp)> {
+        match (a, b) {
+            (Int16Operand::Imm(_), Int16Operand::Imm(_)) => None,
+            (x, Int16Operand::Imm(0)) => Some((x, op)),
+            (Int16Operand::Imm(0), x) => Some((x, swap_compare_op(op))),
+            _ => None,
+        }
+    }
+
+    /// Branch from the operand sign and zero flags without subtraction.
+    fn emit_branch_if_int16_vs_zero(&mut self, op: BinOp, x: &Int16Operand, target: &str) {
+        enum Kind {
+            Word,
+            UnsignedByte,
+            SignedByte(Option<u8>),
+        }
+        let kind = match x {
+            Int16Operand::Var(v) if self.int_var_is_u8_storage(v) => {
+                if self.int_var_byte_is_signed(v) {
+                    Kind::SignedByte(self.signed_byte_negative_from(v))
+                } else {
+                    Kind::UnsignedByte
+                }
+            }
+            Int16Operand::MemU8(_) => Kind::UnsignedByte,
+            _ => Kind::Word,
+        };
+        let fall = format!("__IF_Z0_{}", self.fresh_id());
+        let mut uses_fall = false;
+        match (op, &kind) {
+            (BinOp::Eq | BinOp::Ne, Kind::Word) => {
+                self.emit_int16_load_byte(x, false);
+                self.emit_int16_alu_byte(x, true, "ORA");
+            }
+            (BinOp::Eq | BinOp::Ne, _) => self.emit_int16_load_byte(x, false),
+            _ => {}
+        }
+        match (op, &kind) {
+            (BinOp::Eq, _) => writeln!(self.code, "    BEQ {target}").unwrap(),
+            (BinOp::Ne, _) => writeln!(self.code, "    BNE {target}").unwrap(),
+            (BinOp::Lt | BinOp::Ge, Kind::Word) => {
+                self.emit_int16_load_byte(x, true);
+                let b = if op == BinOp::Lt { "BMI" } else { "BPL" };
+                writeln!(self.code, "    {b} {target}").unwrap();
+            }
+            (BinOp::Gt, Kind::Word) => {
+                self.emit_int16_load_byte(x, true);
+                writeln!(self.code, "    BMI {fall}").unwrap();
+                self.emit_int16_alu_byte(x, false, "ORA");
+                writeln!(self.code, "    BNE {target}").unwrap();
+                uses_fall = true;
+            }
+            (BinOp::Le, Kind::Word) => {
+                self.emit_int16_load_byte(x, true);
+                writeln!(self.code, "    BMI {target}").unwrap();
+                self.emit_int16_alu_byte(x, false, "ORA");
+                writeln!(self.code, "    BEQ {target}").unwrap();
+            }
+            // Never negative.
+            (BinOp::Lt, Kind::UnsignedByte) => {}
+            (BinOp::Ge, Kind::UnsignedByte) => writeln!(self.code, "    JMP {target}").unwrap(),
+            (BinOp::Gt | BinOp::Le, Kind::UnsignedByte) => {
+                self.emit_int16_load_byte(x, false);
+                let b = if op == BinOp::Gt { "BNE" } else { "BEQ" };
+                writeln!(self.code, "    {b} {target}").unwrap();
+            }
+            (BinOp::Lt | BinOp::Ge, Kind::SignedByte(None)) => {
+                self.emit_int16_load_byte(x, false);
+                let b = if op == BinOp::Lt { "BMI" } else { "BPL" };
+                writeln!(self.code, "    {b} {target}").unwrap();
+            }
+            (BinOp::Gt, Kind::SignedByte(None)) => {
+                self.emit_int16_load_byte(x, false);
+                writeln!(self.code, "    BMI {fall}").unwrap();
+                writeln!(self.code, "    BNE {target}").unwrap();
+                uses_fall = true;
+            }
+            (BinOp::Le, Kind::SignedByte(None)) => {
+                self.emit_int16_load_byte(x, false);
+                writeln!(self.code, "    BMI {target}").unwrap();
+                writeln!(self.code, "    BEQ {target}").unwrap();
+            }
+            (BinOp::Lt | BinOp::Ge, Kind::SignedByte(Some(from))) => {
+                self.emit_int16_load_byte(x, false);
+                writeln!(self.code, "    CMP #${from:02X}").unwrap();
+                let b = if op == BinOp::Lt { "BCS" } else { "BCC" };
+                writeln!(self.code, "    {b} {target}").unwrap();
+            }
+            (BinOp::Gt, Kind::SignedByte(Some(from))) => {
+                self.emit_int16_load_byte(x, false);
+                writeln!(self.code, "    BEQ {fall}").unwrap();
+                writeln!(self.code, "    CMP #${from:02X}").unwrap();
+                writeln!(self.code, "    BCC {target}").unwrap();
+                uses_fall = true;
+            }
+            (BinOp::Le, Kind::SignedByte(Some(from))) => {
+                self.emit_int16_load_byte(x, false);
+                writeln!(self.code, "    BEQ {target}").unwrap();
+                writeln!(self.code, "    CMP #${from:02X}").unwrap();
+                writeln!(self.code, "    BCS {target}").unwrap();
+            }
+            _ => unreachable!("a comparison"),
+        }
+        if uses_fall {
+            writeln!(self.code, "{fall}:").unwrap();
+        }
+    }
+
     /// Whether swapping an integer comparison's operands preserves their encoding.
     fn int16_operand_roles_interchangeable(&self, operand: &Int16Operand) -> bool {
         match operand {
@@ -21917,7 +23276,7 @@ impl Codegen {
         if let Some(op) = self.int16_leaf(e) {
             return Some(op);
         }
-        if !self.is_int_island_addsub_only(e) {
+        if !self.is_int_island_addsub_only(e) || !self.expr_proves_ayint_i16(e) {
             return None;
         }
         self.try_emit_int16_eval_addsub(e, None)
@@ -21982,65 +23341,27 @@ impl Codegen {
             writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
             self.invalidate_fac_cache();
         }
-        // Goal: leave FAC = lhs - rhs (FSUB convention is mem - FAC).
-        // When lhs is a Var or Number we can use the per-var or
-        // per-const FSUB stub directly, saving the ST_T0/reload dance.
-        if let Expr::Var(lv) = lhs.as_ref() {
-            if is_direct_float_var(lv) {
-                self.emit_expr_to_fac(rhs)?;
-                self.emit_fac_op_with_var(BinOp::Sub, lv);
-            } else {
-                self.emit_compare_fsub_via_temp(lhs, rhs)?;
-            }
-        } else if let Expr::Number(n) = lhs.as_ref() {
-            self.emit_expr_to_fac(rhs)?;
-            self.emit_fac_op_with_const(BinOp::Sub, *n);
-        } else {
-            self.emit_compare_fsub_via_temp(lhs, rhs)?;
-        }
-        // HEAP_END_NONLET only writes __HEAP_PTR — FAC is preserved,
-        // so we can run it before the EXP/SIGN inspection.
+        self.emit_fcomp_operands(lhs, rhs)?;
         if wrap {
+            writeln!(self.code, "    PHP").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
             writeln!(self.code, "    JSR __HEAP_END_NONLET").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    PLP").unwrap();
             self.invalidate_fac_cache();
         }
-        // Skip when cond is FALSE — inverse of emit_compare's
-        // true-label dispatch.
-        let id = self.fresh_id();
-        let keep = format!("__IF_FCMP_KEEP_{id}");
-        writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
         match op {
-            BinOp::Eq => {
+            BinOp::Eq => writeln!(self.code, "    BNE {skip_label}").unwrap(),
+            BinOp::Ne => writeln!(self.code, "    BEQ {skip_label}").unwrap(),
+            BinOp::Lt => {
+                writeln!(self.code, "    CMP #$01").unwrap();
                 writeln!(self.code, "    BNE {skip_label}").unwrap();
             }
-            BinOp::Ne => {
-                writeln!(self.code, "    BEQ {skip_label}").unwrap();
-            }
-            BinOp::Lt => {
-                // lhs < rhs ⇔ FAC < 0. Skip if equal or non-negative.
-                writeln!(self.code, "    BEQ {skip_label}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {skip_label}").unwrap();
-            }
-            BinOp::Gt => {
-                // lhs > rhs ⇔ FAC > 0. Skip if equal or negative.
-                writeln!(self.code, "    BEQ {skip_label}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BMI {skip_label}").unwrap();
-            }
-            BinOp::Le => {
-                // lhs ≤ rhs ⇔ FAC ≤ 0. Take if equal; skip if positive.
-                writeln!(self.code, "    BEQ {keep}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {skip_label}").unwrap();
-                writeln!(self.code, "{keep}:").unwrap();
-            }
+            BinOp::Gt => writeln!(self.code, "    BPL {skip_label}").unwrap(),
+            BinOp::Le => writeln!(self.code, "    BMI {skip_label}").unwrap(),
             BinOp::Ge => {
-                // lhs ≥ rhs ⇔ FAC ≥ 0. Take if equal; skip if negative.
-                writeln!(self.code, "    BEQ {keep}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BMI {skip_label}").unwrap();
-                writeln!(self.code, "{keep}:").unwrap();
+                writeln!(self.code, "    CMP #$01").unwrap();
+                writeln!(self.code, "    BEQ {skip_label}").unwrap();
             }
             _ => unreachable!(),
         }
@@ -22178,8 +23499,16 @@ impl Codegen {
                         let slot_id = self.for_end_slots;
                         self.for_end_slots += 1;
                         let end_slot_label = format!("FE_{slot_id}");
-                        self.emit_expr_to_fac(end)?;
-                        self.emit_fac_byte_for_value(end);
+                        match end {
+                            Expr::Var(v) if is_integer_scalar(v) && self.int_var_slot_is_current(v) => {
+                                let label = self.intern_var(v.clone());
+                                writeln!(self.code, "    LDA {label}").unwrap();
+                            }
+                            _ => {
+                                self.emit_expr_to_fac(end)?;
+                                self.emit_fac_byte_for_value(end);
+                            }
+                        }
                         writeln!(self.code, "    STA {end_slot_label}").unwrap();
                         return self.emit_for_u8(
                             var,
@@ -22207,12 +23536,7 @@ impl Codegen {
                         let slot_id = self.for_end_slots;
                         self.for_end_slots += 1;
                         let end_slot_label = format!("FE_{slot_id}");
-                        self.emit_expr_to_fac(end)?;
-                        self.emit_fac_to_i16_signed();
-                        writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                        writeln!(self.code, "    STA {end_slot_label}").unwrap();
-                        writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                        writeln!(self.code, "    STA {end_slot_label}+1").unwrap();
+                        self.emit_int_for_bound_to_slot(end, &end_slot_label)?;
                         return self.emit_for_int(
                             var,
                             IntForStart::Literal(s),
@@ -22259,12 +23583,7 @@ impl Codegen {
                     let slot_id = self.for_end_slots;
                     self.for_end_slots += 1;
                     let end_slot_label = format!("FE_{slot_id}");
-                    self.emit_expr_to_fac(end)?;
-                    self.emit_fac_to_i16_signed();
-                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                    writeln!(self.code, "    STA {end_slot_label}").unwrap();
-                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                    writeln!(self.code, "    STA {end_slot_label}+1").unwrap();
+                    self.emit_int_for_bound_to_slot(end, &end_slot_label)?;
                     Some(IntForEnd::Slot(end_slot_label))
                 } else {
                     None
@@ -22322,12 +23641,7 @@ impl Codegen {
                     let slot_id = self.for_end_slots;
                     self.for_end_slots += 1;
                     let end_slot_label = format!("FE_{slot_id}");
-                    self.emit_expr_to_fac(end)?;
-                    self.emit_fac_to_i16_signed();
-                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                    writeln!(self.code, "    STA {end_slot_label}").unwrap();
-                    writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                    writeln!(self.code, "    STA {end_slot_label}+1").unwrap();
+                    self.emit_int_for_bound_to_slot(end, &end_slot_label)?;
                     Some(IntForEnd::Slot(end_slot_label))
                 } else {
                     None
@@ -22439,6 +23753,33 @@ impl Codegen {
             array_pointers,
         }));
         Ok(())
+    }
+
+    /// Copy an integer FOR bound directly or convert it through FAC.
+    fn emit_int_for_bound_to_slot(&mut self, bound: &Expr, slot: &str) -> Result<(), CodegenError> {
+        if let Expr::Var(v) = bound
+            && is_integer_scalar(v)
+            && self.int_var_slot_is_current(v)
+        {
+            let label = self.intern_var(v.clone());
+            writeln!(self.code, "    LDA {label}").unwrap();
+            writeln!(self.code, "    STA {slot}").unwrap();
+            self.emit_int_var_hi_to_a(v, &label);
+            writeln!(self.code, "    STA {slot}+1").unwrap();
+            return Ok(());
+        }
+        self.emit_expr_to_fac(bound)?;
+        self.emit_fac_to_i16_signed();
+        writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+        writeln!(self.code, "    STA {slot}").unwrap();
+        writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+        writeln!(self.code, "    STA {slot}+1").unwrap();
+        Ok(())
+    }
+
+    /// Whether the variable slot holds the current loop value.
+    fn int_var_slot_is_current(&self, var: &VarName) -> bool {
+        self.int_for_counter_label(var).is_none() && self.u8_for_counter_label(var).is_none()
     }
 
     /// Discard the active frame for this variable and all frames above it.
@@ -22736,10 +24077,7 @@ impl Codegen {
         let counter_label = if self.for_counter_aliases_var(var, true) {
             var_label
         } else {
-            let counter_id = self.for_int_slots;
-            self.for_int_slots += 1;
-
-            let _ = self.zp_int_for_assignments.get(&counter_id);
+            let counter_id = self.take_for_counter_id(true);
             format!("FI_{counter_id}")
         };
         // `__FOR_DIFF_LO` is emitted by the NEXT compare regardless of where the counter lives,
@@ -22757,14 +24095,7 @@ impl Codegen {
                 writeln!(self.code, "    LDA #${:02X}", (s >> 8) & 0xFF).unwrap();
                 writeln!(self.code, "    STA {counter_label}+1").unwrap();
             }
-            IntForStart::Dynamic => {
-                self.emit_expr_to_fac(start_expr)?;
-                self.emit_fac_to_i16_signed();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
-                writeln!(self.code, "    STA {counter_label}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
-                writeln!(self.code, "    STA {counter_label}+1").unwrap();
-            }
+            IntForStart::Dynamic => self.emit_int_for_bound_to_slot(start_expr, &counter_label)?,
         }
         // Deposit the start value into the variable's own storage UNCONDITIONALLY, even when
         // the body never reads it.
@@ -22835,8 +24166,7 @@ impl Codegen {
         let counter_label = if self.for_counter_aliases_var(var, false) {
             var_label
         } else {
-            let counter_id = self.for_u8_slots;
-            self.for_u8_slots += 1;
+            let counter_id = self.take_for_counter_id(false);
             format!("FU_{counter_id}")
         };
 
@@ -22928,6 +24258,31 @@ impl Codegen {
                 .end
                 .literal()
                 .expect("exact-hit u8 FOR must have a literal end");
+            let past_end = end_value as i16 + frame.step_value;
+            if frame.step_value.abs() == 1 && (0..=0xFF).contains(&past_end) {
+                let bump = if frame.step_value > 0 { "INC" } else { "DEC" };
+                writeln!(self.code, "    {bump} {counter}").unwrap();
+                if frame.body_reads_loop_var {
+                    self.emit_u8_counter_to_var(&counter, &frame.var);
+                }
+                writeln!(self.code, "    LDA {counter}").unwrap();
+                writeln!(self.code, "    CMP #${past_end:02X}").unwrap();
+                writeln!(self.code, "    BEQ {exit}").unwrap();
+                if let Some(induction) = &frame.induction {
+                    let induction = induction.clone();
+                    self.emit_induction_update(&induction, frame.step_value as f64);
+                }
+                if !frame.array_pointers.is_empty() {
+                    let aps = frame.array_pointers.clone();
+                    self.emit_array_pointers_update(&aps, frame.step_value);
+                }
+                writeln!(self.code, "    JMP {top}").unwrap();
+                writeln!(self.code, "{exit}:").unwrap();
+                if !frame.body_reads_loop_var && counter != self.intern_var(frame.var.clone()) {
+                    self.emit_i16_imm_to_var(past_end, &frame.var);
+                }
+                return;
+            }
             if frame.step_value > 0 {
                 // Forward, end inclusive: exit when counter == end, then
                 // advance and re-run. Test BEFORE advancing so wraparound
@@ -23150,6 +24505,11 @@ impl Codegen {
 
     /// Retire a FOR frame whose NEXT runs through the dispatcher.
     fn retire_for_frame_for_orphan(&mut self, var: Option<&VarName>) {
+        if let Some(v) = var
+            && !self.for_stack.iter().any(|f| f.var() == v)
+        {
+            return;
+        }
         loop {
             let Some(frame) = self.for_stack.pop() else {
                 return;
@@ -23166,15 +24526,26 @@ impl Codegen {
     }
 
     fn emit_next(&mut self, var: Option<&VarName>, line_no: u16) -> Result<(), CodegenError> {
-        // V2 semantics: `NEXT V` searches outward through the FOR stack, popping (abandoning)
-        // each non-matching frame until it finds V.
+        if let Some(v) = var
+            && !self.for_stack.is_empty()
+            && !self.for_stack.iter().any(|f| f.var() == v)
+        {
+            self.last_next_binding = NextBinding::NoFor;
+            self.used_next_no_for = true;
+            writeln!(self.code, "    JMP __NEXT_NO_FOR").unwrap();
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
         let mut abandoned_runtime_frames = 0usize;
         loop {
             let frame = match self.for_stack.pop() {
                 Some(f) => f,
                 None => {
-                    // Empty stack.
-                    if let Some(prev) = self.shared_next_candidate.clone() {
+                    if let Some(prev) = self
+                        .shared_next_candidate
+                        .clone()
+                        .filter(|prev| var.is_none_or(|v| v == prev.var()))
+                    {
                         let id = self.fresh_id();
                         let frame = prev.with_fresh_exit(format!("__FOR_EXIT_{id}"));
                         self.last_next_binding =
@@ -23214,6 +24585,13 @@ impl Codegen {
                     .contains(frame.top_label());
 
                 self.emit_for_stack_drop(abandoned_runtime_frames);
+                let frame = if self.emitted_for_exits.contains(frame.exit_label()) {
+                    let id = self.fresh_id();
+                    frame.with_fresh_exit(format!("__FOR_EXIT_{id}"))
+                } else {
+                    frame
+                };
+                self.emitted_for_exits.insert(frame.exit_label().to_string());
                 match frame {
                     ForFrame::Float(f) => self.emit_next_float(f),
                     ForFrame::Int(f) => self.emit_next_int(f),
@@ -23321,109 +24699,80 @@ impl Codegen {
         // Induction update: only honoured when step folded to a
         // literal — the detection pass requires it, but be defensive
         // here for safety. Trashes FAC; the compare below reloads.
+        let mut induction_ran = false;
         if let (Some(induction), Some(step_value)) = (frame.induction.as_ref(), step_const_value) {
             let induction = induction.clone();
             self.emit_induction_update(&induction, step_value);
+            induction_ran = true;
         }
-        // Compute FAC = counter - end, then inspect its sign. Since
-        // FSUB does FAC = mem - FAC, we need mem = counter and FAC = end.
-        // Load end_slot into FAC, then FSUB with the counter as the
-        // memory operand. For shadow-only vars, V_<v> is stale —
-        // FSUB needs to take the counter from the shadow. We can't
-        // pass a 1-byte int as the memory operand to FSUB (it's a
-        // 5-byte float op), so synth the float in a scratch slot:
-        // re-load FAC from the shadow, MOVMF to FE_0's neighbour
-        // (using the var_label slot would only work if it happened
-        // to be 5 bytes wide — for Integer-promoted vars it isn't),
-        // and FSUB through that.
-        if let Some(tmp) = shadow_tmp {
-            // Counter was already stashed pre-store (above). Just
-            // load end and FSUB through the temp.
-            writeln!(self.code, "    LDA #<{}", frame.end_slot_label).unwrap();
-            writeln!(self.code, "    LDY #>{}", frame.end_slot_label).unwrap();
+        // Compare the counter in FAC with the end slot through FCOMP.
+        let fac_holds_counter = shadow_tmp.is_none()
+            && !integer_counter
+            && !induction_ran
+            && self.shadow_int_label(&frame.var).is_none()
+            && !self.omitted_float_slots.contains(&frame.var);
+        if !fac_holds_counter {
+            let counter = shadow_tmp.clone().unwrap_or_else(|| var_label.clone());
+            writeln!(self.code, "    LDA #<{counter}").unwrap();
+            writeln!(self.code, "    LDY #>{counter}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
-            writeln!(self.code, "    LDA #<{tmp}").unwrap();
-            writeln!(self.code, "    LDY #>{tmp}").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::FSUB).unwrap();
-            self.free_temp(&tmp);
-        } else {
-            writeln!(self.code, "    LDA #<{}", frame.end_slot_label).unwrap();
-            writeln!(self.code, "    LDY #>{}", frame.end_slot_label).unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
-            writeln!(self.code, "    LDA #<{var_label}").unwrap();
-            writeln!(self.code, "    LDY #>{var_label}").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", rt::FSUB).unwrap();
         }
-        // STEP > 0: exit when counter > end. STEP < 0: exit when
-        // counter < end. STEP 0 (v2 edge case): exit when counter ==
-        // end; any other FAC sign continues, since the counter won't
-        // change.
-        let cont_label = format!(
-            "__FOR_CONT_{}",
-            frame.exit_label.trim_start_matches("__FOR_EXIT_")
-        );
+        if let Some(tmp) = &shadow_tmp {
+            self.free_temp(tmp);
+        }
+        writeln!(self.code, "    LDA #<{}", frame.end_slot_label).unwrap();
+        writeln!(self.code, "    LDY #>{}", frame.end_slot_label).unwrap();
+        writeln!(self.code, "    JSR ${:04X}", rt::FCOMP).unwrap();
+        self.invalidate_fac_cache();
         // Use the pooled MFLPT, not the folded f64. `STEP 1E-40` is nonzero as f64
         // and all-zero MFLPT, so the f64 test would treat it as STEP>0.
         let step_mflpt = step_const_value.map(round_to_mflpt);
-        let step_is_zero = matches!(step_mflpt, Some(v) if v == 0.0);
-        // A dynamic STEP can be zero: ROM exits iff counter == end, the opposite
-        // of the BEQ-cont below. Handle that in a separate tail.
-        let dyn_zero_label = match (&frame.step_loc, step_const_value) {
-            (StepLoc::Dynamic { sign_label, .. }, None) => {
-                let id = self.fresh_id();
-                let l = format!("__FOR_DYN_ZS_{id}");
-                writeln!(self.code, "    LDA {sign_label}").unwrap();
-                writeln!(self.code, "    BEQ {l}").unwrap();
-                Some(l)
-            }
-            _ => None,
-        };
-        writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
-        if step_is_zero {
-            writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
-            writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
-            writeln!(self.code, "{}:", frame.exit_label).unwrap();
-            return;
-        }
-        writeln!(self.code, "    BEQ {cont_label}").unwrap();
-        writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
         match (step_mflpt, &frame.step_loc) {
+            (Some(v), _) if v == 0.0 => {
+                writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
+            }
             (Some(v), _) if v > 0.0 => {
-                writeln!(self.code, "    BPL {}", frame.exit_label).unwrap();
+                writeln!(self.code, "    CMP #$01").unwrap();
+                writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
             }
             (Some(_), _) => {
                 writeln!(self.code, "    BMI {}", frame.exit_label).unwrap();
             }
             (None, StepLoc::Dynamic { sign_label, .. }) => {
-                // Runtime branch on STEP sign captured at FOR header.
-                // sign byte: $00 = non-negative (BPL exits on +diff),
-                // $FF = negative (BMI exits on -diff).
-                let id = self.fresh_id();
-                let neg_label = format!("__FOR_DYN_NEG_{id}");
-                let test_done = format!("__FOR_DYN_TD_{id}");
-                writeln!(self.code, "    PHA").unwrap();
-                writeln!(self.code, "    LDA {sign_label}").unwrap();
-                writeln!(self.code, "    BMI {neg_label}").unwrap();
-                writeln!(self.code, "    PLA").unwrap();
-                writeln!(self.code, "    BPL {}", frame.exit_label).unwrap();
-                writeln!(self.code, "    JMP {test_done}").unwrap();
-                writeln!(self.code, "{neg_label}:").unwrap();
-                writeln!(self.code, "    PLA").unwrap();
-                writeln!(self.code, "    BMI {}", frame.exit_label).unwrap();
-                writeln!(self.code, "{test_done}:").unwrap();
+                writeln!(self.code, "    CMP {sign_label}").unwrap();
+                writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
             }
             (None, StepLoc::Const { .. }) => unreachable!("const value missing for const step"),
         }
+        let cont_label = format!(
+            "__FOR_CONT_{}",
+            frame.exit_label.trim_start_matches("__FOR_EXIT_")
+        );
         writeln!(self.code, "{cont_label}:").unwrap();
         writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
-        // Dynamic STEP 0: ROM exits iff FCOMP(counter, limit) is equal.
-        if let Some(l) = dyn_zero_label {
-            writeln!(self.code, "{l}:").unwrap();
-            writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
-            writeln!(self.code, "    BEQ {}", frame.exit_label).unwrap();
-            writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
-        }
         writeln!(self.code, "{}:", frame.exit_label).unwrap();
+    }
+
+    /// Whether literal bounds keep the integer counter within 0..=32767.
+    fn int_for_counter_stays_non_negative(&self, frame: &IntForFrame) -> bool {
+        let IntForEnd::Literal(end) = frame.end else {
+            return false;
+        };
+        if frame.dynamic_start || frame.step_slot.is_some() {
+            return false;
+        }
+        let (start, end, step) = (
+            i32::from(frame.start_value),
+            i32::from(end),
+            i32::from(frame.step_value),
+        );
+        // The end is an operand too, so it must be non-negative as well.
+        let (lo, hi) = if step > 0 {
+            (start.min(end), start.max(end) + 2 * step)
+        } else {
+            (start.min(end) + 2 * step, start.max(end))
+        };
+        lo >= 0 && hi <= 0x7FFF
     }
 
     fn emit_next_int(&mut self, frame: IntForFrame) {
@@ -23536,44 +24885,39 @@ impl Codegen {
             let aps = frame.array_pointers.clone();
             self.emit_array_pointers_update(&aps, frame.step_value);
         }
-        // diff = counter - end (signed). Compute via SBC chain, then
-        // sign-correct the high byte using the V flag. End is
-        // either an immediate literal (the common case) or a 2-byte
-        // BSS slot for the dynamic-end variant.
-        writeln!(self.code, "    SEC").unwrap();
-        writeln!(self.code, "    LDA {counter}").unwrap();
-        match &frame.end {
+        // Order the signed comparison by the step direction.
+        let end_byte = |hi: bool| match &frame.end {
             IntForEnd::Literal(e) => {
-                writeln!(self.code, "    SBC #${:02X}", (*e as u16) & 0xFF).unwrap();
+                format!("#${:02X}", ((*e as u16) >> if hi { 8 } else { 0 }) & 0xFF)
             }
-            IntForEnd::Slot(label) => {
-                writeln!(self.code, "    SBC {label}").unwrap();
+            IntForEnd::Slot(label) if hi => format!("{label}+1"),
+            IntForEnd::Slot(label) => label.clone(),
+        };
+        if frame.step_value < 0 && matches!(frame.end, IntForEnd::Literal(0)) {
+            writeln!(self.code, "    LDA {counter}+1").unwrap();
+            writeln!(self.code, "    BMI {exit}").unwrap();
+            writeln!(self.code, "    JMP {top}").unwrap();
+            writeln!(self.code, "{exit}:").unwrap();
+            if !frame.body_reads_loop_var {
+                self.emit_int_counter_to_var(&counter, &frame.var);
             }
+            return;
         }
-        writeln!(self.code, "    STA __FOR_DIFF_LO").unwrap();
-        writeln!(self.code, "    LDA {counter}+1").unwrap();
-        match &frame.end {
-            IntForEnd::Literal(e) => {
-                writeln!(self.code, "    SBC #${:02X}", ((*e as u16) >> 8) & 0xFF).unwrap();
-            }
-            IntForEnd::Slot(label) => {
-                writeln!(self.code, "    SBC {label}+1").unwrap();
-            }
-        }
-        writeln!(self.code, "    BVC {nv_label}").unwrap();
-        writeln!(self.code, "    EOR #$80").unwrap();
-        writeln!(self.code, "{nv_label}:").unwrap();
-        // .A now = sign-corrected high byte. Stash a copy so we can
-        // do a zero check via ORA without losing the sign.
-        writeln!(self.code, "    TAX").unwrap();
-        writeln!(self.code, "    ORA __FOR_DIFF_LO").unwrap();
-        writeln!(self.code, "    BEQ {top}").unwrap(); // counter == end → continue (inclusive)
-        writeln!(self.code, "    TXA").unwrap(); // restore corrected high → flags
-        if frame.step_value > 0 {
-            // Positive step: exit when counter > end (corrected high non-negative & non-zero).
-            writeln!(self.code, "    BPL {exit}").unwrap();
+        let (minuend_lo, minuend_hi, subtrahend_lo, subtrahend_hi) = if frame.step_value > 0 {
+            (end_byte(false), end_byte(true), counter.clone(), format!("{counter}+1"))
         } else {
-            // Negative step: exit when counter < end (corrected high negative).
+            (counter.clone(), format!("{counter}+1"), end_byte(false), end_byte(true))
+        };
+        writeln!(self.code, "    LDA {minuend_lo}").unwrap();
+        writeln!(self.code, "    CMP {subtrahend_lo}").unwrap();
+        writeln!(self.code, "    LDA {minuend_hi}").unwrap();
+        writeln!(self.code, "    SBC {subtrahend_hi}").unwrap();
+        if self.int_for_counter_stays_non_negative(&frame) {
+            writeln!(self.code, "    BCC {exit}").unwrap();
+        } else {
+            writeln!(self.code, "    BVC {nv_label}").unwrap();
+            writeln!(self.code, "    EOR #$80").unwrap();
+            writeln!(self.code, "{nv_label}:").unwrap();
             writeln!(self.code, "    BMI {exit}").unwrap();
         }
         writeln!(self.code, "    JMP {top}").unwrap();
@@ -23631,11 +24975,19 @@ impl Codegen {
                     writeln!(self.code, "    LDY #${lo:02X}").unwrap();
                     writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
                 } else {
-
-                    let label = self.intern_float(*n);
+                    let round = crate::romfloat::rounding_byte(*n);
+                    let value = match crate::romfloat::Fac::from_f64(*n) {
+                        Some(fac) if round != 0 => crate::romfloat::Fac { round: 0, ..fac }.to_f64(),
+                        _ => *n,
+                    };
+                    let label = self.intern_float(value);
                     writeln!(self.code, "    LDA #<{label}").unwrap();
                     writeln!(self.code, "    LDY #>{label}").unwrap();
                     writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                    if round != 0 {
+                        writeln!(self.code, "    LDA #${round:02X}").unwrap();
+                        writeln!(self.code, "    STA ${:02X}", rt::FAC_ROUNDING).unwrap();
+                    }
                 }
             }
             Expr::Var(v) => {
@@ -23900,7 +25252,12 @@ impl Codegen {
                 self.emit_strexpr_pointer_to_ay(s)?;
                 writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
                 writeln!(self.code, "    STY ${:02X}", rt::STR_OP_LHS_HI).unwrap();
-                writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
+                if self.read_digits || self.profile == Profile::Speed {
+                    writeln!(self.code, "    JSR __VAL_DIGITS").unwrap();
+                    self.used_val_digits = true;
+                } else {
+                    writeln!(self.code, "    JSR __VAL_HELPER").unwrap();
+                }
                 self.used_val = true;
 
                 self.used_val_heap = true;
@@ -24103,6 +25460,14 @@ impl Codegen {
                     .ok_or_else(|| CodegenError::UndefinedFn(name.0.clone()))?
                     .clone();
                 let param_label = self.intern_var(info.param.clone());
+                let inline = !contains_fn_call(&info.body) && count_expr_nodes(&info.body) <= 5;
+                if !inline {
+                    self.emit_expr_to_fac(arg)?;
+                    writeln!(self.code, "    JSR {}", name.label()).unwrap();
+                    self.invalidate_array_addr_cache();
+                    self.invalidate_fac_cache();
+                    return Ok(());
+                }
                 // BASIC v2 semantics: the formal parameter shares its
                 // slot with the user variable of the same name (no
                 // scoping), but the call saves and restores the slot
@@ -24133,19 +25498,8 @@ impl Codegen {
 
                 self.invalidate_array_addr_cache_for_var(&info.param);
                 self.note_fac_contains_var(&info.param);
-                // Inline trivial bodies; JSR larger ones. The threshold
-                // trades code size for the saved JSR/RTS overhead per
-                // call. Bodies that themselves invoke FN are JSR'd —
-                // inlining could blow up under nested expansion.
-                if !contains_fn_call(&info.body) && count_expr_nodes(&info.body) <= 5 {
-                    writeln!(self.code, "    ; inline {}", name.label()).unwrap();
-                    self.emit_expr_to_fac(&info.body)?;
-                } else {
-                    writeln!(self.code, "    JSR {}", name.label()).unwrap();
-                    // The body was emitted elsewhere; whatever address it
-                    // left in ARRAY_ADDR is unknown here.
-                    self.invalidate_array_addr_cache();
-                }
+                writeln!(self.code, "    ; inline {}", name.label()).unwrap();
+                self.emit_expr_to_fac(&info.body)?;
                 // Restore param slot — PLA preserves the FAC bytes
                 // ($61-$66) so the result is intact.
                 writeln!(self.code, "    PLA").unwrap();
@@ -24462,8 +25816,14 @@ impl Codegen {
         let id = self.fresh_id();
         let patch = format!("__PEEK_{id}");
         if !self.try_emit_int16_addr_patch(addr, &patch) {
+            // Read through LINNUM, where FACWORD left the address, as the ROM's PEEK does.
             self.emit_expr_to_fac(addr)?;
-            self.emit_facword_patch(&patch);
+            self.emit_facword_rom();
+            writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "    LDA (${:02X}),Y", rt::LINNUM_LO).unwrap();
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
+            return Ok(());
         }
         writeln!(self.code, "{patch}:").unwrap();
         writeln!(self.code, "    LDY $FFFF").unwrap();
@@ -24655,31 +26015,37 @@ impl Codegen {
         }
         let id = self.fresh_id();
         let patch = format!("__POKE_{id}");
-        if !self.try_emit_int16_addr_patch(addr, &patch) {
+        let via_linnum = !self.try_emit_int16_addr_patch(addr, &patch);
+        if via_linnum {
             self.emit_expr_to_fac(addr)?;
-            self.emit_facword_patch(&patch);
+            self.emit_facword_rom();
         }
-        // Evaluate the byte to write. After FACWORD the low byte sits in
-        // LINNUM_LO, which is what we POKE — but only if it actually
-        // fits in a byte. POKE V, 256 is ?ILLEGAL QUANTITY in BASIC v2.
-        // Same int-var fast path applies for the runtime-address case.
-        if let Expr::Var(v) = value {
-            if v.kind == VarKind::Integer && v.base != "TI" && v.base != "ST" {
-                self.emit_int_var_byte_to_a(v);
-                writeln!(self.code, "{patch}:").unwrap();
-                writeln!(self.code, "    STA $FFFF").unwrap();
+        let value_start = self.code.len();
+        if let Expr::Var(v) = value
+            && v.kind == VarKind::Integer
+            && v.base != "TI"
+            && v.base != "ST"
+        {
+            self.emit_int_var_byte_to_a(v);
+        } else if !self.try_emit_int16_byte_to_a(value) {
+            self.emit_byte_fallback_to_fac(value)?;
+            writeln!(self.code, "    JSR __FAC_BYTE").unwrap();
+            self.used_fac_byte = true;
+            self.invalidate_fac_cache();
+        }
+        if via_linnum {
+            if code_keeps_linnum(&self.code[value_start..]) {
+                writeln!(self.code, "    LDY #$00").unwrap();
+                writeln!(self.code, "    STA (${:02X}),Y", rt::LINNUM_LO).unwrap();
                 return Ok(());
             }
+            let copy = format!(
+                "    LDA ${:02X}\n    STA {patch}+1\n    LDA ${:02X}\n    STA {patch}+2\n",
+                rt::LINNUM_LO,
+                rt::LINNUM_HI
+            );
+            self.code.insert_str(value_start, &copy);
         }
-        if self.try_emit_int16_byte_to_a(value) {
-            writeln!(self.code, "{patch}:").unwrap();
-            writeln!(self.code, "    STA $FFFF").unwrap();
-            return Ok(());
-        }
-        self.emit_byte_fallback_to_fac(value)?;
-        writeln!(self.code, "    JSR __FAC_BYTE").unwrap();
-        self.used_fac_byte = true;
-        self.invalidate_fac_cache();
         writeln!(self.code, "{patch}:").unwrap();
         writeln!(self.code, "    STA $FFFF").unwrap();
         Ok(())
@@ -27575,6 +28941,30 @@ impl Codegen {
             .map_or(false, |r| r.min > -1 || r.max < -1)
     }
 
+    /// Round integer stores before conversion through AYINT.
+    fn emit_ayint_for_store(&mut self, value: &Expr) {
+        if fac_rounding_byte_clear(value) || self.expr_proves_ayint_safe(value) {
+            self.emit_ayint(Some(value));
+            return;
+        }
+        writeln!(self.code, "    JSR __AYINT_RND").unwrap();
+        self.used_ayint = true;
+        self.used_ayint_rnd = true;
+        self.invalidate_fac_cache();
+    }
+
+    /// Round the left operand of AND or OR before conversion.
+    fn emit_ayint_for_pushed(&mut self, value: &Expr) {
+        if fac_rounding_byte_clear(value) || self.expr_proves_ayint_safe(value) {
+            self.emit_ayint(Some(value));
+            return;
+        }
+        writeln!(self.code, "    JSR __AYINT_PSH").unwrap();
+        self.used_ayint = true;
+        self.used_ayint_psh = true;
+        self.invalidate_fac_cache();
+    }
+
     /// Floor FAC to signed 16-bit; raise ILLEGAL QUANTITY outside -32768..=32767.
     fn emit_ayint(&mut self, value: Option<&Expr>) {
         let safe = value.map_or(false, |e| self.expr_proves_ayint_safe(e));
@@ -28232,11 +29622,7 @@ impl Codegen {
         self.emit_close(&file)
     }
 
-    /// `GET# file_num, var [, var2, …]` — flip input via CHKIN, GETIN
-    /// one byte per variable in turn, CLRCHN. A list
-    /// like `GET#1, A$, A$` reads two bytes and leaves the second in
-    /// A$. String vars get a single-char string in the shared
-    /// `__GET_HEAP` slot.
+    /// Select the input channel and read one byte per GET target.
     fn emit_get_file(&mut self, file_num: &Expr, vars: &[VarName]) -> Result<(), CodegenError> {
         self.emit_expr_to_fac(file_num)?;
         self.emit_facword_rom();
@@ -28245,41 +29631,10 @@ impl Codegen {
         writeln!(self.code, "    STX ${:02X}", rt::CHANNL).unwrap();
         writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
         for var in vars {
-            writeln!(self.code, "    JSR ${:04X}", rt::GETIN).unwrap();
-            let label = self.intern_var(var.clone());
-            match var.kind {
-                VarKind::String => {
-                    // Store as a 1-char heap string (or empty if EOF).
-                    writeln!(self.code, "    STA __GET_HEAP+1").unwrap();
-                    writeln!(self.code, "    LDX #$01").unwrap();
-                    writeln!(self.code, "    CMP #$00").unwrap();
-                    let id = self.fresh_id();
-                    let ok = format!("__GETF_OK_{id}");
-                    writeln!(self.code, "    BNE {ok}").unwrap();
-                    writeln!(self.code, "    LDX #$00").unwrap();
-                    writeln!(self.code, "{ok}:").unwrap();
-                    writeln!(self.code, "    STX __GET_HEAP").unwrap();
-                    writeln!(self.code, "    LDA #<__GET_HEAP").unwrap();
-                    writeln!(self.code, "    STA {label}").unwrap();
-                    writeln!(self.code, "    LDA #>__GET_HEAP").unwrap();
-                    writeln!(self.code, "    STA {label}+1").unwrap();
-                    self.used_get_str = true;
-                    self.used_get_heap = true;
-                }
-                VarKind::Float => {
-                    // Byte → FAC via BYTEFAC, then store as MFLPT.
-                    writeln!(self.code, "    TAY").unwrap();
-                    writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
-                    writeln!(self.code, "    LDX #<{label}").unwrap();
-                    writeln!(self.code, "    LDY #>{label}").unwrap();
-                    writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
-                }
-                VarKind::Integer => {
-                    // Byte → 2-byte int slot directly. Hi byte = 0 since
-                    // GETIN returns 0..255.
-                    writeln!(self.code, "    STA {label}").unwrap();
-                    self.emit_zero_int_var_hi(var, &label);
-                }
+            if var.kind == VarKind::String {
+                self.emit_let_str(var, &StrExpr::GetKey)?;
+            } else {
+                self.emit_get(var, &[])?;
             }
         }
         writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
@@ -28305,8 +29660,6 @@ impl Codegen {
         writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
         writeln!(self.code, "    JSR __INPUT_LINE_FILE").unwrap();
         writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
-        writeln!(self.code, "    LDA #$01").unwrap();
-        writeln!(self.code, "    STA __INPUT_POS").unwrap();
         for tgt in targets {
             // Cut the next field; if the line is spent, the helper
             // reopens the channel, reads another line, closes it,
@@ -28786,10 +30139,9 @@ impl Codegen {
                 return Ok(());
             }
         }
-        // Pattern: evaluate `first` to FAC, MOVMF it to a temp slot, then evaluate `second` to
-        // FAC, then apply op with temp as memory operand.
-        let commutative_order_is_free =
-            fac_result_is_already_rounded(lhs) && fac_result_is_already_rounded(rhs);
+        let commutative_order_is_free = op == BinOp::Add
+            && fac_result_is_already_rounded(lhs)
+            && fac_result_is_already_rounded(rhs);
         let lhs_first = matches!(
             op,
             BinOp::Sub
@@ -28806,16 +30158,10 @@ impl Codegen {
         self.emit_expr_to_fac(first)?;
         let temp = self.alloc_temp();
         self.emit_stash_to_temp(&temp);
-        // Identical operands (`x*x`, `x-x`, …): the stash preserved FAC,
-        // so it still holds `first`'s value — and `second == first` is
-        // deterministic, so re-evaluating it is pure waste. Skip it and
-        // let the op use FAC directly against the stashed temp. We only
-        // handle the operands the FAC-cache mechanism *doesn't* (chiefly
-        // `ArrayRef` like `B(I)*B(I)`); cacheable shapes such as
-        // `(A+1)*(A+1)` are left to the cache's `; reuse FAC` path.
         let dedup_second = first == second
             && Self::float_operand_dedup_safe(second)
-            && !expr_fac_cacheable(second);
+            && !expr_fac_cacheable(second)
+            && fac_result_is_already_rounded(second);
         if !dedup_second {
             self.emit_expr_to_fac(second)?;
         }
@@ -28859,6 +30205,28 @@ impl Codegen {
             Some(o) => o,
             None => return false,
         };
+        if let Some((x, x_op)) = Self::int16_compare_with_zero(*op, &a_op, &b_op) {
+            self.emit_branch_if_int16_vs_zero(x_op, x, take_label);
+            return true;
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            // A signed byte variable's high byte is its sign extension, not `#$00`.
+            let lhs_sxt = self.precompute_signed_u8_hi(&a_op);
+            let rhs_sxt = self.precompute_signed_u8_hi(&b_op);
+            let (on_equal, on_unequal) = match op {
+                BinOp::Eq => (Some(take_label), None),
+                _ => (None, Some(take_label)),
+            };
+            self.emit_int16_equality_branch(
+                &a_op,
+                &b_op,
+                lhs_sxt.as_deref(),
+                rhs_sxt.as_deref(),
+                on_equal,
+                on_unequal,
+            );
+            return true;
+        }
         // Same compute-(a-b) prologue as the skip-on-false variant.
         writeln!(self.code, "    SEC").unwrap();
         self.emit_int16_load_byte(&a_op, false);
@@ -28873,15 +30241,6 @@ impl Codegen {
         writeln!(self.code, "{nv}:").unwrap();
         writeln!(self.code, "    TAX").unwrap();
         match op {
-            BinOp::Eq => {
-                // Take if a == b → combined ORA == 0.
-                writeln!(self.code, "    ORA __FOR_DIFF_LO").unwrap();
-                writeln!(self.code, "    BEQ {take_label}").unwrap();
-            }
-            BinOp::Ne => {
-                writeln!(self.code, "    ORA __FOR_DIFF_LO").unwrap();
-                writeln!(self.code, "    BNE {take_label}").unwrap();
-            }
             BinOp::Lt => {
                 // Take if a < b: not equal AND sign-bit set.
                 let keep_id = self.fresh_id();
@@ -28938,73 +30297,48 @@ impl Codegen {
             writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
             self.invalidate_fac_cache();
         }
-        // Same FSUB-prologue as the skip-on-false variant.
-        if let Expr::Var(lv) = lhs.as_ref() {
-            if is_direct_float_var(lv) {
-                self.emit_expr_to_fac(rhs)?;
-                self.emit_fac_op_with_var(BinOp::Sub, lv);
-            } else {
-                self.emit_compare_fsub_via_temp(lhs, rhs)?;
-            }
-        } else if let Expr::Number(n) = lhs.as_ref() {
-            self.emit_expr_to_fac(rhs)?;
-            self.emit_fac_op_with_const(BinOp::Sub, *n);
-        } else {
-            self.emit_compare_fsub_via_temp(lhs, rhs)?;
-        }
+        self.emit_fcomp_operands(lhs, rhs)?;
         if wrap {
+            writeln!(self.code, "    PHP").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
             writeln!(self.code, "    JSR __HEAP_END_NONLET").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    PLP").unwrap();
             self.invalidate_fac_cache();
         }
-        let id = self.fresh_id();
-        let keep = format!("__IF_FCMP_KEEP_T_{id}");
-        writeln!(self.code, "    LDA ${:02X}", rt::FAC_EXP).unwrap();
         match op {
-            BinOp::Eq => {
-                writeln!(self.code, "    BEQ {take_label}").unwrap();
-            }
-            BinOp::Ne => {
-                writeln!(self.code, "    BNE {take_label}").unwrap();
-            }
+            BinOp::Eq => writeln!(self.code, "    BEQ {take_label}").unwrap(),
+            BinOp::Ne => writeln!(self.code, "    BNE {take_label}").unwrap(),
             BinOp::Lt => {
-                // FAC < 0: exp != 0 AND sign bit set.
-                writeln!(self.code, "    BEQ {keep}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BMI {take_label}").unwrap();
-                writeln!(self.code, "{keep}:").unwrap();
-            }
-            BinOp::Gt => {
-                writeln!(self.code, "    BEQ {keep}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {take_label}").unwrap();
-                writeln!(self.code, "{keep}:").unwrap();
-            }
-            BinOp::Le => {
-                // FAC ≤ 0: exp == 0 OR sign bit set.
+                writeln!(self.code, "    CMP #$01").unwrap();
                 writeln!(self.code, "    BEQ {take_label}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BMI {take_label}").unwrap();
             }
-            BinOp::Ge => {
-                writeln!(self.code, "    BEQ {take_label}").unwrap();
-                writeln!(self.code, "    LDA ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {take_label}").unwrap();
-            }
+            BinOp::Gt => writeln!(self.code, "    BMI {take_label}").unwrap(),
             _ => unreachable!(),
         }
         Ok(true)
     }
 
-    /// Standard FSUB-via-temp prologue for IF compare, reused when
-    /// neither operand is a leaf we can route through a per-var or
-    /// per-const stub. Leaves FAC = lhs - rhs.
-    fn emit_compare_fsub_via_temp(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), CodegenError> {
-        self.emit_expr_to_fac(lhs)?;
-        let temp = self.alloc_temp();
-        self.emit_stash_to_temp(&temp);
-        self.emit_expr_to_fac(rhs)?;
-        self.emit_op_with_temp(rt::FSUB, &temp);
-        self.free_temp(&temp);
+    /// Compare a rounded left operand in memory with the right operand in FAC.
+    fn emit_fcomp_operands(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), CodegenError> {
+        match lhs {
+            Expr::Var(lv) if is_direct_float_var(lv) => {
+                self.emit_expr_to_fac(rhs)?;
+                self.emit_fac_op_with_var(BinOp::Eq, lv);
+            }
+            Expr::Number(n) => {
+                self.emit_expr_to_fac(rhs)?;
+                self.emit_fac_op_with_const(BinOp::Eq, *n);
+            }
+            _ => {
+                self.emit_expr_to_fac(lhs)?;
+                let temp = self.alloc_temp();
+                self.emit_stash_to_temp(&temp);
+                self.emit_expr_to_fac(rhs)?;
+                self.emit_op_with_temp(rt::FCOMP, &temp);
+                self.free_temp(&temp);
+            }
+        }
         Ok(())
     }
 
@@ -29058,6 +30392,7 @@ impl Codegen {
     /// temp in any binary op — so it gets a tail-call stub instead of
     /// the 7-byte inline LDX/LDY/JSR triple.
     fn emit_stash_to_temp(&mut self, temp: &str) {
+        let was_clear = self.fac_rounding_clear();
         if temp == "T0" {
             writeln!(self.code, "    JSR __ST__T0").unwrap();
             self.used_st_t0 = true;
@@ -29066,6 +30401,7 @@ impl Codegen {
             writeln!(self.code, "    LDY #>{temp}").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
         }
+        self.note_fac_rounded_by_store(was_clear);
     }
 
     /// Evaluate both operands and apply the bitwise operator after signed 16-bit conversion.
@@ -29087,7 +30423,7 @@ impl Codegen {
         };
         let (slot_lo, slot_hi) = self.logic_slot();
         self.emit_expr_to_fac(lhs)?;
-        self.emit_ayint(Some(lhs));
+        self.emit_ayint_for_pushed(lhs);
         writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
         writeln!(self.code, "    STA {slot_lo}").unwrap();
         writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
@@ -29296,6 +30632,11 @@ impl Codegen {
                     self.used_fsub_t0 = true;
                     return;
                 }
+                a if a == rt::FCOMP => {
+                    writeln!(self.code, "    JSR __FCMP__T0").unwrap();
+                    self.used_fcmp_t0 = true;
+                    return;
+                }
                 a if a == rt::FMULT => {
                     writeln!(self.code, "    JSR __FMULT__T0").unwrap();
                     self.used_fmult_t0 = true;
@@ -29314,71 +30655,24 @@ impl Codegen {
         writeln!(self.code, "    JSR ${addr:04X}").unwrap();
     }
 
-    /// Emit code that compares FAC with `temp` per `op`, leaving -1.0 or
-    /// 0.0 in FAC.
-    ///
-    /// Approach: subtract via FSUB (FAC := FAC - temp = lhs - rhs), then
-    /// inspect FAC's exponent ($61) for zero and FAC's sign ($66) for
-    /// positive/negative. We deliberately avoid a "FCOMP" ROM call —
-    /// $BC5B in the C64 BASIC ROM is SGN, not a memory-comparison entry,
-    /// and the real FCOMP entry point is poorly documented across
-    /// references. Subtract-and-test is unambiguous and uses only
-    /// well-known FAC layout addresses.
+    /// Compare FAC with the saved operand and return a BASIC truth value.
     fn emit_compare(&mut self, op: BinOp, temp: &str) {
-        // emit_binop arranged temp = lhs and FAC = rhs. FSUB does
-        // FAC = mem - FAC, so this leaves FAC = lhs - rhs — the value
-        // whose sign decides every comparison. Route through the
-        // shared T0-FSUB stub when this is the outermost compare.
-        self.emit_op_with_temp(rt::FSUB, temp);
-
-        let id = self.fresh_id();
-        let false_label = format!("__CMP_F_{id}");
-        let done_label = format!("__CMP_D_{id}");
-
-        let mut needs_false_label = false;
-        writeln!(self.code, "    LDA #$FF").unwrap();
-        match op {
-            BinOp::Eq => {
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_EXP).unwrap();
-                writeln!(self.code, "    BEQ {done_label}").unwrap();
-            }
-            BinOp::Ne => {
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_EXP).unwrap();
-                writeln!(self.code, "    BNE {done_label}").unwrap();
-            }
-            BinOp::Lt => {
-                // lhs < rhs ⇔ FAC < 0 ⇔ exp ≠ 0 AND sign bit set
-                needs_false_label = true;
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_EXP).unwrap();
-                writeln!(self.code, "    BEQ {false_label}").unwrap();
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BMI {done_label}").unwrap();
-            }
-            BinOp::Gt => {
-                needs_false_label = true;
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_EXP).unwrap();
-                writeln!(self.code, "    BEQ {false_label}").unwrap();
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {done_label}").unwrap();
-            }
-            BinOp::Le => {
-                // lhs ≤ rhs ⇔ FAC ≤ 0 ⇔ exp = 0 OR sign bit set
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_EXP).unwrap();
-                writeln!(self.code, "    BEQ {done_label}").unwrap();
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BMI {done_label}").unwrap();
-            }
-            BinOp::Ge => {
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_EXP).unwrap();
-                writeln!(self.code, "    BEQ {done_label}").unwrap();
-                writeln!(self.code, "    BIT ${:02X}", rt::FAC_SIGN).unwrap();
-                writeln!(self.code, "    BPL {done_label}").unwrap();
-            }
+        self.emit_op_with_temp(rt::FCOMP, temp);
+        let (against, take_if_equal) = match op {
+            BinOp::Eq => (0x00, true),
+            BinOp::Ne => (0x00, false),
+            BinOp::Lt => (0x01, true),
+            BinOp::Gt => (0xFF, true),
+            BinOp::Le => (0xFF, false),
+            BinOp::Ge => (0x01, false),
             _ => unreachable!(),
-        }
-        if needs_false_label {
-            writeln!(self.code, "{false_label}:").unwrap();
-        }
+        };
+        let done_label = format!("__CMP_D_{}", self.fresh_id());
+        writeln!(self.code, "    TAX").unwrap();
+        writeln!(self.code, "    LDA #$FF").unwrap();
+        writeln!(self.code, "    CPX #${against:02X}").unwrap();
+        let branch = if take_if_equal { "BEQ" } else { "BNE" };
+        writeln!(self.code, "    {branch} {done_label}").unwrap();
         writeln!(self.code, "    LDA #$00").unwrap();
         writeln!(self.code, "{done_label}:").unwrap();
         writeln!(self.code, "    JSR __BOOL_TO_FAC").unwrap();
@@ -30199,14 +31493,14 @@ fn stmt_page1_floor(stmt: &Stmt, def_fns: &HashMap<FnName, DefFnInfo>) -> Option
 
 fn for_frames_at_recursive_gosub(module: &ir::Module) -> Vec<(u32, u32)> {
 
-    fn record(open: &[u16], line_no: u16, target: u16, sites: &mut Vec<(u32, u32)>) {
+    fn record(open: &[u16], line_no: u16, target: u16, sites: &mut Vec<(u32, u32, u16)>) {
         if target > line_no {
             return;
         }
         let inside = open.iter().filter(|&&f| f >= target).count() as u32;
-        sites.push((inside, open.len() as u32 - inside));
+        sites.push((inside, open.len() as u32 - inside, target));
     }
-    fn walk(line_no: u16, stmts: &[Stmt], open: &mut Vec<u16>, sites: &mut Vec<(u32, u32)>) {
+    fn walk(line_no: u16, stmts: &[Stmt], open: &mut Vec<u16>, sites: &mut Vec<(u32, u32, u16)>) {
         for stmt in stmts {
             match stmt {
                 Stmt::For { .. } => open.push(line_no),
@@ -30243,7 +31537,7 @@ fn for_frames_at_recursive_gosub(module: &ir::Module) -> Vec<(u32, u32)> {
             }
         }
     }
-    fn walk_then(line_no: u16, then: &ThenIr, open: &mut Vec<u16>, sites: &mut Vec<(u32, u32)>) {
+    fn walk_then(line_no: u16, then: &ThenIr, open: &mut Vec<u16>, sites: &mut Vec<(u32, u32, u16)>) {
         if let ThenIr::Stmts(inner) = then {
             walk(line_no, inner, open, sites);
         }
@@ -30253,7 +31547,12 @@ fn for_frames_at_recursive_gosub(module: &ir::Module) -> Vec<(u32, u32)> {
     for line in &module.lines {
         walk(line.number, &line.stmts, &mut open, &mut sites);
     }
+    let lines: HashSet<u16> = module.lines.iter().map(|l| l.number).collect();
     sites
+        .into_iter()
+        .filter(|(_, _, target)| lines.contains(target))
+        .map(|(inside, outside, _)| (inside, outside))
+        .collect()
 }
 
 /// Whether any `GOSUB` (including the `ON x GOSUB` form, which lowers
@@ -31230,14 +32529,7 @@ fn str_uses_heap(s: &StrExpr) -> bool {
     }
 }
 
-/// Walk `e` and set every per-T0 helper flag whose corresponding op
-/// would fire during expression lowering. Used by `collect_def_fns`
-/// to predict which `__ST_T0` / `__FADD_T0` / `__FSUB_T0` /
-/// `__FMULT_T0` / `__FDIV_T0` helpers a DEF FN body needs, so the
-/// helper-emission section can land them before the FN body itself
-/// (which is emitted later in `finish()` and would otherwise set the
-/// flags too late). Comparisons go through `emit_compare_fsub_via_temp`
-/// — they trigger `__ST_T0` and `__FSUB_T0`.
+/// Collect the temporary helpers required by an expression.
 fn scan_temp_stash_helpers(
     e: &Expr,
     st: &mut bool,
@@ -31245,6 +32537,7 @@ fn scan_temp_stash_helpers(
     fsub: &mut bool,
     fmult: &mut bool,
     fdiv: &mut bool,
+    fcmp: &mut bool,
 ) {
     match e {
         Expr::Bin(op, l, r) => {
@@ -31268,46 +32561,46 @@ fn scan_temp_stash_helpers(
                 }
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                     *st = true;
-                    *fsub = true;
+                    *fcmp = true;
                 }
             }
-            scan_temp_stash_helpers(l, st, fadd, fsub, fmult, fdiv);
-            scan_temp_stash_helpers(r, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(l, st, fadd, fsub, fmult, fdiv, fcmp);
+            scan_temp_stash_helpers(r, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::Neg(inner) | Expr::Not(inner) => {
-            scan_temp_stash_helpers(inner, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(inner, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::Func1(_, arg) | Expr::FnCall(_, arg) => {
-            scan_temp_stash_helpers(arg, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(arg, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::Peek(addr) | Expr::MemPeek(addr) => {
-            scan_temp_stash_helpers(addr, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(addr, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::ArrayRef(_, idx) => {
             for i in idx {
-                scan_temp_stash_helpers(i, st, fadd, fsub, fmult, fdiv);
+                scan_temp_stash_helpers(i, st, fadd, fsub, fmult, fdiv, fcmp);
             }
         }
         Expr::Pos(arg) | Expr::Usr(arg) | Expr::Joy(arg) | Expr::Pot(arg) => {
-            scan_temp_stash_helpers(arg, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(arg, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::At(row, col) => {
-            scan_temp_stash_helpers(row, st, fadd, fsub, fmult, fdiv);
-            scan_temp_stash_helpers(col, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(row, st, fadd, fsub, fmult, fdiv, fcmp);
+            scan_temp_stash_helpers(col, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::Test(x, y) => {
-            scan_temp_stash_helpers(x, st, fadd, fsub, fmult, fdiv);
-            scan_temp_stash_helpers(y, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(x, st, fadd, fsub, fmult, fdiv, fcmp);
+            scan_temp_stash_helpers(y, st, fadd, fsub, fmult, fdiv, fcmp);
         }
         Expr::Check { first, second } => {
-            scan_temp_stash_helpers(first, st, fadd, fsub, fmult, fdiv);
+            scan_temp_stash_helpers(first, st, fadd, fsub, fmult, fdiv, fcmp);
             if let Some(e) = second {
-                scan_temp_stash_helpers(e, st, fadd, fsub, fmult, fdiv);
+                scan_temp_stash_helpers(e, st, fadd, fsub, fmult, fdiv, fcmp);
             }
         }
         Expr::Inst { start, .. } => {
             if let Some(e) = start {
-                scan_temp_stash_helpers(e, st, fadd, fsub, fmult, fdiv);
+                scan_temp_stash_helpers(e, st, fadd, fsub, fmult, fdiv, fcmp);
             }
         }
         _ => {}
@@ -31481,20 +32774,96 @@ fn scan_module_uses_sys_or_usr(module: &ir::Module) -> bool {
     scan.found
 }
 
-/// The high byte of CURLIN that holds for the WHOLE program, when one does: every BASIC line
-/// number shares it, so `$3A` can be stamped once in the prologue and never again.
+/// Whether a numeric PRINT lies on a control flow cycle.
+fn prints_numbers_in_a_loop(module: &ir::Module, cfg: &crate::cfg::Cfg) -> bool {
+    let prints_number = |id: usize| match cfg.stmt_at(id, module) {
+        Stmt::Print { items, .. } | Stmt::PrintFile { items, .. } => {
+            items.iter().any(|p| matches!(p, PrintPiece::Expr(_)))
+        }
+        _ => false,
+    };
+    let n = cfg.nodes.len();
+    // Iterative Tarjan.
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut call: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut i)) = call.last_mut() {
+            if let Some(&w) = cfg.nodes[v].successors.get(*i) {
+                *i += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    call.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            call.pop();
+            if let Some(&(parent, _)) = call.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut component = Vec::new();
+                loop {
+                    let w = stack.pop().expect("v is on the stack");
+                    on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                let cyclic = component.len() > 1 || cfg.nodes[v].successors.contains(&v);
+                if cyclic && component.iter().any(|&id| prints_number(id)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Common high byte of all line numbers, when one exists.
 fn curlin_hi_invariant(module: &ir::Module) -> Option<u8> {
+    struct Marks(Vec<u16>);
+    impl crate::visit::Visitor for Marks {
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            if let Stmt::LineMark(n) = stmt {
+                self.0.push(*n);
+            }
+            crate::visit::walk_stmt(self, line, stmt);
+        }
+    }
     if module.lines.is_empty()
         || scan_module_uses_sys_or_usr(module)
         || scan_module_observes_curlin(module)
     {
         return None;
     }
+    let mut marks = Marks(Vec::new());
+    crate::visit::walk_module(&mut marks, module);
     let hi = (module.lines[0].number >> 8) as u8;
     module
         .lines
         .iter()
-        .all(|l| (l.number >> 8) as u8 == hi)
+        .map(|l| l.number)
+        .chain(marks.0)
+        .all(|n| (n >> 8) as u8 == hi)
         .then_some(hi)
 }
 
@@ -31514,6 +32883,48 @@ fn stmt_cannot_error(s: &Stmt) -> bool {
             // so CURLIN must stay on this line.
             | Stmt::DefFn { .. }
     )
+}
+
+/// Names backed by clock, I/O status or error state.
+fn is_pseudo_var(v: &VarName) -> bool {
+    matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL")
+}
+
+/// Numeric loads and comparisons that cannot raise an error.
+fn plain_number(e: &Expr) -> bool {
+    match e {
+        Expr::Number(n) => n.is_finite(),
+        Expr::Var(v) => matches!(v.kind, VarKind::Float | VarKind::Integer) && !is_pseudo_var(v),
+        Expr::Peek(addr) => address_literal(addr),
+        _ => false,
+    }
+}
+
+/// Literal PEEK address that needs no range check.
+fn address_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Number(n) if n.fract() == 0.0 && (0.0..=65535.0).contains(n))
+}
+
+/// String pointer loads that require no evaluation.
+fn plain_string(s: &StrExpr) -> bool {
+    match s {
+        StrExpr::Literal(_) => true,
+        StrExpr::Var(v) => v.base != "TI",
+        _ => false,
+    }
+}
+
+/// PRINT values that cannot raise an error.
+fn print_piece_cannot_error(piece: &PrintPiece) -> bool {
+    let byte_literal =
+        |e: &Expr| matches!(e, Expr::Number(n) if n.fract() == 0.0 && (0.0..=255.0).contains(n));
+    match piece {
+        PrintPiece::LiteralString(_) => true,
+        PrintPiece::StrExpr(StrExpr::Literal(_) | StrExpr::Var(_)) => true,
+        PrintPiece::StrExpr(StrExpr::Chr(arg)) => byte_literal(arg),
+        PrintPiece::CharOut(arg) => byte_literal(arg),
+        _ => false,
+    }
 }
 
 /// BASIC V2 operator precedence, as the ROM's table at `$A080` orders it.
@@ -32091,9 +33502,7 @@ fn eval_str_bound(s: &StrExpr, bounds: &HashMap<VarName, u16>) -> u16 {
         // 16 binary digits. Conservative upper bounds.
         StrExpr::HexFmt(_) => 4,
         StrExpr::BinFmt(_) => 16,
-        // STR$ produces "[ -]<digits>[.<digits>][E<sign><exp>]" — at
-        // most ~12 chars for a worst-case float. Round up.
-        StrExpr::Str(_) => 12,
+        StrExpr::Str(_) => 15,
         StrExpr::Left(inner, n) => {
             let inner_max = eval_str_bound(inner, bounds);
             if let Expr::Number(v) = n.as_ref() {
@@ -32170,11 +33579,297 @@ fn stmt_owns_heap_alloc(s: &Stmt) -> bool {
     }
 }
 
-/// Encode a single DATA entry as the bytes that go into the pool:
-/// length byte followed by the canonical text form. Floats get their
-/// debug-format string (close enough to BASIC for typical decimals
-/// and integers; programs that depend on a specific text rendering
-/// can use string-form DATA literals directly).
+/// Convert a signed integer in A/Y to FAC.
+pub const FAST_GIVAYF: &str = "\
+__BYTEFAC:
+    LDA #$00
+__GIVAYF:
+    LDX #$00
+    STX $0D
+    STX $64
+    STX $65
+    STX $70
+    STX $66
+    STY $63
+    TAY
+    BPL __GIVAYF_MAG
+    DEC $66
+    TXA
+    SEC
+    SBC $63
+    STA $63
+    TXA
+    STY $62
+    SBC $62
+    TAY
+__GIVAYF_MAG:
+    LDX #$90
+    TYA
+    BNE __GIVAYF_TOP
+    LDX #$88
+    LDA $63
+    BEQ __GIVAYF_ZERO
+    STY $63
+__GIVAYF_TOP:
+    BMI __GIVAYF_SET
+__GIVAYF_SHIFT:
+    DEX
+    ASL $63
+    ROL
+    BPL __GIVAYF_SHIFT
+__GIVAYF_SET:
+    STA $62
+    STX $61
+    RTS
+__GIVAYF_ZERO:
+    STA $62
+    STA $61
+    RTS
+";
+
+/// Convert a positive FAC below 256 to a byte without FACWORD.
+pub const FAST_FAC_BYTE: &str = "\
+    LDA $66
+    BMI __FAC_BYTE_BAD
+    LDX $61
+    CPX #$89
+    BCS __FAC_BYTE_BAD
+    LDA #$00
+    CPX #$81
+    BCC __FAC_BYTE_DONE
+    LDA $62
+__FAC_BYTE_SHIFT:
+    CPX #$88
+    BEQ __FAC_BYTE_DONE
+    LSR
+    INX
+    BNE __FAC_BYTE_SHIFT
+__FAC_BYTE_DONE:
+    RTS
+__FAC_BYTE_BAD:
+";
+
+/// Convert byte values to FAC and delegate larger values.
+pub const FAST_BYTE_GIVAYF: &str = "\
+__BYTEFAC:
+    LDA #$00
+__GIVAYF:
+    TAX
+    BEQ __GIVAYF_BYTE
+    JMP $B391
+__GIVAYF_BYTE:
+    STX $0D
+    STX $63
+    STX $64
+    STX $65
+    STX $66
+    STX $70
+    LDX #$88
+    TYA
+    BEQ __GIVAYF_ZERO
+    BMI __GIVAYF_SET
+__GIVAYF_SHIFT:
+    DEX
+    ASL
+    BPL __GIVAYF_SHIFT
+__GIVAYF_SET:
+    STA $62
+    STX $61
+    RTS
+__GIVAYF_ZERO:
+    STA $62
+    STA $61
+    RTS
+";
+
+/// Convert positive FAC values below 65536 to LINNUM.
+pub const FAST_FACWORD: &str = "\
+__FACWORD:
+    LDA $66
+    BMI __FACWORD_ROM
+    LDX $61
+    CPX #$91
+    BCS __FACWORD_ROM
+    LDA $62
+    STA $64
+    LDA $63
+    STA $65
+    LDA #$00
+    STA $62
+    STA $63
+    CPX #$81
+    BCC __FACWORD_ZERO
+    CPX #$89
+    BCS __FACWORD_SHIFT
+    LDA $64
+    STA $65
+    LDA #$00
+    STA $64
+    TXA
+    ADC #$08
+    TAX
+__FACWORD_SHIFT:
+    CPX #$90
+    BEQ __FACWORD_DONE
+    LSR $64
+    ROR $65
+    INX
+    BNE __FACWORD_SHIFT
+__FACWORD_ZERO:
+    STA $64
+    STA $65
+__FACWORD_DONE:
+    CLC
+    LDA $64
+    LDY $65
+    STY $14
+    STA $15
+    RTS
+__FACWORD_ROM:
+    JMP $B7F7
+";
+
+/// Route integer conversion calls through the supplied helper.
+pub(crate) fn route_int_to_fac_through_own_code(asm: &str, helper: &str) -> Option<String> {
+    route_rom_calls(asm, &[("$B391", "__GIVAYF"), ("$B3A2", "__BYTEFAC")], helper)
+}
+
+/// Route FACWORD calls through the local helper.
+pub(crate) fn route_facword_through_own_code(asm: &str) -> Option<String> {
+    route_rom_calls(asm, &[("$B7F7", "__FACWORD")], FAST_FACWORD)
+}
+
+/// Place conversion helpers after code that cannot fall through.
+fn route_rom_calls(asm: &str, renames: &[(&str, &str)], helper: &str) -> Option<String> {
+    let marker = "; --- helper subroutines ---\n";
+    let from = asm.find(marker)? + marker.len();
+    let mut at = None;
+    let mut offset = from;
+    let mut prev_exits = false;
+    for line in asm[from..].split_inclusive('\n') {
+        let t = line.split(';').next().unwrap_or("").trim();
+        if !t.is_empty() {
+            if prev_exits && t.ends_with(':') {
+                at = Some(offset);
+                break;
+            }
+            prev_exits = t == "RTS" || t == "RTI" || t.starts_with("JMP ");
+        }
+        offset += line.len();
+    }
+    let at = at?;
+    let mut out = String::with_capacity(asm.len() + helper.len());
+    let mut routed = false;
+    let mut route = |line: &str, out: &mut String| {
+        let t = line.trim();
+        let renamed = t.split_once(' ').and_then(|(mnem, op)| {
+            let (_, to) = renames.iter().find(|(from, _)| *from == op)?;
+            matches!(mnem, "JSR" | "JMP").then(|| format!("    {mnem} {to}"))
+        });
+        match renamed {
+            Some(r) => {
+                routed = true;
+                out.push_str(&r);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    };
+    for line in asm[..at].lines() {
+        route(line, &mut out);
+    }
+    let helper_at = out.len();
+    for line in asm[at..].lines() {
+        route(line, &mut out);
+    }
+    if !routed {
+        return None;
+    }
+    out.insert_str(helper_at, helper);
+    Some(out)
+}
+
+/// Tagged bytes for a whole DATA number within 0..=32767.
+fn tagged_int_bytes(v: &DataValue) -> Option<Vec<u8>> {
+    let DataValue::Float(n) = v else {
+        return None;
+    };
+    if n.fract() != 0.0 || !(0.0..=32767.0).contains(n) {
+        return None;
+    }
+    let i = *n as u16;
+    Some(match i {
+        0..=61 => vec![0xC0 + i as u8],
+        62..=255 => vec![0xFE, i as u8],
+        _ => vec![0xFF, (i & 0xFF) as u8, (i >> 8) as u8],
+    })
+}
+
+/// Shared code cost of tagged DATA reads.
+const READ_TAGGED_COST: usize = 48;
+
+/// Extra tagged DATA code per string READ target.
+const READ_TAGGED_STRING_COST: usize = 48;
+
+/// Extra code cost of testing a tag during cursor advance.
+const READ_TAGGED_ADVANCE_COST: usize = 9;
+
+/// Estimated formatting code cost for tagged integer string reads.
+const READ_TAGGED_TEXT_COST: usize = 700;
+
+/// Does the program already use STR$ and MID$ somewhere?
+fn module_uses_str_and_mid(module: &ir::Module) -> bool {
+    struct Uses {
+        str_: bool,
+        mid: bool,
+    }
+    impl crate::visit::Visitor for Uses {
+        fn visit_str_expr(&mut self, s: &StrExpr) {
+            match s {
+                StrExpr::Str(_) => self.str_ = true,
+                StrExpr::Mid(..) => self.mid = true,
+                _ => {}
+            }
+            crate::visit::walk_str_expr(self, s);
+        }
+    }
+    let mut uses = Uses { str_: false, mid: false };
+    crate::visit::walk_module(&mut uses, module);
+    uses.str_ && uses.mid
+}
+
+/// The heap and its collector, for a program that otherwise has none.
+const READ_TAGGED_HEAP_COST: usize = 1500;
+
+/// Count string READ targets that need the item text.
+pub(crate) fn string_read_target_count(module: &ir::Module) -> usize {
+    struct Count(usize);
+    impl crate::visit::Visitor for Count {
+        fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+            if let Stmt::Read(targets) = stmt {
+                let skip = ir::read_skip_var();
+                self.0 += targets
+                    .iter()
+                    .filter(|t| match t {
+                        ir::ReadTarget::Scalar(v) => v.kind == VarKind::String && *v != skip,
+                        ir::ReadTarget::Array { name, .. } => name.kind == VarKind::String,
+                    })
+                    .count();
+            }
+            crate::visit::walk_stmt(self, line_no, stmt);
+        }
+    }
+    let mut count = Count(0);
+    crate::visit::walk_module(&mut count, module);
+    count.0
+}
+
+/// Four decimal digits keep the sum below signed overflow.
+const DIGITS_FAC_MAX: usize = 4;
+
+/// How many short all-digit DATA items pay for `__DIGITS_FAC` under the Default profile.
+const READ_DIGITS_FROM: usize = 64;
+
 fn data_value_pool_bytes(v: &DataValue, layout: DataPoolLayout) -> Vec<u8> {
     match layout {
         DataPoolLayout::AsciiTagged => {
@@ -32197,11 +33892,21 @@ fn data_value_pool_bytes(v: &DataValue, layout: DataPoolLayout) -> Vec<u8> {
             let i = *n as i16;
             vec![(i as u16 & 0xFF) as u8, ((i as u16) >> 8) as u8]
         }
+        DataPoolLayout::BinaryU8 => {
+            let DataValue::Float(n) = v else {
+                return vec![0u8];
+            };
+            vec![*n as u8]
+        }
         DataPoolLayout::BinaryMflpt => {
             let DataValue::Float(n) = v else {
                 return vec![0u8; 5];
             };
-            float_to_mflpt(*n).to_vec()
+            // READ runs FIN over the item's text and stores the result as LET does, rounded.
+            crate::romfloat::fin(format_data_float(*n).as_bytes())
+                .map(|f| f.packed_rounded())
+                .unwrap_or_else(|| float_to_mflpt(*n))
+                .to_vec()
         }
     }
 }
@@ -32458,52 +34163,26 @@ fn choose_data_pool_layout(data: &[DataValue], module: &ir::Module) -> DataPoolL
     if program_has_string_read(module) {
         return DataPoolLayout::AsciiTagged;
     }
-    let all_fit_i16 = data.iter().all(|v| {
-        let DataValue::Float(n) = v else {
-            return false;
-        };
-        n.is_finite() && n.fract() == 0.0 && (-32768.0..=32767.0).contains(n)
-    });
-    if all_fit_i16 {
+    let all_fit = |lo: f64, hi: f64| {
+        data.iter().all(|v| {
+            let DataValue::Float(n) = v else {
+                return false;
+            };
+            n.is_finite() && n.fract() == 0.0 && (lo..=hi).contains(n)
+        })
+    };
+    if all_fit(0.0, 255.0) {
+        DataPoolLayout::BinaryU8
+    } else if all_fit(-32768.0, 32767.0) {
         DataPoolLayout::BinaryI16
     } else {
         DataPoolLayout::BinaryMflpt
     }
 }
 
-/// True iff any statement in the module READs into a string-typed
-/// target (scalar or array element). Binary DATA layouts can't
-/// satisfy a string READ, so the presence of one forces the ASCII
-/// fallback.
+/// Whether any READ needs text rather than binary DATA.
 fn program_has_string_read(module: &ir::Module) -> bool {
-    fn scan_targets(targets: &[ir::ReadTarget]) -> bool {
-        targets.iter().any(|t| match t {
-            ir::ReadTarget::Scalar(v) => v.kind == VarKind::String,
-            ir::ReadTarget::Array { name, .. } => name.kind == VarKind::String,
-        })
-    }
-    fn scan_stmts(stmts: &[Stmt]) -> bool {
-        for s in stmts {
-            match s {
-                Stmt::Read(t) => {
-                    if scan_targets(t) {
-                        return true;
-                    }
-                }
-                Stmt::If {
-                    then: ThenIr::Stmts(inner),
-                    ..
-                } => {
-                    if scan_stmts(inner) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-    module.lines.iter().any(|line| scan_stmts(&line.stmts))
+    string_read_target_count(module) > 0
 }
 
 /// Comment-only label shown alongside the bytes in the emitted pool.
@@ -33251,6 +34930,19 @@ enum SliceKind {
 }
 
 // ===== Helpers =====
+
+/// Whether a cacheable FAC expression reads `var`.
+fn fac_expr_reads_var(e: &Expr, var: &VarName) -> bool {
+    match e {
+        Expr::Var(v) => v == var,
+        Expr::Neg(inner) | Expr::Not(inner) | Expr::Func1(_, inner) => {
+            fac_expr_reads_var(inner, var)
+        }
+        Expr::Bin(_, lhs, rhs) => fac_expr_reads_var(lhs, var) || fac_expr_reads_var(rhs, var),
+        Expr::Number(_) => false,
+        _ => true,
+    }
+}
 
 /// Returns Some((lo, hi)) if `n` is exactly representable as a signed
 /// 16-bit integer. Used to take the GIVAYF fast path for integer literals
@@ -34006,7 +35698,43 @@ fn compute_zp_pool_order(f: &ZpFeatureScan) -> Vec<u8> {
     pool
 }
 
-/// Rewrite zero-page pointer operands using the relocation map.
+/// Whether a label belongs to the DATA pool.
+fn is_pool_label(name: &str) -> bool {
+    let numbered = |rest: Option<&str>| {
+        rest.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    name == "__DATA"
+        || name == "__DATA_END"
+        || numbered(name.strip_prefix("__DATA_LINE_"))
+        || numbered(name.strip_prefix("__DBAD_S"))
+        || numbered(name.strip_prefix("__DBAD_E"))
+}
+
+/// Prefix every DATA pool label in `asm` with [`RELOCATED_PREFIX`].
+fn rename_relocated_pool_labels(asm: &str) -> String {
+    let bytes = asm.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = String::with_capacity(asm.len() + 1024);
+    let (mut i, mut copied) = (0usize, 0usize);
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        if is_pool_label(&asm[start..i]) {
+            out.push_str(&asm[copied..start]);
+            out.push_str(RELOCATED_PREFIX);
+            copied = start;
+        }
+    }
+    out.push_str(&asm[copied..]);
+    out
+}
+
 fn relocate_zp_operands(asm: &str, remap: &[(u8, u8)]) -> String {
     let mut map = [None; 256];
     for &(from, to) in remap {
@@ -34145,7 +35873,7 @@ fn adjust_for_depth(stmt: &Stmt, for_open: &mut Vec<bool>, struct_open: &mut Vec
 fn collect_for_top_restamp_sites(
     module: &ir::Module,
     tail_wants_curlin: &dyn Fn(&Stmt) -> bool,
-) -> HashSet<(usize, usize)> {
+) -> HashSet<(usize, Vec<usize>)> {
     let mut open: Vec<Option<((usize, usize), u16)>> = Vec::new();
     let mut sites: HashSet<(usize, usize)> = HashSet::new();
     for (line_idx, line) in module.lines.iter().enumerate() {
@@ -34164,7 +35892,64 @@ fn collect_for_top_restamp_sites(
             }
         }
     }
-    sites
+    // Use frame reachability when an IF body changes NEXT pairing.
+    let cfg = crate::cfg::Cfg::build(module);
+    let mut node_of: HashMap<(usize, Vec<usize>), usize> = HashMap::new();
+    for (id, node) in cfg.nodes.iter().enumerate() {
+        node_of.insert((node.stmt.line_idx, node.stmt.path.clone()), id);
+    }
+    let mut out: HashSet<(usize, Vec<usize>)> =
+        sites.into_iter().map(|(line_idx, k)| (line_idx, vec![k])).collect();
+    fn walk(
+        stmts: &[Stmt],
+        prefix: &mut Vec<usize>,
+        line_idx: usize,
+        line_no: u16,
+        module: &ir::Module,
+        cfg: &crate::cfg::Cfg,
+        node_of: &HashMap<(usize, Vec<usize>), usize>,
+        tail_wants_curlin: &dyn Fn(&Stmt) -> bool,
+        out: &mut HashSet<(usize, Vec<usize>)>,
+    ) {
+        for (k, stmt) in stmts.iter().enumerate() {
+            prefix.push(k);
+            if let Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } = stmt
+            {
+                walk(inner, prefix, line_idx, line_no, module, cfg, node_of, tail_wants_curlin, out);
+            }
+            if matches!(stmt, Stmt::For { .. }) && stmts[k + 1..].iter().any(tail_wants_curlin) {
+                let mut body_path = prefix.clone();
+                *body_path.last_mut().unwrap() += 1;
+                if let Some(&body) = node_of.get(&(line_idx, body_path)) {
+                    let re_entered = cfg.nodes[body].predecessors.iter().any(|&p| {
+                        cfg.nodes[p].line_no != line_no
+                            && matches!(cfg.stmt_at(p, module), Stmt::Next { .. })
+                    });
+                    if re_entered {
+                        out.insert((line_idx, prefix.clone()));
+                    }
+                }
+            }
+            prefix.pop();
+        }
+    }
+    for (line_idx, line) in module.lines.iter().enumerate() {
+        walk(
+            &line.stmts,
+            &mut Vec::new(),
+            line_idx,
+            line.number,
+            module,
+            &cfg,
+            &node_of,
+            tail_wants_curlin,
+            &mut out,
+        );
+    }
+    out
 }
 
 fn close_for_restamp_frames(
@@ -34329,17 +36114,6 @@ fn is_basic_bool(e: &Expr) -> bool {
     }
 }
 
-/// Whether skipping this boolean operand preserves side effects and runtime errors.
-fn short_circuit_operand_ok(e: &Expr) -> bool {
-    match e {
-        Expr::Bin(BinOp::And | BinOp::Or | BinOp::Xor, l, r) if is_basic_bool(e) => {
-            short_circuit_operand_ok(l) && short_circuit_operand_ok(r)
-        }
-        Expr::Not(inner) if is_basic_bool(e) => short_circuit_operand_ok(inner),
-        _ => crate::passes::expr_is_pure(e) && crate::passes::expr_cannot_trap(e),
-    }
-}
-
 fn float_zero_compare_var(op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<(BinOp, VarName)> {
     if let Expr::Var(v) = lhs
         && is_direct_float_var(v)
@@ -34364,6 +36138,25 @@ fn is_zero_number(e: &Expr) -> bool {
     matches!(e, Expr::Number(n) if *n == 0.0)
 }
 
+/// Whether generated code preserves both LINNUM bytes.
+fn code_keeps_linnum(code: &str) -> bool {
+    code.lines().all(|line| {
+        let body = line.split(';').next().unwrap_or("").trim();
+        let mut parts = body.split_whitespace();
+        let mnem = parts.next().unwrap_or("");
+        let operand = parts.next().unwrap_or("");
+        if mnem == "JSR" {
+            return false;
+        }
+        let base = operand
+            .trim_start_matches(['#', '('])
+            .split([',', ')', '+'])
+            .next()
+            .unwrap_or("");
+        !matches!(base, "$14" | "$15" | "$0014" | "$0015")
+    })
+}
+
 fn swap_compare_op(op: BinOp) -> BinOp {
     match op {
         BinOp::Lt => BinOp::Gt,
@@ -34383,24 +36176,14 @@ fn range_fits_u8(range: crate::dataflow::IntRange) -> bool {
     range.min >= 0 && range.max <= u8::MAX as i32
 }
 
-/// Sign-classification for byte-storable integer ranges. Unsigned
-/// vars (range fits [0, 255]) widen with `LDA #$00`; signed vars
-/// (any range fitting in 256 distinct values inside [-128, 255]
-/// that includes a negative value) widen by sign-extending bit 7
-/// of the byte.
+/// Sign rule for a byte storage range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ByteSign {
     Unsigned,
     Signed,
 }
 
-/// Predicate for "this range fits one byte of storage." Returns
-/// `Some(Unsigned)` for `[0, 255]`, `Some(Signed)` when the range
-/// includes a negative value but still fits in 256 distinct values
-/// inside `[-128, 255]`, and `None` otherwise. Mixed ranges like
-/// bubble sort's `[-1, 239]` qualify as Signed because the bit
-/// patterns used are `$FF` (for -1) plus `$00..$EF` — sign-extension
-/// from bit 7 recovers the right high byte for either.
+/// Classify ranges that fit one byte of storage.
 fn range_fits_byte(range: crate::dataflow::IntRange) -> Option<ByteSign> {
     if range_fits_u8(range) {
         return Some(ByteSign::Unsigned);
@@ -34411,14 +36194,14 @@ fn range_fits_byte(range: crate::dataflow::IntRange) -> Option<ByteSign> {
     None
 }
 
-/// Record a signed-byte var's proved write range, widening whatever is already there.
-fn merge_signed_byte_bound(
+/// Record a byte var's proved write range, widening whatever is already there.
+fn merge_byte_write_bound(
     signed: &mut HashMap<VarName, (i32, i32)>,
     var: &VarName,
     range: Option<crate::dataflow::IntRange>,
 ) {
     let Some(r) = range else {
-        debug_assert!(false, "range_fits_byte said Signed without a range");
+        debug_assert!(false, "range_fits_byte fitted a write without a range");
         return;
     };
     signed
@@ -34428,6 +36211,44 @@ fn merge_signed_byte_bound(
             b.1 = b.1.max(r.max);
         })
         .or_insert((r.min, r.max));
+}
+
+/// Exclude integer writes without a known range.
+fn reject_unranged_int_writes(
+    stmt: &Stmt,
+    candidates: &mut HashSet<VarName>,
+    rejected: &mut HashSet<VarName>,
+) {
+    struct Writes<'a> {
+        candidates: &'a mut HashSet<VarName>,
+        rejected: &'a mut HashSet<VarName>,
+    }
+    impl crate::visit::Visitor for Writes<'_> {
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            let scalar = |t: &'_ ir::ReadTarget| match t {
+                ir::ReadTarget::Scalar(v) => Some(v.clone()),
+                _ => None,
+            };
+            let written: Vec<VarName> = match stmt {
+                Stmt::Let { var, .. } | Stmt::For { var, .. } | Stmt::KeyGet { var } => {
+                    vec![var.clone()]
+                }
+                Stmt::Get { var, indices } if indices.is_empty() => vec![var.clone()],
+                Stmt::Fetch { target, .. } => vec![target.clone()],
+                Stmt::GetFile { vars, .. } => vars.clone(),
+                Stmt::Read(targets)
+                | Stmt::Input { targets, .. }
+                | Stmt::InputFile { targets, .. } => targets.iter().filter_map(scalar).collect(),
+                _ => Vec::new(),
+            };
+            for var in written.into_iter().filter(is_integer_scalar) {
+                self.candidates.insert(var.clone());
+                self.rejected.insert(var);
+            }
+            crate::visit::walk_stmt(self, line, stmt);
+        }
+    }
+    crate::visit::Visitor::visit_stmt(&mut Writes { candidates, rejected }, 0, stmt);
 }
 
 fn reject_u8_read_targets(
@@ -34679,7 +36500,20 @@ impl IfByte {
     }
 }
 
-/// Match a `Number(n)` whose value fits in u8.
+/// Integral literal within the signed 16 bit range.
+fn small_int_literal(e: &Expr) -> Option<i32> {
+    let (n, sign) = match e {
+        Expr::Number(n) => (*n, 1.0),
+        Expr::Neg(inner) => match inner.as_ref() {
+            Expr::Number(n) => (*n, -1.0),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let n = n * sign;
+    (n.is_finite() && n.fract() == 0.0 && (-32768.0..=32767.0).contains(&n)).then_some(n as i32)
+}
+
 fn u8_literal(e: &Expr) -> Option<u8> {
     let Expr::Number(n) = e else { return None };
     if !n.is_finite() || n.fract() != 0.0 || !(0.0..=255.0).contains(n) {
@@ -35269,23 +37103,45 @@ fn pick_var_mem_operand<'a>(op: BinOp, lhs: &'a Expr, rhs: &'a Expr) -> Option<&
         None
     };
     match op {
-
-        BinOp::Add | BinOp::Mul => pick(lhs).or_else(|| {
+        // FADD gives the same bits whichever operand sits in FAC once both load cleanly.
+        BinOp::Add => pick(lhs).or_else(|| {
             fac_result_is_already_rounded(lhs)
                 .then(|| pick(rhs))
                 .flatten()
         }),
-        BinOp::Sub | BinOp::Div => pick(lhs),
+        BinOp::Mul | BinOp::Sub | BinOp::Div => pick(lhs),
         _ => None,
     }
+}
+
+/// Whether evaluating the expression clears the FAC rounding byte.
+pub(crate) fn fac_rounding_byte_clear(e: &Expr) -> bool {
+    fac_result_is_already_rounded(e)
+        || matches!(
+            e,
+            Expr::Bin(
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Xor,
+                _,
+                _
+            ) | Expr::Not(_)
+        )
 }
 
 /// Whether FAC's rounding byte is clear after evaluating the expression.
 fn fac_result_is_already_rounded(e: &Expr) -> bool {
     match e {
+        // A literal is a straight load unless FIN leaves bits in the rounding byte.
+        Expr::Number(n) => crate::romfloat::rounding_byte(*n) == 0,
         // Straight loads: MOVFM / GIVAYF / BYTEFAC all zero $70.
-        Expr::Number(_)
-        | Expr::Var(_)
+        Expr::Var(_)
         | Expr::ArrayRef(..)
         | Expr::Peek(_)
         | Expr::MemPeek(_)
@@ -35314,7 +37170,10 @@ fn pick_const_mem_operand<'a>(op: BinOp, lhs: &'a Expr, rhs: &'a Expr) -> Option
             }
 
             if let Expr::Number(n) = rhs {
-                if fac_result_is_already_rounded(lhs) {
+                if op == BinOp::Add
+                    && fac_result_is_already_rounded(lhs)
+                    && fac_result_is_already_rounded(rhs)
+                {
                     return Some((*n, lhs));
                 }
             }
@@ -35337,6 +37196,7 @@ fn op_short_name(op: BinOp) -> &'static str {
         BinOp::Sub => "FSUB",
         BinOp::Mul => "FMUL",
         BinOp::Div => "FDIV",
+        BinOp::Eq => "FCMP",
         _ => unreachable!("op_short_name only handles arith ops"),
     }
 }
@@ -35347,6 +37207,7 @@ fn op_rom_addr(op: BinOp) -> u16 {
         BinOp::Sub => rt::FSUB,
         BinOp::Mul => rt::FMULT,
         BinOp::Div => rt::FDIV,
+        BinOp::Eq => rt::FCOMP,
         _ => unreachable!("op_rom_addr only handles arith ops"),
     }
 }
@@ -35377,16 +37238,13 @@ impl<'a> crate::visit::Visitor for FacOpVarCounter<'a> {
                     }
                 }
             }
-            // Compare ops in IF use FSUB underneath when lhs is a Var,
-            // so count those here too — keeps the per-var FSUB stub at
-            // threshold even when the only uses are compares.
             if matches!(
                 op,
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
             ) {
                 if let Expr::Var(v) = lhs.as_ref() {
                     if is_direct_float_var(v) {
-                        *self.uses.entry((v.clone(), BinOp::Sub)).or_insert(0) += 1;
+                        *self.uses.entry((v.clone(), BinOp::Eq)).or_insert(0) += 1;
                     }
                 }
             }
@@ -35418,13 +37276,13 @@ impl<'a> crate::visit::Visitor for FacOpConstCounter<'a> {
                     }
                 }
             }
-            // Compare with Number lhs uses the per-const FSUB stub.
+            // A compare with a Number lhs runs FCOMP against the pooled constant.
             if matches!(
                 op,
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
             ) {
                 if let Expr::Number(n) = lhs.as_ref() {
-                    *self.uses.entry((n.to_bits(), BinOp::Sub)).or_insert(0) += 1;
+                    *self.uses.entry((n.to_bits(), BinOp::Eq)).or_insert(0) += 1;
                 }
             }
         }
@@ -36249,6 +38107,201 @@ fn install_bss_tail_fill(code: &mut String, zp_lo: u8) -> usize {
     run_bytes
 }
 
+/// Clear state blocks outside the zero fill and retain fallback clearing code.
+fn install_state_zero(code: &mut String, labels: &[String], zp_lo: u8) {
+    let lines: Vec<&str> = code.lines().collect();
+    let fill_start = lines.iter().position(|l| l.trim() == format!("{BSS_START_LABEL}:"));
+    let (mut outside, mut inside) = (Vec::new(), Vec::new());
+    for label in labels {
+        let head = format!("{label}:");
+        let Some(at) = lines.iter().position(|l| l.trim() == head) else {
+            continue;
+        };
+        let end = (label == "__VARS_START").then_some("__VARS_END:");
+        let bytes = zero_block_bytes(&lines, at, end);
+        if bytes > 0 {
+            let blocks = if fill_start.is_some_and(|f| f < at) { &mut inside } else { &mut outside };
+            blocks.push((label.as_str(), bytes));
+        }
+    }
+    let reset = lines.iter().any(|l| l.trim_end() == STATE_RESET_ZERO_MARKER);
+    let mut id = 0;
+    let (mut zero, mut kept) = (String::new(), String::new());
+    emit_zero_blocks(&mut zero, &outside, zp_lo, &mut id);
+    emit_zero_blocks(&mut kept, &inside, zp_lo, &mut id);
+    let mut stash = String::new();
+    if !kept.is_empty() {
+        for line in format!("    LDA #$00\n{kept}").lines() {
+            writeln!(stash, "{IF_NO_FILL_PREFIX}{}", line.trim()).unwrap();
+        }
+    }
+    // The routine's own copy of the blocks inside the fill, and the entry past them.
+    let mut first = String::new();
+    let mut entry = "__STATE_RESET";
+    if reset && !inside.is_empty() {
+        first.push_str("    LDA #$00\n");
+        emit_zero_blocks(&mut first, &inside, zp_lo, &mut id);
+        first.push_str("__STATE_RESET_OUT:\n");
+        entry = "__STATE_RESET_OUT";
+    }
+    let mut out = String::with_capacity(code.len() + zero.len() + stash.len() + first.len() + 16);
+    // The zeroing leaves .A zero for the next instruction.
+    let mut a_zero = false;
+    let mut in_init = false;
+    for line in code.split_inclusive('\n') {
+        if in_init {
+            in_init = line.trim_end() != STATE_INIT_CLOSE;
+            continue;
+        }
+        let marker = matches!(line.trim_end(), STATE_INIT_OPEN | STATE_INIT_CLOSE);
+        if a_zero && !line.trim().is_empty() && !marker {
+            a_zero = false;
+            if line.trim_end() == "    LDA #$00" {
+                continue;
+            }
+        }
+        match line.trim_end() {
+            STATE_ZERO_MARKER if !reset => {
+                if !zero.is_empty() {
+                    out.push_str("    LDA #$00\n");
+                    out.push_str(&zero);
+                    a_zero = true;
+                }
+            }
+            STATE_RESET_ZERO_MARKER => {
+                out.push_str(&first);
+                if !zero.is_empty() {
+                    out.push_str("    LDA #$00\n");
+                    out.push_str(&zero);
+                    a_zero = true;
+                }
+            }
+            STATE_INIT_OPEN if reset => {
+                writeln!(out, "    JSR {entry}").unwrap();
+                in_init = true;
+            }
+            STATE_ZERO_MARKER | STATE_INIT_OPEN | STATE_INIT_CLOSE => {}
+            BSS_FILL_CLOSE => {
+                out.push_str(&stash);
+                out.push_str(line);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    *code = out;
+}
+
+/// Count zero bytes up to the next block boundary.
+fn zero_block_bytes(lines: &[&str], at: usize, end: Option<&str>) -> usize {
+    let mut bytes = 0;
+    for line in &lines[at + 1..] {
+        let t = line.trim();
+        if Some(t) == end {
+            break;
+        }
+        if t.is_empty() || t.starts_with(';') {
+            continue;
+        }
+        if t.ends_with(':') {
+            if end.is_some() {
+                continue;
+            }
+            break;
+        }
+        match zero_data_line_bytes(t) {
+            Some(n) => bytes += n,
+            None => break,
+        }
+    }
+    bytes
+}
+
+/// Bytes of the page loop that zeroes one block of 256 bytes or more.
+const ZERO_PAGE_LOOP_BYTES: usize = 29;
+/// Bytes of a `LDX #n` / `DEX` / `BNE` loop besides its stores.
+const ZERO_LOOP_BYTES: usize = 5;
+
+/// Bytes the stores for `size` bytes take in the loop that counts `counts`' largest fit.
+fn zero_stores_bytes(size: usize, counts: &[usize]) -> usize {
+    let fit = counts.iter().copied().filter(|&c| c <= size).max();
+    let stores = fit.map_or(usize::MAX, |c| 3 * size.div_ceil(c));
+    if size >= 256 { stores.min(ZERO_PAGE_LOOP_BYTES) } else { stores }
+}
+
+fn zero_blocks_bytes(sizes: &[usize], counts: &[usize]) -> usize {
+    sizes
+        .iter()
+        .fold(ZERO_LOOP_BYTES * counts.len(), |sum, &s| sum.saturating_add(zero_stores_bytes(s, counts)))
+}
+
+/// Clear blocks with shared loops. A enters and leaves as zero.
+fn emit_zero_blocks(out: &mut String, blocks: &[(&str, usize)], zp_lo: u8, id: &mut usize) {
+    let sizes: Vec<usize> = blocks.iter().map(|b| b.1).filter(|&s| s > 2).collect();
+    let mut counts: Vec<usize> = sizes.iter().map(|&s| s.min(255)).collect();
+    counts.sort_unstable();
+    counts.dedup();
+    // Drop the count whose loop costs more than the stores it saves, while one does.
+    loop {
+        let now = zero_blocks_bytes(&sizes, &counts);
+        let best = (0..counts.len())
+            .map(|k| {
+                let mut fewer = counts.clone();
+                fewer.remove(k);
+                (zero_blocks_bytes(&sizes, &fewer), k)
+            })
+            .min();
+        match best {
+            Some((bytes, k)) if bytes < now => {
+                counts.remove(k);
+            }
+            _ => break,
+        }
+    }
+    for &(label, bytes) in blocks.iter().filter(|b| b.1 <= 2) {
+        writeln!(out, "    STA {label}").unwrap();
+        if bytes == 2 {
+            writeln!(out, "    STA {label}+1").unwrap();
+        }
+    }
+    let paged = |s: usize| s >= 256 && zero_stores_bytes(s, &counts) == ZERO_PAGE_LOOP_BYTES;
+    for &count in counts.iter().rev() {
+        let mut stores = String::new();
+        for &(label, bytes) in blocks {
+            let fit = counts.iter().copied().filter(|&c| c <= bytes).max();
+            if bytes <= 2 || paged(bytes) || fit != Some(count) {
+                continue;
+            }
+            let parts = bytes.div_ceil(count);
+            for k in 0..parts {
+                match if k + 1 == parts { bytes - count } else { k * count } {
+                    0 => writeln!(stores, "    STA {label}-1,X").unwrap(),
+                    base => writeln!(stores, "    STA {label}+{},X", base - 1).unwrap(),
+                }
+            }
+        }
+        if stores.is_empty() {
+            continue;
+        }
+        let l = format!("__SZ_{id}");
+        *id += 1;
+        writeln!(out, "    LDX #${count:02X}\n{l}:\n{stores}    DEX\n    BNE {l}").unwrap();
+    }
+    let zp_hi = zp_lo.wrapping_add(1);
+    for &(label, bytes) in blocks.iter().filter(|b| paged(b.1)) {
+        let l = format!("__SZ_{id}");
+        *id += 1;
+        writeln!(out, "    LDA #<{label}\n    STA ${zp_lo:02X}").unwrap();
+        writeln!(out, "    LDA #>{label}\n    STA ${zp_hi:02X}").unwrap();
+        writeln!(out, "    LDA #$00\n    LDX #${:02X}\n    TAY", bytes >> 8).unwrap();
+        writeln!(out, "{l}P:\n    STA (${zp_lo:02X}),Y\n    INY\n    BNE {l}P").unwrap();
+        writeln!(out, "    INC ${zp_hi:02X}\n    DEX\n    BNE {l}P").unwrap();
+        if bytes & 0xFF != 0 {
+            writeln!(out, "    LDY #${:02X}", bytes & 0xFF).unwrap();
+            writeln!(out, "{l}B:\n    DEY\n    STA (${zp_lo:02X}),Y\n    BNE {l}B").unwrap();
+        }
+    }
+}
+
 fn emit_byte_run(out: &mut String, bytes: &[u8], null_terminated: bool) {
     write!(out, "    .byte ").unwrap();
     for b in bytes {
@@ -36392,6 +38445,22 @@ mod tests {
 
     fn bss_fixture(tail: &str) -> String {
         format!("*=$080D\n    CLD\n{BSS_FILL_MARKER}\n    RTS\n{tail}")
+    }
+
+    #[test]
+    fn the_int_to_fac_helper_goes_where_nothing_runs_into_it() {
+        let asm = "    LDA #$00\n    LDY #$05\n    JSR $B391\n    LDY #$07\n    JSR $B3A2\n\
+                   \x20   LDA #<S0\n; --- helper subroutines ---\n__STR_PRINT:\n    STA $FD\n\
+                   \x20   RTS\n__OTHER:\n    JMP $FFD2\n";
+        let out = super::route_int_to_fac_through_own_code(asm, super::FAST_BYTE_GIVAYF).unwrap();
+        assert!(out.contains("    LDA #<S0\n; --- helper subroutines ---\n__STR_PRINT:\n"), "{out}");
+        assert!(out.contains("    RTS\n__BYTEFAC:\n"), "{out}");
+        assert!(out.contains("    JSR __GIVAYF\n") && out.contains("    JSR __BYTEFAC\n"), "{out}");
+        assert!(!out.contains("JSR $B391") && !out.contains("JSR $B3A2"), "{out}");
+        assert!(out.contains("    JMP $FFD2\n"), "{out}");
+
+        let none = "    LDA #$01\n; --- helper subroutines ---\n__A:\n    RTS\n__B:\n    RTS\n";
+        assert_eq!(super::route_int_to_fac_through_own_code(none, super::FAST_GIVAYF), None);
     }
 
     #[test]
@@ -36616,6 +38685,122 @@ __LOOP:
         }
     }
 
+    #[test]
+    fn the_heap_copy_leaves_the_collectors_owner_pointer_alone() {
+        let m = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![
+                    Stmt::LetStr { var: svar("A"), value: StrExpr::Literal(b"X".to_vec()) },
+                    Stmt::Print {
+                        items: vec![PrintPiece::Expr(Expr::Fre(Box::new(Expr::Number(0.0))))],
+                        newline: true,
+                    },
+                ],
+            }],
+        };
+        let asm = emit_with_profile(&m, Profile::Default).expect("emits");
+        let copy = asm
+            .split("__HEAP_COPY_SMC:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("    RTS\n").next())
+            .expect("the copy helper is emitted");
+        assert!(!copy.contains("$FD") && !copy.contains("$FE"), "{copy}");
+        assert!(asm.contains("    JSR __HEAP_COPY_SMC\n    LDY #$00\n"), "{asm}");
+    }
+
+    fn dim_estimate(lines: Vec<Vec<Stmt>>) -> u32 {
+        let module = Module {
+            lines: lines
+                .into_iter()
+                .enumerate()
+                .map(|(i, stmts)| Line { number: 10 * (i as u16 + 1), stmts })
+                .collect(),
+        };
+        super::runtime_dim_estimate(&module, &super::SourceIntegerVars::default()).compiled
+    }
+
+    fn let_n(name: &str, n: f64) -> Stmt {
+        Stmt::Let { var: fvar(name), value: Expr::Number(n) }
+    }
+
+    fn dim(name: VarName, dims: Vec<Expr>) -> Stmt {
+        Stmt::Dim(vec![DimSpec { name, dims }])
+    }
+
+    #[test]
+    fn runtime_dims_are_sized_from_the_latest_literal_write() {
+        let n = || Expr::Var(fvar("N"));
+        assert_eq!(
+            dim_estimate(vec![
+                vec![let_n("N", 1000.0), let_n("N", 40.0)],
+                vec![dim(fvar("A"), vec![n()]), dim(svar("B"), vec![n()])],
+            ]),
+            41 * 5 + 41 * 2
+        );
+        // (3+1) * (2+1) integers, from `N+1` and a literal.
+        assert_eq!(
+            dim_estimate(vec![
+                vec![let_n("N", 2.0)],
+                vec![dim(ivar("C"), vec![
+                    Expr::Bin(BinOp::Add, Box::new(n()), Box::new(Expr::Number(1.0))),
+                    Expr::Number(2.0),
+                ])],
+            ]),
+            4 * 3 * 2
+        );
+        // An array DIMed twice counts once, at its larger size.
+        assert_eq!(
+            dim_estimate(vec![
+                vec![let_n("N", 9.0), dim(fvar("A"), vec![n()])],
+                vec![let_n("N", 4.0), dim(fvar("A"), vec![n()])],
+            ]),
+            10 * 5
+        );
+    }
+
+    #[test]
+    fn runtime_dims_are_also_sized_as_stock_basic_would_store_them() {
+        let n = || Expr::Var(fvar("N"));
+        let module = Module {
+            lines: vec![Line {
+                number: 10,
+                stmts: vec![
+                    let_n("N", 9.0),
+                    dim(ivar("A"), vec![n()]),
+                    dim(svar("B"), vec![n()]),
+                    dim(ivar("C"), vec![n(), Expr::Number(1.0)]),
+                ],
+            }],
+        };
+        let mut source = super::SourceIntegerVars::default();
+        source.arrays.insert(ivar("A"));
+        let got = super::runtime_dim_estimate(&module, &source);
+        assert_eq!(got.compiled, 10 * 2 + 10 * 2 + 20 * 2);
+        assert_eq!(got.stock, (10 * 2 + 7) + (10 * 3 + 7) + (20 * 5 + 9));
+    }
+
+    #[test]
+    fn runtime_dims_with_unknown_subscripts_count_nothing() {
+        let n = || Expr::Var(fvar("N"));
+        assert_eq!(
+            dim_estimate(vec![
+                vec![let_n("N", 40.0)],
+                vec![Stmt::Input { prompt: None, targets: vec![ReadTarget::Scalar(fvar("N"))] }],
+                vec![dim(fvar("A"), vec![n()]), dim(fvar("B"), vec![Expr::Var(fvar("M"))])],
+            ]),
+            0
+        );
+        // A non-literal LET, and a literal DIM (static storage, not heap).
+        assert_eq!(
+            dim_estimate(vec![
+                vec![Stmt::Let { var: fvar("N"), value: Expr::Var(fvar("Q")) }],
+                vec![dim(fvar("A"), vec![n()]), dim(fvar("B"), vec![Expr::Number(500.0)])],
+            ]),
+            0
+        );
+    }
+
     fn ivar(name: &str) -> VarName {
         VarName {
             base: name.to_string(),
@@ -36834,8 +39019,6 @@ __LOOP:
         );
         assert_assembles(&asm);
 
-        // The counter must be independent of the 6502 stack: the peephole turns `JSR __RET_CHK;
-        // RTS` into a tail jump, so a stack-depth compare would misfire inside a real GOSUB.
         let m = Module {
             lines: vec![
                 Line {
@@ -36844,7 +39027,7 @@ __LOOP:
                 },
                 Line {
                     number: 20,
-                    stmts: vec![Stmt::End],
+                    stmts: vec![Stmt::Goto { target: 30 }],
                 },
                 Line {
                     number: 30,
@@ -39029,12 +41212,8 @@ __LOOP:
             "dynamic STEP should stash sign\n{asm}"
         );
         assert!(
-            asm.contains("LDA FS_SIGN_0"),
-            "NEXT should reload dynamic STEP sign\n{asm}"
-        );
-        assert!(
-            asm.contains("__FOR_DYN_NEG_"),
-            "NEXT should branch by runtime STEP sign\n{asm}"
+            asm.contains("CMP FS_SIGN_0"),
+            "NEXT should compare FCOMP's result with the runtime STEP sign\n{asm}"
         );
     }
 
@@ -39274,12 +41453,13 @@ __LOOP:
             ],
         };
         let asm = emit_with_profile(&m, Profile::default()).unwrap();
-        // V_I gets END+STEP via __LD_BYTE_FAC + MOVMF; the FU counter
-        // slot is sync'd to the same byte so later byte-context reads
-        // of the FOR var (POKE A,I etc.) see the post-loop value.
         assert!(
-            asm.contains("__FOR_EXIT_0:\n    LDA #$06\n    STA FU_0"),
-            "u8 exact FOR should sync counter slot to END+STEP\n{asm}"
+            asm.contains("    INC FU_0\n    LDA FU_0\n    CMP #$06\n    BEQ __FOR_EXIT_0\n"),
+            "u8 exact FOR should test the counter at END+STEP\n{asm}"
+        );
+        assert!(
+            !asm.contains("__FOR_EXIT_0:\n    LDA #$06\n    STA FU_0"),
+            "the counter already holds END+STEP; no re-store\n{asm}"
         );
         assert!(
             asm.contains("LDY #$06"),
@@ -39896,7 +42076,7 @@ __LOOP:
     }
 
     #[test]
-    fn codegen_reuses_fac_after_float_array_store_value() {
+    fn codegen_recomputes_a_value_an_array_store_rounded() {
         let a = fvar("A");
         let x = fvar("X");
         let expr = Expr::Bin(
@@ -39939,8 +42119,8 @@ __LOOP:
         };
         let asm = emit_with_profile(&m, Profile::default()).unwrap();
         assert!(
-            asm.matches("; reuse FAC").count() >= 1,
-            "PRINT should reuse FAC left by float array store\n{asm}"
+            !asm.contains("; reuse FAC"),
+            "PRINT must not reuse the rounded X+1 the array store left\n{asm}"
         );
     }
 
@@ -39977,7 +42157,7 @@ __LOOP:
     }
 
     #[test]
-    fn codegen_reuses_fac_for_repeated_pure_subexpression() {
+    fn codegen_recomputes_a_repeated_subexpression_its_stash_rounded() {
         let a = fvar("A");
         let a_plus_one = Expr::Bin(
             BinOp::Add,
@@ -40000,8 +42180,8 @@ __LOOP:
         };
         let asm = emit_with_profile(&m, Profile::default()).unwrap();
         assert!(
-            asm.matches("; reuse FAC").count() >= 1,
-            "second (A+1) should reuse the FAC copy stashed for the first\n{asm}"
+            !asm.contains("; reuse FAC"),
+            "second (A+1) must not reuse the rounded copy stashed for the first\n{asm}"
         );
     }
 

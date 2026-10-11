@@ -121,8 +121,10 @@ fn the_boot_ceiling_is_captured_before_the_first_heap_init() {
         let capture = asm
             .find("    STA __ARR_HEAP_BOOT\n")
             .unwrap_or_else(|| panic!("({profile:?}) no boot-ceiling capture:\n{asm}"));
-        let first_init = asm
-            .find("    JSR __HEAP_INIT\n")
+        let first_init = ["    JSR __HEAP_INIT\n", "    JSR __STATE_RESET"]
+            .iter()
+            .filter_map(|call| asm.find(call))
+            .min()
             .unwrap_or_else(|| panic!("({profile:?}) no heap init call"));
         assert!(
             capture < first_init,
@@ -206,7 +208,7 @@ fn the_fallback_is_guarded_by_a_compare_against_heap_bottom() {
         .1;
     let init = &init[..init.find("\n    RTS").unwrap_or(init.len())];
     assert!(
-        init.contains("SBC #<__HEAP_BOTTOM") && init.contains("SBC #>__HEAP_BOTTOM"),
+        init.contains("CMP #<__HEAP_BOTTOM") && init.contains("SBC #>__HEAP_BOTTOM"),
         "the ceiling is no longer compared against __HEAP_BOTTOM:\n{init}"
     );
     assert!(

@@ -238,10 +238,11 @@ mod tests {
                 } else {
                     source.push_str(&format!("{name}:\n.byte 0,0\n"));
                 }
+                // Integer and string slots are stable labels to the ordinary policy too.
                 let mut original = parse(&source);
                 assert!(
-                    !ph301_with_window_min_sites(&mut original, 4, JsrPolicy::Refused, 2),
-                    "ordinary policy changed"
+                    ph301_with_window_min_sites(&mut original, 4, JsrPolicy::Refused, 2),
+                    "the ordinary policy factors windows on integer and string slots"
                 );
                 let mut items = parse(&source);
                 assert!(compact(&mut items));

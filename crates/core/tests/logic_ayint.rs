@@ -283,8 +283,13 @@ fn a_provably_bad_subscript_deletes_the_right_operand_outright() {
                30 PRINT \"Z\"\n40 END\n";
     for (profile, extraram) in VARIANTS {
         let asm = compile_variant(src, profile, extraram).asm;
+        let lines: Vec<&str> =
+            asm.lines().map(|l| l.split(';').next().unwrap().trim()).filter(|l| !l.is_empty()).collect();
+        let runs_in = lines.iter().position(|l| *l == "__BAD_SUBSCRIPT:").is_some_and(|i| {
+            i > 0 && !["RTS", "RTI"].contains(&lines[i - 1]) && !lines[i - 1].starts_with("JMP ")
+        });
         assert!(
-            asm.contains(BAD_SUBSCRIPT.site(extraram)),
+            asm.contains(BAD_SUBSCRIPT.site(extraram)) || runs_in,
             "{profile:?} extraram={extraram}: the trap itself must stay:\n{asm}"
         );
         assert!(

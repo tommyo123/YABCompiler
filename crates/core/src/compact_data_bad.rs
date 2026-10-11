@@ -252,6 +252,7 @@ mod tests {
                         codegen::SourceIntegerVars::from_module(&module),
                         true,
                         false,
+                        None,
                     )
                     .unwrap();
                     assert!(

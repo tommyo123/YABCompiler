@@ -9,12 +9,28 @@ fn asm_of(src: &str) -> String {
         .asm
 }
 
-/// `(frames pushed, handlers emitted)`, read off the emitted assembly.
 fn frames(asm: &str) -> (usize, usize) {
+    let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+    let helpers = lines
+        .iter()
+        .position(|l| *l == "; --- peephole-factored helpers ---")
+        .unwrap_or(lines.len());
+    let pushes = (0..lines.len())
+        .filter(|&i| lines[i] == "STA __FOR_STACK,X")
+        .map(|i| {
+            if i < helpers {
+                return 1;
+            }
+            let label = lines[..i].iter().rev().find(|l| l.ends_with(':')).unwrap();
+            let label = label.trim_end_matches(':');
+            lines
+                .iter()
+                .filter(|l| **l == format!("JSR {label}") || **l == format!("JMP {label}"))
+                .count()
+        })
+        .sum();
     (
-        asm.lines()
-            .filter(|l| l.trim() == "STA __FOR_STACK,X")
-            .count(),
+        pushes,
         asm.lines()
             .filter(|l| l.starts_with("__FOR_NEXT_HANDLER_"))
             .count(),

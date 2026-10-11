@@ -344,7 +344,11 @@ fn zero_page_base_does_not_reach_the_indexed_compare() {
     assert_no(&asm, "LDA $00F0,X");
     assert_no(&asm, "CMP $00F0,X");
     let asm = asm_of("10 x=peek(828)\n20 if peek(x)=77 then print \"hit\"\n");
-    assert_seq(&asm, &["LDX VI_X", "LDA $0000,X", "CMP #$4D", "BNE"]);
+    assert_seq(&asm, &["LDA $0000,X", "CMP #$4D", "BNE"]);
+    assert!(
+        has_seq(&asm, &["LDX VI_X", "LDA $0000,X"]) || has_seq(&asm, &["STA VI_X", "TAX"]),
+        "X must carry VI_X into the indexed compare:\n{asm}"
+    );
 }
 
 // Composition with the surrounding IF machinery.

@@ -202,7 +202,11 @@ pub fn solve<D: DataflowAnalysis>(
                     (None, None) => false,
                     _ => true,
                 };
-                let changed = new_in != state[id].0 || new_out != state[id].1 || per_succ_changed;
+                // Variables read by an unresolved NEXT.
+                let changed = visit_counts[id] == 1
+                    || new_in != state[id].0
+                    || new_out != state[id].1
+                    || per_succ_changed;
                 state[id] = (new_in, new_out);
                 match new_per_succ {
                     Some(v) => {
@@ -298,6 +302,7 @@ impl crate::analysis::Analysis for LiveVars {
         // small modules; revisit if it ever shows up in profiles.
         let flow = LiveVarsFlow {
             fns: FnBodyReads::build(module),
+            for_vars: for_loop_vars(module),
         };
         let solved = solve(module, &cfg, &flow);
         LiveVarsResult { per_node: solved }
@@ -315,6 +320,26 @@ pub struct LiveVarsResult {
 /// The transfer half of `LiveVars`.
 struct LiveVarsFlow {
     fns: FnBodyReads,
+    /// Variables read by an unresolved NEXT.
+    for_vars: Vec<VarName>,
+}
+
+/// The variables of every FOR statement in the module.
+fn for_loop_vars(module: &Module) -> Vec<VarName> {
+    struct Fors(Vec<VarName>);
+    impl crate::visit::Visitor for Fors {
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            if let Stmt::For { var, .. } = stmt
+                && !self.0.contains(var)
+            {
+                self.0.push(var.clone());
+            }
+            crate::visit::walk_stmt(self, line, stmt);
+        }
+    }
+    let mut fors = Fors(Vec::new());
+    crate::visit::walk_module(&mut fors, module);
+    fors.0
 }
 
 impl DataflowAnalysis for LiveVarsFlow {
@@ -340,6 +365,11 @@ impl DataflowAnalysis for LiveVarsFlow {
         // …then use (revive read vars).
         for v in stmt_uses(stmt, &self.fns) {
             live.insert(v);
+        }
+        if let Stmt::Next { vars } = stmt
+            && vars.iter().any(Option::is_none)
+        {
+            live.extend(self.for_vars.iter().cloned());
         }
         live
     }
@@ -889,27 +919,17 @@ impl DataflowAnalysis for NumericFactsFlow {
     ) -> Option<Vec<Self::Lattice>> {
         let stmt = cfg.stmt_at(node_id, module);
 
-        // NEXT refinement: the uniform transfer kills the loop counter
-        // (its post-loop value `end+step` is out of range). But that
-        // killed state also flows along the *back-edge* into the loop
-        // body, and NumericState's intersection join then wipes the
-        // counter's range out of the body — so without this, no FOR
-        // counter ever has a usable range inside its own loop. Split
-        // the edges: on the back-edge (loop continues, counter still in
-        // [start,end]) preserve the incoming range; on the exit edge
-        // kill it as the uniform transfer does. Edges are told apart by
-        // line: the body sits at/above the NEXT, the fall-through below.
+        // Refine the counter only on the NEXT loop edge.
         if let Stmt::Next { vars } = stmt {
             if vars.is_empty() || vars.iter().any(Option::is_none) {
                 return None; // bare NEXT — leave to the uniform kill
             }
             let killed = transfer_numeric_stmt(stmt, in_state, self.data_range);
             let preserved = in_state.clone();
-            let self_line = node.line_no;
             let mut outs = Vec::with_capacity(node.successors.len());
             let mut any_back_edge = false;
             for &succ in &node.successors {
-                if cfg.nodes[succ].line_no <= self_line {
+                if succ <= node_id {
                     outs.push(preserved.clone()); // back-edge: counter in range
                     any_back_edge = true;
                 } else {
@@ -2730,7 +2750,7 @@ impl<'a> crate::visit::Visitor for ShadowExprCollector<'a> {
 /// terminology). LET / FOR header / INPUT / READ / GET targets count;
 /// array element writes don't kill scalar liveness so they're left
 /// out. NEXT writes the loop counter (implicit increment).
-fn stmt_defs(stmt: &Stmt) -> Vec<VarName> {
+pub(crate) fn stmt_defs(stmt: &Stmt) -> Vec<VarName> {
     let mut out = Vec::new();
     match stmt {
         Stmt::Let { var, .. } | Stmt::LetStr { var, .. } => out.push(var.clone()),
@@ -3608,6 +3628,27 @@ mod tests {
             facts.expr_int_range_before_path(&path, &Expr::Var(x)),
             Some(IntRange::singleton(5))
         );
+    }
+
+    #[test]
+    fn numeric_facts_join_a_predecessor_first_visited_late() {
+        use crate::ir::Pass;
+        let src = "10 READ C\n40 GOSUB 800\n70 J%=3:IF C<0 THEN GOSUB 900\n\
+                   80 PRINT D(J%)\n120 END\n800 X=1\n900 J%=J%*SGN(C):RETURN\n990 DATA -1\n";
+        let bytes = crate::tokenize_program(src).unwrap();
+        let program = crate::prg::Program::parse(&bytes).unwrap();
+        let ast = crate::parse::program(&program).unwrap();
+        let mut m = crate::ir::lower(&ast).unwrap();
+        crate::passes::ResolveBareNext.run(&mut m).unwrap();
+        let mut reg = Registry::new();
+        let facts = reg.get(&m, &NumericFactAnalysis).clone();
+        let line_80 = m.lines.iter().position(|l| l.number == 80).unwrap();
+        let path = crate::cfg::StmtPath {
+            line_idx: line_80,
+            path: vec![0],
+        };
+        let j = facts.expr_int_range_before_path(&path, &Expr::Var(ivar("J")));
+        assert!(j.is_none_or(|r| r.min < 0), "J% at line 80: {j:?}");
     }
 
     #[test]

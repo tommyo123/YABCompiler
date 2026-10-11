@@ -1,5 +1,3 @@
-
-
 mod common;
 
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
@@ -84,11 +82,14 @@ fn ph209_fires_on_every_profile() {
     // must take it too.
     for profile in [Profile::Default, Profile::Size, Profile::Speed] {
         let got = asm_at(CMP_SRC, profile);
-        assert!(
-            ph209_sites(&got) >= 3,
-            "{profile:?} hoists the spill, saw {}",
-            ph209_sites(&got)
-        );
+        assert_eq!(spill_triples(&got), 0, "{profile:?} leaves a stack spill:\n{got}");
+        if profile != Profile::Size {
+            assert!(
+                ph209_sites(&got) >= 3,
+                "{profile:?} hoists the spill, saw {}",
+                ph209_sites(&got)
+            );
+        }
     }
 }
 

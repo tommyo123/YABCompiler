@@ -138,6 +138,9 @@ pub const FLOAT_ONE: u16 = 0xB9BC;
 // $B853, $BA30 expect ARG to be pre-loaded and are not used here.
 pub const FADD: u16 = 0xB867;
 pub const FSUB: u16 = 0xB850;
+
+/// Compare FAC with memory and return 0, $01 or $FF with matching N/Z.
+pub const FCOMP: u16 = 0xBC5B;
 pub const FMULT: u16 = 0xBA28;
 pub const FDIV: u16 = 0xBB0F;
 
@@ -154,16 +157,6 @@ pub const FPWRT: u16 = 0xBF7B;
 /// base operand without going through memory.
 pub const FACARG: u16 = 0xBC0C;
 
-/// Compare FAC with memory at `.A` (lo) `.Y` (hi). Returns:
-///   `.A` = $00 if FAC == mem
-///   `.A` = $01 if FAC > mem
-///   `.A` = $FF if FAC < mem
-///
-/// Currently unused — codegen does FSUB + sign-check on $61/$66 instead,
-/// which is unambiguous and matches our existing infrastructure. Kept
-/// here so a future "use FCOMP" optimisation pass has the address ready.
-#[allow(dead_code)]
-pub const FCOMP: u16 = 0xBC5B;
 
 // ---------- BASIC: float printing ----------
 /// Convert FAC to a null-terminated PETSCII string at $0100. The
@@ -216,8 +209,22 @@ pub const FACWORD: u16 = 0xB7F7;
 /// Floor FAC to signed 16-bit; raise ILLEGAL QUANTITY outside -32768..=32767.
 pub const AYINT: u16 = 0xB1BF;
 
+/// Round FAC by shifting $70 and adding its top bit.
+pub const ROUND: u16 = 0xBC1B;
+
+pub const FAC_ROUNDING: u8 = 0x70;
+
 /// Convert unsigned byte in `.Y` (not `.A`) to FAC.
 pub const BYTEFAC: u16 = 0xB3A2;
+
+/// Read the jiffy count into the FAC mantissa and return Y as zero.
+pub const GETTIM: u16 = 0xAF84;
+
+/// Normalize the FAC mantissa with exponent X and sign A. Carry must be set.
+pub const FLOATB: u16 = 0xBC4F;
+
+/// Convert the jiffy count into ASCII time digits.
+pub const FOUTIM: u16 = 0xBE68;
 
 /// Parse the string at `INDEX1` of length `.A`/`.Y` into FAC. Used to
 /// implement `VAL(s$)` and the numeric variant of `INPUT`. Caller is

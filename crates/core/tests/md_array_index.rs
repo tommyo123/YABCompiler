@@ -55,9 +55,11 @@ fn check_stops_with(src: &str, banner: &str) {
 #[test]
 fn all_literal_multidim_subscript_folds_to_a_constant_address() {
     let asm = asm_of("10 DIM B(10,10)\n20 X=B(3,4)\n30 END\n");
-    // (3*11 + 4) = element 37.
+    let materialised =
+        asm.contains("LDA #<(__ARR_B_I+74)") && asm.contains("LDA #>(__ARR_B_I+74)");
+    let absolute = asm.contains("LDA __ARR_B_I+74") && asm.contains("LDA __ARR_B_I+75");
     assert!(
-        asm.contains("LDA #<(__ARR_B_I+74)") && asm.contains("LDA #>(__ARR_B_I+74)"),
+        materialised || absolute,
         "expected a folded constant address, got:\n{asm}"
     );
     assert!(

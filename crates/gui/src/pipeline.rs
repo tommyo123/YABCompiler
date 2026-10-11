@@ -46,6 +46,10 @@ pub struct BuildRequest<'a> {
     /// via [`yabcompiler_core::parse_start_address`]. `None` keeps the
     /// default $0801 + SYS launcher.
     pub custom_start_text: Option<&'a str>,
+    /// Write a compressed program with its decoder.
+    pub compress: yabcompiler_core::AutoMode,
+    /// Move DATA to RAM at $D000 when the program starts.
+    pub data_relocate: yabcompiler_core::AutoMode,
 }
 
 impl BuildRequest<'_> {
@@ -61,6 +65,9 @@ impl BuildRequest<'_> {
         }
         if let Some(text) = self.custom_start_text {
             parse_start_address(text.trim()).map_err(|e| format!("start address: {e}"))?;
+            if self.compress == yabcompiler_core::AutoMode::On {
+                return Err("compress needs the default start address".to_string());
+            }
         }
         Ok(())
     }
@@ -75,6 +82,8 @@ impl BuildRequest<'_> {
             lenient_syntax: self.lenient_syntax,
             safe_sys_calls: self.safe_sys_calls,
             rem_hint_dialect: self.rem_hint_dialect,
+            compress: self.compress,
+            data_relocate: self.data_relocate,
             ..CompileOptions::default()
         };
         let trimmed = self.reserved_text.trim();

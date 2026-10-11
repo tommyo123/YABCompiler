@@ -201,7 +201,7 @@ const CONST_OP_STUBS: &str = "\
 10 dim a(20)
 20 for i=0 to 20:a(i)=i/3:next i
 30 for i=0 to 20
-40 p=a(i)*1.5
+40 p=1.5*a(i)
 50 q=a(i)+2.5
 60 r=2.5+(p*q)
 70 s=1.5*(p+q)

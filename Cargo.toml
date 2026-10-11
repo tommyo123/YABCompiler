@@ -13,7 +13,7 @@ default-members = [
 
 [workspace.package]
 # Match VERSION in crates/core/src/config.rs.
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 authors = ["Tommy Olsen"]
 license = "MIT"

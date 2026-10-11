@@ -1,5 +1,7 @@
 //! `__STR_PRINT`'s inline-argument convention (PH114).
 
+mod common;
+
 use yabcompiler_core::{CompileOptions, Compiled, Profile, compile_with_options, tokenize_program};
 
 fn register_form(inline: &Compiled) -> Vec<u8> {
@@ -66,7 +68,8 @@ fn convertible(n: usize) -> usize {
 }
 
 fn inline_sites(asm: &str) -> usize {
-    asm.lines()
+    common::expand_call_entries(asm)
+        .lines()
         .filter(|l| l.trim() == "JSR __STR_PRINT_I")
         .count()
 }
@@ -163,7 +166,7 @@ fn hello_must_not_grow() {
     assert_eq!(inline_sites(&c.asm), 0);
     assert!(!c.asm.contains("__STR_PRINT_I"));
 
-    assert_eq!(c.prg_bytes.len(), 56);
+    assert_eq!(c.prg_bytes.len(), 48);
     assert_eq!(run(&c), "HELLO\n");
 }
 

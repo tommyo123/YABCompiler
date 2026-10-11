@@ -241,17 +241,23 @@ fn compile_extraram(src: &str) -> yabcompiler_core::Compiled {
     compile_with_options(&prg, opts).expect("compiles")
 }
 
+fn zero_bytes_before_data(asm: &str) -> usize {
+    let (head, _) = asm.split_once("\n__DATA:\n").expect("DATA pool");
+    head.lines()
+        .rev()
+        .map(|line| line.split(';').next().unwrap().trim())
+        .filter(|line| !line.is_empty())
+        .map_while(|line| {
+            let bytes: Vec<_> = line.strip_prefix(".byte ")?.split(',').map(str::trim).collect();
+            bytes.iter().all(|byte| *byte == "$00").then_some(bytes.len())
+        })
+        .sum()
+}
+
 #[test]
 fn a_reservation_inside_an_extraram_pool_moves_the_pool_not_the_entries() {
     let c = compile_extraram(&big_pool_program());
-    assert!(
-        c.asm.contains("dead fill so the DATA pool starts above every reserved range"),
-        "the clearance fill is what makes this program build"
-    );
-    // The fill goes in front of the pool, never between two entries.
-    let fill = c.asm.find("dead fill").expect("fill emitted");
-    let data = c.asm.find("\n__DATA:\n").expect("pool emitted");
-    assert!(fill < data, "the fill must precede `__DATA:`");
+    assert!(zero_bytes_before_data(&c.asm) > 0, "{}", c.asm);
     let r = emu64::run_prg_to_end(&c.prg_bytes, common::MAX_INSNS).expect("runs");
     assert!(r.clean_exit, "must reach the final RTS");
     assert_eq!(common::petscii_to_string(&r.output), " 36 \n");
@@ -261,10 +267,7 @@ fn a_reservation_inside_an_extraram_pool_moves_the_pool_not_the_entries() {
 fn an_extraram_pool_clear_of_every_reservation_takes_no_fill() {
     let src = big_pool_program().replace("POKE3000+N", "POKE53280+N");
     let c = compile_extraram(&src);
-    assert!(
-        !c.asm.contains("dead fill so the DATA pool starts"),
-        "nothing to clear, so nothing to pay for"
-    );
+    assert_eq!(zero_bytes_before_data(&c.asm), 0, "{}", c.asm);
 }
 
 #[test]

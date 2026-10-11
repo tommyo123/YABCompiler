@@ -64,11 +64,15 @@ fn print_number_does_not_erase_the_column_it_skips() {
     // drift.
     for profile in [Profile::Default, Profile::Speed, Profile::Size] {
         let asm = asm_at("10 PRINT 1\n", profile);
-        let body = asm
-            .split("__PRINT_FAC:")
-            .nth(1)
-            .expect("__PRINT_FAC is emitted");
-        let tail: String = body.lines().take(6).collect::<Vec<_>>().join("\n");
+        let body = ["__PRINT_FAC:", "__PRINT_INT16:"]
+            .iter()
+            .find_map(|label| asm.split(label).nth(1))
+            .expect("a number printer is emitted");
+        let tail: String = body
+            .lines()
+            .take_while(|l| !(l.starts_with('_') && !l.starts_with("__PN_")))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             tail.contains("JMP $AB3B"),
             "{profile:?}: __PRINT_FAC must advance through the ROM gap \

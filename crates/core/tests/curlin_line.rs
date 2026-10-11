@@ -66,3 +66,15 @@ fn stamps_correctly_returning_to_a_low_line_after_a_high_one() {
         "returning to a low line must reset the high byte:\n{out}"
     );
 }
+
+#[test]
+fn an_inlined_subroutine_above_255_restores_the_high_byte() {
+    let src = "10 READ C:D(2)=C:DATA 1\n50 GOSUB 850:D(3)=D(J%)\n130 END\n850 J%=-D(2):RETURN\n";
+    let prg = common::compile_source(src).expect("compiles");
+    let r = emu64::run_prg_to_end(&prg, 5_000_000).expect("runs");
+    assert_eq!(
+        r.error_banner().as_deref(),
+        Some("?ILLEGAL QUANTITY  ERROR IN 50"),
+        "{src}"
+    );
+}

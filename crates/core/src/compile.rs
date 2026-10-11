@@ -78,6 +78,31 @@ pub struct CompileOptions {
     /// the predictor is skipped — extraram can't add space below the
     /// program's start.
     pub custom_start_address: Option<u16>,
+    /// Move DATA to $D000 when space is needed and memory access permits it.
+    pub data_relocate: AutoMode,
+    /// Write a compressed program with its decoder.
+    pub compress: AutoMode,
+}
+
+/// An option the compiler may decide for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl AutoMode {
+    /// `auto`, `on` or `off`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
 }
 
 impl Default for CompileOptions {
@@ -99,6 +124,8 @@ impl Default for CompileOptions {
             rem_hint_dialect: BasicHintDialect::None,
             dialect: Dialect::default(),
             custom_start_address: None,
+            data_relocate: AutoMode::default(),
+            compress: AutoMode::default(),
         }
     }
 }
@@ -192,6 +219,9 @@ pub const MAX_HEAP_CHUNK: u32 = 255 + 1 + 2;
 
 /// Smallest heap window the extraram-ON layout may ship with, for a program that also carves runtime-`DIM` arrays out of it.
 pub const MIN_EXTRARAM_DIM_HEAP: u32 = 0x0200;
+
+/// BASIC program text address.
+const BASIC_TXTTAB: u32 = 0x0801;
 
 /// First runtime address we hand to user code: BASIC's load address
 /// (\$0801) plus the 12-byte SYS stub. Used by the predictor to
@@ -390,6 +420,11 @@ pub struct Diagnostics {
     pub compact_heap_layout: bool,
 
     pub sys_param_substitution_dropped: bool,
+    /// Bytes of DATA moved to $D000 at startup.
+    pub data_relocated: usize,
+    /// Heap bytes needed for relocated DATA string reads.
+    pub data_text_heap: usize,
+    pub compressed_from: Option<usize>,
 }
 
 /// A reserved hole and the short image tail that requires its padding.
@@ -509,9 +544,117 @@ pub fn compile_with_options(
     prg_bytes: &[u8],
     options: CompileOptions,
 ) -> Result<Compiled, CompileError> {
+    let compress = options.compress;
+    let compiled = match options.data_relocate {
+        AutoMode::Auto => compile_relocating_when_short_of_room(prg_bytes, options)?,
+        _ => compile_with_options_once(prg_bytes, options)?,
+    };
+    compress_output(compiled, compress)
+}
+
+/// Retry with relocated DATA when the program or heap needs more room.
+fn compile_relocating_when_short_of_room(
+    prg_bytes: &[u8],
+    options: CompileOptions,
+) -> Result<Compiled, CompileError> {
+    let first = compile_with_options_once(
+        prg_bytes,
+        CompileOptions {
+            data_relocate: AutoMode::Off,
+            ..options.clone()
+        },
+    );
+    let short = match &first {
+        Ok(compiled) => short_of_heap_room(&compiled.diagnostics),
+        Err(CompileError::Assemble { .. }) => true,
+        Err(_) => false,
+    };
+    if !short {
+        return first;
+    }
+    let moving = CompileOptions {
+        data_relocate: AutoMode::On,
+        ..options
+    };
+    match compile_with_options_once(prg_bytes, moving) {
+        Ok(moved) if moved.diagnostics.data_relocated > 0 => match &first {
+            // Relocation must repay the heap cost of copied text.
+            Ok(kept) if heap_room(&moved) < heap_room(kept) + moved.diagnostics.data_text_heap as u32 => {
+                first
+            }
+            _ => Ok(moved),
+        },
+        _ => first,
+    }
+}
+
+/// Bytes between the end of `build`'s image and the top of its heap.
+fn heap_room(build: &Compiled) -> u32 {
+    let end = u32::from(build.diagnostics.end_address) + 1;
+    let top = if build.diagnostics.extraram.is_on() {
+        u32::from(extraram::heap_ceiling(&build.diagnostics.effective_reserved, end))
+    } else {
+        DEFAULT_MEMSIZ
+    };
+    top.saturating_sub(end)
+}
+
+/// Heap cost of copied DATA text and string headers.
+fn data_text_heap(module: &ir::Module) -> usize {
+    if codegen::string_read_target_count(module) == 0 {
+        return 0;
+    }
+    let mut total = 0;
+    for_each_stmt(module, &mut |stmt| {
+        if let ir::Stmt::Data(values) = stmt {
+            for v in values {
+                if let crate::ast::DataValue::String(text) | crate::ast::DataValue::Quoted(text) = v {
+                    total += text.len() + 3;
+                }
+            }
+        }
+    });
+    total
+}
+
+/// The image ends past `$C800`, or past `$9800` when the auto choice left extraram off.
+fn short_of_heap_room(diagnostics: &Diagnostics) -> bool {
+    let end = diagnostics.end_address;
+    end > 0xC800 || (diagnostics.extraram == ExtraRamDecision::AutoOff && end > 0x9800)
+}
+
+/// Pack the file when asked to, or in auto mode when it reaches past `$CFFF`.
+fn compress_output(mut compiled: Compiled, mode: AutoMode) -> Result<Compiled, CompileError> {
+    let start = u32::from(compiled.diagnostics.start_address);
+    let file_end = start + compiled.prg_bytes.len().saturating_sub(2) as u32;
+    let needed = file_end > u32::from(IO_AREA_LO);
+    if mode == AutoMode::Off || (mode == AutoMode::Auto && !needed) {
+        return Ok(compiled);
+    }
+    match crate::crunch::self_extracting_prg(&compiled.prg_bytes) {
+        Ok(packed) => {
+            compiled.diagnostics.compressed_from = Some(compiled.prg_bytes.len());
+            compiled.prg_bytes = packed.prg;
+            Ok(compiled)
+        }
+        Err(e) if needed || mode == AutoMode::On => Err(CompileError::Assemble {
+            message: e.to_string(),
+            asm: None,
+        }),
+        Err(_) => Ok(compiled),
+    }
+}
+
+fn compile_with_options_once(
+    prg_bytes: &[u8],
+    options: CompileOptions,
+) -> Result<Compiled, CompileError> {
     let mut saw_sys_param_vars = false;
     match compile_at_profile_reporting(prg_bytes, options.clone(), &mut saw_sys_param_vars) {
         Ok(compiled) => {
+            let compiled = prefer_unpacked_when_smaller(compiled, &options, |rescue| {
+                compile_at_profile_rescue(prg_bytes, options.clone(), rescue)
+            });
             let compiled = prefer_dim_heap_headroom(compiled, &options, || {
                 compile_at_profile(
                     prg_bytes,
@@ -639,7 +782,28 @@ fn prefer_dim_heap_headroom(
     first
 }
 
-/// Check live-string capacity after a successful size fallback.
+/// Compare PRINT packing layouts and keep the smallest valid build.
+fn prefer_unpacked_when_smaller(
+    first: Compiled,
+    options: &CompileOptions,
+    retry: impl Fn(LayoutRescue) -> Result<Compiled, CompileError>,
+) -> Compiled {
+    if options.profile != Profile::Size || !first.asm.contains(crate::packed_print::DECODER_LABEL) {
+        return first;
+    }
+    let other = retry(LayoutRescue::Unpacked)
+        .or_else(|_| retry(LayoutRescue::Dedup))
+        .or_else(|_| retry(LayoutRescue::PackedPrint));
+    match other {
+        // Try the other packing layout when it may save more bytes.
+        Ok(other) if other.prg_bytes.len() < first.prg_bytes.len() => match retry(LayoutRescue::PackedOther) {
+            Ok(packed) if packed.prg_bytes.len() < other.prg_bytes.len() => packed,
+            _ => other,
+        },
+        _ => first,
+    }
+}
+
 fn prefer_compact_heap_headroom(
     first: Compiled,
     options: &CompileOptions,
@@ -705,6 +869,10 @@ fn managed_extraram_heap_window(build: &Compiled, origin: u32) -> Option<u32> {
 enum LayoutRescue {
     #[default]
     Ordinary,
+    /// Layout without PRINT packing.
+    Unpacked,
+    /// Layout with the alternate PRINT packing.
+    PackedOther,
     Dedup,
     PackedPrint,
     Compact,
@@ -749,6 +917,7 @@ fn compile_at_profile_reporting_rescue(
 
     let mut syntax_traps = Vec::new();
     let mut deferred_fn_bodies = Vec::new();
+    let compress = options.compress;
     let mut compiled = compile_pipeline(
         prg_bytes,
         options,
@@ -760,7 +929,7 @@ fn compile_at_profile_reporting_rescue(
     compiled.diagnostics.syntax_traps = syntax_traps;
     compiled.diagnostics.deferred_fn_bodies = deferred_fn_bodies;
 
-    reject_io_area_overlap(&compiled)?;
+    reject_io_area_overlap(&compiled, compress)?;
     Ok(compiled)
 }
 
@@ -837,7 +1006,10 @@ fn compile_pipeline(
         })
     });
     let tsb_target = !matches!(options.dialect, Dialect::BasicV2) && uses_proc;
-    let (asm, zp_pressure) = codegen::emit_with_profile_at_opts_diag_and_data_rescue(
+    let inplace = original_image_to_materialise(prg_bytes, &ast, &module, &options);
+    let data_relocate = data_relocation_plan(&module, &options, tsb_target);
+    let dims = codegen::runtime_dim_estimate(&module, &source_integer_vars);
+    let (asm, mut zp_pressure) = codegen::emit_with_profile_at_opts_diag_and_data_rescue(
         &module,
         options.profile,
         origin as u16,
@@ -847,8 +1019,13 @@ fn compile_pipeline(
         source_integer_vars,
         matches!(rescue, LayoutRescue::Compact | LayoutRescue::DataFirst),
         tsb_target,
+        data_relocate,
     )
     .map_err(CompileError::Codegen)?;
+    // Request more heap only for arrays that fit in BASIC.
+    let text_len = prg_bytes.len().saturating_sub(2) as u32;
+    let stock_room = (DEFAULT_MEMSIZ - BASIC_TXTTAB).saturating_sub(text_len);
+    zp_pressure.runtime_dim_demand = if dims.stock <= stock_room { dims.compiled } else { 0 };
     // Run asm-level peephole passes before extraram rewrites so liveness analysis sees raw ROM calls.
     let peep = |a: &str| {
         let optimized = crate::peephole::run_with_options(
@@ -856,29 +1033,55 @@ fn compile_pipeline(
             options.profile,
             crate::peephole::Options {
                 inline_str_print_args: true,
-                aggressive_size_dedup: !matches!(rescue, LayoutRescue::Ordinary),
-                compact_size_dedup: matches!(rescue, LayoutRescue::Compact | LayoutRescue::DataFirst),
+                // Size builds use the same deduplication as layout retries.
+                aggressive_size_dedup: options.profile == Profile::Size
+                    || !matches!(
+                        rescue,
+                        LayoutRescue::Ordinary | LayoutRescue::Unpacked | LayoutRescue::PackedOther
+                    ),
+                compact_size_dedup: options.profile == Profile::Size
+                    || matches!(rescue, LayoutRescue::Compact | LayoutRescue::DataFirst),
                 ..crate::peephole::Options::default()
             },
         );
         let packed = match rescue {
+            // Pack PRINT text under Size when it repays the decoder.
             LayoutRescue::PackedPrint => crate::packed_print::compress(&optimized).unwrap_or(optimized),
+            LayoutRescue::Ordinary if options.profile == Profile::Size => {
+                crate::packed_print::compress_size(&optimized, false).unwrap_or(optimized)
+            }
+            LayoutRescue::PackedOther => {
+                crate::packed_print::compress_size(&optimized, true).unwrap_or(optimized)
+            }
             LayoutRescue::Compact | LayoutRescue::DataFirst => crate::packed_print::compress_compact(&optimized)
                 .or_else(|| crate::packed_print::compress(&optimized))
                 .unwrap_or(optimized),
             _ => optimized,
         };
-        if matches!(rescue, LayoutRescue::DataFirst) {
+        let packed = if matches!(rescue, LayoutRescue::DataFirst) {
             data_before_constants(&packed).unwrap_or(packed)
         } else {
             packed
+        };
+        // Route conversions after optimization recognizes their ROM addresses.
+        let helper = match options.profile {
+            Profile::Size => return packed,
+            Profile::Speed => codegen::FAST_GIVAYF,
+            _ => codegen::FAST_BYTE_GIVAYF,
+        };
+        let routed = codegen::route_int_to_fac_through_own_code(&packed, helper).unwrap_or(packed);
+        // Use the FACWORD helper under Speed.
+        if options.profile == Profile::Speed {
+            codegen::route_facword_through_own_code(&routed).unwrap_or(routed)
+        } else {
+            routed
         }
     };
     let (asm, asm_copy_base) = resolve_val_variants(&asm, peep);
 
-    let inplace = original_image_to_materialise(prg_bytes, &ast, &module, &options);
     let base_asm = asm;
 
+    let dim_demand = zp_pressure.runtime_dim_demand;
     let attempt = |image: Option<InplaceImage<'_>>| -> Result<Compiled, CompileError> {
 
     let splice = |base: &str| -> Result<Option<String>, CompileError> {
@@ -1031,11 +1234,12 @@ fn compile_pipeline(
         image,
     )?;
     let probe_end = origin + probe.machine_code.len() as u32;
-    if probe_end < AUTO_EXTRARAM_TRIGGER && string_heap_window(&probe, origin).is_ok() {
+    let probe_fits =
+        probe_end < AUTO_EXTRARAM_TRIGGER && string_heap_window(&probe, origin).is_ok();
+    if probe_fits && !starves_runtime_dims(&probe, origin, dim_demand) {
         return Ok(probe);
     }
-    // Predictor: either the *image* would land at or past \$9F00, or it fits but leaves the
-    // runtime *string heap* starved (see `MIN_STRING_HEAP`).
+    // Try extra RAM when the image, strings or arrays need more room.
     let extraram_build = assemble_pass_dropping_unpaid_bss_fill(
         &asm,
         asm_copy,
@@ -1047,6 +1251,13 @@ fn compile_pipeline(
         zp_pressure,
         image,
     );
+    if probe_fits {
+        // Keep extra RAM only when it adds heap space.
+        return Ok(match extraram_build {
+            Ok(built) if more_heap_than_probe(&built, &probe, origin) => built,
+            _ => probe,
+        });
+    }
     match extraram_build {
         // The escalation's own post-condition.
         Ok(built) => verify_extraram_heap(&built, origin).map(|()| built),
@@ -1209,6 +1420,24 @@ fn string_heap_window(build: &Compiled, origin: u32) -> Result<Option<u32>, u32>
     } else {
         Ok(Some(window))
     }
+}
+
+/// Bytes between the end of an extraram-off `build`'s image and MEMSIZ.
+fn room_below_memsiz(build: &Compiled, origin: u32) -> u32 {
+    DEFAULT_MEMSIZ.saturating_sub(origin + build.machine_code.len() as u32)
+}
+
+/// Whether runtime arrays and the string floor exceed the available heap.
+fn starves_runtime_dims(probe: &Compiled, origin: u32, demand: u32) -> bool {
+    demand > 0
+        && origin < DEFAULT_MEMSIZ
+        && probe.asm.contains("__ARR_HEAP_TOP:")
+        && room_below_memsiz(probe, origin) < MIN_STRING_HEAP.saturating_add(demand)
+}
+
+fn more_heap_than_probe(built: &Compiled, probe: &Compiled, origin: u32) -> bool {
+    matches!(extraram_heap_window(built, origin),
+        Ok(Some(on)) if on > room_below_memsiz(probe, origin))
 }
 
 fn extraram_heap_window(build: &Compiled, origin: u32) -> Result<Option<u32>, u32> {
@@ -1415,7 +1644,8 @@ fn assemble_pass_settling_bss_fill(
         inplace,
     );
     match (with_fill, without_fill) {
-        (Ok(a), Ok(b)) => Ok(if b.prg_bytes.len() < a.prg_bytes.len() {
+        // Prefer no fill when both files have the same size.
+        (Ok(a), Ok(b)) => Ok(if b.prg_bytes.len() <= a.prg_bytes.len() {
             b
         } else {
             a
@@ -1498,6 +1728,10 @@ fn assemble_pass(
     let mut all_reserved: Vec<(u16, u16)> = Vec::new();
     all_reserved.extend(auto_ranges.iter().copied());
     all_reserved.extend(manual_ranges.iter().copied());
+    // A relocated pool's READ buffer, kept clear of the image and the heap.
+    if let Some(page) = data_buf_page(asm) {
+        all_reserved.push((page, page + 0xFF));
+    }
 
     if let Some(image) = inplace.filter(InplaceImage::is_low_trimmed) {
         all_reserved.push((image.tail_start(), image.image_last()));
@@ -1524,10 +1758,11 @@ fn assemble_pass(
     // lands contiguously past every reservation.
     let (final_asm, absorbed) = if extraram_on {
         (
-            extraram::inject_with_reserved(
+            extraram::inject_with_heap_floor(
                 asm,
                 &merged,
                 zp_pressure.program_touches_memsiz,
+                MIN_STRING_HEAP.saturating_add(zp_pressure.runtime_dim_demand),
             ),
             Vec::new(),
         )
@@ -1708,12 +1943,15 @@ fn assemble_pass(
             asm: Some(final_asm.clone()),
         }
     })?;
-    verify_data_pool_contiguous(&final_asm, |name| assembler.lookup(name)).map_err(|message| {
-        CompileError::Assemble {
-            message,
-            asm: Some(final_asm.clone()),
-        }
-    })?;
+    let data_blob = data_blob_bytes(&final_asm);
+    if data_blob.is_empty() {
+        verify_data_pool_contiguous(&final_asm, |name| assembler.lookup(name)).map_err(|message| {
+            CompileError::Assemble {
+                message,
+                asm: Some(final_asm.clone()),
+            }
+        })?;
+    }
 
     verify_label_bytes(
         &final_asm,
@@ -1767,11 +2005,27 @@ fn assemble_pass(
         });
     }
     let bss_truncated = machine_code.len() - keep;
-    let stored = &machine_code[..keep];
+    let mut stored = machine_code[..keep].to_vec();
+    if !data_blob.is_empty() {
+        let origin = options.custom_start_address.unwrap_or(CODE_ORIGIN as u16);
+        let load = append_relocated_data(
+            &mut stored,
+            &data_blob,
+            origin,
+            &merged,
+            |name| assembler.lookup(name),
+        )
+        .map_err(|message| CompileError::Assemble {
+            message,
+            asm: Some(final_asm.clone()),
+        })?;
+        let at = usize::from(assembler.lookup(codegen::DATA_LOAD_LABEL).unwrap_or(origin) - origin);
+        machine_code[at..at + 2].copy_from_slice(&load.to_le_bytes());
+    }
     let (prg_bytes, start_address) = if let Some(addr) = options.custom_start_address {
-        (pack::pack_raw(addr, stored), addr)
+        (pack::pack_raw(addr, &stored), addr)
     } else {
-        (pack::pack(stored), 0x0801)
+        (pack::pack(&stored), 0x0801)
     };
 
     if let Some(image) = inplace {
@@ -1827,6 +2081,9 @@ fn assemble_pass(
         size_profile_heap_improvement: None,
         compact_heap_layout: false,
         sys_param_substitution_dropped: false,
+        data_relocated: data_blob.len(),
+        data_text_heap: if data_blob.is_empty() { 0 } else { data_text_heap(module) },
+        compressed_from: None,
     };
     Ok(Compiled {
         asm: final_asm,
@@ -2046,8 +2303,22 @@ fn branchless_probe_text(asm: &str) -> String {
 }
 
 fn assemble_with_aligned_vectors(
+    asm: String,
+    reserved: &[(u16, u16)],
+) -> Result<Assembled, CompileError> {
+    // Undo split inline PRINT arguments before retrying the full layout.
+    if asm.contains(crate::peephole::STR_PRINT_INLINE_ENTRY)
+        && let Ok(assembled) = assemble_with_aligned_vectors_mode(asm.clone(), reserved, true)
+    {
+        return Ok(assembled);
+    }
+    assemble_with_aligned_vectors_mode(asm, reserved, false)
+}
+
+fn assemble_with_aligned_vectors_mode(
     mut asm: String,
     reserved: &[(u16, u16)],
+    per_site_undo: bool,
 ) -> Result<Assembled, CompileError> {
     // One assembler item keeps a reservation bridge out of the indexed table.
     asm = coalesce_for_handler_table(&asm).map_err(|message| CompileError::Assemble {
@@ -2057,6 +2328,7 @@ fn assemble_with_aligned_vectors(
     let mut shims = 0usize;
     let mut fills = 0usize;
     let mut inline_args_undone = false;
+    let mut inline_undo_rounds = 0usize;
     loop {
         let mut assembler = Assembler6502::new();
         // Reserved-region pass: feed the assembler regions of memory that it must NOT place
@@ -2078,8 +2350,18 @@ fn assemble_with_aligned_vectors(
                     asm: Some(asm.clone()),
                 })?;
 
-        if !inline_args_undone && inline_arg_split_by_bridge(&items) {
-            asm = crate::peephole::undo_str_print_inline_args(&asm);
+        let split = inline_args_split_by_bridge(
+            &items,
+            &crate::peephole::str_print_inline_entry_names(&asm),
+        );
+        if !split.is_empty() {
+            // Bound local retries because moving a site can split another.
+            asm = if per_site_undo && inline_undo_rounds < INLINE_ARG_UNDO_ROUNDS {
+                crate::peephole::undo_str_print_inline_args_at(&asm, Some(&split))
+            } else {
+                crate::peephole::undo_str_print_inline_args(&asm)
+            };
+            inline_undo_rounds += 1;
             inline_args_undone = true;
             continue;
         }
@@ -2120,6 +2402,31 @@ fn assemble_with_aligned_vectors(
                 continue;
             }
             Ok(None) => {}
+        }
+
+        if let Some(need) = vars_block_clearance_fill(&asm, reserved, |n| assembler.lookup(n)) {
+            if fills > reserved.len() + 2 {
+                return Err(CompileError::Assemble {
+                    message: format!(
+                        "internal error: after {fills} round(s) of clearance fill the \
+                         variable block at ${:04X} still overlaps a reserved range. CLR and \
+                         RUN clear it as one run, so a bridge inside it would have them \
+                         zero the reserved bytes too.",
+                        assembler.lookup("__VARS_START").unwrap_or(0),
+                    ),
+                    asm: Some(asm),
+                });
+            }
+            asm = insert_clearance_before(&asm, "__VARS_START:", need, VARS_CLEARANCE_NOTE)
+                .ok_or_else(|| CompileError::Assemble {
+                    message: "internal error: a reserved range falls inside the variable \
+                              block, but there is no `__VARS_START:` line to splice \
+                              clearance fill in front of"
+                        .to_string(),
+                    asm: Some(asm.clone()),
+                })?;
+            fills += 1;
+            continue;
         }
 
         if let Some(orphan) = bridge_orphans(&items, reserved)
@@ -2231,11 +2538,13 @@ fn io_area_overlap(image_start: u16, image_len: usize) -> Option<(u16, u16)> {
     (lo <= hi && last >= IO_AREA_LO as usize).then_some((lo, hi))
 }
 
-/// Reject a load image that overlaps the I/O area at $D000-$DFFF.
-fn reject_io_area_overlap(compiled: &Compiled) -> Result<(), CompileError> {
+/// Reject I/O overlap unless compression writes the image with all RAM visible.
+fn reject_io_area_overlap(compiled: &Compiled, compress: AutoMode) -> Result<(), CompileError> {
     let start = compiled.diagnostics.start_address;
 
-    let len = compiled.prg_bytes.len().saturating_sub(2) + compiled.diagnostics.bss_truncated;
+    let stored = compiled.prg_bytes.len().saturating_sub(2);
+    let runtime = stored - compiled.diagnostics.data_relocated + compiled.diagnostics.bss_truncated;
+    let len = if compress == AutoMode::Off { runtime.max(stored) } else { runtime };
     let Some((lo, hi)) = io_area_overlap(start, len) else {
         return Ok(());
     };
@@ -2839,7 +3148,7 @@ fn is_assembler_generated_label(name: &str) -> bool {
 fn is_end_marker_label(name: &str) -> bool {
     matches!(
         name,
-        "__DATA_END" | "__DATA_HOISTED_END" | "__BSS_END" | "__CP_END"
+        "__DATA_END" | "__DATA_HOISTED_END" | "__BSS_END" | "__CP_END" | "__VARS_END"
             | crate::extraram::DATA_END_LABEL
     )
 }
@@ -2957,21 +3266,35 @@ fn bridge_orphans(items: &[Item], reserved: &[(u16, u16)]) -> Vec<BridgeOrphan> 
     out
 }
 
-/// True when the assembler put anything between a `JSR __STR_PRINT_I` and the `.word` that is supposed to be its argument.
-fn inline_arg_split_by_bridge(items: &[Item]) -> bool {
-    items.iter().enumerate().any(|(i, item)| {
+/// Find inline PRINT calls separated from their arguments by a bridge.
+fn inline_args_split_by_bridge(
+    items: &[Item],
+    entries: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<usize> {
+    let mut split = std::collections::HashSet::new();
+    let mut ordinal = 0usize;
+    for (i, item) in items.iter().enumerate() {
         let Item::Instruction {
             mnemonic,
             operand: Some(op),
         } = item
         else {
-            return false;
+            continue;
         };
-        mnemonic.eq_ignore_ascii_case("JSR")
-            && op.trim() == crate::peephole::STR_PRINT_INLINE_ENTRY
-            && !matches!(items.get(i + 1), Some(Item::Words(_)))
-    })
+        if mnemonic.eq_ignore_ascii_case("JSR")
+            && (op.trim() == crate::peephole::STR_PRINT_INLINE_ENTRY || entries.contains(op.trim()))
+        {
+            if !matches!(items.get(i + 1), Some(Item::Words(_))) {
+                split.insert(ordinal);
+            }
+            ordinal += 1;
+        }
+    }
+    split
 }
+
+/// Local undo rounds before restoring every inline PRINT call.
+const INLINE_ARG_UNDO_ROUNDS: usize = 8;
 
 // FOR dispatch reads base+2*id, so all entries must be one indivisible assembler item.
 fn for_handler_table(asm: &str) -> Result<Option<(std::ops::Range<usize>, Vec<&str>)>, String> {
@@ -3403,7 +3726,7 @@ where
     Ok(())
 }
 
-/// How many bytes of dead fill have to go in front of `__DATA:` for the pool to clear every reserved range, or `None` when it already does.
+/// Fill needed to move DATA past its first reserved overlap.
 fn data_pool_clearance_fill<F>(
     asm: &str,
     reserved: &[(u16, u16)],
@@ -3412,9 +3735,6 @@ fn data_pool_clearance_fill<F>(
 where
     F: Fn(&str) -> Option<u16>,
 {
-    if reserved.is_empty() {
-        return Ok(None);
-    }
     let Some(start) = lookup("__DATA") else {
         return Ok(None);
     };
@@ -3427,8 +3747,11 @@ where
     if want == 0 {
         return Ok(None);
     }
+    let Some(fill) = clearance_fill(u32::from(start), want as u32, reserved) else {
+        return Ok(None);
+    };
+    // Where the pool ends up once every range it meets is cleared.
     let mut s = u32::from(start);
-    // Each step clears one reservation and can expose the next, so iterate; `reserved` is disjoint, so one pass per range suffices.
     for _ in 0..=reserved.len() {
         let last = s + want as u32 - 1;
         let Some(&(_, hi)) = reserved
@@ -3437,10 +3760,7 @@ where
         else {
             break;
         };
-        s = u32::from(hi) + 1;
-    }
-    if s == u32::from(start) {
-        return Ok(None);
+        s = u32::from(hi) + 2;
     }
     if s + want as u32 > 0x1_0000 {
         return Err(format!(
@@ -3451,18 +3771,58 @@ where
              --no-auto-reserve if it was discovered automatically."
         ));
     }
-    Ok(Some((s - u32::from(start)) as usize))
+    Ok(Some(fill))
 }
 
-/// Splice `len` bytes of dead fill in front of the `__DATA:` label, so the pool that follows starts higher up.
+/// Fill needed to move a block past its first reserved overlap.
+fn clearance_fill(start: u32, len: u32, reserved: &[(u16, u16)]) -> Option<usize> {
+    let last = start + len - 1;
+    let lo = reserved
+        .iter()
+        .filter(|&&(lo, hi)| u32::from(lo) <= last && u32::from(hi) >= start)
+        .map(|&(lo, _)| u32::from(lo))
+        .min()?;
+    Some(lo.saturating_sub(start + 2).max(1) as usize)
+}
+
+/// Move the variable block as a unit so clearing preserves reserved bytes.
+fn vars_block_clearance_fill<F>(asm: &str, reserved: &[(u16, u16)], lookup: F) -> Option<usize>
+where
+    F: Fn(&str) -> Option<u16>,
+{
+    let start = lookup("__VARS_START")?;
+    let open = asm.find("\n__VARS_START:\n")?;
+    let close = open + asm[open..].find("\n__VARS_END:\n")?;
+    let want = data_pool_byte_len(&asm[open..close]) as u32;
+    if want == 0 {
+        return None;
+    }
+    // Include bridge bytes in the linked block extent.
+    let linked = lookup("__VARS_END").map_or(0, |end| u32::from(end).saturating_sub(u32::from(start)));
+    clearance_fill(u32::from(start), want.max(linked), reserved)
+}
+
+const VARS_CLEARANCE_NOTE: &str = "; Keep variable clearing outside reserved ranges\n";
+
+/// Insert fill before DATA to move it past reserved ranges.
 fn insert_data_pool_clearance(asm: &str, len: usize) -> Option<String> {
+    insert_clearance_before(
+        asm,
+        "__DATA:",
+        len,
+        "; Keep DATA bytes outside reserved ranges\n",
+    )
+}
+
+/// Insert fill before a label, with the final byte on its own line.
+fn insert_clearance_before(asm: &str, label: &str, len: usize, note: &str) -> Option<String> {
     if len == 0 {
         return Some(asm.to_string());
     }
     let mut at = 0usize;
     let mut found = None;
     for line in asm.split_inclusive('\n') {
-        if line.trim_end() == "__DATA:" {
+        if line.trim_end() == label {
             found = Some(at);
             break;
         }
@@ -3470,13 +3830,9 @@ fn insert_data_pool_clearance(asm: &str, len: usize) -> Option<String> {
     }
     let at = found?;
     let mut block = String::with_capacity(len * 4 + 256);
-    block.push_str(
-        "; layout: dead fill so the DATA pool starts above every reserved range.\n\
-         ; The assembler bridges a reservation with a `JMP` plus zero pad, and\n\
-         ; READ walks the pool byte by byte with no relocation — a bridge inside\n\
-         ; it is handed back as DATA values. See `data_pool_clearance_fill`.\n",
-    );
-    let mut left = len;
+    block.push_str(note);
+    // Keep the final byte separate so the bridge moves it.
+    let mut left = len - 1;
     while left > 0 {
         let take = left.min(16);
         block.push_str("    .byte ");
@@ -3489,11 +3845,88 @@ fn insert_data_pool_clearance(asm: &str, len: usize) -> Option<String> {
         block.push('\n');
         left -= take;
     }
+    block.push_str("    .byte $00\n");
     let mut out = String::with_capacity(asm.len() + block.len());
     out.push_str(&asm[..at]);
     out.push_str(&block);
     out.push_str(&asm[at..]);
     Some(out)
+}
+
+/// The page a relocated pool's READ buffer sits at, when it is outside the image.
+fn data_buf_page(asm: &str) -> Option<u16> {
+    let prefix = format!("{} = $", codegen::DATA_BUF_LABEL);
+    asm.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .and_then(|hex| u16::from_str_radix(hex.trim(), 16).ok())
+}
+
+/// Read relocated DATA bytes from generated markers.
+fn data_blob_bytes(asm: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for hex in asm.lines().filter_map(|line| line.strip_prefix(codegen::DATA_BLOB_MARKER)) {
+        let hex = hex.trim().as_bytes();
+        for pair in hex.chunks(2) {
+            let text = std::str::from_utf8(pair).expect("codegen writes hex digits");
+            out.push(u8::from_str_radix(text, 16).expect("codegen writes hex digits"));
+        }
+    }
+    out
+}
+
+/// Append relocated DATA and set its load address in the startup code.
+fn append_relocated_data<F>(
+    stored: &mut Vec<u8>,
+    blob: &[u8],
+    origin: u16,
+    reserved: &[(u16, u16)],
+    lookup: F,
+) -> Result<u16, String>
+where
+    F: Fn(&str) -> Option<u16>,
+{
+    let run = u32::from(codegen::DATA_RUN_ADDR);
+    let len = blob.len() as u32;
+    let label = |name: &str| lookup(&format!("{}{name}", codegen::RELOCATED_PREFIX));
+    let (Some(start), Some(end)) = (label("__DATA"), label("__DATA_END")) else {
+        return Err("internal error: the relocated DATA pool has no labels".to_string());
+    };
+    if u32::from(start) != run || u32::from(end) - u32::from(start) != len {
+        return Err(format!(
+            "internal error: the relocated DATA pool links at ${start:04X}-${end:04X}, \
+             not at ${run:04X} with {len} bytes"
+        ));
+    }
+    let load = u32::from(origin) + stored.len() as u32;
+    if load + len > codegen::DATA_RUN_LIMIT {
+        return Err(format!("the DATA pool would load past ${:04X}", codegen::DATA_RUN_LIMIT - 1));
+    }
+    let last = run + len - 1;
+    if let Some((r_lo, r_hi)) = reserved
+        .iter()
+        .find(|&&(r_lo, r_hi)| u32::from(r_lo) <= last && u32::from(r_hi) >= run)
+    {
+        return Err(format!(
+            "the DATA pool runs at ${run:04X}-${last:04X}, across the reserved range \
+             ${r_lo:04X}-${r_hi:04X}"
+        ));
+    }
+    if let Some(buf) = lookup(codegen::DATA_BUF_LABEL)
+        && (buf >= 0xD000 - 0xFF || (0xA000 - 0xFF..0xC000).contains(&buf))
+    {
+        return Err(format!("the DATA buffer at ${buf:04X} is not plain RAM"));
+    }
+    let Some(at) = lookup(codegen::DATA_LOAD_LABEL)
+        .and_then(|addr| addr.checked_sub(origin))
+        .map(usize::from)
+        .filter(|&at| at + 2 <= stored.len())
+    else {
+        return Err("internal error: the DATA move has no load address to patch".to_string());
+    };
+    let load = load as u16;
+    stored[at..at + 2].copy_from_slice(&load.to_le_bytes());
+    stored.extend_from_slice(blob);
+    Ok(load)
 }
 
 /// Post-condition on the linked image: the DATA pool occupies exactly as many bytes as it has entries, in one run starting at `__DATA`.
@@ -3616,6 +4049,108 @@ impl ReserveCtx {
             data_runs,
         }
     }
+}
+
+/// Where READ copies an item from a relocated DATA pool, or `None` when the pool stays in place.
+fn data_relocation_plan(
+    module: &ir::Module,
+    options: &CompileOptions,
+    tsb_target: bool,
+) -> Option<codegen::DataBuf> {
+    // Auto requests relocation only when more room is needed.
+    if options.data_relocate != AutoMode::On
+        || may_touch_ram_under_roms(module)
+        || options.custom_start_address.is_some()
+        || tsb_target
+        || module_reads_basic_txttab(module)
+    {
+        return None;
+    }
+    Some(data_buffer_page(module, options))
+}
+
+/// Collect numeric values, optionally excluding addresses that only read or call.
+fn program_numbers(module: &ir::Module, skip_reads: bool) -> Vec<f64> {
+    struct Numbers {
+        skip_reads: bool,
+        out: Vec<f64>,
+    }
+    impl crate::visit::Visitor for Numbers {
+        fn visit_stmt(&mut self, line_no: u16, stmt: &ir::Stmt) {
+            match stmt {
+                ir::Stmt::Data(values) => {
+                    for v in values {
+                        if let crate::ast::DataValue::Float(n) = v {
+                            self.out.push(*n);
+                        }
+                    }
+                }
+                ir::Stmt::Sys { addr: ir::Expr::Number(_), regs, .. } if self.skip_reads => {
+                    for r in regs {
+                        self.visit_expr(r);
+                    }
+                    return;
+                }
+                ir::Stmt::Wait { addr: ir::Expr::Number(_), mask, eor } if self.skip_reads => {
+                    self.visit_expr(mask);
+                    if let Some(e) = eor {
+                        self.visit_expr(e);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            crate::visit::walk_stmt(self, line_no, stmt);
+        }
+        fn visit_expr(&mut self, e: &ir::Expr) {
+            match e {
+                ir::Expr::Number(n) => self.out.push(*n),
+                ir::Expr::Peek(inner) | ir::Expr::MemPeek(inner)
+                    if self.skip_reads && matches!(**inner, ir::Expr::Number(_)) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut numbers = Numbers { skip_reads, out: Vec::new() };
+    crate::visit::Visitor::visit_module(&mut numbers, module);
+    numbers.out
+}
+
+/// Whether memory writes or banking can overwrite relocated DATA.
+fn may_touch_ram_under_roms(module: &ir::Module) -> bool {
+    if program_numbers(module, true).iter().any(|n| (57344.0..=65535.0).contains(n)) {
+        return true;
+    }
+    let mut banks_roms = false;
+    for_each_stmt(module, &mut |stmt| {
+        if let ir::Stmt::Poke { addr, .. } = stmt
+            && matches!(literal_addr(addr), Some(0 | 1))
+        {
+            banks_roms = true;
+        }
+    });
+    let (bank, _) = resolve_vic_bank(module);
+    banks_roms || !matches!(bank, CharsetBank::Fixed(base) if base < 0xC000)
+}
+
+/// Choose an unused page below $D000, otherwise use BSS.
+fn data_buffer_page(module: &ir::Module, options: &CompileOptions) -> codegen::DataBuf {
+    if program_numbers(module, false).iter().any(|n| (49152.0..=53247.0).contains(n)) {
+        return codegen::DataBuf::Bss;
+    }
+    let mut reserved = options.reserved_ranges.clone();
+    if options.auto_reserve {
+        reserved.extend(discover_reserved_ranges(module));
+    }
+    (0xC0u16..=0xCF)
+        .rev()
+        .map(|page| page << 8)
+        .find(|&page| !reserved.iter().any(|&(lo, hi)| lo <= page + 0xFF && hi >= page))
+        .map_or(codegen::DataBuf::Bss, codegen::DataBuf::At)
 }
 
 /// Visit every statement in `module`, descending into the bodies of the statements that carry one.
@@ -4905,7 +5440,7 @@ fn note_addr_for_range(
 }
 
 /// Does `e` read an array element anywhere?
-fn expr_reads_an_array(e: &ir::Expr) -> bool {
+pub(crate) fn expr_reads_an_array(e: &ir::Expr) -> bool {
     use ir::Expr;
     match e {
         Expr::ArrayRef(..) => true,
@@ -7215,7 +7750,7 @@ mod tests {
         let mut source = String::new();
         for i in 0..24u8 {
             let letter = char::from(b'A' + i);
-            source.push_str(&format!("{} PRINT \"{}AB{letter}\";\n", 10 + u32::from(i) * 10, letter.to_string().repeat(177)));
+            source.push_str(&format!("{} PRINT \"{}AB{letter}\";\n", 10 + u32::from(i) * 10, (0..177).map(|k| if k % 8 == 7 { '.' } else { letter }).collect::<String>()));
         }
         source.push_str("500 END\n");
         let input = crate::tokenize_program(&source).unwrap();
@@ -7713,6 +8248,43 @@ mod tests {
             string_heap_window(&out, 0x9C00),
             Ok(None),
             "window question does not apply"
+        );
+    }
+
+    fn runtime_dim_of(n: u32) -> Vec<u8> {
+        crate::source::tokenize_program(&format!(
+            "10 N={n}:GOSUB 100\n20 DIM A(N)\n30 A(N)=1\n40 PRINT A(N)\n50 END\n\
+             100 IF PEEK(2)=7 THEN N=5\n110 RETURN\n"
+        ))
+        .expect("tokenizes")
+    }
+
+    #[test]
+    fn runtime_dims_the_heap_below_memsiz_cannot_hold_switch_to_extraram() {
+        let opts = CompileOptions {
+            custom_start_address: Some(0x9000),
+            ..CompileOptions::default()
+        };
+        let small = compile_with_options(&runtime_dim_of(10), opts.clone()).expect("compiles");
+        assert!(
+            matches!(small.diagnostics.extraram, ExtraRamDecision::AutoOff),
+            "55 bytes of array fit below MEMSIZ, got {:?}",
+            small.diagnostics.extraram
+        );
+        let room = room_below_memsiz(&small, 0x9000);
+        let big = compile_with_options(&runtime_dim_of(1000), opts).expect("compiles");
+        assert!(
+            room < 1001 * 5,
+            "fixture premise: {room} bytes below MEMSIZ can't hold the array"
+        );
+        assert!(
+            matches!(big.diagnostics.extraram, ExtraRamDecision::AutoOn),
+            "the DIM estimate asks for the RAM-under-ROM heap, got {:?}",
+            big.diagnostics.extraram
+        );
+        assert!(
+            extraram_heap_window(&big, 0x9000).expect("window").expect("measured") > room,
+            "and gets more heap than below MEMSIZ"
         );
     }
 
@@ -9916,7 +10488,6 @@ JMPTBL:
 
     #[test]
     fn a_reservation_inside_the_pool_is_measured_from_the_entries_not_the_labels() {
-        // The pool is 8 bytes at $0C74-$0C7B and $0C78-$0C7F is reserved, so the pool has to start at $0C80: four bytes of fill.
         let inside = &[(0x0C78u16, 0x0C7Fu16)];
         assert_eq!(
             data_pool_clearance_fill(POOL_ASM, inside, |n| match n {
@@ -9924,18 +10495,34 @@ JMPTBL:
                 "__DATA_END" => Some(0x1000), // already split; must be ignored
                 _ => None,
             }),
-            Ok(Some(0x0C80 - 0x0C74))
+            Ok(Some(0x0C76 - 0x0C74))
         );
     }
 
     #[test]
-    fn clearing_one_reservation_walks_the_pool_past_the_next() {
-
-        let two = &[(0x0C78u16, 0x0C7Fu16), (0x0C80u16, 0x0C8Fu16)];
+    fn the_fill_clears_the_lowest_reservation_first() {
+        let two = &[(0x0C7Bu16, 0x0C8Fu16), (0x0C77u16, 0x0C77u16)];
         assert_eq!(
             data_pool_clearance_fill(POOL_ASM, two, |n| (n == "__DATA").then_some(0x0C74)),
-            Ok(Some(0x0C90 - 0x0C74))
+            Ok(Some(1))
         );
+    }
+
+    #[test]
+    fn the_fill_puts_the_block_just_past_the_range() {
+        // From the first start that overlaps the range to the last one the assembler can bridge.
+        for start in 0x0FF9u16..=0x0FFD {
+            let asm = format!("*=${start:04X}\n{POOL_ASM}");
+            let reserved = [(0x1000u16, 0x17FFu16)];
+            let fill = data_pool_clearance_fill(&asm, &reserved, |n| (n == "__DATA").then_some(start))
+                .expect("fits")
+                .expect("the pool crosses the range");
+            let asm = insert_data_pool_clearance(&asm, fill).expect("__DATA: is in the asm");
+            let mut assembler = Assembler6502::new();
+            assembler.add_reserved_range(0x1000, 0x17FF).expect("valid range");
+            assembler.assemble_bytes(&asm).unwrap_or_else(|e| panic!("assembles: {e:?}\n{asm}"));
+            assert_eq!(assembler.lookup("__DATA"), Some(0x1801), "from ${start:04X}:\n{asm}");
+        }
     }
 
     #[test]
@@ -9953,8 +10540,7 @@ JMPTBL:
         let at = out.find("__DATA:").expect("label survives");
         let head = &out[..at];
         assert_eq!(head.matches("$00").count(), 4, "{out}");
-        assert!(head.contains("dead fill"), "{out}");
-        // The entries themselves are untouched and still in order.
+        // Keep the pool entries in order.
         let tail = &out[at..];
         assert_eq!(tail, POOL_ASM, "{out}");
 

@@ -45,7 +45,14 @@ fn build_extraram_above_window(rows: usize) -> Compiled {
     );
     for r in 0..rows {
         let body: Vec<String> = (0..20)
-            .map(|j| format!("POKE 53280,PEEK(781)+{}", (r * 20 + j) % 251))
+            .map(|j| {
+                format!(
+                    "POKE {},PEEK({})+{}",
+                    49152 + (r * 20 + j) % 4000,
+                    780 + (r + j) % 4,
+                    (r * 20 + j) % 251
+                )
+            })
             .collect();
         s.push_str(&format!("{} {}\n", 1000 + r, body.join(":")));
     }

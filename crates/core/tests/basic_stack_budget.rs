@@ -6,7 +6,7 @@ const PROFILES: [Profile; 3] = [Profile::Default, Profile::Speed, Profile::Size]
 
 fn build(src: &str, profile: Profile, extraram: bool) -> yabcompiler_core::Compiled {
     let prg = tokenize_program(src).expect("tokenize");
-    compile_with_options(
+    let mut c = compile_with_options(
         &prg,
         CompileOptions {
             profile,
@@ -15,7 +15,9 @@ fn build(src: &str, profile: Profile, extraram: bool) -> yabcompiler_core::Compi
             ..CompileOptions::default()
         },
     )
-    .expect("compile")
+    .expect("compile");
+    c.asm = common::expand_call_entries(&c.asm);
+    c
 }
 
 fn run(prg: &[u8]) -> (bool, String) {

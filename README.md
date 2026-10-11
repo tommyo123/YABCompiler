@@ -66,11 +66,25 @@ accept this option.
 Choose `--profile=speed` or `--profile=size` to favor speed or smaller
 programs. The default profile balances both.
 
+`--compress` writes a compressed `.prg` with its decoder. By default
+a file that reaches past `$CFFF` is compressed.
+
+`--data-relocate` moves DATA to RAM at `$D000` when the program starts,
+which leaves more room for the program and its heap. By default this
+happens when a program needs the room.
+
 GUI: launch `yabcompiler-gui`, pick a `.bas` or `.prg` as the input,
 press Compile. The menu bar holds the same actions plus theme and
 about. The settings panel is on the left, including a dialect picker
 that matches `--dialect` for ASCII `.bas` files. The output and
 generated assembly are on the right.
+
+Auto Extra RAM may leave too little heap for variables in large compiled
+programs. If you suspect this, try Move DATA set to On (`--data-relocate=on`)
+first, as it can free more heap. Force Extra RAM on (`--extraram`) if needed.
+
+Auto-reserve can miss memory ranges. If this causes problems, add the missing
+ranges manually in the GUI or with `--reserved`.
 
 ## Features
 
