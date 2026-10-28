@@ -53,3 +53,8 @@ fn a_redefined_function_binds_the_same_way() {
          40 PRINT FN A(2);X\n",
     );
 }
+
+#[test]
+fn an_inlined_body_ignores_the_outer_variables_range() {
+    same_as_the_rom("10 X=1:DEF FN A(X)=INT(X)\n20 PRINT FN A(2.5):X=X+1:IF X<3 THEN 20\n");
+}

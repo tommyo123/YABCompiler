@@ -2668,6 +2668,11 @@ fn with_known_flag_contracts(base: FlagLivenessConfig) -> FlagLivenessConfig {
 /// Drop it. Same for any conditional branch — falling through and
 /// jumping land at the same point either way.
 fn ph001_dead_jump_to_next(items: &mut Vec<Item>) -> bool {
+    drop_jumps_to_next(items, true)
+}
+
+/// Drop jumps to the next label, respecting section boundaries when requested.
+fn drop_jumps_to_next(items: &mut Vec<Item>, cross_sections: bool) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < items.len() {
@@ -2680,6 +2685,11 @@ fn ph001_dead_jump_to_next(items: &mut Vec<Item>) -> bool {
                 let mut dead = false;
                 while j < items.len() {
                     match &items[j] {
+                        Item::Comment(c)
+                            if !cross_sections && c.trim_start().starts_with("; ---") =>
+                        {
+                            break;
+                        }
                         Item::Blank | Item::Comment(_) => j += 1,
                         Item::Label(name) if name == target => {
                             dead = true;
@@ -4210,6 +4220,192 @@ fn any_insn_addresses_stack_page(items: &[Item], idxs: impl IntoIterator<Item = 
         matches!(&items[i], Item::Insn(insn)
             if insn.operand.as_deref().is_some_and(operand_addresses_stack_page))
     })
+}
+
+/// Inline factored helpers into short loops within the code-size budget.
+fn ph331_inline_helpers_in_loops(items: &mut Vec<Item>) -> bool {
+    const MAX_LOOP: usize = 80;
+    const MAX_BODY: usize = 40;
+    const MAX_IMAGE: usize = 16 * 1024;
+    const BUDGET: usize = 2048;
+    let zp = ZpEquates::scan(items);
+    let image: usize = items
+        .iter()
+        .map(|it| match it {
+            Item::Insn(ins) => approx_insn_bytes(ins, &zp),
+            Item::Directive(raw) => directive_bytes(raw).map_or(raw.len(), |b| b as usize),
+            _ => 0,
+        })
+        .sum();
+    if image > MAX_IMAGE {
+        return false;
+    }
+    let labels = register_liveness_label_map(items);
+    let smc = smc_patched_labels(items);
+    // Length of the smallest loop around each item.
+    let mut loop_len = vec![usize::MAX; items.len()];
+    for (j, it) in items.iter().enumerate() {
+        let Item::Insn(ins) = it else { continue };
+        if ins.mnem != "JMP" && !is_cond_branch(&ins.mnem) {
+            continue;
+        }
+        // A tail call back to an earlier helper is not a loop: the region must not leave.
+        if let Some(&h) = ins.operand.as_deref().and_then(|op| labels.get(op))
+            && h < j
+            && j - h <= MAX_LOOP
+            && items[h + 1..j].iter().all(|it| match it {
+                Item::Insn(i) if matches!(i.mnem.as_str(), "RTS" | "RTI") => false,
+                Item::Insn(i) if i.mnem == "JMP" => i
+                    .operand
+                    .as_deref()
+                    .and_then(|t| labels.get(t))
+                    .is_some_and(|&t| (h..=j).contains(&t)),
+                _ => true,
+            })
+        {
+            loop_len[h..=j]
+                .iter_mut()
+                .for_each(|l| *l = (*l).min(j - h));
+        }
+    }
+    let factored = |n: &str| is_factored_helper_label(n) || n.starts_with("__PH326_");
+    // Follow straight-line helper calls and tail jumps; reject other control flow.
+    let expand = |name: &str| -> Option<Vec<Item>> {
+        let mut out = Vec::new();
+        let mut i = *labels.get(name)? + 1;
+        let mut hops = 0;
+        loop {
+            let it = items.get(i)?;
+            match it {
+                Item::Label(l) => {
+                    if smc.contains(l) {
+                        return None;
+                    }
+                }
+                Item::Comment(_) | Item::Blank => {}
+                Item::Insn(ins) => {
+                    let op = ins.operand.as_deref().unwrap_or("");
+                    let control = op.starts_with('L')
+                        && op[1..].bytes().all(|b| b.is_ascii_digit())
+                        || op.contains("GOSUB")
+                        || op.contains("__FOR_")
+                        || op.contains("RETURN");
+                    if is_cond_branch(&ins.mnem)
+                        || matches!(
+                            ins.mnem.as_str(),
+                            "PHA" | "PLA" | "PHP" | "PLP" | "TSX" | "TXS" | "RTI" | "BRK"
+                        )
+                        || operand_addresses_stack_page(op)
+                        || control
+                        || op.starts_with('(')
+                    {
+                        return None;
+                    }
+                    match ins.mnem.as_str() {
+                        "RTS" => return Some(out),
+                        "JMP" if factored(op) && hops < 4 => {
+                            hops += 1;
+                            i = *labels.get(op)?;
+                        }
+                        "JMP" => {
+                            out.push(Item::Insn(Insn {
+                                mnem: "JSR".to_string(),
+                                operand: Some(op.to_string()),
+                                comment: None,
+                            }));
+                            return Some(out);
+                        }
+                        _ => out.push(it.clone()),
+                    }
+                    if out.len() > MAX_BODY {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            if items[i..].first().is_some_and(is_sys_wrap_marker) {
+                return None;
+            }
+            i += 1;
+        }
+    };
+    let mut sites: Vec<(usize, usize, Vec<Item>)> = Vec::new();
+    for (k, it) in items.iter().enumerate() {
+        let Item::Insn(ins) = it else { continue };
+        if ins.mnem != "JSR" || loop_len[k] == usize::MAX {
+            continue;
+        }
+        let Some(op) = ins.operand.as_deref() else {
+            continue;
+        };
+        if !factored(op) {
+            continue;
+        }
+        if let Some(body) = expand(op) {
+            sites.push((loop_len[k], k, body));
+        }
+    }
+    sites.sort_by_key(|&(len, k, _)| (len, k));
+    let mut spent = 0usize;
+    let mut plans: Vec<(usize, Vec<Item>)> = Vec::new();
+    for (_, k, body) in sites {
+        let bytes: usize = body
+            .iter()
+            .map(|it| match it {
+                Item::Insn(ins) => approx_insn_bytes(ins, &zp),
+                _ => 0,
+            })
+            .sum();
+        let grows = bytes.saturating_sub(3);
+        if spent + grows > BUDGET {
+            continue;
+        }
+        spent += grows;
+        plans.push((k, body));
+    }
+    if plans.is_empty() {
+        return false;
+    }
+    plans.sort_by_key(|&(k, _)| k);
+    for (k, body) in plans.into_iter().rev() {
+        items.splice(k..=k, body);
+    }
+    while drop_dead_factored_helpers(items) {}
+    true
+}
+
+/// Remove unused factored helpers through their final return or tail jump.
+fn drop_dead_factored_helpers(items: &mut Vec<Item>) -> bool {
+    let refs = label_ref_counts(items);
+    let referenced = |l: &str| refs.get(l).copied().unwrap_or(0) > 0;
+    for i in 0..items.len() {
+        let Item::Label(name) = &items[i] else {
+            continue;
+        };
+        if !(is_factored_helper_label(name) || name.starts_with("__PH326_")) || referenced(name) {
+            continue;
+        }
+        let entered = prev_struct(items, i)
+            .is_none_or(|j| !matches!(&items[j], Item::Insn(p) if is_uncond_terminator(&p.mnem)));
+        if entered {
+            continue;
+        }
+        let mut end = i + 1;
+        while end < items.len() {
+            match &items[end] {
+                Item::Label(l) if referenced(l) => break,
+                Item::Directive(_) | Item::Origin(_) => return false,
+                Item::Insn(ins) if is_uncond_terminator(&ins.mnem) => {
+                    end += 1;
+                    break;
+                }
+                _ => end += 1,
+            }
+        }
+        items.drain(i..end);
+        return true;
+    }
+    false
 }
 
 /// Inline a factored helper with one caller when relocation is safe.
@@ -8959,6 +9155,322 @@ fn is_plain_label(s: &str) -> bool {
 /// The label the inline-argument trampoline is reached by.
 pub const STR_PRINT_INLINE_ENTRY: &str = "__STR_PRINT_I";
 
+/// The label of the trampoline that prints the text stored behind its call.
+pub const STR_PRINT_TEXT_ENTRY: &str = "__STR_PRINT_T";
+
+/// The comment that opens the string pool section.
+const STRING_POOL_HEADER: &str = "; --- string pool (length-prefixed) ---";
+
+/// Bytes of the inline-argument trampoline.
+const STR_PRINT_INLINE_HELPER: isize = 34;
+/// Bytes of the text trampoline.
+const STR_PRINT_TEXT_HELPER: isize = 33;
+/// Longest text the trampoline's Y index can walk past.
+const STR_PRINT_TEXT_MAX: usize = 254;
+
+/// Whether any PRINT call keeps its argument behind the call.
+pub fn has_inline_print_args(asm: &str) -> bool {
+    asm.contains(STR_PRINT_INLINE_ENTRY) || asm.contains(STR_PRINT_TEXT_ENTRY)
+}
+
+/// The text trampoline: print the length-prefixed text behind the call and return past it.
+fn append_str_print_text_helper(items: &mut Vec<Item>, lo: &str, hi: &str) {
+    items.push(Item::Label(STR_PRINT_TEXT_ENTRY.to_string()));
+    push_insn(items, "PLA", None);
+    push_insn(items, "STA", Some(lo.to_string()));
+    push_insn(items, "PLA", None);
+    push_insn(items, "STA", Some(hi.to_string()));
+    // The return address is the call's last byte, so the length sits one past it.
+    push_insn(items, "LDY", Some("#$01".to_string()));
+    push_insn(items, "LDA", Some(format!("({lo}),Y")));
+    push_insn(items, "TAX", None);
+    items.push(Item::Label("__STR_PRINT_T_LOOP".to_string()));
+    push_insn(items, "INY", None);
+    push_insn(items, "LDA", Some(format!("({lo}),Y")));
+    push_insn(items, "JSR", Some("$FFD2".to_string()));
+    push_insn(items, "DEX", None);
+    push_insn(items, "BNE", Some("__STR_PRINT_T_LOOP".to_string()));
+    // Y is the length plus one, so the byte after the text is the pointer plus Y plus one.
+    push_insn(items, "TYA", None);
+    push_insn(items, "SEC", None);
+    push_insn(items, "ADC", Some(lo.to_string()));
+    push_insn(items, "STA", Some(lo.to_string()));
+    push_insn(items, "BCC", Some("__STR_PRINT_T_GO".to_string()));
+    push_insn(items, "INC", Some(hi.to_string()));
+    items.push(Item::Label("__STR_PRINT_T_GO".to_string()));
+    push_insn(items, "JMP", Some(format!("({lo})")));
+}
+
+/// Complete string-pool records indexed by label, including their length bytes.
+fn whole_pool_records(
+    items: &[Item],
+) -> std::collections::HashMap<String, (usize, usize, Vec<u8>)> {
+    let mut records = std::collections::HashMap::new();
+    let Some(header) = items
+        .iter()
+        .position(|it| matches!(it, Item::Comment(c) if c.trim() == STRING_POOL_HEADER))
+    else {
+        return records;
+    };
+    let mut at = header + 1;
+    let mut previous_whole = true;
+    while matches!(items.get(at), Some(Item::Blank)) {
+        at += 1;
+    }
+    while let Some(Item::Label(name)) = items.get(at) {
+        let mut bytes = Vec::new();
+        let mut end = at + 1;
+        let mut parsed = true;
+        while let Some(Item::Directive(raw)) = items.get(end) {
+            match raw.trim().strip_prefix(".byte ") {
+                Some(body) => {
+                    for v in body.split(',') {
+                        match v
+                            .trim()
+                            .strip_prefix('$')
+                            .and_then(|h| u8::from_str_radix(h, 16).ok())
+                        {
+                            Some(b) => bytes.push(b),
+                            None => parsed = false,
+                        }
+                    }
+                }
+                None => parsed = false,
+            }
+            end += 1;
+        }
+        let whole = parsed
+            && bytes
+                .first()
+                .is_some_and(|&n| usize::from(n) + 1 == bytes.len());
+        if whole
+            && previous_whole
+            && name
+                .strip_prefix('S')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            records.insert(name.clone(), (at, end, bytes));
+        }
+        previous_whole = whole;
+        at = end;
+        while matches!(items.get(at), Some(Item::Blank)) {
+            at += 1;
+        }
+    }
+    records
+}
+
+/// Move single-use printed literals behind their calls when this reduces code size.
+pub fn inline_single_use_print_text(asm: &str, register_sites: bool) -> Option<String> {
+    use std::collections::{HashMap, HashSet};
+    if asm.contains(crate::packed_print::DECODER_LABEL) || asm.contains(STR_PRINT_TEXT_ENTRY) {
+        return None;
+    }
+    let mut items = parse(asm);
+    let (lo, hi) = str_print_zp_pair(&items)?;
+    // JMP ($xxFF) reads its high byte from the start of the same page.
+    if lo == "$FF" {
+        return None;
+    }
+    let records = whole_pool_records(&items);
+    if records.is_empty() {
+        return None;
+    }
+    // Every mention of a pool label; one with an offset also rules out the record after it.
+    let mut mentions: HashMap<&str, usize> = HashMap::new();
+    let mut offset_next: HashSet<usize> = HashSet::new();
+    for it in &items {
+        let text = match it {
+            Item::Insn(insn) => insn.operand.as_deref().unwrap_or(""),
+            Item::Directive(raw) => raw.split(';').next().unwrap_or(""),
+            _ => continue,
+        };
+        let mut rest = text;
+        while let Some(start) = rest.find(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            let tail = &rest[start..];
+            let len = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            if let Some((name, record)) = records.get_key_value(&tail[..len]) {
+                *mentions.entry(name.as_str()).or_default() += 1;
+                if tail[len..].trim_start().starts_with(['+', '-']) {
+                    offset_next.insert(record.1);
+                }
+            }
+            rest = &tail[len..];
+        }
+    }
+    let smc = smc_patched_labels(&items);
+    let patched_site = |i: usize| {
+        prev_struct(&items, i)
+            .is_some_and(|p| matches!(&items[p], Item::Label(n) if smc.contains(n)))
+    };
+    let eligible = |name: &str, uses: usize| {
+        records.get(name).is_some_and(|r| {
+            let len = r.2.len() - 1;
+            (1..=STR_PRINT_TEXT_MAX).contains(&len) && !offset_next.contains(&r.0)
+        }) && mentions.get(name) == Some(&uses)
+            && !smc.contains(name)
+    };
+    // (call index, indices dropped, label)
+    let mut sites: Vec<(usize, Vec<usize>, String)> = Vec::new();
+    let (mut pointer_count, mut register_count) = (0isize, 0isize);
+    let mut i = 0;
+    while i < items.len() {
+        if let Item::Insn(call) = &items[i]
+            && call.mnem == "JSR"
+            && call.operand.as_deref() == Some(STR_PRINT_INLINE_ENTRY)
+            && let Some(k) = next_struct(&items, i)
+            && let Item::Directive(d) = &items[k]
+            && let Some(label) = d.trim().strip_prefix(".word ").map(str::trim)
+            && eligible(label, 1)
+            && !patched_site(i)
+        {
+            sites.push((i, vec![k], label.to_string()));
+            pointer_count += 1;
+            i = k + 1;
+            continue;
+        }
+        if register_sites
+            && let Item::Insn(a) = &items[i]
+            && a.mnem == "LDA"
+            && let Some(label) = a.operand.as_deref().and_then(|op| op.strip_prefix("#<"))
+            && let Some(j) = next_struct(&items, i)
+            && let Item::Insn(b) = &items[j]
+            && b.mnem == "LDY"
+            && b.operand.as_deref() == Some(format!("#>{label}").as_str())
+            && let Some(k) = next_struct(&items, j)
+            && let Item::Insn(c) = &items[k]
+            && c.mnem == "JSR"
+            && c.operand.as_deref() == Some("__STR_PRINT")
+            && eligible(label, 2)
+            && !patched_site(i)
+        {
+            sites.push((i, vec![j, k], label.to_string()));
+            register_count += 1;
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+    if sites.is_empty() {
+        return None;
+    }
+    // The inline-argument trampoline goes when no call reaches it any more.
+    let (entries, _) = str_print_inline_entries(&items);
+    let pointer_calls = items
+        .iter()
+        .filter(|it| {
+            matches!(it, Item::Insn(insn) if insn.operand.as_deref().is_some_and(|op| op
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|t| t == STR_PRINT_INLINE_ENTRY)))
+        })
+        .count() as isize;
+    let tramp = items
+        .iter()
+        .position(|it| matches!(it, Item::Label(n) if n == STR_PRINT_INLINE_ENTRY));
+    let tramp_end = tramp.and_then(|at| {
+        items[at + 1..]
+            .iter()
+            .position(|it| {
+                matches!(it, Item::Insn(insn)
+                    if insn.mnem == "JMP" && insn.operand.as_deref() == Some("__STR_PRINT_PTR"))
+            })
+            .map(|off| at + 1 + off + 1)
+    });
+    // Calls left on it go back to the register form when that costs less than keeping it.
+    let left: Vec<(usize, usize, String)> = (0..items.len())
+        .filter(|&i| !sites.iter().any(|s| s.0 == i))
+        .filter_map(|i| match &items[i] {
+            Item::Insn(insn)
+                if insn.mnem == "JSR"
+                    && insn.operand.as_deref() == Some(STR_PRINT_INLINE_ENTRY) =>
+            {
+                let k = next_struct(&items, i)?;
+                let Item::Directive(d) = &items[k] else {
+                    return None;
+                };
+                let label = d.trim().strip_prefix(".word ")?.trim();
+                is_plain_label(label).then(|| (i, k, label.to_string()))
+            }
+            _ => None,
+        })
+        .collect();
+    let left_count = left.len() as isize;
+    let drop_tramp = tramp.is_some()
+        && tramp_end.is_some()
+        && entries.is_empty()
+        && pointer_calls == pointer_count + left_count
+        && 2 * left_count < STR_PRINT_INLINE_HELPER
+        && !asm.contains(&format!(".word {STR_PRINT_INLINE_ENTRY}"));
+    let saved = 2 * pointer_count
+        + 4 * register_count
+        + if drop_tramp {
+            STR_PRINT_INLINE_HELPER - 2 * left_count
+        } else {
+            0
+        }
+        - STR_PRINT_TEXT_HELPER;
+    if saved <= 0 {
+        return None;
+    }
+    let mut replace: HashMap<usize, Item> = HashMap::new();
+    let mut drop: HashSet<usize> = HashSet::new();
+    let mut expand: HashMap<usize, Vec<Item>> = HashMap::new();
+    if drop_tramp {
+        for (call, arg, label) in &left {
+            let mut seq = Vec::new();
+            push_insn(&mut seq, "LDA", Some(format!("#<{label}")));
+            push_insn(&mut seq, "LDY", Some(format!("#>{label}")));
+            push_insn(&mut seq, "JSR", Some("__STR_PRINT".to_string()));
+            expand.insert(*call, seq);
+            drop.insert(*arg);
+        }
+    }
+    for (call, dropped, label) in &sites {
+        let (start, end, bytes) = &records[label];
+        replace.insert(
+            *call,
+            Item::Insn(Insn {
+                mnem: "JSR".to_string(),
+                operand: Some(STR_PRINT_TEXT_ENTRY.to_string()),
+                comment: None,
+            }),
+        );
+        let list: Vec<String> = bytes.iter().map(|b| format!("${b:02X}")).collect();
+        let (&data, rest) = dropped.split_last().expect("one argument item");
+        drop.extend(rest);
+        replace.insert(
+            data,
+            Item::Directive(format!("    .byte {} ; {label}", list.join(","))),
+        );
+        drop.extend(*start..*end);
+    }
+    if drop_tramp {
+        drop.extend(tramp.expect("checked")..tramp_end.expect("checked"));
+    }
+    let mut out = Vec::with_capacity(items.len() + 32);
+    for (idx, it) in items.drain(..).enumerate() {
+        if let Some(new) = replace.remove(&idx) {
+            out.push(new);
+        } else if let Some(seq) = expand.remove(&idx) {
+            out.extend(seq);
+        } else if !drop.contains(&idx) {
+            out.push(it);
+        }
+    }
+    let mut helpers: Vec<Item> = Vec::new();
+    if !helper_section_present(&out) {
+        helpers.push(Item::Blank);
+        helpers.push(Item::Comment(
+            "; --- peephole-factored helpers ---".to_string(),
+        ));
+    }
+    append_str_print_text_helper(&mut helpers, &lo, &hi);
+    append_helpers_before_heap(&mut out, helpers);
+    Some(render(&out))
+}
+
 /// Find shared prefix entries leading to inline PRINT.
 fn str_print_inline_entries(items: &[Item]) -> (std::collections::HashMap<String, Vec<Insn>>, Option<usize>) {
     let mut entries = std::collections::HashMap::new();
@@ -9023,18 +9535,27 @@ pub fn undo_str_print_inline_args_at(
     asm: &str,
     sites: Option<&std::collections::HashSet<usize>>,
 ) -> String {
-    if !asm.contains(STR_PRINT_INLINE_ENTRY) {
+    if !has_inline_print_args(asm) {
         return asm.to_string();
     }
     let items = parse(asm);
     let (entries, entries_start) = str_print_inline_entries(&items);
-    let is_site = |it: &Item| {
-        matches!(it, Item::Insn(insn)
-            if insn.mnem == "JSR" && insn.operand.as_deref().is_some_and(
-                |op| op == STR_PRINT_INLINE_ENTRY || entries.contains_key(op)))
+    // Some(true) for a call with its text behind it, Some(false) for one with a pointer.
+    let site_kind = |it: &Item| match it {
+        Item::Insn(insn) if insn.mnem == "JSR" => match insn.operand.as_deref() {
+            Some(STR_PRINT_TEXT_ENTRY) => Some(true),
+            Some(op) if op == STR_PRINT_INLINE_ENTRY || entries.contains_key(op) => Some(false),
+            _ => None,
+        },
+        _ => None,
     };
-    let total = items.iter().filter(|it| is_site(it)).count();
-    let undo_all = sites.is_none_or(|s| (0..total).all(|k| s.contains(&k)));
+    let named = |ordinal: usize| sites.is_none_or(|s| s.contains(&ordinal));
+    // A trampoline goes once every call that uses it is undone.
+    let mut keeps = [false, false];
+    for (ordinal, kind) in items.iter().filter_map(|it| site_kind(it)).enumerate() {
+        keeps[usize::from(kind)] |= !named(ordinal);
+    }
+    let [keep_pointer, keep_text] = keeps;
 
     let entry = items.iter().position(
         |it| matches!(it, Item::Label(name) if name == STR_PRINT_INLINE_ENTRY),
@@ -9049,22 +9570,66 @@ pub fn undo_str_print_inline_args_at(
             })
             .map(|off| at + 1 + off + 1)
     });
-    if entry.is_some() && tramp_end.is_none() {
+    let text_entry = items
+        .iter()
+        .position(|it| matches!(it, Item::Label(name) if name == STR_PRINT_TEXT_ENTRY));
+    // The text trampoline ends in its indirect jump back.
+    let text_end = text_entry.and_then(|at| {
+        items[at + 1..]
+            .iter()
+            .position(|it| {
+                matches!(it, Item::Insn(insn)
+                    if insn.mnem == "JMP" && insn.operand.as_deref().is_some_and(|op| op.starts_with('(')))
+            })
+            .map(|off| at + 1 + off + 1)
+    });
+    if entry.is_some() && tramp_end.is_none() || text_entry.is_some() && text_end.is_none() {
         return asm.to_string();
     }
     let mut out: Vec<Item> = Vec::with_capacity(items.len() + 64);
+    // Pool records taken back from text calls, and where the text trampoline was.
+    let mut restored: Vec<Item> = Vec::new();
+    let mut text_at: Option<usize> = None;
     let mut ordinal = 0usize;
     let mut i = 0usize;
     while i < items.len() {
-        if undo_all && (Some(i) == entry || Some(i) == entries_start) {
+        if !keep_pointer && (Some(i) == entry || Some(i) == entries_start) {
             i = tramp_end.expect("checked above");
             continue;
         }
-        let chosen = is_site(&items[i]) && {
+        if Some(i) == text_entry {
+            let end = text_end.expect("checked above");
+            if keep_text {
+                out.extend_from_slice(&items[i..end]);
+            }
+            text_at = Some(out.len());
+            i = end;
+            continue;
+        }
+        let kind = site_kind(&items[i]);
+        let chosen = kind.is_some() && {
             ordinal += 1;
-            undo_all || sites.is_some_and(|s| s.contains(&(ordinal - 1)))
+            named(ordinal - 1)
         };
         if chosen
+            && kind == Some(true)
+            && let Some(k) = next_struct(&items, i)
+            && let Item::Directive(d) = &items[k]
+            && let Some((body, label)) = d.split_once(';')
+            && body.trim().starts_with(".byte ")
+            && is_plain_label(label.trim())
+        {
+            let label = label.trim();
+            push_insn(&mut out, "LDA", Some(format!("#<{label}")));
+            push_insn(&mut out, "LDY", Some(format!("#>{label}")));
+            push_insn(&mut out, "JSR", Some("__STR_PRINT".to_string()));
+            restored.push(Item::Label(label.to_string()));
+            restored.push(Item::Directive(format!("    {}", body.trim())));
+            i = k + 1;
+            continue;
+        }
+        if chosen
+            && kind == Some(false)
             && let Some(k) = next_struct(&items, i)
             && let Item::Directive(d) = &items[k]
             && let Some(label) = d.trim().strip_prefix(".word ")
@@ -9085,6 +9650,16 @@ pub fn undo_str_print_inline_args_at(
         }
         out.push(items[i].clone());
         i += 1;
+    }
+    if !restored.is_empty() {
+        // Back into the string pool, or where the trampoline was when the pool section is gone.
+        let at = out
+            .iter()
+            .position(|it| matches!(it, Item::Comment(c) if c.trim() == STRING_POOL_HEADER))
+            .map(|p| p + 1)
+            .or(text_at)
+            .unwrap_or(out.len());
+        out.splice(at..at, restored);
     }
     render(&out)
 }
@@ -11757,6 +12332,208 @@ fn next_insn_idx(items: &[Item], from: usize) -> Option<usize> {
     (from..items.len()).find(|&k| matches!(items[k], Item::Insn(_)))
 }
 
+/// Remove unread byte-counter stores when reachable code cannot observe the cell.
+fn ph153_drop_dead_counter_stores(items: &mut Vec<Item>) -> bool {
+    let Some(helpers_at) = items.iter().position(
+        |it| matches!(it, Item::Comment(c) if c.trim() == "; --- helper subroutines ---"),
+    ) else {
+        return false;
+    };
+    // An interrupt handler could read the cell at any instruction.
+    if items.iter().any(|it| {
+        matches!(it, Item::Insn(i) if i.operand.as_deref().is_some_and(|o| {
+            let o = o.to_ascii_uppercase();
+            o.starts_with("$0314") || o.starts_with("$0315") || o.starts_with("$0318") || o.starts_with("$FFFE")
+        }))
+    }) {
+        return false;
+    }
+    let equ = collect_equ_values(items);
+    let is_counter = |name: &str| {
+        name.strip_prefix("FU_")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut cells: Vec<u16> = equ
+        .iter()
+        .filter(|(name, v)| is_counter(name) && **v < 0x100)
+        .map(|(_, v)| *v)
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    if cells.is_empty() {
+        return false;
+    }
+    let labels = register_liveness_label_map(items);
+    let target = |op: Option<&str>| op.and_then(|o| labels.get(o).copied());
+    let n = items.len();
+    // The helper code a JSR can reach, and whether it can leave the helpers other than by RTS.
+    let mut reach_memo: std::collections::HashMap<usize, (Vec<usize>, bool)> =
+        std::collections::HashMap::new();
+    let mut reach = |entry: usize| -> (Vec<usize>, bool) {
+        if let Some(r) = reach_memo.get(&entry) {
+            return r.clone();
+        }
+        let mut seen = vec![false; n];
+        let mut stack = vec![entry];
+        let mut out = Vec::new();
+        let mut escapes = false;
+        while let Some(k) = stack.pop() {
+            if k >= n || seen[k] {
+                continue;
+            }
+            if k < helpers_at {
+                escapes = true;
+                continue;
+            }
+            seen[k] = true;
+            out.push(k);
+            let Item::Insn(ins) = &items[k] else {
+                stack.push(k + 1);
+                continue;
+            };
+            let op = ins.operand.as_deref();
+            let external = op.is_some_and(|o| o.starts_with('$'));
+            match ins.mnem.as_str() {
+                "RTS" => {}
+                "RTI" | "BRK" | "TXS" => escapes = true,
+                // A tail call into the ROM returns to this helper's caller.
+                "JMP" if external => {}
+                "JMP" => match target(op) {
+                    Some(t) => stack.push(t),
+                    None => escapes = true,
+                },
+                "JSR" => {
+                    if !external {
+                        match target(op) {
+                            Some(t) => stack.push(t),
+                            None => escapes = true,
+                        }
+                    }
+                    stack.push(k + 1);
+                }
+                m if is_cond_branch(m) => {
+                    match target(op) {
+                        Some(t) => stack.push(t),
+                        None => escapes = true,
+                    }
+                    stack.push(k + 1);
+                }
+                _ => stack.push(k + 1),
+            }
+        }
+        reach_memo.insert(entry, (out.clone(), escapes));
+        (out, escapes)
+    };
+    let mut drop: Vec<usize> = Vec::new();
+    for cell in cells {
+        // Every name the cell goes by, and its literal address.
+        let names: Vec<&str> = equ
+            .iter()
+            .filter(|(_, v)| **v == cell)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let literal = format!("${cell:02X}");
+        let mentions = |op: &str| {
+            names.iter().any(|n| operand_mentions_var(op, n))
+                || op
+                    .trim_start_matches(['#', '<', '>', '('])
+                    .split([',', ')', '+'])
+                    .next()
+                    .is_some_and(|base| base.eq_ignore_ascii_case(&literal))
+        };
+        let mut uses = vec![false; n];
+        let mut kills = vec![false; n];
+        let mut exit_live = vec![false; n];
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (k, it) in items.iter().enumerate().take(helpers_at) {
+            let next = (k + 1 < helpers_at).then_some(k + 1);
+            let Item::Insn(ins) = it else {
+                match next {
+                    Some(nx) => succ[k].push(nx),
+                    None => exit_live[k] = true,
+                }
+                continue;
+            };
+            let op = ins.operand.as_deref();
+            let exact = op.is_some_and(|o| names.contains(&o) || o.eq_ignore_ascii_case(&literal));
+            if matches!(ins.mnem.as_str(), "STA" | "STX" | "STY") && exact {
+                kills[k] = true;
+            } else if op.is_some_and(&mentions) {
+                uses[k] = true;
+            }
+            let to = |t: Option<usize>, succ: &mut Vec<usize>, live: &mut bool| match t {
+                Some(t) if t < helpers_at => succ.push(t),
+                _ => *live = true,
+            };
+            match ins.mnem.as_str() {
+                "JMP" => to(target(op), &mut succ[k], &mut exit_live[k]),
+                "RTS" | "RTI" | "BRK" => exit_live[k] = true,
+                "JSR" => {
+                    match target(op) {
+                        // A GOSUB continues in main code.
+                        Some(t) if t < helpers_at => succ[k].push(t),
+                        Some(t) => {
+                            let (code, escapes) = reach(t);
+                            if escapes
+                                || code.iter().any(|&c| {
+                                    matches!(&items[c], Item::Insn(i)
+                                        if i.operand.as_deref().is_some_and(&mentions))
+                                })
+                            {
+                                uses[k] = true;
+                            }
+                        }
+                        None if op.is_some_and(|o| o.starts_with('$')) => {}
+                        None => uses[k] = true,
+                    }
+                    match next {
+                        Some(nx) => succ[k].push(nx),
+                        None => exit_live[k] = true,
+                    }
+                }
+                m if is_cond_branch(m) => {
+                    to(target(op), &mut succ[k], &mut exit_live[k]);
+                    match next {
+                        Some(nx) => succ[k].push(nx),
+                        None => exit_live[k] = true,
+                    }
+                }
+                m => match next {
+                    Some(nx) if !is_uncond_terminator(m) => succ[k].push(nx),
+                    _ => exit_live[k] = true,
+                },
+            }
+        }
+        let mut live_in = vec![false; n];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for k in (0..helpers_at).rev() {
+                let out = exit_live[k] || succ[k].iter().any(|&s| live_in[s]);
+                let inn = uses[k] || (out && !kills[k]);
+                if inn != live_in[k] {
+                    live_in[k] = inn;
+                    changed = true;
+                }
+            }
+        }
+        for k in 0..helpers_at {
+            if kills[k] && !exit_live[k] && !succ[k].iter().any(|&s| live_in[s]) {
+                drop.push(k);
+            }
+        }
+    }
+    if drop.is_empty() {
+        return false;
+    }
+    drop.sort_unstable();
+    drop.dedup();
+    for k in drop.into_iter().rev() {
+        items.remove(k);
+    }
+    true
+}
+
 /// Keep counting loop indices in X when calls and exits preserve it.
 fn ph210_loop_index_to_x(items: &mut Vec<Item>) -> bool {
     let labels = register_liveness_label_map(items);
@@ -12114,6 +12891,7 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
 
         changed |= ph208_hoist_ldy_zero_from_loop(&mut items);
         changed |= ph210_loop_index_to_x(&mut items);
+        changed |= ph153_drop_dead_counter_stores(&mut items);
 
         changed |= ph304_merge_identical_blocks(&mut items);
 
@@ -12278,8 +13056,13 @@ fn run_once_with_options(asm: &str, profile: Profile, opts: Options) -> String {
         ph114_str_print_inline_args(&mut items);
     }
     ph326_absorb_shared_call_prefix(&mut items);
+    if profile == Profile::Speed {
+        ph331_inline_helpers_in_loops(&mut items);
+    }
     ph330_drop_add_of_zero_with_known_carry(&mut items);
     ph329_branch_straight_to_the_jmp_target(&mut items);
+    // The late passes can leave a jump to the next label.
+    drop_jumps_to_next(&mut items, false);
     render(&items)
 }
 
@@ -12636,6 +13419,70 @@ FAR:
             .expect("the register form assembles");
     }
 
+    #[test]
+    fn text_behind_the_call_returns_past_every_length_it_takes() {
+        let lengths = [1usize, 2, 127, 128, 200, 253, 254, 255, 3, 4, 5];
+        let mut asm = String::from("*=$2000\n");
+        for (i, _) in lengths.iter().enumerate() {
+            asm.push_str(&format!(
+                "    LDA #<S{i}\n    LDY #>S{i}\n    JSR __STR_PRINT\n    INC $0404\n"
+            ));
+        }
+        asm.push_str(concat!(
+            "    JMP $FFFE\n__STR_PRINT:\n    STA $FD\n    STY $FE\n__STR_PRINT_PTR:\n",
+            "    LDY #$00\n    LDA ($FD),Y\n    BEQ __P_DONE\n    TAX\n    INY\n__P_LOOP:\n",
+            "    LDA ($FD),Y\n    JSR $FFD2\n    INY\n    DEX\n    BNE __P_LOOP\n__P_DONE:\n    RTS\n",
+            "; --- string pool (length-prefixed) ---\n",
+        ));
+        let mut want = Vec::new();
+        for (i, &n) in lengths.iter().enumerate() {
+            let text: Vec<u8> = (0..n).map(|k| 0x41 + ((k + i) % 26) as u8).collect();
+            want.extend_from_slice(&text);
+            let bytes: Vec<String> = std::iter::once(n as u8)
+                .chain(text)
+                .map(|b| format!("${b:02X}"))
+                .collect();
+            asm.push_str(&format!("S{i}:\n    .byte {}\n", bytes.join(",")));
+        }
+        let out =
+            inline_single_use_print_text(&asm, true).expect("the calls pay for the trampoline");
+        assert_eq!(
+            out.matches("JSR __STR_PRINT_T\n").count(),
+            lengths.len() - 1,
+            "{out}"
+        );
+        assert!(
+            out.contains("    LDA #<S7\n    LDY #>S7\n"),
+            "255 bytes stay in the pool:\n{out}"
+        );
+        let bytes = asm6502::Assembler6502::new().assemble_bytes(&out).unwrap();
+        let mut system = emu64::System::new();
+        system.mem.ram[0x2000..0x2000 + bytes.len()].copy_from_slice(&bytes);
+        system.mem.ram[0x404] = 0;
+        system.start_at(0x2000);
+        system.cpu.regs.sp = 0xf0;
+        for _ in 0..200_000 {
+            if system.cpu.regs.pc == 0xfffe {
+                break;
+            }
+            assert!(system.step());
+        }
+        assert_eq!(system.cpu.regs.pc, 0xfffe);
+        assert_eq!(system.cpu.regs.sp, 0xf0);
+        assert_eq!(
+            system.mem.ram[0x404],
+            lengths.len() as u8,
+            "every call came back once"
+        );
+        assert_eq!(system.output, want);
+
+        let plain = undo_str_print_inline_args(&out);
+        assert!(!plain.contains(STR_PRINT_TEXT_ENTRY), "{plain}");
+        asm6502::Assembler6502::new()
+            .assemble_bytes(&plain)
+            .expect("the register form assembles");
+    }
+
     fn ph327_program(payload: &[u8], sites: usize, tail_jump: bool) -> String {
         let mut s = String::from("*=$C000\n");
         for n in 0..sites {
@@ -12979,6 +13826,13 @@ FAR:
 
         assert!(!got.contains("L1:"), "dead label swept:\n{got}");
         assert!(got.contains("RTS"), "fall-through code kept:\n{got}");
+    }
+
+    #[test]
+    fn the_late_jump_cleanup_stays_inside_its_section() {
+        let mut items = parse("    JMP L1\n; --- helpers ---\nL1:\n    RTS\n");
+        assert!(!drop_jumps_to_next(&mut items, false));
+        assert!(drop_jumps_to_next(&mut items, true));
     }
 
     #[test]
@@ -14080,8 +14934,9 @@ done:
             "missing helper repaired:\n{got}"
         );
         assert!(
-            got.contains("JMP __FAC_TO_INT16"),
-            "helper tail-calls dependency:\n{got}"
+            got.contains("JMP __FAC_TO_INT16")
+                || got.contains("JSR __BOOL_TO_FAC\n__FAC_TO_INT16:"),
+            "helper tail-calls or falls into its dependency:\n{got}"
         );
     }
 

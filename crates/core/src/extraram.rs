@@ -106,6 +106,11 @@ const ROM_CALLS: &[RomCall] = &[
         addr: 0xBBD4,
         label: "MOVMF",
     },
+    // The store after ROUND, which the speed profile's MOVMF calls.
+    RomCall {
+        addr: 0xBBD7,
+        label: "MOVMF_STORE",
+    },
     RomCall {
         addr: 0xBC1B,
         label: "ROUND",
@@ -135,6 +140,40 @@ const ROM_CALLS: &[RomCall] = &[
         addr: 0xBB0F,
         label: "FDIV",
     },
+    // `__I24_FAC` ends in a jump to this normalisation entry; it branches on carry only.
+    RomCall {
+        addr: 0xB8D2,
+        label: "FADD_NORMALIZE_SIGNED",
+    },
+    RomCall {
+        addr: 0xB86A,
+        label: "FADDT",
+    },
+    RomCall {
+        addr: 0xB853,
+        label: "FSUBT",
+    },
+    RomCall {
+        addr: 0xBA2B,
+        label: "FMULTT",
+    },
+    RomCall {
+        addr: 0xBB12,
+        label: "FDIVT",
+    },
+    // `--fast-float` hands these cases back to the ROM.
+    RomCall {
+        addr: 0xBA30,
+        label: "FMULT_ROM",
+    },
+    RomCall {
+        addr: 0xB97E,
+        label: "OVERFLOW",
+    },
+    RomCall {
+        addr: 0xB8D2,
+        label: "FADD_NORM",
+    },
     RomCall {
         addr: 0xBF7B,
         label: "FPWRT",
@@ -162,6 +201,27 @@ const ROM_CALLS: &[RomCall] = &[
     RomCall {
         addr: 0xBCCC,
         label: "FN_INT",
+    },
+    // The pieces of FADD the speed profile's own FADD calls.
+    RomCall {
+        addr: 0xBA8C,
+        label: "CONUPK",
+    },
+    RomCall {
+        addr: 0xBBFC,
+        label: "MOVFA",
+    },
+    RomCall {
+        addr: 0xB881,
+        label: "FADD_ARG_UP",
+    },
+    RomCall {
+        addr: 0xB893,
+        label: "FADD_ARG_DOWN",
+    },
+    RomCall {
+        addr: 0xB8A3,
+        label: "FADD_ALIGNED",
     },
     RomCall {
         addr: 0xBC39,
@@ -230,6 +290,11 @@ const ROM_CALLS: &[RomCall] = &[
     RomCall {
         addr: 0xE097,
         label: "FN_RND",
+    },
+    // The tail of RND that the speed profile's own RND jumps to.
+    RomCall {
+        addr: 0xE0E3,
+        label: "RND_TAIL",
     },
     RomCall {
         addr: 0xE26B,
@@ -857,10 +922,14 @@ fn emit_preamble(
         };
         let _ = writeln!(s, "__JT_{}:", call.label);
 
-        if ceiling.is_some() && matches!(call.addr, 0xA437 | 0xA46C | 0xE37B) {
+        if ceiling.is_some() && matches!(call.addr, 0xA437 | 0xA46C | 0xE37B | 0xB97E) {
             let _ = writeln!(s, "    JSR {MEMSIZ_RESTORE}");
         }
         let _ = writeln!(s, "    INC $01");
+        if matches!(call.addr, 0xB86A | 0xBA2B | 0xBB12) {
+            // These entries branch on the FAC exponent loaded just before the call.
+            let _ = writeln!(s, "    LDA $61");
+        }
         let _ = writeln!(s, "    JSR ${:04X}", call.addr);
         let _ = writeln!(s, "    DEC $01");
         if call.addr == crate::runtime::FCOMP {

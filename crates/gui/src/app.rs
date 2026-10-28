@@ -136,6 +136,8 @@ pub struct YabApp {
     auto_reserve: bool,
     lenient_syntax: bool,
     safe_sys_calls: bool,
+    unchecked: bool,
+    fast_float: bool,
     rem_hint_dialect: yabcompiler_core::BasicHintDialect,
     reserved_ranges: String,
     custom_start_enabled: bool,
@@ -178,6 +180,8 @@ impl Default for YabApp {
             auto_reserve: true,
             lenient_syntax: false,
             safe_sys_calls: false,
+            unchecked: false,
+            fast_float: false,
             rem_hint_dialect: yabcompiler_core::BasicHintDialect::None,
             reserved_ranges: String::new(),
             custom_start_enabled: false,
@@ -596,6 +600,21 @@ impl YabApp {
                 .color(theme_subtle_color(ui))
                 .small(),
         );
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.unchecked, "No error checks")
+            .on_hover_text(
+                "Leave out run-time error checks and line tracking. A program\n\
+                 that runs without an error behaves the same; one that would\n\
+                 stop with an error may do anything.",
+            );
+        ui.checkbox(
+            &mut self.fast_float,
+            "Fast float (float code embedded, larger binary)",
+        )
+        .on_hover_text(
+            "Float routines in the program instead of the ROM's: the same\n\
+             results as the ROM, faster, but a larger file.",
+        );
     }
 
     /// Dialect picker for ASCII `.bas` input.
@@ -917,6 +936,8 @@ impl YabApp {
             self.auto_reserve = true;
             self.lenient_syntax = false;
             self.safe_sys_calls = false;
+            self.unchecked = false;
+            self.fast_float = false;
             self.rem_hint_dialect = yabcompiler_core::BasicHintDialect::None;
             self.reserved_ranges.clear();
             self.custom_start_enabled = false;
@@ -1044,6 +1065,8 @@ impl YabApp {
             auto_reserve: self.auto_reserve,
             lenient_syntax: self.lenient_syntax,
             safe_sys_calls: self.safe_sys_calls,
+            unchecked: self.unchecked,
+            fast_float: self.fast_float,
             rem_hint_dialect: self.rem_hint_dialect,
             reserved_text: &self.reserved_ranges,
             custom_start_text: custom_start,
@@ -1143,6 +1166,25 @@ fn format_diagnostics(d: &yabcompiler_core::Diagnostics) -> String {
     out.push_str(&format!("  extraram: {}\n", d.extraram));
     if d.data_relocated > 0 {
         out.push_str(&format!("  DATA {} bytes moved to $D000 at start\n", d.data_relocated));
+    }
+    if let Some((before, after)) = d.size_profile_heap_improvement {
+        let layout = if d.compact_heap_layout {
+            "compact "
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "  profile : selected {layout}Size layout to increase verified heap capacity \
+             from {before} to {after} bytes\n"
+        ));
+    } else if d.size_profile_fallback {
+        out.push_str(
+            "  profile : the chosen profile did not fit any legal layout; \
+             rebuilt with Size (smaller, slower)\n",
+        );
+    }
+    if d.fast_float_dropped {
+        out.push_str("  float   : Fast float left out; the program needs the memory\n");
     }
     if !d.effective_reserved.is_empty() {
         let source = match (d.auto_reserved.is_empty(), d.manual_reserved.is_empty()) {

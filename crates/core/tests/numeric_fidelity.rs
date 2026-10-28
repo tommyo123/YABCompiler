@@ -156,6 +156,30 @@ fn out_of_range_int_store_is_not_constant_folded() {
         );
     }
 }
+/// A sum that rounds past the largest float stops with ?OVERFLOW where it is stored or pushed.
+#[test]
+fn rounding_overflow_is_not_constant_folded() {
+    for src in [
+        "10 X=1.7014118342E38:Y=X+1.9807041E28:PRINT \"A\"\n",
+        "10 X=1.7014118342E38+1.9807041E28:PRINT \"B\"\n",
+        "10 X=1.7014118342E38:IF X+1.9807041E28>0 THEN PRINT \"C\"\n",
+        "10 X%=1.7014118342E38+1.9807041E28\n",
+    ] {
+        let prg = tokenize_program(src).expect("tokenizes");
+        let want = emu64::run_basic_to_end(&prg, 20_000_000).expect("runs in the interpreter");
+        assert_eq!(want.error_code, Some(15), "{src}");
+        for (profile, extraram) in VARIANTS {
+            let bytes = compile_variant(src, profile, extraram).prg_bytes;
+            let got = emu64::run_prg_to_end(&bytes, 20_000_000).expect("runs");
+            assert_eq!(
+                (&got.output, got.error_code, got.error_line),
+                (&want.output, want.error_code, want.error_line),
+                "{profile:?} extraram={extraram}:\n{src}"
+            );
+        }
+    }
+}
+
 #[test]
 fn dead_out_of_range_int_store_survives_dead_store_elim() {
     check_asm("10 A%=40000\n20 END\n", "JSR __AYINT", true);
@@ -280,5 +304,17 @@ fn constant_mem_operand_fast_path_still_fires_for_plain_loads() {
 #[test]
 fn computed_lhs_is_packed_to_a_temp_before_a_constant_operand() {
     let src = "10 PRINT INT(LOG(EXP(1))*1000)\n20 END\n";
-    check_asm(src, "__ST__T0", true);
+    for (profile, extraram) in VARIANTS {
+        let asm = compile_variant(src, profile, extraram).asm;
+        // Speed rounds it into ARG instead.
+        let needle = if profile == Profile::Speed {
+            "__FAC_TO_ARG:"
+        } else {
+            "__ST__T0"
+        };
+        assert!(
+            asm.contains(needle),
+            "{profile:?} extraram={extraram}: no {needle}:\n{src}"
+        );
+    }
 }

@@ -116,7 +116,7 @@ fn the_cap_is_applied_per_hole() {
 // End to end, against real compiler output.
 #[test]
 fn a_real_overshooting_image_reports_its_hole() {
-    let c = compile(&filler(152), vec![(0x3000, 0x3FFF)]);
+    let c = compile(&filler(157), vec![(0x3000, 0x3FFF)]);
     let o = c
         .diagnostics
         .reserved_overshoots
@@ -133,7 +133,7 @@ fn a_real_overshooting_image_reports_its_hole() {
 
 #[test]
 fn an_image_that_clears_the_hole_says_nothing() {
-    let c = compile(&filler(151), vec![(0x3000, 0x3FFF)]);
+    let c = compile(&filler(156), vec![(0x3000, 0x3FFF)]);
     assert!(
         c.diagnostics.reserved_overshoots.is_empty(),
         "nothing to report at {:04X}: {:#?}",
@@ -149,8 +149,8 @@ fn an_image_that_clears_the_hole_says_nothing() {
 
 #[test]
 fn the_cliff_is_real() {
-    let over = compile(&filler(152), vec![(0x3000, 0x3FFF)]);
-    let under = compile(&filler(151), vec![(0x3000, 0x3FFF)]);
+    let over = compile(&filler(157), vec![(0x3000, 0x3FFF)]);
+    let under = compile(&filler(156), vec![(0x3000, 0x3FFF)]);
     let o = over.diagnostics.reserved_overshoots[0];
     let jump = over.prg_bytes.len() - under.prg_bytes.len();
     assert!(

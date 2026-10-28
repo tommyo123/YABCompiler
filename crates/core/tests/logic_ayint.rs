@@ -272,7 +272,7 @@ fn value_context_with_operands_swapped_swaps_the_order() {
 fn left_operand_bounds_check_runs_before_the_right_operand() {
     check_emit_order(
         "5 READ I\n10 DIM Q(2)\n20 IF Q(I)=1 AND LOG(0)=1 THEN PRINT \"Y\"\n\
-         30 PRINT \"Z\"\n40 DATA 9\n50 END\n",
+         30 PRINT \"Z\"\n40 DATA 9,0.5\n50 END\n",
         BOUNDS_GUARD,
         FN_LOG,
     );

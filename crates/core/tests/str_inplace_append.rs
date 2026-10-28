@@ -247,3 +247,49 @@ fn appending_still_happens_in_place_after_an_array_store() {
         "one array store must not make the appends quadratic: {base} vs {with_store}"
     );
 }
+
+fn speed_run(src: &str) -> (String, u64, String) {
+    let prg = tokenize_program(src).expect("tokenizes");
+    let c = compile_with_options(
+        &prg,
+        CompileOptions {
+            profile: yabcompiler_core::Profile::Speed,
+            ..CompileOptions::default()
+        },
+    )
+    .expect("compiles");
+    let r = emu64::run_prg_to_end(&c.prg_bytes, 60_000_000).expect("runs");
+    assert!(r.clean_exit, "must reach END: {src}");
+    let rom = emu64::run_basic_to_end(&prg, 400_000_000).expect("runs in the interpreter");
+    assert_eq!(
+        common::petscii_to_string(&r.output),
+        common::petscii_to_string(&rom.output),
+        "{src}"
+    );
+    (
+        common::petscii_to_string(&r.output).trim_end().to_string(),
+        r.instructions,
+        c.asm,
+    )
+}
+
+/// Under Speed an element whose chunk is the last one stored grows where it is.
+#[test]
+fn speed_appends_to_an_array_element_in_place() {
+    let (out, _, asm) = speed_run(
+        "10 DIM C$(3):FOR I=1 TO 90:C$(2)=C$(2)+\"X\":NEXT:PRINT LEN(C$(2))\n\
+         20 FOR I=1 TO 2:C$(1)=C$(1)+C$(2):C$(3)=C$(3)+\"Y\":NEXT:PRINT LEN(C$(1));C$(3)\n\
+         30 C$(2)=\"Q\":C$(2)=C$(2)+\"R\":PRINT C$(2);LEN(C$(1))\n",
+    );
+    assert!(asm.contains("JSR __ARR_APPEND_PRE"), "{asm}");
+    assert_eq!(out, " 90 \n 180 YY\nQR 180");
+    let bench =
+        |n: usize| format!("10 DIM C$(3):FOR I=1 TO {n}:C$(2)=C$(2)+\"X\":NEXT:PRINT LEN(C$(2))\n");
+    let (_, n100, _) = speed_run(&bench(100));
+    let (_, n200, _) = speed_run(&bench(200));
+    let ratio = n200 as f64 / n100 as f64;
+    assert!(
+        ratio < 2.4,
+        "array appends are still superlinear: {n100} insns at n=100, {n200} at n=200"
+    );
+}

@@ -364,7 +364,7 @@ fn a_program_without_val_has_no_val_buf() {
 const RUNTIME_FLOAT_ARRAY: &str = "\
 10 N=PEEK(781)+40
 20 DIM A(N)
-30 FOR I=1 TO 3:A(I)=I*100:NEXT
+30 FOR I=1 TO 3:A(I)=I*100+0.5:NEXT
 40 FOR I=1 TO 3:PRINT A(I):NEXT
 50 END
 ";

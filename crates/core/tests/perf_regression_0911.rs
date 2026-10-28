@@ -56,27 +56,26 @@ fn a03_inequality_guard_admits_large_step() {
 
 #[test]
 fn a04_equality_guard_does_not_bound_a_step_over() {
+    // X steps over M; the later X>300 exit is what bounds it.
     let src =
         "10 M=240:X=1\n20 X=X+2:IF X=M THEN 40\n25 IF X>300 THEN 40\n30 GOTO 20\n40 PRINT X\n";
-    let asm = compile(src, Profile::Default).asm;
-    // The later X>300 guard can independently justify a word shadow.
-    assert!(!asm.contains("VI_X"));
-    if asm.contains("ZSI_V_X") {
-        assert!(asm.contains("LDA ZSI_V_X+1"));
-    }
     output(src, "301");
+    // Without that exit nothing bounds X, and it passes 32767.
+    let src = "10 M=240:X=1\n20 X=X+2:K=K+1:IF X=M THEN 40\n25 IF K<20000 THEN 20\n40 PRINT X\n";
+    assert!(!compile(src, Profile::Default).asm.contains("VI_X"));
+    output(src, "40001");
 }
 
 #[test]
 fn a05_equality_guard_does_not_bound_a_wrong_side_start() {
+    // X starts past M; the later X>300 exit is what bounds it.
     let src =
         "10 M=10:X=20\n20 X=X+1:IF X=M THEN 40\n25 IF X>300 THEN 40\n30 GOTO 20\n40 PRINT X\n";
-    let asm = compile(src, Profile::Default).asm;
-    assert!(!asm.contains("VI_X"));
-    if asm.contains("ZSI_V_X") {
-        assert!(asm.contains("LDA ZSI_V_X+1"));
-    }
     output(src, "301");
+    // Without that exit nothing bounds X, and it passes 32767.
+    let src = "10 M=10:X=20\n20 X=X+1:K=K+1:IF X=M THEN 40\n25 IF K<40000 THEN 20\n40 PRINT X\n";
+    assert!(!compile(src, Profile::Default).asm.contains("VI_X"));
+    output(src, "40020");
 }
 
 fn quantity_error(src: &str, line: u16) {

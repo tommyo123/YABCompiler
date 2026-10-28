@@ -110,18 +110,53 @@ fn a_poke_loader_reads_its_bytes() {
 }
 
 #[test]
+fn spaces_inside_and_after_digits_are_skipped_as_fin_does() {
+    let src = with_many_digit_items(
+        "10 READ A,B%,C$:PRINT A;B%;C$\n\
+         20 PRINT VAL(\"1 2\");VAL(\" 34 \")\n\
+         30 DATA 7 ,1 2,8 \n",
+    );
+    assert!(asm(&src, Profile::Default).contains("__DIGITS_LIN:"));
+    same_as_the_rom(&src);
+}
+
+#[test]
 fn the_profiles_choose_the_shortcut_by_pool_size() {
-    let few = "10 READ A,B$:PRINT A;B$\n20 DATA 12,X\n";
-    assert!(!asm(few, Profile::Default).contains("__DIGITS_FAC"));
+    let few = "10 READ A,B$:PRINT A;B$\n20 DATA 12,AB\n";
+    assert!(!asm(few, Profile::Default).contains("__DIGITS_LIN"));
     assert!(asm(few, Profile::Speed).contains("__READ_DIGITS:"));
     let many = with_many_digit_items("10 READ B$:PRINT B$\n20 DATA X\n");
-    assert!(asm(&many, Profile::Default).contains("__READ_DIGITS:"));
-    assert!(!asm(&many, Profile::Size).contains("__DIGITS_FAC"));
+    assert!(asm(&many, Profile::Default).contains("__DIGITS_LIN:"));
+    assert!(!asm(&many, Profile::Size).contains("__DIGITS_LIN"));
 }
 
 #[test]
 fn a_quoted_digit_item_is_still_refused() {
     let src = with_many_digit_items("10 READ A$,B:PRINT A$;B\n20 READ C:PRINT C\n30 DATA \"7\",8,\"9\"\n");
-    assert!(!asm(&src, Profile::Default).contains("__DIGITS_FAC"));
+    assert!(!asm(&src, Profile::Default).contains("__DIGITS_LIN"));
     same_as_the_rom(&src);
+}
+
+#[test]
+fn integer_targets_take_digits_without_fac() {
+    let items: Vec<String> = (0..70).map(|i| (i * 37 % 1000).to_string()).collect();
+    for strings in ["5 READ T$:PRINT T$\n6 DATA HELLO\n", ""] {
+        let src = format!(
+            "1 S=0:FOR I=1 TO 70:READ A%:S=S+A%:NEXT:PRINT S\n{strings}\
+             10 FOR I=0 TO 9:READ B%:PRINT B%;:NEXT:PRINT\n\
+             20 DATA 7,-5,1.5,+3, 12,-0,9999,-9999,1E3,-1.5\n\
+             30 READ A%:PRINT A%\n40 DATA 40000\n\
+             9000 DATA {}\n",
+            items.join(",")
+        );
+        let profile = if strings.is_empty() {
+            Profile::Speed
+        } else {
+            Profile::Default
+        };
+        let code = asm(&src, profile);
+        assert!(code.contains("__READ_DIGITS_INT:"), "{code}");
+        assert!(!code.contains("__DIGITS_GIVAYF"), "{code}");
+        same_as_the_rom(&src);
+    }
 }

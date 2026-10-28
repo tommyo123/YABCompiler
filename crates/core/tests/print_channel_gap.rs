@@ -295,7 +295,8 @@ fn get_file_brackets_channl_in_the_rom_order() {
     for profile in ALL_PROFILES {
         let asm = asm_at("10 OPEN 1,3\n20 GET#1,A$\n30 CLOSE 1\n", profile);
         assert!(
-            asm.contains("STX $13\n    JSR $FFC6"),
+            asm.contains("STX $13\n    JSR __CHKIN_CK")
+                && asm.contains("__CHKIN_CK:\n    JSR $FFC6"),
             "{profile:?}: GET# must set CHANNL immediately before CHKIN:\n{asm}"
         );
         assert!(
@@ -445,7 +446,8 @@ fn cmd_and_print_file_maintain_channl() {
     for profile in ALL_PROFILES {
         let cmd = asm_at("10 OPEN 1,3\n20 CMD 1\n30 PRINT \"A\"\n", profile);
         assert!(
-            cmd.contains("STX $13\n    JSR $FFC9"),
+            cmd.contains("STX $13\n    JSR __CHKOUT_CK")
+                && cmd.contains("__CHKOUT_CK:\n    JSR $FFC9"),
             "{profile:?}: CMD must set CHANNL immediately before CHKOUT"
         );
         assert!(

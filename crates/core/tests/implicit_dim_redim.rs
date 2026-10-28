@@ -92,13 +92,21 @@ fn a_multi_name_dim_traps_on_the_created_one() {
 }
 
 #[test]
-fn dim_of_an_already_dimmed_array_is_still_not_an_error() {
-    check_ok("10 dim k(5)\n20 dim k(5)\n30 print k(2)\n", " 0");
+fn dim_of_an_already_dimmed_array_is_an_error() {
+    check_error(
+        "10 dim k(5)\n20 dim k(5)\n30 print k(2)\n",
+        "",
+        "?REDIM'D ARRAY  ERROR IN 20",
+    );
 }
 
 #[test]
-fn a_reference_between_two_dims_stays_inside_the_deviation() {
-    check_ok("10 dim k(5)\n20 k(2)=7\n30 dim k(5)\n40 print k(2)\n", " 7");
+fn a_reference_between_two_dims_does_not_change_that() {
+    check_error(
+        "10 dim k(5)\n20 k(2)=7\n30 dim k(5)\n40 print k(2)\n",
+        "",
+        "?REDIM'D ARRAY  ERROR IN 30",
+    );
 }
 
 /// The ordinary case, which is most `DIM`s in most programs.
@@ -134,12 +142,13 @@ fn a_reference_reached_through_a_gosub_still_counts_when_it_is_inlined() {
     );
 }
 
-/// The reach limit, written down so it is a decision and not a surprise.
+/// A `DIM` that something jumps back to still sees the reference before it.
 #[test]
-fn a_dim_that_something_jumps_back_to_is_left_alone() {
-    check_ok(
+fn a_dim_that_something_jumps_back_to_still_traps() {
+    check_error(
         "10 k(2)=5\n20 dim k(5)\n30 print k(2)\n40 if a=1 then 20\n",
-        " 5",
+        "",
+        "?REDIM'D ARRAY  ERROR IN 20",
     );
 }
 

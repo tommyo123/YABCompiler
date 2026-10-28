@@ -82,6 +82,10 @@ pub struct CompileOptions {
     pub data_relocate: AutoMode,
     /// Write a compressed program with its decoder.
     pub compress: AutoMode,
+    /// Omit runtime error checks and line tracking for programs that run without errors.
+    pub unchecked: bool,
+    /// Embed faster float routines with matching arithmetic results.
+    pub fast_float: bool,
 }
 
 /// An option the compiler may decide for itself.
@@ -126,6 +130,8 @@ impl Default for CompileOptions {
             custom_start_address: None,
             data_relocate: AutoMode::default(),
             compress: AutoMode::default(),
+            unchecked: false,
+            fast_float: false,
         }
     }
 }
@@ -414,6 +420,8 @@ pub struct Diagnostics {
     pub original_image: Option<(u16, u16)>,
     /// The build selected [`Profile::Size`] after a layout failure or to improve a tight managed heap window at the default profile.
     pub size_profile_fallback: bool,
+    /// Whether the layout omitted float routines to preserve memory.
+    pub fast_float_dropped: bool,
 
     pub size_profile_heap_improvement: Option<(u32, u32)>,
 
@@ -651,6 +659,21 @@ fn compile_with_options_once(
 ) -> Result<Compiled, CompileError> {
     let mut saw_sys_param_vars = false;
     match compile_at_profile_reporting(prg_bytes, options.clone(), &mut saw_sys_param_vars) {
+        // Omit embedded float routines when the program needs the available heap.
+        Ok(compiled)
+            if options.fast_float && compiled.diagnostics.extraram == ExtraRamDecision::AutoOn =>
+        {
+            let without = CompileOptions {
+                fast_float: false,
+                ..options.clone()
+            };
+            let mut plain = compile_with_options_once(prg_bytes, without)?;
+            if plain.diagnostics.extraram != ExtraRamDecision::AutoOn {
+                return Ok(compiled);
+            }
+            plain.diagnostics.fast_float_dropped = true;
+            Ok(plain)
+        }
         Ok(compiled) => {
             let compiled = prefer_unpacked_when_smaller(compiled, &options, |rescue| {
                 compile_at_profile_rescue(prg_bytes, options.clone(), rescue)
@@ -679,6 +702,17 @@ fn compile_with_options_once(
 
             if !matches!(first, CompileError::Assemble { .. }) {
                 return Err(first);
+            }
+            // Omit embedded float routines before changing the profile.
+            if options.fast_float {
+                let without = CompileOptions {
+                    fast_float: false,
+                    ..options.clone()
+                };
+                if let Ok(mut compiled) = compile_with_options_once(prg_bytes, without) {
+                    compiled.diagnostics.fast_float_dropped = true;
+                    return Ok(compiled);
+                }
             }
             if options.profile != Profile::Size {
                 let retry = CompileOptions {
@@ -853,7 +887,7 @@ fn prefer_rescued_heap_headroom(
 fn managed_extraram_heap_window(build: &Compiled, origin: u32) -> Option<u32> {
     if !build.diagnostics.extraram.is_on()
         || !build.asm.contains(extraram::MEMSIZ_APPLY)
-        || !build.asm.contains("__HEAP_PTR:")
+        || !(build.asm.contains("__HEAP_PTR:") || build.asm.contains("Z__HEAP_PTR ="))
     {
         return None;
     }
@@ -983,7 +1017,7 @@ fn compile_pipeline(
         .map(|d| (d.name.clone(), d.code))
         .collect();
     let (mut module, source_integer_vars) =
-        lower_and_optimize_with_source_types(&ast, options.profile)?;
+        lower_and_optimize_with_source_types(&ast, options.profile, options.unchecked)?;
     *saw_sys_param_vars = !crate::sys_params::scan_module(&module).is_empty();
     if options.no_sys_param_substitution {
         // Retry SYS sites with raw parameter text to reduce code size.
@@ -1020,6 +1054,8 @@ fn compile_pipeline(
         matches!(rescue, LayoutRescue::Compact | LayoutRescue::DataFirst),
         tsb_target,
         data_relocate,
+        options.unchecked,
+        options.fast_float,
     )
     .map_err(CompileError::Codegen)?;
     // Request more heap only for arrays that fit in BASIC.
@@ -1063,16 +1099,38 @@ fn compile_pipeline(
         } else {
             packed
         };
+        let packed = crate::peephole::inline_single_use_print_text(
+            &packed,
+            options.profile == Profile::Size,
+        )
+        .unwrap_or(packed);
+        let packed = codegen::place_heap_cells_in_zero_page(&packed);
+        let packed = if options.fast_float {
+            // Unrolled under Speed, loops elsewhere.
+            let form = if options.profile == Profile::Speed {
+                crate::fast_float::Form::Fast
+            } else {
+                crate::fast_float::Form::Compact
+            };
+            crate::fast_float::route(&packed, form)
+        } else {
+            packed
+        };
+        // Fast float takes the speed profile's float helpers too.
+        let fast = options.profile == Profile::Speed || options.fast_float;
         // Route conversions after optimization recognizes their ROM addresses.
         let helper = match options.profile {
-            Profile::Size => return packed,
-            Profile::Speed => codegen::FAST_GIVAYF,
+            Profile::Size if !options.fast_float => return packed,
+            _ if fast => codegen::FAST_GIVAYF,
             _ => codegen::FAST_BYTE_GIVAYF,
         };
         let routed = codegen::route_int_to_fac_through_own_code(&packed, helper).unwrap_or(packed);
-        // Use the FACWORD helper under Speed.
-        if options.profile == Profile::Speed {
-            codegen::route_facword_through_own_code(&routed).unwrap_or(routed)
+        // Use the FACWORD and INT helpers under Speed.
+        if fast {
+            let routed = codegen::route_facword_through_own_code(&routed).unwrap_or(routed);
+            let routed = codegen::route_int_through_own_code(&routed).unwrap_or(routed);
+            let routed = codegen::route_fadd_through_own_code(&routed).unwrap_or(routed);
+            codegen::route_movmf_through_own_code(&routed).unwrap_or(routed)
         } else {
             routed
         }
@@ -1576,7 +1634,7 @@ fn assemble_pass_dropping_unpaid_bss_fill_inner(
         zp_pressure,
         inplace,
     );
-    if built.is_ok() || !asm.contains(crate::peephole::STR_PRINT_INLINE_ENTRY) {
+    if built.is_ok() || !crate::peephole::has_inline_print_args(asm) {
         return built;
     }
     let plain = crate::peephole::undo_str_print_inline_args(asm);
@@ -1672,6 +1730,11 @@ fn assemble_pass(
     zp_pressure: codegen::ZpPressure,
     inplace: Option<InplaceImage<'_>>,
 ) -> Result<Compiled, CompileError> {
+    // Extraram rearranges the image; FMULT keeps to the ROM there.
+    let without_tables = extraram_on
+        .then(|| crate::fast_float::without_tables(asm))
+        .flatten();
+    let asm = without_tables.as_deref().unwrap_or(asm);
     let inplace_body = inplace.map(|i| i.body);
     let inplace_window = inplace_body.map(original_image_bounds);
     let mut auto_ranges: Vec<(u16, u16)> = if options.auto_reserve {
@@ -1770,19 +1833,46 @@ fn assemble_pass(
         relocate_data_past_reservations(asm, &merged)
     };
 
+    let final_asm = codegen::settle_bss_fill(&final_asm).unwrap_or(final_asm);
     let assembler_reserved: Vec<(u16, u16)> = merged
         .iter()
         .copied()
         .filter(|r| !absorbed.contains(r))
         .collect();
 
-    let mut assembled = assemble_with_aligned_vectors(final_asm, &assembler_reserved).map_err(|e| {
-        explain_address_space_overflow(
-            e,
-            options.custom_start_address.unwrap_or(CODE_ORIGIN as u16),
-            &assembler_reserved,
-        )
-    })?;
+    let same_page = options.profile != Profile::Size;
+    let shorter = branch_known_flag_jumps(&final_asm, &assembler_reserved, same_page)
+        .and_then(|asm| assemble_with_aligned_vectors(asm, &assembler_reserved).ok());
+    let mut assembled = match shorter {
+        Some(assembled) => assembled,
+        None => assemble_with_aligned_vectors(final_asm, &assembler_reserved).map_err(|e| {
+            explain_address_space_overflow(
+                e,
+                options.custom_start_address.unwrap_or(CODE_ORIGIN as u16),
+                &assembler_reserved,
+            )
+        })?,
+    };
+    // Use ROM multiplication when reserved ranges split the table storage.
+    if let (Some(start), Some(end)) = (
+        assembled.assembler.lookup(crate::fast_float::TABLE_LABEL),
+        assembled
+            .assembler
+            .lookup(crate::fast_float::TABLE_END_LABEL),
+    ) && !crate::fast_float::table_area_is_clear(start, end, &merged)
+        && let Some(stripped) = crate::fast_float::without_tables(asm)
+    {
+        return assemble_pass(
+            &stripped,
+            module,
+            extraram_on,
+            options,
+            extraram_decision,
+            skipped_statements,
+            zp_pressure,
+            inplace,
+        );
+    }
     if extraram_on && asm.contains(VAL_HIGH_HEAP_MARKER) {
         let floor = assembled.assembler.lookup("__HEAP_BOTTOM").ok_or_else(|| CompileError::Assemble {
             message: "VAL layout has no linked heap marker".into(),
@@ -2004,6 +2094,21 @@ fn assemble_pass(
             asm: Some(final_asm.clone()),
         });
     }
+    // An unrolled zero fill stores the page count codegen saw; the run must still be that long.
+    if let (Some(span), Some(start), Some(end)) = (
+        assembler.lookup(codegen::BSS_FILL_SPAN_LABEL),
+        assembler.lookup(codegen::BSS_START_LABEL),
+        assembler.lookup(codegen::BSS_END_LABEL),
+    ) && end.wrapping_sub(start) != span
+    {
+        return Err(CompileError::Assemble {
+            message: format!(
+                "internal error: the zero fill was laid out for {span} bytes, but the run holds {}",
+                end.wrapping_sub(start)
+            ),
+            asm: Some(final_asm.clone()),
+        });
+    }
     let bss_truncated = machine_code.len() - keep;
     let mut stored = machine_code[..keep].to_vec();
     if !data_blob.is_empty() {
@@ -2078,6 +2183,7 @@ fn assemble_pass(
         original_image: inplace_window,
         // Set by `compile_with_options` only, and only on the retry.
         size_profile_fallback: false,
+        fast_float_dropped: false,
         size_profile_heap_improvement: None,
         compact_heap_layout: false,
         sys_param_substitution_dropped: false,
@@ -2307,12 +2413,140 @@ fn assemble_with_aligned_vectors(
     reserved: &[(u16, u16)],
 ) -> Result<Assembled, CompileError> {
     // Undo split inline PRINT arguments before retrying the full layout.
-    if asm.contains(crate::peephole::STR_PRINT_INLINE_ENTRY)
+    if crate::peephole::has_inline_print_args(&asm)
         && let Ok(assembled) = assemble_with_aligned_vectors_mode(asm.clone(), reserved, true)
     {
         return Ok(assembled);
     }
     assemble_with_aligned_vectors_mode(asm, reserved, false)
+}
+
+/// Probe label linked in front of a candidate for `branch_known_flag_jumps`.
+const KNOWN_FLAG_PROBE: &str = "__KFJ_";
+
+/// Replace known-flag jumps with reachable branches, optionally on the same page.
+fn branch_known_flag_jumps(asm: &str, reserved: &[(u16, u16)], same_page: bool) -> Option<String> {
+    let lines: Vec<&str> = asm.lines().collect();
+    // A label named with an offset may have its code patched; its JMPs stay.
+    let mut patched: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for line in &lines {
+        let body = line.split(';').next().unwrap_or("");
+        for (at, _) in body.match_indices(['+', '-']) {
+            let name = body[..at].trim_end();
+            let start = name
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |k| k + 1);
+            if !name[start..].is_empty() {
+                patched.insert(&name[start..]);
+            }
+        }
+    }
+    let pinned_end = lines.iter().position(|l| l.trim() == INPLACE_PIN_END);
+    let mut sites: Vec<(usize, &str, &str)> = Vec::new();
+    let mut known: Option<&str> = None;
+    let mut block: Option<&str> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let body = line.split(';').next().unwrap_or("");
+        let t = body.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !body.starts_with([' ', '\t']) {
+            known = None;
+            block = t.strip_suffix(':');
+            continue;
+        }
+        let (mnem, operand) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
+        let operand = operand.trim();
+        match mnem.to_ascii_uppercase().as_str() {
+            "LDA" | "LDX" | "LDY" if operand.starts_with('#') => known = Some(&operand[1..]),
+            "STA" | "STX" | "STY" | "CLC" | "SEC" | "CLI" | "SEI" | "CLD" | "SED" | "CLV"
+            | "PHA" | "PHP" | "NOP" => {}
+            "JMP" => {
+                let symbol = operand.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && operand
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if let Some(value) = known
+                    && symbol
+                    && pinned_end.is_none_or(|end| i > end)
+                    && !block.is_some_and(|b| patched.contains(b))
+                {
+                    sites.push((i, value, operand));
+                }
+                known = None;
+            }
+            _ => known = None,
+        }
+    }
+    if sites.is_empty() {
+        return None;
+    }
+    // The text with the chosen branches, and with a probe label in front of every site.
+    let render = |chosen: &[Option<&str>], probes: bool| {
+        let mut text = String::with_capacity(asm.len() + sites.len() * 12);
+        let mut next = sites.iter().zip(chosen).enumerate().peekable();
+        for (i, line) in lines.iter().enumerate() {
+            match next.next_if(|(_, (s, _))| s.0 == i) {
+                Some((n, (&(_, _, target), branch))) => {
+                    if probes {
+                        text.push_str(&format!("{KNOWN_FLAG_PROBE}{n}:\n"));
+                    }
+                    match branch {
+                        Some(branch) => {
+                            let indent = &line[..line.len() - line.trim_start().len()];
+                            text.push_str(&format!("{indent}{branch} {target}"));
+                        }
+                        None => text.push_str(line),
+                    }
+                }
+                None => text.push_str(line),
+            }
+            text.push('\n');
+        }
+        text
+    };
+    // Later rounds undo the branches the shrunk layout moved out of place.
+    let mut chosen: Vec<Option<&str>> = vec![None; sites.len()];
+    for round in 0..4 {
+        let linked = assemble_with_aligned_vectors(render(&chosen, true), reserved).ok()?;
+        let lookup = |name: &str| linked.assembler.lookup(name);
+        let value_of = |imm: &str| {
+            if let Some(name) = imm.strip_prefix('<') {
+                lookup(name.trim()).map(|v| v & 0xFF)
+            } else if let Some(name) = imm.strip_prefix('>') {
+                lookup(name.trim()).map(|v| v >> 8)
+            } else if let Some(bits) = imm.strip_prefix('%') {
+                u16::from_str_radix(bits, 2).ok()
+            } else {
+                parse_literal_operand(imm)
+            }
+        };
+        let mut changed = false;
+        for (n, &(_, imm, target)) in sites.iter().enumerate() {
+            let fits = match (lookup(&format!("{KNOWN_FLAG_PROBE}{n}")), lookup(target)) {
+                (Some(at), Some(to)) => {
+                    let next = at.wrapping_add(2);
+                    (-128..=127).contains(&(i32::from(to) - i32::from(next)))
+                        && (!same_page || next >> 8 == to >> 8)
+                }
+                _ => false,
+            };
+            if round == 0 && fits {
+                if let Some(value) = value_of(imm) {
+                    chosen[n] = Some(if value & 0xFF == 0 { "BEQ" } else { "BNE" });
+                    changed = true;
+                }
+            } else if !fits && chosen[n].is_some() {
+                chosen[n] = None;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    chosen.iter().any(Option::is_some).then(|| render(&chosen, false))
 }
 
 fn assemble_with_aligned_vectors_mode(
@@ -2510,6 +2744,22 @@ fn bss_tail_keep_len(
     lookup: impl Fn(&str) -> Option<u16>,
 ) -> usize {
     let full = machine_code.len();
+    // FMULT's table area ends the image; it is filled at run time.
+    let full = match (
+        lookup(crate::fast_float::TABLE_LABEL),
+        lookup(crate::fast_float::TABLE_END_LABEL),
+    ) {
+        (Some(start), Some(end))
+            if (end as usize).checked_sub(origin as usize) == Some(full)
+                && (start as usize) >= origin as usize
+                && machine_code[start as usize - origin as usize..]
+                    .iter()
+                    .all(|b| *b == 0) =>
+        {
+            start as usize - origin as usize
+        }
+        _ => full,
+    };
     let (Some(start), Some(end)) = (
         lookup(codegen::BSS_START_LABEL),
         lookup(codegen::BSS_END_LABEL),
@@ -2718,13 +2968,15 @@ struct AsmInsn<'a> {
     /// Operand text with the comment and surrounding space removed; empty for
     /// implied/accumulator instructions.
     operand: &'a str,
+    /// The comment after `;`, if any.
+    comment: &'a str,
 }
 
 /// The instruction lines of `asm`, in order.
 fn asm_instructions(asm: &str) -> Vec<AsmInsn<'_>> {
     let mut out = Vec::new();
     for (i, raw) in asm.lines().enumerate() {
-        let code = raw.split(';').next().unwrap_or("");
+        let (code, comment) = raw.split_once(';').unwrap_or((raw, ""));
         if !code.starts_with(char::is_whitespace) {
             continue;
         }
@@ -2743,6 +2995,7 @@ fn asm_instructions(asm: &str) -> Vec<AsmInsn<'_>> {
             line: i + 1,
             mnemonic,
             operand: rest,
+            comment,
         });
     }
     out
@@ -2816,7 +3069,7 @@ fn verify_no_narrowed_index(
         let Some(addr) = resolve_addr_operand(base, lookup) else {
             continue;
         };
-        if addr == 0 || addr >= 0x100 {
+        if addr == 0 || addr >= 0x100 || insn.comment.contains(crate::fast_float::BOUNDED_INDEX) {
             continue;
         }
         let wraps_at = 0x100 - addr;
@@ -2965,6 +3218,7 @@ fn verify_smc_patch_offsets(
                     line: i + 1,
                     mnemonic,
                     operand: trimmed[3..].trim(),
+                    comment: "",
                 },
             );
         }
@@ -3281,9 +3535,16 @@ fn inline_args_split_by_bridge(
         else {
             continue;
         };
-        if mnemonic.eq_ignore_ascii_case("JSR")
-            && (op.trim() == crate::peephole::STR_PRINT_INLINE_ENTRY || entries.contains(op.trim()))
-        {
+        if !mnemonic.eq_ignore_ascii_case("JSR") {
+            continue;
+        }
+        let op = op.trim();
+        if op == crate::peephole::STR_PRINT_TEXT_ENTRY {
+            if !matches!(items.get(i + 1), Some(Item::Data(_))) {
+                split.insert(ordinal);
+            }
+            ordinal += 1;
+        } else if op == crate::peephole::STR_PRINT_INLINE_ENTRY || entries.contains(op) {
             if !matches!(items.get(i + 1), Some(Item::Words(_))) {
                 split.insert(ordinal);
             }
@@ -9701,7 +9962,7 @@ mod tests {
     #[test]
     fn auto_reserve_publishes_no_exit_value_for_an_unreadable_limit() {
 
-        let r = reserved_for(b"\x81 I\xb21\xa4N:\x82:\x97 I\xaa12288,0");
+        let r = reserved_for(b"N\xb2\xc2(2):\x81 I\xb21\xa4N:\x82:\x97 I\xaa12288,0");
         assert!(
             !r.iter().any(|(s, e)| *e >= 0x3000 && *s <= 0x30FF),
             "an unknown limit leaves the counter unknown; got {r:?}"
@@ -10699,6 +10960,31 @@ JMPTBL:
     }
 
     #[test]
+    fn a_jmp_after_an_immediate_load_branches_when_its_target_is_in_reach() {
+        let far = "    NOP\n".repeat(200);
+        let asm = format!(
+            "*=$0801\nA:\n    LDA #$01\n    STA $02\n    JMP NEAR\nB:\n    LDX #$00\n    CLC\n    JMP NEAR\n\
+             C:\n    LDA #$01\n    JMP FAR\nD:\n    LDA #$01\nE:\n    JMP NEAR\nP:\n    LDA #$01\n    JMP NEAR\n\
+             NEAR:\n    STA P+2\n    RTS\n{far}FAR:\n    RTS\n"
+        );
+        let out = branch_known_flag_jumps(&asm, &[], true).expect("a jump is rewritten");
+        let lines: Vec<&str> = out.lines().map(str::trim).collect();
+        let after = |label: &str, n: usize| {
+            let at = lines
+                .iter()
+                .position(|l| *l == format!("{label}:"))
+                .unwrap();
+            lines[at + n]
+        };
+        assert_eq!(after("A", 3), "BNE NEAR");
+        assert_eq!(after("B", 3), "BEQ NEAR");
+        assert_eq!(after("C", 2), "JMP FAR", "out of reach");
+        assert_eq!(after("E", 1), "JMP NEAR", "a label resets the flags");
+        assert_eq!(after("P", 2), "JMP NEAR", "patched code keeps its JMP");
+        assert!(assemble_with_aligned_vectors(out, &[]).is_ok());
+    }
+
+    #[test]
     fn for_handler_table_reservation_keeps_every_symbolic_word() {
         for start in 0x08f6..=0x08fd {
             let asm = format!("*=${start:04X}\nHANDLER=$1234\n__FOR_HANDLER_TABLE:\n    .word $0000\n    .word HANDLER\n");
@@ -10844,12 +11130,13 @@ JMPTBL:
 
 /// Lower the AST and run the whole optimising pipeline, returning the IR module in exactly the state `codegen` is handed.
 pub fn lower_and_optimize(ast: &ast::Program, _profile: Profile) -> Result<ir::Module, CompileError> {
-    lower_and_optimize_with_source_types(ast, _profile).map(|(module, _)| module)
+    lower_and_optimize_with_source_types(ast, _profile, false).map(|(module, _)| module)
 }
 
 fn lower_and_optimize_with_source_types(
     ast: &ast::Program,
-    _profile: Profile,
+    profile: Profile,
+    unchecked: bool,
 ) -> Result<(ir::Module, codegen::SourceIntegerVars), CompileError> {
     // AST-level passes run BEFORE lowering so the IR sees the
     // already-rewritten statement sequence.
@@ -10942,7 +11229,11 @@ fn lower_and_optimize_with_source_types(
     // ResolveBareNext first so bare `NEXT` carries its loop var
     // before liveness analysis runs.
     pipeline.add(crate::passes::ResolveBareNext);
-    pipeline.add(crate::passes::DeadStoreElim);
+    if unchecked {
+        pipeline.add(crate::passes::DeadStoreElimUnchecked);
+    } else {
+        pipeline.add(crate::passes::DeadStoreElim);
+    }
     // Split multi-type scalars (SSA-style): when a Float var has
     // disjoint def-use lifetimes (one float-assigned, one int-
     // assigned with no shared readers), rename each lifetime to its
@@ -10992,6 +11283,11 @@ fn lower_and_optimize_with_source_types(
 
     source_integer_vars.retain_live_arrays(&module);
     let mut pipeline = ir::Pipeline::new();
+    pipeline.add(crate::passes::ForBoundsFromFacts);
+    // Both copies of a guarded loop cost bytes, so only the speed profile takes them.
+    if profile == Profile::Speed {
+        pipeline.add(crate::passes::GuardedIntFor);
+    }
     pipeline.add(crate::passes::IntArrayPromote);
     // After dead-line elim so we don't waste analysis on lines that'll
     // be removed anyway. Loop-induction detection runs first so

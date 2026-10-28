@@ -1,4 +1,4 @@
-//! `__STR_PRINT`'s inline-argument convention (PH114).
+//! Inline PRINT pointers for literals shared by multiple call sites.
 
 mod common;
 
@@ -52,13 +52,13 @@ fn run(compiled: &Compiled) -> String {
     petscii(&r.output)
 }
 
-/// `n` PRINTs of distinct literals.
+/// `n` PRINTs, two to a literal, so each literal keeps its pool record and its pointer.
 fn many_prints(n: usize) -> (String, String) {
     let mut src = String::new();
     let mut want = String::new();
     for i in 0..n {
-        src.push_str(&format!("{} PRINT \"LINE{}\"\n", 10 + i, i));
-        want.push_str(&format!("LINE{i}\n"));
+        src.push_str(&format!("{} PRINT \"LINE{}\"\n", 10 + i, i / 2));
+        want.push_str(&format!("LINE{}\n", i / 2));
     }
     (src, want)
 }
@@ -127,9 +127,9 @@ fn the_call_returns_past_its_own_argument() {
     let mut src = String::from("10 X=0\n");
     let mut want = String::new();
     for i in 0..25 {
-        src.push_str(&format!("{} PRINT \"T{}\"\n", 20 + i * 2, i));
+        src.push_str(&format!("{} PRINT \"T{}\"\n", 20 + i * 2, i / 2));
         src.push_str(&format!("{} X=X+{}\n", 21 + i * 2, i));
-        want.push_str(&format!("T{i}\n"));
+        want.push_str(&format!("T{}\n", i / 2));
     }
     src.push_str("900 PRINT X\n");
     want.push_str(" 300 \n");
@@ -259,7 +259,7 @@ fn nothing_is_ever_spliced_above_str_print() {
     let long = many_prints(30).0;
     let mut with_both = String::from("10 A$=\"Z\"\n");
     for i in 0..25 {
-        with_both.push_str(&format!("{} PRINT \"F{}\"\n", 20 + i, i));
+        with_both.push_str(&format!("{} PRINT \"F{}\"\n", 20 + i, i / 2));
     }
     with_both.push_str("900 PRINT A$\n");
     for src in [
@@ -309,8 +309,8 @@ fn a_fall_through_print_and_inline_sites_coexist() {
     let mut src = String::from("10 A$=\"TAIL\"\n");
     let mut want = String::new();
     for i in 0..25 {
-        src.push_str(&format!("{} PRINT \"F{}\"\n", 20 + i, i));
-        want.push_str(&format!("F{i}\n"));
+        src.push_str(&format!("{} PRINT \"F{}\"\n", 20 + i, i / 2));
+        want.push_str(&format!("F{}\n", i / 2));
     }
     src.push_str("900 PRINT A$\n");
     want.push_str("TAIL\n");
@@ -337,8 +337,8 @@ fn the_trampoline_is_never_inside_the_heap_or_the_bss() {
     let mut src = String::from("10 DIM Q(200)\n20 A$=\"SEED\"\n");
     let mut want = String::new();
     for i in 0..30 {
-        src.push_str(&format!("{} PRINT \"H{}\"\n", 30 + i, i));
-        want.push_str(&format!("H{i}\n"));
+        src.push_str(&format!("{} PRINT \"H{}\"\n", 30 + i, i / 2));
+        want.push_str(&format!("H{}\n", i / 2));
     }
     src.push_str("900 A$=A$+\"X\"\n910 PRINT A$\n");
     want.push_str("SEEDX\n");
@@ -360,9 +360,9 @@ fn a_heap_program_with_both_optimizations_still_runs() {
     let mut src = String::from("10 DIM Q(300)\n20 B$=\"\"\n");
     let mut want = String::new();
     for i in 0..25 {
-        src.push_str(&format!("{} PRINT \"M{}\"\n", 30 + i * 2, i));
+        src.push_str(&format!("{} PRINT \"M{}\"\n", 30 + i * 2, i / 2));
         src.push_str(&format!("{} B$=B$+\"{}\"\n", 31 + i * 2, i % 10));
-        want.push_str(&format!("M{i}\n"));
+        want.push_str(&format!("M{}\n", i / 2));
     }
     src.push_str("900 Q(299)=42\n910 PRINT LEN(B$);Q(299)\n");
     want.push_str(" 25  42 \n");
@@ -381,8 +381,8 @@ fn the_trampoline_follows_a_relocated_zero_page_pair() {
     let mut src = String::from("10 POKE 253,1\n");
     let mut want = String::new();
     for i in 0..25 {
-        src.push_str(&format!("{} PRINT \"Z{}\"\n", 20 + i, i));
-        want.push_str(&format!("Z{i}\n"));
+        src.push_str(&format!("{} PRINT \"Z{}\"\n", 20 + i, i / 2));
+        want.push_str(&format!("Z{}\n", i / 2));
     }
     src.push_str("900 PRINT PEEK(253)\n");
     want.push_str(" 1 \n");

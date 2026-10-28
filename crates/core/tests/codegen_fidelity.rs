@@ -458,21 +458,26 @@ fn an_externally_bumped_for_counter_keeps_its_integer_slot() {
     assert_eq!(text_output(src), " 3  6 F 7 \n");
 }
 
-/// `DIM A(20000)` is 100005 bytes of zeroed BSS.
-#[test]
-fn a_static_dim_past_the_address_space_is_refused() {
-    let msg = compile_err("10 DIM A(20000)\n20 PRINT \"OK\"\n");
-    assert!(
-        msg.contains("OUT OF MEMORY"),
-        "expected an out-of-memory diagnostic, got: {msg}"
-    );
+fn banner(src: &str) -> (Vec<u8>, Option<String>) {
+    let prg = common::compile_source(src).expect("compiles");
+    let r = emu64::run_prg_to_end(&prg, MAX_INSNS).expect("runs");
+    (r.output.clone(), r.error_banner())
 }
 
-/// The integer-array form wraps at a different size; catch it too.
+/// `DIM A(20000)` is 100005 bytes of zeroed BSS; the ROM runs out of memory.
 #[test]
-fn a_static_integer_dim_past_the_address_space_is_refused() {
-    let msg = compile_err("10 DIM A%(40000)\n20 PRINT \"OK\"\n");
-    assert!(msg.contains("OUT OF MEMORY"), "got: {msg}");
+fn a_static_dim_past_the_address_space_raises_out_of_memory() {
+    let (out, got) = banner("10 DIM A(20000)\n20 PRINT \"OK\"\n");
+    assert_eq!(got.as_deref(), Some("?OUT OF MEMORY  ERROR IN 10"));
+    assert!(out.is_empty(), "{out:?}");
+}
+
+/// An integer array whose declared bound exceeds available memory.
+#[test]
+fn a_static_integer_dim_past_the_address_space_raises_illegal_quantity() {
+    let (out, got) = banner("10 DIM A%(40000)\n20 PRINT \"OK\"\n");
+    assert_eq!(got.as_deref(), Some("?ILLEGAL QUANTITY  ERROR IN 10"));
+    assert!(out.is_empty(), "{out:?}");
 }
 
 #[test]

@@ -251,14 +251,17 @@ fn the_fill_is_the_first_thing_after_cld() {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with(';') && !l.starts_with("*="))
         .collect();
-    // Skip the zero-page equates (`NAME = $XX`).
-    let first = body
-        .iter()
-        .position(|l| !l.contains(" = $"))
-        .expect("some code");
+    // Skip the equates (`NAME = $XX`), code that takes no room.
+    let body: Vec<&str> = body.into_iter().filter(|l| !l.contains(" = $")).collect();
+    let first = 0;
     assert_eq!(body[first], "CLD");
+    // The page loop stages its pointer; the stores page by page clear A first.
     assert!(
-        body[first + 1].starts_with("LDA #<__BSS_START"),
+        body[first + 1].starts_with("LDA #<__BSS_START")
+            || (body[first + 1] == "LDA #$00"
+                && body[first + 2..first + 5]
+                    .iter()
+                    .any(|l| l.contains("__BSS_START"))),
         "the fill has to be the first thing that runs, got `{}`",
         body[first + 1]
     );
@@ -267,8 +270,8 @@ fn the_fill_is_the_first_thing_after_cld() {
 #[test]
 fn the_fill_follows_a_relocated_zero_page_pair() {
     // The loop is emitted ahead of `relocate_zp_operands`, so its pointer moves with the rest
-    // when the program POKEs the pair the compiler wanted.
-    let c = compile("10 DIM Q(200)\n20 POKE 251,3\n30 PRINT PEEK(251);Q(0)\n");
+    // when POKE uses its pair. Fifteen pages exceed the default inline-fill limit.
+    let c = compile("10 DIM Q(2000)\n20 POKE 251,3\n30 PRINT PEEK(251);Q(0)\n");
     assert!(c.diagnostics.bss_truncated > 0);
     let staged = c
         .asm
@@ -415,4 +418,28 @@ fn a_shipped_fill_always_bought_a_truncation() {
         with_fill > 0 && without_fill > 0,
         "the sweep has to exercise both outcomes: {with_fill} with, {without_fill} without"
     );
+}
+
+#[test]
+fn speed_clears_page_by_page_on_every_run() {
+    // 1,501 integers: 11 pages and a tail, each page one store in the Y loop.
+    let src = "\
+10 DIM A(1500):S=0:FOR I=0 TO 1500 STEP 100:S=S+A(I):NEXT:PRINT S;A(1500)
+20 IF PEEK(828)=7 THEN END
+30 POKE 828,7:FOR I=0 TO 1500 STEP 7:A(I)=I:NEXT:RUN
+";
+    let c = compile_at(
+        src,
+        CompileOptions {
+            profile: Profile::Speed,
+            ..CompileOptions::default()
+        },
+    );
+    assert!(
+        c.diagnostics.bss_truncated > 2900,
+        "{}",
+        c.diagnostics.bss_truncated
+    );
+    assert!(c.asm.contains("STA __BSS_START+$0A00,Y"), "{}", c.asm);
+    assert_eq!(run(&c), " 0  0 \n 0  0 \n");
 }

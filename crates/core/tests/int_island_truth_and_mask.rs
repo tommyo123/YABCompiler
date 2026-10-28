@@ -1,5 +1,6 @@
 mod common;
 
+use yabcompiler_core::codegen::FAST_FADD;
 use yabcompiler_core::{CompileOptions, Profile, compile_with_options, tokenize_program};
 
 const PROFILES: [Profile; 3] = [Profile::Default, Profile::Speed, Profile::Size];
@@ -54,11 +55,16 @@ fn assert_illegal_quantity(src: &str, line: u16, prefix: &str) {
     }
 }
 
+/// The asm without the speed profile's FADD, which loads FAC_EXP itself.
+fn condition_asm(src: &str, profile: Profile) -> String {
+    build(src, profile).asm.replace(FAST_FADD, "")
+}
+
 /// `LDA $61` is FAC_EXP: the generic "is the FAC non-zero" fallback at the bottom of `emit_branch_skip_on_false`.
 #[track_caller]
 fn assert_stays_on_the_island(src: &str) {
     for profile in PROFILES {
-        let asm = build(src, profile).asm;
+        let asm = condition_asm(src, profile);
         assert!(
             !asm.contains("LDA $61"),
             "{profile:?}: {src:?}\n  condition must not fall back to the FAC:\n{asm}"
@@ -109,7 +115,7 @@ fn a_range_that_straddles_the_multiple_is_refused() {
     assert_prints(src, "Y\nZ\n");
 
     for profile in PROFILES {
-        let asm = build(src, profile).asm;
+        let asm = condition_asm(src, profile);
         assert!(
             asm.contains("LDA $61") && !asm.contains("    ORA "),
             "{profile:?}: this condition must leave the island for the FAC:\n{asm}"

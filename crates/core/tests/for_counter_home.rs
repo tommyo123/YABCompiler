@@ -183,7 +183,8 @@ fn still_reads_the_counter_slot_when_the_body_is_closed() {
          100 for i=8 to 9:print \"e\";i;:next:return\n\
          200 print \"o\";i;\"q\";:return\n",
     );
-    let l100 = block(&asm, "L100");
+    // The loop top is a label of its own, so take everything up to line 200.
+    let l100 = &asm[asm.find("\nL100:\n").expect("L100")..asm.find("\nL200:\n").expect("L200")];
     assert!(
         l100.contains("LDY FU_0") || l100.contains("STA FU_0\n    TAY\n"),
         "line 100's own body still reads I out of the u8 counter slot:\n{asm}"

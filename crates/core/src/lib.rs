@@ -11,6 +11,7 @@ pub mod crunch;
 pub mod dataflow;
 pub mod expr_type;
 pub mod extraram;
+pub mod fast_float;
 pub mod for_next_runtime;
 pub mod gosub_depth;
 pub mod image_reach;

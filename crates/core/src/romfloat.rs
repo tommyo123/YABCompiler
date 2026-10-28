@@ -71,6 +71,14 @@ impl Fac {
         m.movmf()
     }
 
+    /// As `packed_rounded`, or None where the rounding raises ?OVERFLOW.
+    pub fn packed_rounded_checked(self) -> Option<[u8; 5]> {
+        let mut m = Machine::new();
+        m.set_fac(self);
+        m.round_checked().ok()?;
+        Some(m.pack())
+    }
+
     /// Pack FAC without its rounding byte.
     pub fn packed_truncated(self) -> [u8; 5] {
         [
@@ -257,6 +265,11 @@ impl Machine {
     /// Round FAC, pack it and clear the rounding byte.
     pub fn movmf(&mut self) -> [u8; 5] {
         self.round();
+        self.pack()
+    }
+
+    /// Pack FAC as it stands and clear the rounding byte.
+    fn pack(&mut self) -> [u8; 5] {
         let out = [
             self.z[FAC],
             (self.z[FAC_SIGN] | 0x7F) & self.z[FAC + 1],
@@ -992,7 +1005,7 @@ pub enum Op {
 pub fn binop(op: Op, l: f64, r: f64) -> Option<f64> {
     let lf = fac_of(l)?;
     let rf = fac_of(r)?;
-    let mem = lf.packed_rounded();
+    let mem = lf.packed_rounded_checked()?;
     let mut m = Machine::new();
     m.set_fac(rf);
     let truth = |b: bool| if b { -1.0 } else { 0.0 };
@@ -1016,7 +1029,7 @@ pub fn binop(op: Op, l: f64, r: f64) -> Option<f64> {
 pub fn int_store(v: f64) -> Option<f64> {
     let mut m = Machine::new();
     m.set_fac(fac_of(v)?);
-    m.round();
+    m.round_checked().ok()?;
     let f = m.fac().to_f64().floor();
     (-32768.0..=32767.0).contains(&f).then_some(f)
 }
@@ -1025,6 +1038,6 @@ pub fn int_store(v: f64) -> Option<f64> {
 pub fn rounded(v: f64) -> Option<f64> {
     let f = fac_of(v)?;
     let mut m = Machine::new();
-    m.movfm(f.packed_rounded());
+    m.movfm(f.packed_rounded_checked()?);
     Some(m.fac().to_f64())
 }

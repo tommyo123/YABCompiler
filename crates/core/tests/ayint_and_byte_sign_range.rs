@@ -263,3 +263,12 @@ fn a_percent_to_percent_copy_stays_on_the_island() {
         );
     }
 }
+
+/// AND with a small mask stores a byte, but each operand still goes through AYINT first.
+#[test]
+fn a_masked_byte_store_of_an_out_of_range_operand_is_illegal_quantity() {
+    assert_illegal_quantity("10 J%=40000 AND 3:PRINT J%\n", 10, "");
+    assert_illegal_quantity("10 A%=100:J%=(A%+40000) AND 3:PRINT J%\n", 10, "");
+    assert_illegal_quantity("10 J%=-32769 OR 3:PRINT J%\n", 10, "");
+    assert_prints("10 J%=-1 AND 3:PRINT J%\n", " 3 \n");
+}

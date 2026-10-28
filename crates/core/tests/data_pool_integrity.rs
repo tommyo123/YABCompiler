@@ -243,15 +243,25 @@ fn compile_extraram(src: &str) -> yabcompiler_core::Compiled {
 
 fn zero_bytes_before_data(asm: &str) -> usize {
     let (head, _) = asm.split_once("\n__DATA:\n").expect("DATA pool");
-    head.lines()
-        .rev()
-        .map(|line| line.split(';').next().unwrap().trim())
-        .filter(|line| !line.is_empty())
-        .map_while(|line| {
-            let bytes: Vec<_> = line.strip_prefix(".byte ")?.split(',').map(str::trim).collect();
-            bytes.iter().all(|byte| *byte == "$00").then_some(bytes.len())
-        })
-        .sum()
+    let mut runs = Vec::new();
+    for line in head.lines().rev().map(|line| line.split(';').next().unwrap().trim()) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(".byte ") else {
+            // The line right under a label is that label's storage, not fill.
+            if line.ends_with(':') {
+                runs.pop();
+            }
+            break;
+        };
+        let bytes: Vec<_> = rest.split(',').map(str::trim).collect();
+        if !bytes.iter().all(|byte| *byte == "$00") {
+            break;
+        }
+        runs.push(bytes.len());
+    }
+    runs.iter().sum()
 }
 
 #[test]

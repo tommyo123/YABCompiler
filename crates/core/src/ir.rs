@@ -11,6 +11,8 @@
 //! Passes run in registration order; each one sees the previous pass's
 //! output. Returning `Ok` with the unchanged IR is fine (no-op pass).
 
+use std::collections::{HashMap, HashSet};
+
 use crate::ast::{
     self, BinOp, FnName, Func1, OnBranchKind, ProcName, ScreenRectOp, ScreenScrollOp, ThenBranch,
     VarName,
@@ -105,6 +107,83 @@ impl Module {
         crate::visit::walk_module(&mut find, self);
         find.0
     }
+
+    /// Implicit arrays whose consistent rank cannot fit in available BASIC memory.
+    pub fn arrays_the_rom_cannot_auto_dim(&self) -> HashMap<VarName, usize> {
+        #[derive(Default)]
+        struct Refs {
+            dimmed: HashSet<VarName>,
+            counts: HashMap<VarName, HashSet<usize>>,
+        }
+        impl Refs {
+            fn note(&mut self, name: &VarName, n: usize) {
+                self.counts.entry(name.clone()).or_default().insert(n);
+            }
+        }
+        impl crate::visit::Visitor for Refs {
+            fn visit_expr(&mut self, e: &Expr) {
+                if let Expr::ArrayRef(name, idx) = e {
+                    self.note(name, idx.len());
+                }
+                crate::visit::walk_expr(self, e);
+            }
+            fn visit_str_expr(&mut self, s: &StrExpr) {
+                if let StrExpr::ArrayRef(name, idx) = s {
+                    self.note(name, idx.len());
+                }
+                crate::visit::walk_str_expr(self, s);
+            }
+            fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+                match stmt {
+                    Stmt::Dim(specs) => self.dimmed.extend(specs.iter().map(|s| s.name.clone())),
+                    Stmt::ArrayLet { name, indices, .. }
+                    | Stmt::ArrayLetStr { name, indices, .. } => self.note(name, indices.len()),
+                    Stmt::Read(targets)
+                    | Stmt::Input { targets, .. }
+                    | Stmt::InputFile { targets, .. } => {
+                        for t in targets {
+                            if let ReadTarget::Array { name, indices } = t {
+                                self.note(name, indices.len());
+                            }
+                        }
+                    }
+                    Stmt::Get { var, indices } if !indices.is_empty() => {
+                        self.note(var, indices.len())
+                    }
+                    Stmt::Fetch {
+                        target,
+                        target_indices,
+                        ..
+                    } if !target_indices.is_empty() => self.note(target, target_indices.len()),
+                    _ => {}
+                }
+                crate::visit::walk_stmt(self, line, stmt);
+            }
+        }
+        let mut refs = Refs::default();
+        crate::visit::walk_module(&mut refs, self);
+        refs.counts
+            .into_iter()
+            .filter(|(name, counts)| !refs.dimmed.contains(name) && counts.len() == 1)
+            .filter_map(|(name, counts)| {
+                let n = counts.into_iter().next()?;
+                (rom_array_bytes(name.kind, &vec![11.0; n]) > ROM_FREE_BYTES).then_some((name, n))
+            })
+            .collect()
+    }
+}
+
+/// Bytes BASIC ever has free for variables and arrays, $0801-$9FFF.
+pub const ROM_FREE_BYTES: f64 = 38911.0;
+
+/// Bytes the ROM's array table needs for an array with `counts` elements per dimension.
+pub fn rom_array_bytes(kind: ast::VarKind, counts: &[f64]) -> f64 {
+    let element = match kind {
+        ast::VarKind::Float => 5.0,
+        ast::VarKind::Integer => 2.0,
+        ast::VarKind::String => 3.0,
+    };
+    counts.iter().product::<f64>() * element + 5.0 + 2.0 * counts.len() as f64
 }
 
 #[derive(Debug, Clone)]

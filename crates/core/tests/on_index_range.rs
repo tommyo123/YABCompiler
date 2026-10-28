@@ -145,8 +145,8 @@ fn a_u8_proven_selector_skips_the_range_check() {
         for profile in [Profile::Default, Profile::Size] {
             let c = build(src, profile);
             assert!(
-                c.asm.contains("__FAC_BYTE_OK"),
-                "a u8-proven selector must use the no-check helper:\n{src}\n{}",
+                c.asm.contains("__FAC_BYTE_OK") || !c.asm.contains("__FAC_BYTE"),
+                "a u8-proven selector must skip the checked helper:\n{src}\n{}",
                 c.asm
             );
             if profile == Profile::Size {

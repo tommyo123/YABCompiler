@@ -40,6 +40,10 @@ pub struct BuildRequest<'a> {
     pub auto_reserve: bool,
     pub lenient_syntax: bool,
     pub safe_sys_calls: bool,
+    /// Leave out run-time error checks and line tracking.
+    pub unchecked: bool,
+    /// Embed float routines with matching arithmetic results.
+    pub fast_float: bool,
     pub rem_hint_dialect: yabcompiler_core::BasicHintDialect,
     pub reserved_text: &'a str,
     /// `Some(text)` enables the custom-start path; the text is parsed
@@ -81,6 +85,8 @@ impl BuildRequest<'_> {
             auto_reserve: self.auto_reserve,
             lenient_syntax: self.lenient_syntax,
             safe_sys_calls: self.safe_sys_calls,
+            unchecked: self.unchecked,
+            fast_float: self.fast_float,
             rem_hint_dialect: self.rem_hint_dialect,
             compress: self.compress,
             data_relocate: self.data_relocate,

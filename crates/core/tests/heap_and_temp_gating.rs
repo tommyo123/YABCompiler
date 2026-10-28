@@ -47,7 +47,7 @@ fn assert_heap_pointer_is_sound(asm: &str, label: &str) {
         return;
     }
     assert!(
-        asm.contains("__HEAP_PTR:"),
+        asm.contains("__HEAP_PTR:") || asm.contains("Z__HEAP_PTR = $"),
         "{label}: reads __HEAP_PTR but never defines it"
     );
     assert!(
@@ -320,9 +320,9 @@ fn the_prewalk_does_not_inflate_the_temp_count() {
                 && t.len() > 2
         })
         .count();
-    assert_eq!(
-        defined, 1,
-        "one handler temp, reused — not one slot per emission pass:\n{asm}"
+    assert!(
+        defined <= 1,
+        "at most one handler temp, reused — not one slot per emission pass:\n{asm}"
     );
 }
 

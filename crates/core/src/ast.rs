@@ -1037,6 +1037,8 @@ pub enum DataValue {
     Float(f64),
     String(Vec<u8>),
     Quoted(Vec<u8>),
+    /// A quoted DATA item whose trailing text causes a READ syntax error.
+    Unreadable,
 }
 
 impl DataValue {
@@ -1044,6 +1046,7 @@ impl DataValue {
     pub fn text(&self) -> Option<&[u8]> {
         match self {
             DataValue::String(b) | DataValue::Quoted(b) => Some(b),
+            DataValue::Unreadable => Some(&[]),
             DataValue::Float(_) => None,
         }
     }

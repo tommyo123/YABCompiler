@@ -253,6 +253,8 @@ mod tests {
                         true,
                         false,
                         None,
+                        false,
+                        false,
                     )
                     .unwrap();
                     assert!(

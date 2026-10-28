@@ -1839,7 +1839,8 @@ fn try_fold_str(s: &StrExpr) -> Option<Vec<u8>> {
         StrExpr::Concat(a, b) => {
             let mut out = try_fold_str(a)?;
             out.extend_from_slice(&try_fold_str(b)?);
-            Some(out)
+            // Past 255 characters the ROM raises ?STRING TOO LONG; leave that to the runtime.
+            (out.len() <= 255).then_some(out)
         }
         StrExpr::Left(inner, n) => {
             let bytes = try_fold_str(inner)?;
@@ -1954,7 +1955,8 @@ fn fold_bin(op: BinOp, l: f64, r: f64) -> Option<f64> {
         }
         BinOp::Pow => return fold_bin_exact(op, l, r),
     };
-    crate::romfloat::binop(op, l, r)
+    // A result that cannot be rounded raises ?OVERFLOW when stored or pushed: keep it at run time.
+    crate::romfloat::binop(op, l, r).filter(|v| crate::romfloat::rounded(*v).is_some())
 }
 
 fn fold_bin_exact(op: BinOp, l: f64, r: f64) -> Option<f64> {
@@ -1972,12 +1974,14 @@ fn fold_bin_exact(op: BinOp, l: f64, r: f64) -> Option<f64> {
                 Some(l / r)
             }
         }
-        // `^` is NOT `powf`.
+        // Fold integer powers of two exactly for exponents in -127..126.
         BinOp::Pow => {
             if r == 0.0 {
                 Some(1.0)
             } else if l == 0.0 {
                 Some(0.0)
+            } else if l == 2.0 && r.fract() == 0.0 && (-127.0..=126.0).contains(&r) {
+                Some(r.exp2())
             } else {
                 None
             }
@@ -2430,10 +2434,19 @@ impl ir::Pass for IntForBodyAnalysis {
             // tells us codegen will swap matching `Var(loop_var) *
             // K` shapes for a MOVFM from the per-FOR FB_ slot, so
             // those reads don't need V_var either.
-            if !body
-                .iter()
-                .any(|s| stmt_loop_var_needs_fac(s, &loop_var, induction_const, for_lowering))
-            {
+            let u16_range = match &module.lines[*fli].stmts[*fsi] {
+                Stmt::For {
+                    start, end, step, ..
+                } => u16_for_counter_range(start, end, step),
+                _ => None,
+            };
+            let reads = match u16_range {
+                Some((_, hi)) => u16_counter_needs_sync(&body, &loop_var, hi),
+                None => body
+                    .iter()
+                    .any(|s| stmt_loop_var_needs_fac(s, &loop_var, induction_const, for_lowering)),
+            };
+            if !reads {
                 unread_positions.insert((*fli, *fsi));
             }
         }
@@ -2472,6 +2485,97 @@ impl ir::Pass for IntForBodyAnalysis {
         }
         Ok(())
     }
+}
+
+/// Use unsigned 16-bit counters when every loop value stays in 0..65535.
+pub(crate) fn u16_for_counter_range(start: &Expr, end: &Expr, step: &Expr) -> Option<(u16, u16)> {
+    let lit = |e: &Expr| match e {
+        Expr::Number(n) if n.fract() == 0.0 && (0.0..=65535.0).contains(n) => Some(*n as i32),
+        _ => None,
+    };
+    let (s, e) = (lit(start)?, lit(end)?);
+    let st = expr_as_f64_literal(step).and_then(f64_to_i16_lit)? as i32;
+    if st == 0 || (s <= 32767 && e <= 32767) {
+        return None;
+    }
+    let (lo, hi) = if st > 0 {
+        let last = if s <= e { s + (e - s) / st * st } else { s };
+        (s, last)
+    } else {
+        let last = if s >= e { s - (s - e) / -st * -st } else { s };
+        (last, s)
+    };
+    let exit = if st > 0 { hi + st } else { lo + st };
+    (0..=65535)
+        .contains(&exit)
+        .then_some((lo as u16, hi as u16))
+}
+
+/// A POKE/PEEK address `J` or `J+K` that stays in 0..=65535 for every counter value.
+pub(crate) fn is_u16_counter_addr(addr: &Expr, var: &VarName, hi: u16) -> bool {
+    let is_var = |e: &Expr| matches!(e, Expr::Var(v) if v == var);
+    let offset_fits = |e: &Expr| matches!(e, Expr::Number(k) if k.fract() == 0.0 && *k >= 0.0 && *k + hi as f64 <= 65535.0);
+    match addr {
+        e if is_var(e) => true,
+        Expr::Bin(BinOp::Add, l, r) => {
+            (is_var(l) && offset_fits(r)) || (is_var(r) && offset_fits(l))
+        }
+        _ => false,
+    }
+}
+
+/// Whether non-address reads or loop exits require a current float counter slot.
+fn u16_counter_needs_sync(body: &[&Stmt], var: &VarName, hi: u16) -> bool {
+    use crate::visit::Visitor;
+    struct Reads<'a> {
+        var: &'a VarName,
+        hi: u16,
+        found: bool,
+    }
+    impl Visitor for Reads<'_> {
+        fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+            match stmt {
+                Stmt::Poke { addr, value } if is_u16_counter_addr(addr, self.var, self.hi) => {
+                    self.visit_expr(value)
+                }
+                Stmt::Let { .. }
+                | Stmt::LetStr { .. }
+                | Stmt::ArrayLet { .. }
+                | Stmt::ArrayLetStr { .. }
+                | Stmt::Poke { .. }
+                | Stmt::Print { .. }
+                | Stmt::Read(_)
+                | Stmt::Rem(_)
+                | Stmt::LineMark(_)
+                | Stmt::Data(_) => crate::visit::walk_stmt(self, line_no, stmt),
+                Stmt::If {
+                    then: ThenIr::Stmts(_),
+                    ..
+                } => crate::visit::walk_stmt(self, line_no, stmt),
+                _ => self.found = true,
+            }
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Peek(a) | Expr::MemPeek(a) if is_u16_counter_addr(a, self.var, self.hi) => {}
+                _ => crate::visit::walk_expr(self, e),
+            }
+        }
+        fn visit_var_read(&mut self, v: &VarName) {
+            if v == self.var {
+                self.found = true;
+            }
+        }
+    }
+    let mut reads = Reads {
+        var,
+        hi,
+        found: false,
+    };
+    for stmt in body {
+        reads.visit_stmt(0, stmt);
+    }
+    reads.found
 }
 
 /// A body with no textual end can visit any line.
@@ -2542,6 +2646,507 @@ fn unmatched_counter_stmt_is_safe(stmt: &Stmt, var: &VarName, routines: &Routine
         }
         _ => true,
     }
+}
+
+/// Replace FOR bounds with constants when range analysis proves a single value.
+pub struct ForBoundsFromFacts;
+
+impl ir::Pass for ForBoundsFromFacts {
+    fn name(&self) -> &'static str {
+        "for-bounds-from-facts"
+    }
+
+    fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        fn pure(e: &Expr) -> bool {
+            match e {
+                Expr::Var(v) => v.kind != VarKind::String && v.base != "TI" && v.base != "ST",
+                Expr::Number(_) => true,
+                Expr::Neg(inner) => pure(inner),
+                Expr::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul, l, r) => pure(l) && pure(r),
+                _ => false,
+            }
+        }
+        let mut reg = crate::analysis::Registry::new();
+        let facts = reg.get(module, &crate::dataflow::NumericFactAnalysis);
+        let mut edits = Vec::new();
+        for (line_idx, line) in module.lines.iter().enumerate() {
+            for (i, stmt) in line.stmts.iter().enumerate() {
+                let Stmt::For {
+                    start, end, step, ..
+                } = stmt
+                else {
+                    continue;
+                };
+                let path = crate::cfg::StmtPath {
+                    line_idx,
+                    path: vec![i],
+                };
+                for (k, e) in [start, end, step].into_iter().enumerate() {
+                    if matches!(e, Expr::Number(_)) || !pure(e) {
+                        continue;
+                    }
+                    if let Some(r) = facts.expr_int_range_before_path(&path, e)
+                        && r.min == r.max
+                    {
+                        edits.push((line_idx, i, k, r.min));
+                    }
+                }
+            }
+        }
+        for (line_idx, i, k, value) in edits {
+            if let Stmt::For {
+                start, end, step, ..
+            } = &mut module.lines[line_idx].stmts[i]
+            {
+                *[start, end, step][k] = Expr::Number(f64::from(value));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Guard short loops with integer counters and retain a float fallback.
+pub struct GuardedIntFor;
+
+/// Longest loop body that gets a guarded copy.
+const GUARDED_FOR_MAX_BODY: usize = 8;
+/// Most statements after the NEXT, which both loops carry.
+const GUARDED_FOR_MAX_TAIL: usize = 6;
+
+/// A body statement that cannot transfer control or declare anything.
+fn guarded_for_straight_stmt(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Let { .. }
+            | Stmt::LetStr { .. }
+            | Stmt::ArrayLet { .. }
+            | Stmt::ArrayLetStr { .. }
+            | Stmt::Poke { .. }
+            | Stmt::Print { .. }
+            | Stmt::Read(_)
+            | Stmt::Restore
+            | Stmt::Get { .. }
+            | Stmt::Input { .. }
+            | Stmt::Wait { .. }
+            | Stmt::Sys { .. }
+            | Stmt::Rem(_)
+            | Stmt::LineMark(_)
+    )
+}
+
+/// How many statements the tail after the NEXT holds, if it can be copied.
+fn guarded_for_tail_len(stmts: &[Stmt]) -> Option<usize> {
+    let mut n = 0;
+    for stmt in stmts {
+        n += match stmt {
+            Stmt::Goto { .. }
+            | Stmt::GoSub { .. }
+            | Stmt::Return
+            | Stmt::End
+            | Stmt::Stop
+            | Stmt::OnBranch { .. }
+            | Stmt::For { .. }
+            | Stmt::Next { .. }
+            | Stmt::If {
+                then: ThenIr::Goto(_),
+                ..
+            } => 1,
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => 1 + guarded_for_tail_len(inner)?,
+            s if guarded_for_straight_stmt(s) => 1,
+            _ => return None,
+        };
+    }
+    Some(n)
+}
+
+/// A body the copy can take: straight statements and whole inner loops, none writing `var`.
+fn guarded_for_body_ok(body: &[Stmt], var: &VarName, routines: &RoutineWrites) -> bool {
+    if body.len() > GUARDED_FOR_MAX_BODY {
+        return false;
+    }
+    let mut open: Vec<&VarName> = Vec::new();
+    for stmt in body {
+        match stmt {
+            Stmt::For { var: inner, .. } if inner != var => open.push(inner),
+            Stmt::Next { vars } => {
+                for v in vars {
+                    let Some(top) = open.pop() else {
+                        return false;
+                    };
+                    if v.as_ref().is_some_and(|v| v != top) {
+                        return false;
+                    }
+                }
+            }
+            s if guarded_for_straight_stmt(s) && stmt_is_int_safe_with(s, var, Some(routines)) => {}
+            _ => return false,
+        }
+    }
+    open.is_empty()
+}
+
+/// Split a guarded loop into its body, closing NEXT, and following statements.
+struct GuardedForParts {
+    body: Vec<Stmt>,
+    next: Stmt,
+    tail: Vec<Stmt>,
+}
+
+fn guarded_for_parts(stmts: &[Stmt], fsi: usize, nsi: usize, own: usize) -> GuardedForParts {
+    let Stmt::Next { vars } = &stmts[nsi] else {
+        unreachable!("NEXT at its index");
+    };
+    let mut body = stmts[fsi + 1..nsi].to_vec();
+    if own > 0 {
+        body.push(Stmt::Next {
+            vars: vars[..own].to_vec(),
+        });
+    }
+    let mut tail = Vec::new();
+    if own + 1 < vars.len() {
+        tail.push(Stmt::Next {
+            vars: vars[own + 1..].to_vec(),
+        });
+    }
+    tail.extend(stmts[nsi + 1..].iter().cloned());
+    GuardedForParts {
+        body,
+        next: Stmt::Next {
+            vars: vec![vars[own].clone()],
+        },
+        tail,
+    }
+}
+
+/// The loops inside the original loop's copy keep the general lowering: nothing analyses them.
+fn guarded_for_plain_loops(stmts: &mut [Stmt]) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::For {
+                body_int_safe,
+                body_reads_loop_var,
+                induction_const,
+                array_inductions,
+                ..
+            } => {
+                *body_int_safe = false;
+                *body_reads_loop_var = true;
+                *induction_const = None;
+                array_inductions.clear();
+            }
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => guarded_for_plain_loops(inner),
+            _ => {}
+        }
+    }
+}
+
+impl ir::Pass for GuardedIntFor {
+    fn name(&self) -> &'static str {
+        "guarded-int-for"
+    }
+
+    fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        if module.has_on_key() || module.has_error_continuation() {
+            return Ok(());
+        }
+        let (pairs, _, _) = textual_for_next_pairs(module);
+        let lifetimes = crate::for_next_runtime::analyze(module);
+        let routines = build_routine_writes(module);
+        let mut reg = crate::analysis::Registry::new();
+        let facts = reg.get(module, &crate::dataflow::NumericFactAnalysis);
+        let mut sites = Vec::new();
+        for ((li, fsi), (nli, nsi)) in pairs {
+            if li != nli {
+                continue;
+            }
+            let line = &module.lines[li];
+            let (
+                Stmt::For {
+                    var,
+                    start,
+                    end,
+                    step,
+                    ..
+                },
+                Stmt::Next { vars },
+            ) = (&line.stmts[fsi], &line.stmts[nsi])
+            else {
+                continue;
+            };
+            if var.kind != VarKind::Float || var.base == "TI" || var.base == "ST" {
+                continue;
+            }
+            let Some(st) = expr_as_i16_literal(step)
+                .filter(|&st| st != 0)
+                .map(i32::from)
+            else {
+                continue;
+            };
+            let Some(own) = vars
+                .iter()
+                .position(|v| v.as_ref().is_none_or(|v| v == var))
+            else {
+                continue;
+            };
+            let parts = guarded_for_parts(&line.stmts, fsi, nsi, own);
+            let (lo, hi) = guarded_for_counter_range(st, guarded_for_address_cap(&parts.body, var));
+            let start_lit = expr_as_i16_literal(start).map(i32::from);
+            if matches!(start, Expr::Number(_))
+                && !start_lit.is_some_and(|s| (lo..=hi).contains(&s))
+            {
+                continue;
+            }
+            // Keep the original lowering when known bounds make the guard unnecessary.
+            let path = crate::cfg::StmtPath {
+                line_idx: li,
+                path: vec![fsi],
+            };
+            let range = |e: &Expr| facts.expr_int_range_before_path(&path, e);
+            let never = |e: &Expr| range(e).is_some_and(|r| r.min > hi || r.max < lo);
+            if never(start) || never(end) {
+                continue;
+            }
+            if let (Some(s), Some(e)) = (range(start), range(end)) {
+                let (min, max) = (s.min.min(e.min), s.max.max(e.max));
+                if min >= i16::MIN as i32 && crate::codegen::int_for_exit_fits_i16(min, max, st) {
+                    continue;
+                }
+            }
+            if lifetimes.for_tier(line.number, li, &[fsi])
+                != crate::for_next_runtime::ForTier::Static
+                || lifetimes.static_for_needs_discard(line.number, li, &[fsi])
+                || lifetimes.for_is_externally_entered(line.number, li, &[fsi])
+                || lifetimes.is_orphan_next(line.number, li, &[nsi])
+            {
+                continue;
+            }
+            if !guarded_for_body_ok(&parts.body, var, &routines)
+                || !guarded_for_tail_len(&parts.tail).is_some_and(|n| n <= GUARDED_FOR_MAX_TAIL)
+            {
+                continue;
+            }
+            sites.push((li, fsi, nsi, own, st, start_lit, (lo, hi)));
+        }
+        // One loop per line: a rewrite moves every statement after its FOR.
+        sites.sort_by_key(|&(li, fsi, ..)| (li, std::cmp::Reverse(fsi)));
+        sites.dedup_by_key(|site| site.0);
+        for (id, (li, fsi, nsi, own, st, start_lit, range)) in sites.into_iter().enumerate().rev() {
+            guard_int_for(module, li, fsi, nsi, own, st, start_lit, range, id);
+        }
+        Ok(())
+    }
+}
+
+/// Counter bounds that remain nonnegative and fit after the final step.
+fn guarded_for_counter_range(step: i32, cap: i32) -> (i32, i32) {
+    let hi = if step > 0 {
+        i16::MAX as i32 - step
+    } else {
+        i16::MAX as i32
+    };
+    (0, hi.min(cap))
+}
+
+/// The highest counter value an address `K+V` in the body leaves inside 64K.
+fn guarded_for_address_cap(body: &[Stmt], var: &VarName) -> i32 {
+    use crate::visit::Visitor;
+    struct Offsets<'a>(&'a VarName, f64);
+    impl Visitor for Offsets<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if let Expr::Bin(BinOp::Add, l, r) = e {
+                match (l.as_ref(), r.as_ref()) {
+                    (Expr::Number(k), Expr::Var(v)) | (Expr::Var(v), Expr::Number(k))
+                        if v == self.0 =>
+                    {
+                        self.1 = self.1.max(*k);
+                    }
+                    _ => {}
+                }
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut offsets = Offsets(var, 0.0);
+    for stmt in body {
+        offsets.visit_stmt(0, stmt);
+    }
+    (65535.0 - offsets.1).clamp(0.0, i16::MAX as f64) as i32
+}
+
+/// Build guarded integer and float versions with shared evaluated loop bounds.
+fn guard_int_for(
+    module: &mut ir::Module,
+    li: usize,
+    fsi: usize,
+    nsi: usize,
+    own: usize,
+    st: i32,
+    start_lit: Option<i32>,
+    (lo, hi): (i32, i32),
+    id: usize,
+) {
+    let next_line = module.lines.get(li + 1).map(|l| l.number);
+    let line = &mut module.lines[li];
+    let GuardedForParts { body, next, tail } = guarded_for_parts(&line.stmts, fsi, nsi, own);
+    line.stmts.truncate(fsi + 1);
+    let Some(Stmt::For {
+        var: loop_var,
+        start,
+        end,
+        step,
+        ..
+    }) = line.stmts.pop()
+    else {
+        unreachable!("FOR at its index");
+    };
+    let temp = |tag: &str, kind| VarName {
+        base: format!("__GIF_{tag}{id}"),
+        kind,
+    };
+    let end_t = temp("E", VarKind::Float);
+    let start_i = temp("A", VarKind::Integer);
+    let end_i = temp("B", VarKind::Integer);
+    let num = |n: i32| Expr::Number(f64::from(n));
+    let ev = |v: &VarName| Expr::Var(v.clone());
+    let bin = |op, l, r| Expr::Bin(op, Box::new(l), Box::new(r));
+    let up = st > 0;
+    // Round ascending ends down and descending ends up for integer counter bounds.
+    let (end_lo, end_hi) = match (start_lit, up) {
+        (Some(s), true) => (s, hi),
+        (Some(s), false) => (-s, -lo),
+        (None, true) => (lo, hi),
+        (None, false) => (-hi, -lo),
+    };
+
+    line.stmts.push(Stmt::Let {
+        var: loop_var.clone(),
+        value: start,
+    });
+    line.stmts.push(Stmt::Let {
+        var: end_t.clone(),
+        value: end,
+    });
+    // An end the guard below rejects.
+    line.stmts.push(Stmt::Let {
+        var: end_i.clone(),
+        value: num(if up { i16::MAX as i32 } else { i16::MIN as i32 }),
+    });
+    let mut fits = if up {
+        bin(
+            BinOp::And,
+            bin(BinOp::Ge, ev(&end_t), num(-32768)),
+            bin(BinOp::Lt, ev(&end_t), num(32768)),
+        )
+    } else {
+        bin(
+            BinOp::And,
+            bin(BinOp::Gt, ev(&end_t), num(-32768)),
+            bin(BinOp::Le, ev(&end_t), num(32768)),
+        )
+    };
+    let mut fill = Vec::new();
+    if start_lit.is_none() {
+        fits = bin(
+            BinOp::And,
+            bin(
+                BinOp::And,
+                bin(BinOp::Ge, ev(&loop_var), num(-32768)),
+                bin(BinOp::Lt, ev(&loop_var), num(32768)),
+            ),
+            fits,
+        );
+        fill.push(Stmt::Let {
+            var: start_i.clone(),
+            value: ev(&loop_var),
+        });
+    }
+    fill.push(Stmt::Let {
+        var: end_i.clone(),
+        value: if up {
+            ev(&end_t)
+        } else {
+            Expr::Neg(Box::new(ev(&end_t)))
+        },
+    });
+    line.stmts.push(Stmt::If {
+        cond: fits,
+        then: ThenIr::Stmts(fill),
+    });
+
+    let mut miss = bin(
+        BinOp::Or,
+        bin(BinOp::Lt, ev(&end_i), num(end_lo)),
+        bin(BinOp::Gt, ev(&end_i), num(end_hi)),
+    );
+    if start_lit.is_none() {
+        miss = bin(
+            BinOp::Or,
+            bin(
+                BinOp::Or,
+                bin(
+                    BinOp::Or,
+                    bin(BinOp::Ne, ev(&start_i), ev(&loop_var)),
+                    bin(BinOp::Lt, ev(&start_i), num(lo)),
+                ),
+                bin(BinOp::Gt, ev(&start_i), num(hi)),
+            ),
+            miss,
+        );
+    }
+    let mut original = vec![Stmt::For {
+        var: loop_var.clone(),
+        start: ev(&loop_var),
+        end: ev(&end_t),
+        step: step.clone(),
+        body_int_safe: true,
+        body_reads_loop_var: true,
+        induction_const: None,
+        array_inductions: Vec::new(),
+    }];
+    original.extend(body.iter().cloned());
+    original.push(next.clone());
+    original.extend(tail.iter().cloned());
+    guarded_for_plain_loops(&mut original[1..]);
+    if !original
+        .last()
+        .is_some_and(|s| matches!(s, Stmt::Goto { .. } | Stmt::Return | Stmt::End | Stmt::Stop))
+    {
+        original.push(match next_line {
+            Some(target) => Stmt::Goto { target },
+            None => Stmt::End,
+        });
+    }
+    line.stmts.push(Stmt::If {
+        cond: miss,
+        then: ThenIr::Stmts(original),
+    });
+
+    line.stmts.push(Stmt::For {
+        var: loop_var,
+        start: match start_lit {
+            Some(s) => num(s),
+            None => ev(&start_i),
+        },
+        end: if up {
+            ev(&end_i)
+        } else {
+            Expr::Neg(Box::new(ev(&end_i)))
+        },
+        step,
+        body_int_safe: true,
+        body_reads_loop_var: true,
+        induction_const: None,
+        array_inductions: Vec::new(),
+    });
+    line.stmts.extend(body);
+    line.stmts.push(next);
+    line.stmts.extend(tail);
 }
 
 /// Combine a FOR loop that writes a constant value to a contiguous address range.
@@ -2767,7 +3372,7 @@ fn match_poke_fill_triplet(
 /// offset (`+K` or `-K`); returns `None` for anything else, including
 /// expressions that mention `loop_var` more than once or wrap it in
 /// other operations.
-fn match_loop_var_with_offset(e: &Expr, loop_var: &VarName) -> Option<i32> {
+pub(crate) fn match_loop_var_with_offset(e: &Expr, loop_var: &VarName) -> Option<i32> {
     match e {
         Expr::Var(v) if v == loop_var => Some(0),
         Expr::Bin(BinOp::Add, l, r) => {
@@ -4359,7 +4964,7 @@ fn stmt_loop_var_needs_fac(
                 || str_reads_var(value, target)
         }
         Stmt::Poke { addr, value } => {
-            expr_loop_var_needs_fac(addr, target, true, induction)
+            addr_loop_var_needs_fac(addr, target, induction)
                 || expr_loop_var_needs_fac(value, target, true, induction)
         }
         Stmt::PokeFill {
@@ -4807,9 +5412,7 @@ fn expr_loop_var_needs_fac(
             expr_loop_var_needs_fac(l, target, inner, induction)
                 || expr_loop_var_needs_fac(r, target, inner, induction)
         }
-        Expr::Peek(addr) | Expr::MemPeek(addr) => {
-            expr_loop_var_needs_fac(addr, target, true, induction)
-        }
+        Expr::Peek(addr) | Expr::MemPeek(addr) => addr_loop_var_needs_fac(addr, target, induction),
         Expr::ArrayRef(_, indices) => indices
             .iter()
             .any(|i| expr_loop_var_needs_fac(i, target, true, induction)),
@@ -4829,6 +5432,66 @@ fn expr_loop_var_needs_fac(
         // StrCompare.
         _ => expr_reads_var(e, target),
     }
+}
+
+/// For a constant-base address, only the remaining terms require integer evaluation.
+fn addr_loop_var_needs_fac(addr: &Expr, target: &VarName, induction: Option<f64>) -> bool {
+    let u16_lit =
+        |e: &Expr| matches!(e, Expr::Number(n) if n.fract() == 0.0 && (0.0..=65535.0).contains(n));
+    if let Expr::Bin(BinOp::Add, l, r) = addr {
+        if u16_lit(l) {
+            return expr_loop_var_needs_fac(r, target, true, induction);
+        }
+        if u16_lit(r) {
+            return expr_loop_var_needs_fac(l, target, true, induction);
+        }
+    }
+    if let Some((_, rest)) = split_u16_address(addr) {
+        return expr_loop_var_needs_fac(&rest, target, true, induction);
+    }
+    expr_loop_var_needs_fac(addr, target, true, induction)
+}
+
+/// Separate a large constant address base from the remaining integer terms.
+pub(crate) fn split_u16_address(addr: &Expr) -> Option<(u16, Expr)> {
+    fn flatten<'a>(e: &'a Expr, add: bool, out: &mut Vec<(bool, &'a Expr)>) {
+        match e {
+            Expr::Bin(BinOp::Add, l, r) => {
+                flatten(l, add, out);
+                flatten(r, add, out);
+            }
+            Expr::Bin(BinOp::Sub, l, r) => {
+                flatten(l, add, out);
+                flatten(r, !add, out);
+            }
+            _ => out.push((add, e)),
+        }
+    }
+    let mut terms = Vec::new();
+    flatten(addr, true, &mut terms);
+    let mut base = 0.0;
+    let mut rest: Option<Expr> = None;
+    let mut literals = 0;
+    for (add, term) in terms {
+        if let Expr::Number(n) = term {
+            if n.fract() != 0.0 {
+                return None;
+            }
+            base += if add { *n } else { -*n };
+            literals += 1;
+            continue;
+        }
+        rest = Some(match rest {
+            None if add => term.clone(),
+            None => return None,
+            Some(acc) => {
+                let op = if add { BinOp::Add } else { BinOp::Sub };
+                Expr::Bin(op, Box::new(acc), Box::new(term.clone()))
+            }
+        });
+    }
+    let rest = rest?;
+    (literals > 0 && (32768.0..=65535.0).contains(&base)).then(|| (base as u16, rest))
 }
 
 /// Mirror of `Codegen::is_int_island_addsub_only` restricted to the
@@ -5259,10 +5922,14 @@ pub(crate) fn literal_scalar_i16_ranges(
     let mut writes = WriteCollector {
         defs: HashMap::new(),
         bad: HashSet::new(),
+        soft_bad: HashSet::new(),
+        data_bounds: None,
         scalar_used: HashSet::new(),
         array_used: HashSet::new(),
     };
     crate::visit::walk_module(&mut writes, module);
+    let soft_bad = std::mem::take(&mut writes.soft_bad);
+    writes.bad.extend(soft_bad);
     writes.bad.extend(collect_for_counter_vars(module));
     writes
         .defs
@@ -9601,6 +10268,10 @@ impl ir::Pass for IntArrayPromote {
             .filter(|a| !facts.int_array_bases.contains(&a.base))
             .cloned()
             .collect();
+        // An integer copy would fit where the ROM runs out of memory.
+        for a in module.arrays_the_rom_cannot_auto_dim().keys() {
+            array_cand.remove(a);
+        }
 
         let write_ok = |reqs: Option<&Vec<WriteReq>>,
                         scalar_cand: &HashSet<VarName>,
@@ -9661,7 +10332,10 @@ impl ir::Pass for IntPromote {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        let promote = compute_int_promotable(module);
+        let mut promote = compute_int_promotable(module);
+        for a in module.arrays_the_rom_cannot_auto_dim().keys() {
+            promote.remove(a);
+        }
         if promote.is_empty() {
             return Ok(());
         }
@@ -9669,6 +10343,28 @@ impl ir::Pass for IntPromote {
         promoter.rewrite_module(module);
         Ok(())
     }
+}
+
+/// Float scalars whose every write is proved integral and within i16.
+fn flow_proven_i16_scalars(module: &ir::Module) -> HashSet<VarName> {
+    let mut reg = crate::analysis::Registry::new();
+    let cfg = reg.get(module, &crate::cfg::CfgBuild).clone();
+    let facts = reg.get(module, &crate::dataflow::NumericFactAnalysis);
+    let mut fits: HashMap<VarName, bool> = HashMap::new();
+    for id in 0..cfg.nodes.len() {
+        for v in crate::dataflow::stmt_defs(cfg.stmt_at(id, module)) {
+            if v.kind != VarKind::Float || matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL") {
+                continue;
+            }
+            let ok = facts
+                .per_node
+                .get(id)
+                .and_then(|(_, out)| out.get(&v))
+                .is_some_and(|r| r.fits_i16());
+            *fits.entry(v).or_insert(true) &= ok;
+        }
+    }
+    fits.into_iter().filter(|(_, ok)| *ok).map(|(v, _)| v).collect()
 }
 
 /// Compute the set of vars that are safe to demote to integer.
@@ -9679,6 +10375,9 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     let mut info = WriteCollector {
         defs: HashMap::new(),
         bad: HashSet::new(),
+        soft_bad: HashSet::new(),
+        data_bounds: crate::dataflow::compute_data_range(module)
+            .map(|r| (f64::from(r.min), f64::from(r.max))),
         scalar_used: HashSet::new(),
         array_used: HashSet::new(),
     };
@@ -9686,9 +10385,14 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     let WriteCollector {
         defs,
         mut bad,
+        soft_bad,
+        data_bounds: _,
         scalar_used,
         array_used,
     } = info;
+    // Scalars the flow-sensitive range analysis bounds at every write: integral and inside i16.
+    let flow_proven = flow_proven_i16_scalars(module);
+    bad.extend(soft_bad.into_iter().filter(|v| !flow_proven.contains(v)));
 
     bad.extend(scan_for_counters_with_unsafe_body(module));
     // V2 IR shares VarName between scalar `A` and array `A()`, but at
@@ -9750,6 +10454,9 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
         let mut to_drop: Vec<VarName> = Vec::new();
         for v in &candidates {
             let Some(values) = defs.get(v) else { continue };
+            if flow_proven.contains(v) {
+                continue;
+            }
             for value in values {
                 if !int_stayable(value, &candidates) {
                     if trace {
@@ -9774,6 +10481,7 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
                     &counted,
                     uncounted_cycle,
                 );
+            to_drop.retain(|v| !flow_proven.contains(v));
             if to_drop.is_empty() {
                 break;
             }
@@ -9806,6 +10514,7 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     let mut classifier = UseClassifier {
         counts: HashMap::new(),
         promote: &candidates,
+        weight: 1,
     };
     classifier.classify_module(module);
     let counts = classifier.counts;
@@ -9874,6 +10583,68 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
     candidates
 }
 
+/// Whether an expression performs arithmetic rather than copying a value.
+fn has_arith_op(e: &Expr) -> bool {
+    match e {
+        Expr::Bin(op, l, r) => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor)
+                || has_arith_op(l)
+                || has_arith_op(r)
+        }
+        Expr::Func1(Func1::Int, arg) => matches!(arg.as_ref(), Expr::Bin(BinOp::Div, _, _)) || has_arith_op(arg),
+        Expr::Neg(inner) | Expr::Not(inner) | Expr::Func1(_, inner) => has_arith_op(inner),
+        _ => false,
+    }
+}
+
+/// Estimate statement frequency from enclosing loops and backward branches, capped at 64.
+fn statement_loop_weights(module: &ir::Module) -> Vec<Vec<u32>> {
+    let mut depth: Vec<Vec<u32>> =
+        module.lines.iter().map(|line| vec![0; line.stmts.len()]).collect();
+    let (pairs, _, _) = textual_for_next_pairs(module);
+    for &(for_at, next_at) in &pairs {
+        for (li, line) in depth.iter_mut().enumerate().take(next_at.0 + 1).skip(for_at.0) {
+            for (si, d) in line.iter_mut().enumerate() {
+                if (li, si) > for_at && (li, si) <= next_at {
+                    *d += 1;
+                }
+            }
+        }
+    }
+    let index_of = |target: u16| module.lines.iter().position(|line| line.number >= target);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (li, line) in module.lines.iter().enumerate() {
+        for stmt in &line.stmts {
+            let mut targets: Vec<u16> = Vec::new();
+            match stmt {
+                Stmt::Goto { target } => targets.push(*target),
+                Stmt::If { then: crate::ir::ThenIr::Goto(t), .. } => targets.push(*t),
+                Stmt::OnBranch { targets: ts, .. } => targets.extend(ts.iter().copied()),
+                _ => {}
+            }
+            for t in targets {
+                if let Some(ti) = index_of(t)
+                    && ti <= li
+                    && !spans.contains(&(ti, li))
+                {
+                    spans.push((ti, li));
+                }
+            }
+        }
+    }
+    for (from, to) in spans {
+        for line in &mut depth[from..=to] {
+            for d in line.iter_mut() {
+                *d += 1;
+            }
+        }
+    }
+    depth
+        .into_iter()
+        .map(|line| line.into_iter().map(|d| 4u32.saturating_pow(d).min(64)).collect())
+        .collect()
+}
+
 /// Per-var classification of how each read is consumed. Drives the
 /// cost/benefit gate in `compute_int_promotable`.
 #[derive(Default, Clone, Copy, Debug)]
@@ -9940,12 +10711,16 @@ enum UseRole {
 struct UseClassifier<'a> {
     counts: HashMap<VarName, UseCounts>,
     promote: &'a HashSet<VarName>,
+    /// How much a use in the statement being classified counts: see `statement_loop_weights`.
+    weight: u32,
 }
 
 impl<'a> UseClassifier<'a> {
     fn classify_module(&mut self, module: &ir::Module) {
-        for line in &module.lines {
-            for stmt in &line.stmts {
+        let weights = statement_loop_weights(module);
+        for (line, line_weights) in module.lines.iter().zip(&weights) {
+            for (stmt, &weight) in line.stmts.iter().zip(line_weights) {
+                self.weight = weight;
                 self.classify_stmt(stmt);
             }
         }
@@ -9959,17 +10734,18 @@ impl<'a> UseClassifier<'a> {
             return;
         }
         let c = self.counts.entry(v.clone()).or_default();
+        // Count conversions once and weight arithmetic savings by statement frequency.
         match role {
             UseRole::Print => c.print += 1,
             UseRole::PrintArg => c.print_arg += 1,
             UseRole::Transcend => c.transcend += 1,
-            UseRole::Arith => c.arith += 1,
-            UseRole::Index => c.index += 1,
-            UseRole::Addr => c.addr += 1,
-            UseRole::ForVar => c.for_var += 1,
-            UseRole::ForBound => c.for_bound += 1,
-            UseRole::Cond => c.cond += 1,
-            UseRole::LetRhs => c.let_rhs += 1,
+            UseRole::Arith => c.arith += self.weight,
+            UseRole::Index => c.index += self.weight,
+            UseRole::Addr => c.addr += self.weight,
+            UseRole::ForVar => c.for_var += self.weight,
+            UseRole::ForBound => c.for_bound += self.weight,
+            UseRole::Cond => c.cond += self.weight,
+            UseRole::LetRhs => c.let_rhs += self.weight,
             UseRole::Skip => {}
         }
     }
@@ -10105,7 +10881,13 @@ impl<'a> UseClassifier<'a> {
     /// no candidate vars or are already disqualified.
     fn classify_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { value, .. } => self.walk_expr(value, UseRole::LetRhs),
+            Stmt::Let { var, value } => {
+                self.walk_expr(value, UseRole::LetRhs);
+                // Integer arithmetic replaces the float operation that computed the value.
+                if has_arith_op(value) && int_stayable(value, self.promote) {
+                    self.note(var, UseRole::Arith);
+                }
+            }
             Stmt::LetStr { .. } => {}
             Stmt::ArrayLet {
                 name,
@@ -10254,6 +11036,10 @@ impl<'a> UseClassifier<'a> {
 struct WriteCollector {
     defs: HashMap<VarName, Vec<Expr>>,
     bad: HashSet<VarName>,
+    /// Scalars written by READ: disqualified unless range analysis bounds every write.
+    soft_bad: HashSet<VarName>,
+    /// Minimum and maximum DATA values when all entries fit i16.
+    data_bounds: Option<(f64, f64)>,
     /// Names referenced as scalars (Var/Let). When the same name is
     /// also referenced as an array, we can't promote either side
     /// because the IR shares a single VarName.
@@ -10359,11 +11145,23 @@ impl crate::visit::Visitor for WriteCollector {
                 }
             }
             Stmt::Read(targets) | Stmt::Input { targets, .. } => {
+                let read = matches!(stmt, Stmt::Read(_));
                 for t in targets {
                     match t {
                         crate::ir::ReadTarget::Scalar(v) => {
                             self.note_scalar(v);
-                            self.bad.insert(v.clone());
+                            if read {
+                                self.soft_bad.insert(v.clone());
+                                // The DATA range stands in for the values a READ stores.
+                                if let Some((lo, hi)) = self.data_bounds {
+                                    self.defs
+                                        .entry(v.clone())
+                                        .or_default()
+                                        .extend([Expr::Number(lo), Expr::Number(hi)]);
+                                }
+                            } else {
+                                self.bad.insert(v.clone());
+                            }
                         }
                         crate::ir::ReadTarget::Array { name, .. } => {
                             self.note_array(name);
@@ -10720,8 +11518,14 @@ fn int_range_escapees(
     // True when a cycle is not a FOR/NEXT pair, so an accumulator can run forever.
     uncounted_cycle: bool,
 ) -> Vec<VarName> {
-    let mut ranges: HashMap<VarName, PromRange> = HashMap::new();
+    // RUN and CLR start every variable at 0, so that value is in every range.
+    let mut ranges: HashMap<VarName, PromRange> = candidates
+        .iter()
+        .map(|v| (v.clone(), PromRange::new(0, 0)))
+        .collect();
     let mut unstable: HashSet<VarName> = HashSet::new();
+    // Ranges still growing in the last round: not a bound.
+    let mut unsettled: HashSet<VarName> = HashSet::new();
     for round in 0..=PROM_RANGE_ROUNDS {
         let mut changed = false;
         // Deterministic order: the fixpoint result does not depend on it, but the escapee list
@@ -10746,11 +11550,11 @@ fn int_range_escapees(
                 Some(&old) => {
                     ranges.insert(v.clone(), old.join(next));
                     changed = true;
-                    if round == PROM_RANGE_ROUNDS
-                        && !for_counters.contains(v)
-                        && !guarded.contains_key(v)
-                    {
-                        unstable.insert(v.clone());
+                    if round == PROM_RANGE_ROUNDS {
+                        unsettled.insert(v.clone());
+                        if !for_counters.contains(v) && !guarded.contains_key(v) {
+                            unstable.insert(v.clone());
+                        }
                     }
                 }
                 None => {
@@ -10768,20 +11572,26 @@ fn int_range_escapees(
         defs.get(v)
             .is_some_and(|values| values.iter().any(|e| expr_reads_var(e, v)))
     };
+    // A write whose value has no interval leaves the variable unbounded.
+    let unranged = |v: &VarName| {
+        defs.get(v).is_some_and(|values| {
+            values.iter().any(|e| prom_range_of(e, candidates, &ranges).is_none())
+        })
+    };
     let mut out: Vec<VarName> = candidates
         .iter()
         .filter(|v| {
 
             // Range still widening after the last fixpoint round. Check this
             // first so an accumulator that never settled is still dropped.
-            if unstable.contains(*v) {
+            if unstable.contains(*v) || unranged(v) {
                 return true;
             }
             if uncounted_cycle && accumulator(v) {
                 // A loop-exit test bounds the value at the test, not the store.
                 // Keep only if the execution-count proof or the fixpoint covers it.
                 return !(counted.contains(*v)
-                    || ranges.get(*v).is_some_and(|r| r.fits_i16()));
+                    || (!unsettled.contains(*v) && ranges.get(*v).is_some_and(|r| r.fits_i16())));
             }
             if let Some(b) = guarded.get(*v) {
                 return !b.fits_i16();
@@ -11296,9 +12106,36 @@ fn prom_range_of(
             | BinOp::Le
             | BinOp::Gt
             | BinOp::Ge => PromRange::new(-1, 0),
-            BinOp::And | BinOp::Or | BinOp::Xor => PromRange::i16(),
+            BinOp::And => {
+                // A non-negative constant mask clamps the result to 0..=mask.
+                let mask = [l, r].into_iter().find_map(|e| match e.as_ref() {
+                    Expr::Number(n) if n.fract() == 0.0 && (0.0..=32767.0).contains(n) => {
+                        Some(*n as i64)
+                    }
+                    _ => None,
+                });
+                mask.map_or(PromRange::i16(), |m| PromRange::new(0, m))
+            }
+            BinOp::Or | BinOp::Xor => PromRange::i16(),
             _ => return None,
         },
+        // Allow one unit around the exact quotient floor for float division rounding.
+        Expr::Func1(Func1::Int, arg) if matches!(arg.as_ref(), Expr::Bin(BinOp::Div, _, _)) => {
+            let Expr::Bin(BinOp::Div, l, r) = arg.as_ref() else { unreachable!() };
+            let (a, b) = bin(l, r)?;
+            if b.min <= 0 && b.max >= 0 {
+                return None;
+            }
+            let corners = [
+                a.min as f64 / b.min as f64,
+                a.min as f64 / b.max as f64,
+                a.max as f64 / b.min as f64,
+                a.max as f64 / b.max as f64,
+            ];
+            let lo = corners.iter().copied().fold(f64::INFINITY, f64::min).floor();
+            let hi = corners.iter().copied().fold(f64::NEG_INFINITY, f64::max).floor();
+            PromRange::new(lo as i64 - 1, hi as i64 + 1)
+        }
         Expr::Func1(f, arg) => match f {
             Func1::Abs => {
                 let r = prom_range_of(arg, candidates, ranges)?;
@@ -11357,6 +12194,10 @@ fn int_stayable(e: &Expr, int_vars: &HashSet<VarName>) -> bool {
                 && int_stayable(r, int_vars)
         }
         Expr::Func1(f, arg) => match f {
+            // INT(a/b) of two integers is an integer.
+            Func1::Int if let Expr::Bin(BinOp::Div, l, r) = arg.as_ref() => {
+                int_stayable(l, int_vars) && int_stayable(r, int_vars)
+            }
             // ABS/INT/SGN preserve int when input is int.
             Func1::Abs | Func1::Int | Func1::Sgn => int_stayable(arg, int_vars),
             _ => false,
@@ -11939,9 +12780,13 @@ impl<'a> VarKindPromoter<'a> {
             }
             Stmt::Read(targets) | Stmt::Input { targets, .. } => {
                 for t in targets.iter_mut() {
-                    if let crate::ir::ReadTarget::Array { indices, .. } = t {
-                        for e in indices.iter_mut() {
-                            self.rewrite_expr(e);
+                    match t {
+                        // Promote READ targets only when every write is bounded; exclude INPUT targets.
+                        crate::ir::ReadTarget::Scalar(v) => self.maybe_promote(v),
+                        crate::ir::ReadTarget::Array { indices, .. } => {
+                            for e in indices.iter_mut() {
+                                self.rewrite_expr(e);
+                            }
                         }
                     }
                 }
@@ -12285,95 +13130,117 @@ impl ir::Pass for DeadStoreElim {
     }
 
     fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
-        // Build the CFG + live-vars analysis once. Both go through
-        // the registry so other passes downstream can reuse them.
-        let mut reg = crate::analysis::Registry::new();
-        let cfg = reg.get(module, &crate::cfg::CfgBuild).clone();
-        let live = reg.get(module, &crate::dataflow::LiveVars).clone();
-
-        // When the program never calls FRE, heap-allocating string
-        // RHSs (Concat, CHR$, STR$, Left/Right/Mid, Dup, Insert) are
-        // unobservable apart from the binding they create — dropping
-        // a dead one just lets the heap fill slower and the GC fire
-        // less often. With FRE present we keep the conservative
-        // `str_is_pure` gate so the FRE return value doesn't change.
-        let fre_observable = module_uses_fre(module);
-
-        let fretop_observable = module_reads_fretop(module);
-
-        // Positions where the statement being there at all is the observable effect ; see `stack_floor_trap_positions`.
-        let floor_traps = stack_floor_trap_positions(module);
-
-        // For each top-level LET, find its CfgNode and check if the
-        // var is live at the OUT side of that node. If not — and
-        // the RHS is pure — mark the line+stmt for removal.
-        let mut to_remove: HashSet<(usize, Vec<usize>)> = HashSet::new();
-        let mut skipped_reads: Vec<(usize, Vec<usize>, usize)> = Vec::new();
-        for (id, node) in cfg.nodes.iter().enumerate() {
-            let stmt = cfg.stmt_at(id, module);
-            if let Stmt::Read(targets) = stmt {
-                let live_out = &live.per_node[id].1;
-                let skip = ir::read_skip_var();
-                for (k, t) in targets.iter().enumerate() {
-                    let ir::ReadTarget::Scalar(v) = t else { continue };
-                    let read_later = targets[k + 1..].iter().any(|later| match later {
-                        ir::ReadTarget::Array { indices, .. } => {
-                            indices.iter().any(|e| ir::expr_may_read_var(e, v))
-                        }
-                        ir::ReadTarget::Scalar(_) => false,
-                    });
-                    if v.kind == VarKind::String
-                        && *v != skip
-                        && !live_out.contains(v)
-                        && str_store_cannot_trap(v)
-                        && !read_later
-                    {
-                        skipped_reads.push((node.stmt.line_idx, node.stmt.path.clone(), k));
-                    }
-                }
-            }
-            let drop = match stmt {
-                Stmt::Let { var, value } => {
-                    let live_out = &live.per_node[id].1;
-
-                    !live_out.contains(var)
-                        && expr_is_pure(value)
-                        && expr_cannot_trap(value)
-                        && int_store_cannot_trap(var, value)
-                }
-                Stmt::LetStr { var, value } => {
-                    let live_out = &live.per_node[id].1;
-
-                    !live_out.contains(var)
-                        && str_store_cannot_trap(var)
-                        && str_is_pure_for_dead_store(value, fre_observable)
-                        && !(fretop_observable && is_str_self_assign(var, value))
-                }
-                _ => false,
-            };
-            if drop
-                && (floor_traps.is_empty()
-                    || !floor_traps.contains(&(node.stmt.line_idx, node.stmt.path.clone())))
-            {
-                to_remove.insert((node.stmt.line_idx, node.stmt.path.clone()));
-            }
-        }
-        for (line_idx, path, k) in skipped_reads {
-            if let Stmt::Read(targets) = stmt_at_path_mut(module, line_idx, &path) {
-                targets[k] = ir::ReadTarget::Scalar(ir::read_skip_var());
-            }
-        }
-        if to_remove.is_empty() {
-            return Ok(());
-        }
-
-        // Apply: walk lines and drop the marked stmts. Path-based
-        // removal so we can hit nested THEN-body LETs too.
-        for (line_idx, line) in module.lines.iter_mut().enumerate() {
-            drop_paths_in(&mut line.stmts, &[], line_idx, &to_remove);
-        }
-        Ok(())
+        dead_store_elim(module, false)
     }
+}
+
+/// [`DeadStoreElim`] for `--no-error-checks`: a store goes even when its value could raise an error.
+pub struct DeadStoreElimUnchecked;
+
+impl ir::Pass for DeadStoreElimUnchecked {
+    fn name(&self) -> &'static str {
+        "dead-store-elim-unchecked"
+    }
+
+    fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        dead_store_elim(module, true)
+    }
+}
+
+fn dead_store_elim(module: &mut ir::Module, unchecked: bool) -> Result<(), ir::PassError> {
+    // Build and cache the control-flow and liveness analyses.
+    let mut reg = crate::analysis::Registry::new();
+    let cfg = reg.get(module, &crate::cfg::CfgBuild).clone();
+    let live = reg.get(module, &crate::dataflow::LiveVars).clone();
+
+    // Retain observable heap allocations when FRE is used.
+    let fre_observable = module_uses_fre(module);
+
+    let fretop_observable = module_reads_fretop(module);
+
+    // Statement positions whose execution itself has an observable effect.
+    let floor_traps = if unchecked {
+        HashSet::new()
+    } else {
+        stack_floor_trap_positions(module)
+    };
+
+    // Mark assignments for removal when the destination is dead and the value is pure.
+    let mut to_remove: HashSet<(usize, Vec<usize>)> = HashSet::new();
+    let mut skipped_reads: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+    for (id, node) in cfg.nodes.iter().enumerate() {
+        let stmt = cfg.stmt_at(id, module);
+        if let Stmt::Read(targets) = stmt {
+            let live_out = &live.per_node[id].1;
+            let skip = ir::read_skip_var();
+            for (k, t) in targets.iter().enumerate() {
+                let ir::ReadTarget::Scalar(v) = t else {
+                    continue;
+                };
+                let read_later = targets[k + 1..].iter().any(|later| match later {
+                    ir::ReadTarget::Array { indices, .. } => {
+                        indices.iter().any(|e| ir::expr_may_read_var(e, v))
+                    }
+                    ir::ReadTarget::Scalar(_) => false,
+                });
+                if v.kind == VarKind::String
+                    && *v != skip
+                    && !live_out.contains(v)
+                    && str_store_cannot_trap(v)
+                    && !read_later
+                {
+                    skipped_reads.push((node.stmt.line_idx, node.stmt.path.clone(), k));
+                }
+            }
+        }
+        let drop = match stmt {
+            Stmt::Let { var, value } if unchecked => {
+                !live.per_node[id].1.contains(var) && expr_effect_free(value)
+            }
+            Stmt::Let { var, value } => {
+                let live_out = &live.per_node[id].1;
+
+                !live_out.contains(var)
+                    && expr_is_pure(value)
+                    && expr_cannot_trap(value)
+                    && int_store_cannot_trap(var, value)
+            }
+            Stmt::LetStr { var, value } => {
+                let live_out = &live.per_node[id].1;
+                let value_goes = if unchecked && !fre_observable {
+                    str_effect_free(value)
+                } else {
+                    str_is_pure_for_dead_store(value, fre_observable)
+                };
+
+                !live_out.contains(var)
+                    && str_store_cannot_trap(var)
+                    && value_goes
+                    && !(fretop_observable && is_str_self_assign(var, value))
+            }
+            _ => false,
+        };
+        if drop
+            && (floor_traps.is_empty()
+                || !floor_traps.contains(&(node.stmt.line_idx, node.stmt.path.clone())))
+        {
+            to_remove.insert((node.stmt.line_idx, node.stmt.path.clone()));
+        }
+    }
+    for (line_idx, path, k) in skipped_reads {
+        if let Stmt::Read(targets) = stmt_at_path_mut(module, line_idx, &path) {
+            targets[k] = ir::ReadTarget::Scalar(ir::read_skip_var());
+        }
+    }
+    if to_remove.is_empty() {
+        return Ok(());
+    }
+
+    // Remove marked statements, including assignments inside THEN branches.
+    for (line_idx, line) in module.lines.iter_mut().enumerate() {
+        drop_paths_in(&mut line.stmts, &[], line_idx, &to_remove);
+    }
+    Ok(())
 }
 
 /// Statement positions where evaluating anything at all is fatal, so deleting the statement deletes a `?OUT OF MEMORY`.
@@ -12673,6 +13540,45 @@ pub(crate) fn str_reads_are_repeatable(s: &StrExpr) -> bool {
     }
 }
 
+/// Whether evaluating e has no side effects apart from a possible runtime error.
+pub(crate) fn expr_effect_free(e: &Expr) -> bool {
+    match e {
+        Expr::Var(v) if v.kind == VarKind::Float && v.base == "ST" => false,
+        Expr::Number(_) | Expr::String(_) | Expr::Var(_) | Expr::Pos(_) => true,
+        Expr::Neg(inner) | Expr::Not(inner) => expr_effect_free(inner),
+        Expr::Bin(_, l, r) => expr_effect_free(l) && expr_effect_free(r),
+        Expr::Func1(Func1::Rnd, _) => false,
+        Expr::Func1(_, arg) => expr_effect_free(arg),
+        Expr::Peek(_) | Expr::MemPeek(_) => expr_is_pure(e),
+        Expr::ArrayRef(_, indices) => indices.iter().all(expr_effect_free),
+        Expr::Len(s) | Expr::Asc(s) | Expr::Val(s) => str_effect_free(s),
+        Expr::StrCompare(_, l, r) => str_effect_free(l) && str_effect_free(r),
+        _ => false,
+    }
+}
+
+/// String side of [`expr_effect_free`]. A heap allocation only shows in FRE.
+pub(crate) fn str_effect_free(s: &StrExpr) -> bool {
+    match s {
+        StrExpr::Literal(_) | StrExpr::Var(_) => true,
+        StrExpr::GetKey => false,
+        StrExpr::Chr(e) | StrExpr::Str(e) | StrExpr::HexFmt(e) | StrExpr::BinFmt(e) => {
+            expr_effect_free(e)
+        }
+        StrExpr::Concat(a, b) => str_effect_free(a) && str_effect_free(b),
+        StrExpr::Left(s, n) | StrExpr::Right(s, n) | StrExpr::Dup(s, n) => {
+            str_effect_free(s) && expr_effect_free(n)
+        }
+        StrExpr::Mid(s, from, len) => {
+            str_effect_free(s)
+                && expr_effect_free(from)
+                && len.as_deref().is_none_or(expr_effect_free)
+        }
+        StrExpr::Insert(a, b, n) => str_effect_free(a) && str_effect_free(b) && expr_effect_free(n),
+        StrExpr::ArrayRef(_, indices) => indices.iter().all(expr_effect_free),
+    }
+}
+
 pub(crate) fn expr_is_pure(e: &Expr) -> bool {
     match e {
         Expr::Number(n) => n.is_finite(),
@@ -12819,7 +13725,7 @@ fn str_is_pure(s: &StrExpr) -> bool {
 ///
 /// `GetKey` and `ArrayRef` are still rejected because their side
 /// effects (advancing the keyboard buffer, possibly raising ?BAD
-/// SUBSCRIPT) are observable regardless of FRE.
+/// SUBSCRIPT) remain observable, as do invalid string lengths or byte arguments.
 fn str_is_pure_for_dead_store(s: &StrExpr, fre_observable: bool) -> bool {
     // Volatile string reads (`TI$`) move FRE even if the store is unused.
     if fre_observable && !str_reads_are_repeatable(s) {
@@ -12832,21 +13738,45 @@ fn str_is_pure_for_dead_store(s: &StrExpr, fre_observable: bool) -> bool {
         return false;
     }
     match s {
-        StrExpr::Chr(_) | StrExpr::Str(_) | StrExpr::HexFmt(_) | StrExpr::BinFmt(_) => true,
+        StrExpr::Chr(e) => byte_literal_at_least(e, 0.0),
+        StrExpr::Str(e) => expr_cannot_trap(e),
         StrExpr::Concat(l, r) => {
             str_is_pure_for_dead_store(l, fre_observable)
                 && str_is_pure_for_dead_store(r, fre_observable)
+                && str_len_bound(l) + str_len_bound(r) <= 255
         }
-        StrExpr::Left(s, _) | StrExpr::Right(s, _) | StrExpr::Dup(s, _) => {
+        StrExpr::Left(s, n) | StrExpr::Right(s, n) => {
+            str_is_pure_for_dead_store(s, fre_observable) && byte_literal_at_least(n, 0.0)
+        }
+        StrExpr::Mid(s, from, len) => {
             str_is_pure_for_dead_store(s, fre_observable)
+                && byte_literal_at_least(from, 1.0)
+                && len.as_deref().is_none_or(|n| byte_literal_at_least(n, 0.0))
         }
-        StrExpr::Mid(s, _, _) => str_is_pure_for_dead_store(s, fre_observable),
-        StrExpr::Insert(a, b, _) => {
-            str_is_pure_for_dead_store(a, fre_observable)
-                && str_is_pure_for_dead_store(b, fre_observable)
-        }
-        StrExpr::ArrayRef(_, _) | StrExpr::GetKey => false,
         _ => false,
+    }
+}
+
+/// True iff `e` is a literal that GETBYT takes without ?ILLEGAL QUANTITY, at least `min`.
+fn byte_literal_at_least(e: &Expr, min: f64) -> bool {
+    matches!(e, Expr::Number(n) if *n >= min && *n < 256.0)
+}
+
+/// Most characters `s` can hold; 255 when it depends on a variable.
+fn str_len_bound(s: &StrExpr) -> usize {
+    let byte = |e: &Expr| match e {
+        Expr::Number(n) if *n >= 0.0 && *n < 256.0 => *n as usize,
+        _ => 255,
+    };
+    match s {
+        StrExpr::Literal(b) => b.len().min(255),
+        StrExpr::Chr(_) => 1,
+        // "-1.23456789E-38"
+        StrExpr::Str(_) => 15,
+        StrExpr::Concat(l, r) => (str_len_bound(l) + str_len_bound(r)).min(255),
+        StrExpr::Left(s, n) | StrExpr::Right(s, n) => str_len_bound(s).min(byte(n)),
+        StrExpr::Mid(s, _, len) => str_len_bound(s).min(len.as_deref().map_or(255, byte)),
+        _ => 255,
     }
 }
 
@@ -15399,9 +16329,90 @@ mod tests {
         }
     }
 
+    /// `LEFT$(A$,10)+"X"`: at most 11 characters, so it cannot raise ?STRING TOO LONG.
+    fn short_concat(a: &VarName) -> crate::ir::StrExpr {
+        crate::ir::StrExpr::Concat(
+            Box::new(crate::ir::StrExpr::Left(
+                Box::new(crate::ir::StrExpr::Var(a.clone())),
+                Box::new(Expr::Number(10.0)),
+            )),
+            Box::new(crate::ir::StrExpr::Literal(b"X".to_vec())),
+        )
+    }
+
+    /// `A$=<value> : A$="reset" : PRINT A$` after DeadStoreElim: is the first store still there?
+    fn dead_str_store_kept(value: crate::ir::StrExpr) -> bool {
+        let a = svar("A");
+        let mut module = Module {
+            lines: vec![
+                Line {
+                    number: 10,
+                    stmts: vec![Stmt::LetStr {
+                        var: a.clone(),
+                        value,
+                    }],
+                },
+                Line {
+                    number: 20,
+                    stmts: vec![Stmt::LetStr {
+                        var: a.clone(),
+                        value: crate::ir::StrExpr::Literal(b"reset".to_vec()),
+                    }],
+                },
+                Line {
+                    number: 30,
+                    stmts: vec![Stmt::Print {
+                        items: vec![crate::ir::PrintPiece::StrExpr(crate::ir::StrExpr::Var(a))],
+                        newline: true,
+                    }],
+                },
+            ],
+        };
+        DeadStoreElim.run(&mut module).unwrap();
+        !module.lines[0].stmts.is_empty()
+    }
+
+    #[test]
+    fn dead_store_keeps_what_can_raise_an_error() {
+        use crate::ir::StrExpr as S;
+        let a = || Box::new(S::Var(svar("A")));
+        let n = |v: f64| Box::new(Expr::Number(v));
+        let i = || Box::new(Expr::Var(fvar("I")));
+        let x = || Box::new(S::Literal(b"X".to_vec()));
+        for (what, value) in [
+            ("A$ may already hold 255 characters", S::Concat(a(), x())),
+            ("CHR$ of a variable may be out of range", S::Chr(i())),
+            ("CHR$(256)", S::Chr(n(256.0))),
+            ("LEFT$ with a variable count", S::Left(a(), i())),
+            ("RIGHT$ with a negative count", S::Right(a(), n(-1.0))),
+            ("MID$ from 0", S::Mid(a(), n(0.0), None)),
+            (
+                "MID$ with a length of 256",
+                S::Mid(a(), n(1.0), Some(n(256.0))),
+            ),
+            (
+                "STR$ of a product may overflow",
+                S::Str(Box::new(Expr::Bin(BinOp::Mul, i(), i()))),
+            ),
+        ] {
+            assert!(dead_str_store_kept(value), "{what}: the store must stay");
+        }
+        for (what, value) in [
+            ("CHR$(65)", S::Chr(n(65.0))),
+            ("STR$(I)", S::Str(i())),
+            ("MID$(A$,1,255)", S::Mid(a(), n(1.0), Some(n(255.0)))),
+            ("RIGHT$(A$,0)", S::Right(a(), n(0.0))),
+        ] {
+            assert!(
+                !dead_str_store_kept(value),
+                "{what} cannot fail: the store goes"
+            );
+        }
+    }
+
     #[test]
     fn dead_store_drops_heap_concat_when_no_fre() {
-        // `A$=A$+"X" : A$="reset"` — without FRE in the program, the
+        // `A$=LEFT$(A$,10)+"X" : A$="reset"` — without FRE in the program, the
         // first allocation is unobservable. The relaxed dead-store
         // gate should drop it.
         let a = svar("A");
@@ -15411,10 +16422,7 @@ mod tests {
                     number: 10,
                     stmts: vec![Stmt::LetStr {
                         var: a.clone(),
-                        value: crate::ir::StrExpr::Concat(
-                            Box::new(crate::ir::StrExpr::Var(a.clone())),
-                            Box::new(crate::ir::StrExpr::Literal(b"X".to_vec())),
-                        ),
+                        value: short_concat(&a),
                     }],
                 },
                 Line {
@@ -15454,10 +16462,7 @@ mod tests {
                     number: 10,
                     stmts: vec![Stmt::LetStr {
                         var: a.clone(),
-                        value: crate::ir::StrExpr::Concat(
-                            Box::new(crate::ir::StrExpr::Var(a.clone())),
-                            Box::new(crate::ir::StrExpr::Literal(b"X".to_vec())),
-                        ),
+                        value: short_concat(&a),
                     }],
                 },
                 Line {

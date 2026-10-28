@@ -48,6 +48,10 @@ fn usage_to(program: &str, to: UsageTo) {
     usage_line!(to, "    --asm <file>          Also write the generated 6502 assembly.");
     usage_line!(to, "    --profile=<p>         default | speed | size  (default: default)");
     usage_line!(to, "    --lenient-syntax      Accept BASIC v2 typos that v2 only catches at runtime.");
+    usage_line!(to, "    --no-error-checks     Leave out run-time error checks and line tracking.");
+    usage_line!(to, "                          Programs that would stop with an error may do anything.");
+    usage_line!(to, "    --fast-float          Float code embedded in the program: same results as the ROM,");
+    usage_line!(to, "                          faster, larger binary.");
     usage_line!(to, "    --safe-sys-calls      Save/restore $FB-$FE and ZP-pool cells around every SYS."
     );
     usage_line!(to, "    --sys-register-args   Non-v2: read `SYS a,x,y,sr` as A/X/Y/SR preloads instead");
@@ -287,6 +291,14 @@ fn run_compile(args: &[String]) -> ExitCode {
                 options.safe_sys_calls = true;
                 i += 1;
             }
+            "--no-error-checks" => {
+                options.unchecked = true;
+                i += 1;
+            }
+            "--fast-float" => {
+                options.fast_float = true;
+                i += 1;
+            }
             "--sys-register-args" => {
                 options.sys_register_args = true;
                 i += 1;
@@ -425,6 +437,9 @@ fn print_diagnostics(compiled: &yabcompiler_core::Compiled) {
             "  profile : the requested profile did not fit any legal layout; \
              rebuilt at --profile=size (smaller, slower)"
         );
+    }
+    if d.fast_float_dropped {
+        eprintln!("  float   : --fast-float left out; the program needs the memory");
     }
     if let Some((lo, hi)) = d.original_image {
         // Report the preserved input image and relocated compiled code.

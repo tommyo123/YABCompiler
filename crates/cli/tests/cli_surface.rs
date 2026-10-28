@@ -99,6 +99,34 @@ fn compile_writes_a_loadable_image_and_exits_zero() {
 }
 
 #[test]
+fn no_error_checks_compiles_a_smaller_image() {
+    let src = scratch("checks.bas");
+    std::fs::write(
+        &src,
+        "10 DIM A(10)\n20 FOR I=1 TO 10:A(I)=I:NEXT\n30 PRINT A(5)\n",
+    )
+    .expect("write source");
+    let compile = |name: &str, extra: &[&str]| {
+        let img = scratch(name);
+        let o = yabc()
+            .args(["compile", src.to_str().unwrap(), img.to_str().unwrap()])
+            .args(extra)
+            .output()
+            .expect("run yabcompiler");
+        assert_eq!(code(&o), 0, "compile {extra:?} should succeed: {}", err(&o));
+        std::fs::read(&img)
+            .expect("compile should have written the image")
+            .len()
+    };
+    let checked = compile("checked.prg", &[]);
+    let unchecked = compile("unchecked.prg", &["--no-error-checks"]);
+    assert!(
+        unchecked < checked,
+        "--no-error-checks: {unchecked} bytes, plain: {checked}"
+    );
+}
+
+#[test]
 fn list_round_trips_a_source_file_to_its_listing() {
     let src = scratch("listing.bas");
     std::fs::write(&src, "10 PRINT \"HI\"\n").expect("write source");

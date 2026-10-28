@@ -266,7 +266,7 @@ fn an_int_mask_nested_inside_a_byte_path_condition() {
     let src = "10 DIM Q(1)\n20 Q(0)=0:Q(1)=1\n30 READ M\n40 T=0\n\
                50 IF Q(1)=1 AND (M AND 10)=12 THEN T=T+1\n\
                60 IF Q(1)=1 OR (M AND 10)=12 THEN T=T+2\n\
-               70 PRINT T\n80 DATA 12\n90 END\n";
+               70 PRINT T\n80 DATA 12,0.5\n90 END\n";
     check_output(src, &nums(&[" 2"]));
     let asm = compile_variant(src, Profile::Default, false).asm;
     assert!(takes_byte_path(&asm), "outer must be byte:\n{asm}");

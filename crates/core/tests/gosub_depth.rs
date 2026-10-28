@@ -328,6 +328,102 @@ fn deep_but_valid_recursion_with_for_frames_runs_to_completion() {
     }
 }
 
+/// Runs `src` in the ROM and compiled, and checks output and error agree in every profile.
+fn same_as_rom(src: &str) {
+    let prg = tokenize_program(src).expect("tokenize");
+    let rom = emu64::run_basic_to_end(&prg, common::MAX_INSNS).expect("runs in the interpreter");
+    let want = (
+        common::petscii_to_string(&rom.output),
+        rom.error_code,
+        rom.error_line,
+    );
+    for profile in PROFILES {
+        for extraram in [false, true] {
+            let built = build(src, profile, extraram);
+            let r = emu64::run_prg_to_end(&built.prg_bytes, common::MAX_INSNS).expect("runs");
+            let got = (
+                common::petscii_to_string(&r.output),
+                r.error_code,
+                r.error_line,
+            );
+            assert_eq!(got, want, "({profile:?}, extraram={extraram}):\n{src}");
+        }
+    }
+}
+
+/// NEXT and reopened FOR statements discard their inner frames.
+#[test]
+fn loops_the_rom_drops_do_not_tighten_the_budget() {
+    for (src, limit) in [
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=20 THEN RETURN\n\
+             110 FOR J=1 TO 1:FOR I=0 TO 0:NEXT J:GOSUB 100:RETURN\n",
+            LOOSE_LIMIT,
+        ),
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=20 THEN RETURN\n\
+             110 FOR J=1 TO 1:FOR I=0 TO 0\n120 NEXT J\n130 GOSUB 100:RETURN\n",
+            LOOSE_LIMIT,
+        ),
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=6 THEN RETURN\n\
+             110 FOR J=1 TO 1:FOR J=1 TO 1:GOSUB 100:NEXT:RETURN\n",
+            TIGHT_LIMIT,
+        ),
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=6 THEN RETURN\n\
+             110 FOR J=1 TO 1:FOR I=1 TO 1:FOR J=1 TO 1:GOSUB 100:NEXT:RETURN\n",
+            TIGHT_LIMIT,
+        ),
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=6 THEN RETURN\n\
+             110 FOR J=1 TO 1:FOR I=0 TO 0:NEXT J:FOR K=1 TO 1:GOSUB 100:NEXT:RETURN\n",
+            TIGHT_LIMIT,
+        ),
+    ] {
+        for profile in PROFILES {
+            assert_eq!(
+                guard_limit(&build(src, profile, false).asm),
+                limit,
+                "({profile:?}):\n{src}"
+            );
+        }
+        same_as_rom(src);
+    }
+}
+
+/// GOSUB depth includes only definitely open and reachable FOR frames.
+#[test]
+fn only_loops_that_are_surely_open_tighten_the_budget() {
+    for (src, limit) in [
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=15 THEN RETURN\n\
+             110 IF K>3 THEN FOR B=1 TO 2:FOR N=1 TO 2\n120 GOSUB 100:RETURN\n",
+            LOOSE_LIMIT,
+        ),
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D<6 THEN FOR K=1 TO 1:GOSUB 100:NEXT\n\
+             110 RETURN\n",
+            TIGHT_LIMIT,
+        ),
+        // Unreachable line 120 never creates a FOR frame.
+        (
+            "10 GOSUB 100:PRINT D:END\n100 D=D+1:IF D>=15 THEN RETURN\n110 GOTO 130\n\
+             120 FOR K=1 TO 2\n130 GOSUB 100:RETURN\n140 GOSUB 120\n",
+            LOOSE_LIMIT,
+        ),
+    ] {
+        for profile in PROFILES {
+            assert_eq!(
+                guard_limit(&build(src, profile, false).asm),
+                limit,
+                "({profile:?}):\n{src}"
+            );
+        }
+        same_as_rom(src);
+    }
+}
+
 #[test]
 fn a_flat_gosub_loop_never_trips_the_guard() {
     const SRC: &str = "10 T=0\n\

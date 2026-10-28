@@ -42,8 +42,8 @@ const LOOP: &str = "10 M=240\n20 M=M-1\n30 POKE 1025,M AND 255\n40 POKE 1026,M+1
 
 #[test]
 fn a_dead_hot_mirror_disappears_and_the_loop_stays_fast() {
-    // Remains a Float scalar with a shadow: the promotion interval fixpoint cannot bound this backwards-branch guard.
-    let src = "10 X=0\n20 X=X+1:POKE1024+X,1:IFX<200THEN20\n";
+    // GET leaves X as a float with an integer copy; an empty keyboard yields zero.
+    let src = "10 GET X\n20 X=X+1:POKE1024+X,1:IFX<200THEN20\n";
     for profile in PROFILES {
         let c = compile(src, profile);
         assert!(

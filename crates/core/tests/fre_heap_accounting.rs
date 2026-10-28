@@ -17,8 +17,11 @@ fn build(src: &str, profile: Profile) -> (Vec<u8>, String) {
     (c.prg_bytes, c.asm)
 }
 
+/// The default build's asm, with heap cells that moved to zero page under their usual names.
 fn asm_of(src: &str) -> String {
-    build(src, Profile::Default).1
+    build(src, Profile::Default)
+        .1
+        .replace("Z__HEAP_", "__HEAP_")
 }
 
 /// Assert `src` prints `expected` and ends cleanly, on every profile.

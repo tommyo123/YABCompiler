@@ -71,7 +71,8 @@ fn assert_no(a: &str, needle: &str) {
 #[test]
 fn fac_compare_materialises_the_boolean_without_a_jmp() {
     for op in ["<", "<=", "=", ">=", ">", "<>"] {
-        let src = format!("10 a=peek(1024)/3:b=peek(1025)/7\n20 c=(a{op}b):print c\n");
+        // READ, not arithmetic: the speed profile's ARG helpers read the FAC exponent and sign.
+        let src = format!("10 read a,b\n20 c=(a{op}b):print c\n30 data 1.25,2.5\n");
         let a = asm(&src);
         assert_seq(&a, &["TAX", "LDA #$FF", "CPX"]);
         assert_no(&a, "JMP __CMP_D");

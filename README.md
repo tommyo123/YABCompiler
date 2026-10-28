@@ -1,26 +1,20 @@
 # YABCompiler
 
-Yet Another Basic Compiler. Compiles Commodore BASIC V2 programs to
-native 6502 machine code that runs on a stock C64. It also compiles
-the subset of Simons' BASIC (Tuned Simons' BASIC dialect) commands that make
-sense in a compiled program (see below).
+Yet Another Basic Compiler for the Commodore 64. Compiles BASIC V2
+and selected Simons' BASIC and Tuned Simons' BASIC commands to 6502
+machine code.
 
-Input can be either a tokenized `.prg` (as saved by an emulator or a
-real 1541) or plain `.bas` source. Output is a runnable `.prg`.
-Programs that worked under the interpreter usually work compiled, only
-faster.
+Input is `.bas` source or a tokenized `.prg`. The compiled `.prg` runs
+on a stock C64 or in an emulator.
 
-## Why
+## Version 1.0.3
 
-The C64 BASIC interpreter is slow. Most type-in programs from the 80s
-spend more time in the interpreter loop than doing useful work. A
-compiler that takes the same source and emits real 6502 code lifts
-games and utilities from "barely playable" to "fast enough to enjoy"
-without rewriting them.
+Loops, math, arrays, strings and READ run faster. The default and size
+profiles produce smaller programs. Runtime errors match C64 BASIC
+more closely.
 
-YABCompiler keeps the source untouched. You compile the `.prg`, copy
-the result to a disk image, and run it on real hardware or in an
-emulator.
+New options: `--no-error-checks` and `--fast-float`. Both are available
+in the CLI and GUI.
 
 ## Download
 
@@ -43,7 +37,7 @@ cargo build --release -p yabcompiler-cli
 cargo build --release -p yabcompiler-gui
 ```
 
-The CLI binary lands at `target/release/yabcompiler`, the GUI at
+The CLI binary is at `target/release/yabcompiler`, the GUI at
 `target/release/yabcompiler-gui`. Building the Windows installer and
 the Linux library requirements are covered in [BUILD.md](BUILD.md).
 
@@ -73,11 +67,17 @@ a file that reaches past `$CFFF` is compressed.
 which leaves more room for the program and its heap. By default this
 happens when a program needs the room.
 
-GUI: launch `yabcompiler-gui`, pick a `.bas` or `.prg` as the input,
-press Compile. The menu bar holds the same actions plus theme and
-about. The settings panel is on the left, including a dialect picker
-that matches `--dialect` for ASCII `.bas` files. The output and
-generated assembly are on the right.
+`--no-error-checks` removes runtime error checks and line tracking for
+smaller, faster programs. Use it only with programs that run without
+errors.
+
+`--fast-float` adds faster math routines with the same results as the
+C64 BASIC ROM. The file gets larger. The compiler leaves this option
+out if the program needs the memory.
+
+GUI: launch `yabcompiler-gui`, select a `.bas` or `.prg`, then press
+Compile. The left panel includes the dialect, No error checks and
+Fast float options. Output and generated assembly appear on the right.
 
 Auto Extra RAM may leave too little heap for variables in large compiled
 programs. If you suspect this, try Move DATA set to On (`--data-relocate=on`)
@@ -94,8 +94,9 @@ ranges manually in the GUI or with `--reserved`.
   storage where it is safe to do so. `FRE()` reports this compiler's
   heap, not the interpreter's number, because a compiled program has
   no BASIC variable table.
-* Optimizations for loops, array access and shared instruction sequences.
-  Trailing zero data can be initialized at startup to reduce file size.
+* Faster loops, math, arrays, strings and READ. Compact DATA, text and
+  shared code reduce file size. Trailing zero data is cleared at startup
+  when this saves space in the file.
 * Optional extra RAM mode banks BASIC ROM out and uses
   `$A000-$BFFF` for program code or data. The compiler decides
   automatically based on size, or you can force it.
@@ -150,10 +151,9 @@ test_synthetic  behavioural tests with expected output
 cargo test -p yabcompiler-core
 ```
 
-The corpus tests compile each program and run the result through the
-bundled `emu64` emulator, then compare the captured output against a
-golden file. emu64 runs in process, so the full suite finishes in
-seconds. See [BUILD.md](BUILD.md) for running the full workspace tests.
+Tests run compiled programs in the included `emu64` emulator and
+compare their output with expected results. Large program tests can
+take several minutes. See [BUILD.md](BUILD.md) for workspace tests.
 
 ## License
 

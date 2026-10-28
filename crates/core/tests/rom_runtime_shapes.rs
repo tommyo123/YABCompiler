@@ -164,7 +164,7 @@ fn a_loop_that_never_reads_curlin_gets_no_restamp() {
 
     let reads = "10 for i=1 to 10:a=peek(57)\n20 next\n30 print a\n";
     // A loop body that can raise an error ends on another BASIC line.
-    let fallible_tail = "10 for i=1 to 10:a=a+i\n20 next\n30 print a\n";
+    let fallible_tail = "10 for i=1 to 10:a=a*100+1e30\n20 next\n30 print a\n";
     for p in PROFILES {
         assert_ne!(
             top_of_for_body(&build(quiet, p).asm),

@@ -134,10 +134,13 @@ pub const FLOAT_ONE: u16 = 0xB9BC;
 //   FDIV:  FAC = mem / FAC    (codegen evaluates lhs to mem, rhs to FAC)
 //
 // Each routine has multiple ROM entry points; the ones below load the
-// operand from `.A,.Y` themselves. The companion entries at $B86A,
-// $B853, $BA30 expect ARG to be pre-loaded and are not used here.
+// operand from A/Y. The T entries use ARG, sign product $6F, and exponent A.
 pub const FADD: u16 = 0xB867;
 pub const FSUB: u16 = 0xB850;
+pub const FADDT: u16 = 0xB86A;
+pub const FSUBT: u16 = 0xB853;
+pub const FMULTT: u16 = 0xBA2B;
+pub const FDIVT: u16 = 0xBB12;
 
 /// Compare FAC with memory and return 0, $01 or $FF with matching N/Z.
 pub const FCOMP: u16 = 0xBC5B;
@@ -209,6 +212,9 @@ pub const FACWORD: u16 = 0xB7F7;
 /// Floor FAC to signed 16-bit; raise ILLEGAL QUANTITY outside -32768..=32767.
 pub const AYINT: u16 = 0xB1BF;
 
+/// INTIDX after its FRMEVL: AYINT, but a negative FAC raises ILLEGAL QUANTITY too.
+pub const INTIDX_CHECK: u16 = 0xB1BB;
+
 /// Round FAC by shifting $70 and adding its top bit.
 pub const ROUND: u16 = 0xBC1B;
 
@@ -245,6 +251,8 @@ pub const TXTPTR_HI: u8 = 0x7B;
 /// source-of-text address.
 pub const INDEX1_LO: u8 = 0x22;
 pub const INDEX1_HI: u8 = 0x23;
+/// INDEX2, the ROM's second scratch pointer; free between ROM calls.
+pub const INDEX2_HI: u8 = 0x25;
 /// VALTYPE selects parsing mode for several input routines: $00 means
 /// "expect number", $80 means "expect string". We only ever set it to 0.
 pub const VALTYPE: u8 = 0x0D;
@@ -345,6 +353,8 @@ pub const LINPRT: u16 = 0xBDCD;
 /// in the FAC mantissa bytes ($62 MSB through $65 LSB). For values
 /// fitting 24 bits, $62 is zero and $63/$64/$65 carry the result.
 pub const QINT: u16 = 0xBC9B;
+/// Normalize an integer mantissa in FAC; clear carry denotes negative two's complement.
+pub const FADD_NORMALIZE_SIGNED: u16 = 0xB8D2;
 
 /// AYINT result bytes: high at $64, low at $65.
 pub const QINT_RESULT_HI: u8 = 0x64;

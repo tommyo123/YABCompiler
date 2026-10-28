@@ -126,8 +126,23 @@ pub(crate) const VAL_BUF_CLOSE: &str = "; @@VAL_BUF_CLOSE@@";
 
 /// Opens the truncatable run.
 pub const BSS_START_LABEL: &str = "__BSS_START";
+
+/// Restores the index-context flag when an index or address lowering ends.
+struct IndexContextGuard(std::rc::Rc<std::cell::Cell<bool>>, bool);
+
+impl Drop for IndexContextGuard {
+    fn drop(&mut self) {
+        self.0.set(self.1);
+    }
+}
 /// One past the last truncatable byte.
 pub const BSS_END_LABEL: &str = "__BSS_END";
+/// Expected byte count of the unrolled zero fill.
+pub const BSS_FILL_SPAN_LABEL: &str = "BSS__FILL_SPAN";
+/// Size of [`bss_fill_block`], the one a fill pays against.
+const BSS_FILL_LOOP_BYTES: usize = 37;
+/// Most pages the speed profile's fill stores one by one.
+const BSS_FILL_UNROLL_PAGES: usize = 32;
 /// Minimum byte saving required to omit trailing zeros.
 const BSS_FILL_MIN_BYTES: usize = 64;
 
@@ -549,8 +564,18 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_source_types(
     source_integer_vars: SourceIntegerVars,
 ) -> Result<(String, ZpPressure), CodegenError> {
     emit_with_profile_at_opts_diag_and_data_rescue(
-        module, profile, origin, safe_sys_calls, hints, poisoned_fns,
-        source_integer_vars, false, false, None,
+        module,
+        profile,
+        origin,
+        safe_sys_calls,
+        hints,
+        poisoned_fns,
+        source_integer_vars,
+        false,
+        false,
+        None,
+        false,
+        false,
     )
 }
 
@@ -567,6 +592,8 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_data_rescue(
     // TSB dialect: boot like TSB, not a stock C64.
     tsb_target: bool,
     data_relocate: Option<DataBuf>,
+    unchecked: bool,
+    fast_float: bool,
 ) -> Result<(String, ZpPressure), CodegenError> {
     let analysis = CodegenAnalysis::from_module(module);
     let orphan_for_next = crate::for_next_runtime::analyze(module);
@@ -588,6 +615,8 @@ pub(crate) fn emit_with_profile_at_opts_diag_and_data_rescue(
         cg.safe_sys_calls = safe_sys_calls;
         cg.tsb_target = tsb_target;
         cg.data_relocate = data_relocate;
+        cg.unchecked = unchecked;
+        cg.fast_float = fast_float;
         cg.forced_byte_bases = hints.byte_vars.clone();
         cg.forced_zp_bases = hints.zp_vars.clone();
         cg.poisoned_fns = poisoned_fns.clone();
@@ -697,6 +726,26 @@ struct Codegen {
     /// Number of per-FOR END slots allocated so far. We never free them
     /// (not worth the bookkeeping for a few bytes).
     for_end_slots: usize,
+    /// Address caches by float variable label and added constant, in id order.
+    addr_caches: Vec<(String, u16)>,
+    /// Float variables whose whole value in 0..=65535 is cached for `V+counter` addresses.
+    addr_int_caches: Vec<String>,
+    /// Integer sums per FOR statement, with a flag for runtime checks.
+    wide_sum_plans: HashMap<crate::cfg::StmtPath, Vec<(VarName, bool)>>,
+    /// FOR statements whose exit store precedes every read of the variable.
+    dead_for_header_stores: HashSet<crate::cfg::StmtPath>,
+    /// Float variables summed in a 24-bit slot inside the open loop with this top label.
+    wide_sums: Vec<WideSum>,
+    used_i24_fac: bool,
+    used_ws_load: bool,
+    used_cs_load_u: bool,
+    used_cs_load_s: bool,
+    used_cs_mf_u: bool,
+    used_cs_mf_s: bool,
+    /// `FOR N=a TO b:POKE N+K1,PEEK(N+K2):NEXT` lines lowered to a block copy, keyed by the FOR.
+    copy_loop_plans: HashMap<crate::cfg::StmtPath, CopyLoop>,
+    /// The copy the FOR being emitted stands for.
+    pending_copy: Option<CopyLoop>,
     /// Number of dynamic-STEP sign slots allocated (1 byte each, named
     /// `FS_SIGN_<n>`). NEXT reads the matching one to decide which way
     /// the exit-sign branch should go when STEP wasn't a constant at
@@ -783,6 +832,8 @@ struct Codegen {
     used_str_left: bool,
     used_str_right: bool,
     used_str_mid: bool,
+    /// True iff `ASC(MID$(...))` used the helper `__ASC_MID`.
+    used_asc_mid: bool,
     /// True iff anything in the program needs the heap initialised at
     /// startup (any of: concat, STR$, LEFT$, RIGHT$, MID$).
     heap_init_needed: bool,
@@ -829,6 +880,10 @@ struct Codegen {
     data_line_offsets: Vec<(u16, usize)>,
     /// DATA intervals that numeric READ rejects, with their BASIC line numbers.
     data_bad: Vec<(usize, usize, u16)>,
+    /// DATA items every READ rejects, with their BASIC line numbers.
+    data_unreadable: Vec<(usize, u16)>,
+    /// Whether a string READ checks for those items.
+    used_read_str_chk: bool,
     compact_data_metadata: bool,
     compact_data_bad: Option<crate::compact_data_bad::CompactDataBad>,
     /// Whether numeric READ needs the invalid-DATA table and check.
@@ -919,6 +974,8 @@ struct Codegen {
     /// `__READ_STR_COPY` copies a buffered text item onto the heap.
     used_read_str_copy: bool,
     read_targets: usize,
+    /// Some READ target is a float or a string, which take tagged items through FAC.
+    read_needs_fac: bool,
     /// Some READ advanced the DATA cursor through `__DATA_ADVANCE`.
     used_data_advance: bool,
     /// True iff any orphan NEXT can find the runtime FOR stack empty.
@@ -936,14 +993,24 @@ struct Codegen {
     used_jmp22: bool,
     /// Use tagged binary integers when they save space.
     data_ints_tagged: bool,
+    /// Items of a tagged pool that keep their text anyway (Speed: DATA lines with text in them).
+    data_tags_kept_text: Vec<bool>,
     /// True iff a numeric READ enters through `__READ_TAGGED`.
     used_read_tagged: bool,
+    /// True iff a string READ writes a tagged integer's digits through `__TAG_TEXT`.
+    used_tag_text: bool,
     /// The entry `__READ_TAGGED` hands a text item to.
     read_tagged_text_entry: &'static str,
     /// Whether digit reads repay the helper size.
     read_digits: bool,
     /// Whether numeric READ needs the digit helper.
     used_read_digits: bool,
+    /// An integer READ target takes digit items straight from LINNUM, without FAC.
+    used_read_digits_int: bool,
+    /// An integer READ target takes tagged items without FAC.
+    used_read_tagged_int: bool,
+    /// The integer READ entry an integer array element READ goes through, when one does.
+    read_arr_int_entry: Option<&'static str>,
     /// True iff `VAL` enters through `__VAL_DIGITS`, the same shortcut in front of FIN.
     used_val_digits: bool,
     /// Whether GOSUB and RETURN checks are proved unnecessary.
@@ -983,6 +1050,11 @@ struct Codegen {
     /// hit by every non-trivial binary op — stubbing it shrinks each
     /// call from 7 bytes to 3.
     used_st_t0: bool,
+    /// Array indices and addresses use byte FOR counters as integer operands.
+    index_context: std::rc::Rc<std::cell::Cell<bool>>,
+    /// `__FAC_TO_ARG` and the ARG-operand entries a binary op used, by op.
+    used_fac_to_arg: bool,
+    used_arg_ops: Vec<BinOp>,
     /// Same idea for the four float-arithmetic ops with T0 as memory
     /// operand. Each used_op_t0 flag pulls in its own stub.
     used_fadd_t0: bool,
@@ -1018,6 +1090,8 @@ struct Codegen {
     /// the end of the binary; the call site is a 3-byte JSR. Filled
     /// during emission, drained at finish().
     bnds_stub_uses: HashMap<u16, u32>,
+    /// Bounds-check stubs with the state byte and both possible array bounds.
+    bnds_state_stubs: std::collections::BTreeMap<String, (String, u16, u16)>,
     /// Per-(dim_label) stub usage for runtime-dimensioned arrays.
     /// `__BNDS_RT_<dim_label>` does the sign check + 16-bit compare
     /// against the dim slot, trapping to `__BAD_SUBSCRIPT` when the
@@ -1078,6 +1152,8 @@ struct Codegen {
     /// routine. Used by `try_emit_int16_eval_addsub` for general
     /// `Mul` nodes that aren't power-of-two.
     used_mul16: bool,
+    /// True iff the trapping signed multiply `__MUL16C` was emitted.
+    used_mul16c: bool,
     /// True iff the signed int-island DIV helper `__DIV16` was
     /// emitted. Implements floor-division on signed i16 with a
     /// `?DIVISION BY ZERO` trap. Both DIV(a,b) and MOD(a,b) on
@@ -1085,6 +1161,18 @@ struct Codegen {
     /// after the call, NUM ($14/$15) holds the floor quotient and
     /// `__DIV16_REM` holds the floor remainder (sign of divisor).
     used_div16: bool,
+    /// True iff `x / 2^k` used the exponent helper `__FDIV2K`.
+    used_fdiv2k: bool,
+    /// True iff `x * 2^k` used the exponent helper `__FMUL2K`.
+    used_fmul2k: bool,
+    /// True iff `2^n` used the helper `__POW2`.
+    used_pow2: bool,
+    /// True iff `2^n` used its entry `__POW2_FAC`, which takes n in FAC.
+    used_pow2_fac: bool,
+    /// True iff RND used the speed profile's `__RND_POS`.
+    used_fast_rnd: bool,
+    /// True iff RND used its entry `__RND`, which takes the argument in FAC.
+    used_fast_rnd_arg: bool,
     /// True iff the small-constant MUL strength-reduction lowered a
     /// `Var * K` (K ∈ {3, 5, 6, 7, 9, 10, 12, ...}) into a shift+add
     /// chain — pulls in the 2-byte BSS scratch `__SMUL_TMP` used to
@@ -1108,6 +1196,8 @@ struct Codegen {
     last_array_addr: Option<(VarName, Vec<Expr>)>,
     /// Active rebased PEEK window: `(base variable, bottom displacement)`.
     peek_rebase: Option<(VarName, i32)>,
+    /// The integer island may read ASC, LEN and u16 literals while it evaluates for FAC.
+    island_for_fac: bool,
     /// Expressions whose value is definitely still resident in FAC1.
     /// This is a tiny local CSE/liveness cache: helpers that consume or
     /// overwrite FAC clear it, while MOVMF-style stores can add aliases
@@ -1125,8 +1215,14 @@ struct Codegen {
     /// Statically-allocated arrays that a `CLR`/`RUN` has un-DIMmed and that no later `DIM` has
     /// re-armed, on every path that reaches the current emission point.
     static_arrays_undimmed: HashSet<VarName>,
+    /// Possible static array states at each statement with known control flow.
+    array_states: Option<ArrayStateInfo>,
+    /// Static arrays the `DIM` statement being emitted has declared so far.
+    arrays_dimmed_in_stmt: HashSet<VarName>,
 
     redim_traps: HashSet<(u16, VarName)>,
+    /// Arrays whose auto-DIM the ROM can never hold: every reference raises ?OUT OF MEMORY.
+    oom_arrays: HashSet<VarName>,
     /// Runtime-DIM arrays whose `__ARR_<X>_BASE` lives in zero-page —
     /// the EQU directive at the top of the binary points the label
     /// at a 2-byte ZP slot, so the per-access \`ADC __ARR_<X>_BASE\`
@@ -1139,8 +1235,10 @@ struct Codegen {
     /// `__OPEN_F/D/S` used to stage SETLFS arguments across the
     /// per-arg evaluations.
     used_open: bool,
-    /// True iff a `PRINT#` reached the CHKOUT-with-error-check helper.
+    /// True iff a `PRINT#` or `CMD` reached the CHKOUT-with-error-check helper.
     used_chkout_check: bool,
+    /// True iff a `GET#` or `INPUT#` reached the CHKIN-with-error-check helper.
+    used_chkin_check: bool,
     /// True iff any INPUT# was emitted — pulls in the CHRIN-based
     /// `__INPUT_LINE_FILE` helper alongside the existing INPUT_BUF
     /// machinery.
@@ -1320,6 +1418,8 @@ struct Codegen {
     /// allocation overwrites the now-stale chunk instead of leaving
     /// it as heap garbage.
     used_lastvar_str: bool,
+    /// `__ARR_APPEND_PRE`/`__ARR_APPEND_POST`: `A$(I)=A$(I)+X$` grows the element in place.
+    used_arr_append: bool,
 
     used_lvc_helper: bool,
     used_lvu_helper: bool,
@@ -1385,6 +1485,24 @@ struct Codegen {
     shadow_int_vars: HashMap<VarName, String>,
     /// Speculatively omitted float mirrors.
     omitted_float_slots: HashSet<VarName>,
+    /// Float scalars that also keep a checked 16-bit copy in speed (see `CheckedShadow`).
+    checked_shadows: HashMap<VarName, CheckedShadow>,
+    /// Checked integer copies and the ranges proved by the active guard.
+    cs_active: Vec<(VarName, crate::dataflow::IntRange)>,
+    /// Times code generation consulted an active checked copy.
+    cs_hits: std::cell::Cell<usize>,
+    /// Set while `emit_let` emits the float store of a checked variable.
+    cs_plain_let: bool,
+    /// Lines of short loops, the only ones that read checked copies.
+    cs_tight_lines: HashSet<u16>,
+    /// The line of the statement being emitted.
+    cs_line: u16,
+    /// Checked variables whose float slot is written through `__CS_ST_<label>`.
+    cs_store_stubs: Vec<VarName>,
+    /// Checked variables that are also FOR variables.
+    cs_for_vars: HashSet<VarName>,
+    /// Open loops whose NEXT must mark checked copies stale.
+    cs_dirty_loops: HashSet<String>,
     source_integer_vars: SourceIntegerVars,
     /// Final-IR execution counts prove every assignment to these scalars stays in i16.
     bounded_accumulators: HashSet<VarName>,
@@ -1403,6 +1521,8 @@ struct Codegen {
     /// 1 byte and 1 cycle smaller than the absolute form.
     /// `__STATE_RESET` clears these byte-by-byte before main.
     zp_promotions: Vec<(String, u8, usize)>,
+    /// String-heap cells moved to zero page, as (label, address of the low byte).
+    zp_heap_cells: Vec<(&'static str, u8)>,
     /// Integer variables whose `V_<base>` slot was placed in zero
     /// page. `intern_var` skips appending these to `vars_order` so
     /// the absolute BSS slot isn't also emitted.
@@ -1466,6 +1586,10 @@ struct Codegen {
     /// When true, every emitted `SYS` PHA-saves $FB-$FE and the bytes
     /// in `zp_claimed`, restoring them after the JSR.
     safe_sys_calls: bool,
+    /// Omit error checks and line tracking unless the program uses error handlers.
+    unchecked: bool,
+    /// `--fast-float`: the speed profile's float code in every profile.
+    fast_float: bool,
     /// Route each param-`SYS`'s return sequence through the shared `__SYS_TXT_OUT` subroutine instead of inlining it.
     sys_param_helper: bool,
 
@@ -1553,6 +1677,10 @@ struct CodegenAnalysis {
     zp_reach: ZpProgramReach,
     /// Whether a loop prints numbers often enough to use fast helpers.
     prints_numbers_in_a_loop: bool,
+    /// Each FOR loop's header and NEXT node with the float variables its statements write.
+    loop_float_writes: Vec<(usize, usize, HashSet<VarName>)>,
+    node_of_path: HashMap<crate::cfg::StmtPath, usize>,
+    cfg: crate::cfg::Cfg,
 }
 
 impl CodegenAnalysis {
@@ -1573,6 +1701,28 @@ impl CodegenAnalysis {
         let cfg = registry.get(module, &crate::cfg::CfgBuild).clone();
         let zp_reach = scan_zp_program_reach(module, &cfg, &numeric_facts);
         let prints_numbers_in_a_loop = prints_numbers_in_a_loop(module, &cfg);
+        let loops = registry.get(module, &crate::analysis::LoopAnalysis).clone();
+        let loop_float_writes = loops
+            .loops
+            .iter()
+            .map(|lp| {
+                let writes = (lp.header..=lp.latch)
+                    .filter_map(|n| effects.summary_for_node(n))
+                    .flat_map(|e| e.writes.iter())
+                    .filter_map(|w| match w {
+                        crate::analysis::EffectRegion::ScalarFloat(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (lp.header, lp.latch, writes)
+            })
+            .collect();
+        let node_of_path = cfg
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(id, node)| (node.stmt.clone(), id))
+            .collect();
         Self {
             numeric_facts,
             literal_for_bounds: crate::passes::literal_scalar_i16_ranges(module),
@@ -1581,7 +1731,22 @@ impl CodegenAnalysis {
             defined_before_use,
             zp_reach,
             prints_numbers_in_a_loop,
+            loop_float_writes,
+            node_of_path,
+            cfg,
         }
+    }
+
+    /// Whether the innermost FOR loop around `path` leaves `var` alone.
+    fn innermost_loop_keeps(&self, path: &crate::cfg::StmtPath, var: &VarName) -> bool {
+        let Some(&node) = self.node_of_path.get(path) else {
+            return false;
+        };
+        self.loop_float_writes
+            .iter()
+            .filter(|(header, latch, _)| *header < node && node < *latch)
+            .max_by_key(|(header, ..)| *header)
+            .is_some_and(|(.., writes)| !writes.contains(var))
     }
 
     fn for_expr_int_range(
@@ -1644,6 +1809,60 @@ struct DefFnInfo {
     body: Expr,
 }
 
+/// Possible runtime states of static arrays declared by DIM.
+#[derive(Clone)]
+struct ArrayStateInfo {
+    index: HashMap<VarName, usize>,
+    per_node: Vec<Vec<u8>>,
+    refs: Vec<Vec<usize>>,
+    /// Combined array states for code shared by several statements.
+    any: Vec<u8>,
+    /// Array state bytes: 0 absent, 1 implicit, 2 declared by DIM.
+    labels: Vec<Option<String>>,
+    /// Arrays whose creation must be recorded for later DIM checks.
+    dim_tested: Vec<bool>,
+}
+
+/// Which bound a static array access checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayMode {
+    Declared,
+    Implicit,
+    /// Either one, picked at run time.
+    Either,
+}
+
+/// Checked 16-bit copy of a float scalar; byte 2 is zero while the copy is current.
+#[derive(Clone)]
+struct CheckedShadow {
+    label: String,
+    /// The copy holds 0..65535 rather than -32768..32767.
+    unsigned: bool,
+}
+
+impl CheckedShadow {
+    fn range(&self) -> crate::dataflow::IntRange {
+        if self.unsigned {
+            crate::dataflow::IntRange::new(0, 65535)
+        } else {
+            crate::dataflow::IntRange::i16()
+        }
+    }
+}
+
+/// Machine state shared by both versions of a guarded statement.
+#[derive(Clone)]
+struct CsState {
+    fac_cache: Vec<Expr>,
+    last_array_addr: Option<(VarName, Vec<Expr>)>,
+    peek_rebase: Option<(VarName, i32)>,
+    runtime_array_base_validated: HashSet<VarName>,
+    static_arrays_undimmed: HashSet<VarName>,
+    curlin_hi_marked: bool,
+    curlin_clobbered_by_call: bool,
+    curlin_lo_dirty: bool,
+}
+
 #[derive(Clone)]
 enum ForFrame {
     /// FAC-based loop: counter, end, and step all live in MFLPT slots
@@ -1660,6 +1879,8 @@ enum ForFrame {
     /// ADC/SBC immediate. Picked when start/end fit in `[0, 255]`
     /// and the step lands exactly on END.
     U8(U8ForFrame),
+    /// Unsigned 16-bit loop bounds used by POKE and PEEK addresses.
+    U16(IntForFrame, u16),
 }
 
 /// Shorthand for the statement identity `for_next_runtime` keys its pairing on.
@@ -1704,6 +1925,8 @@ struct DoFrame {
 struct FloatForFrame {
     var: VarName,
     end_slot_label: String,
+    /// The end, when it is an integer literal.
+    end_literal: Option<i32>,
     step_loc: StepLoc,
     top_label: String,
     exit_label: String,
@@ -1723,6 +1946,27 @@ struct FloatForFrame {
 struct InductionFrame {
     k_value: f64,
     slot_label: String,
+}
+
+/// Ascending byte copy and the counter value after the loop.
+#[derive(Clone, Debug)]
+struct CopyLoop {
+    var: VarName,
+    src: u16,
+    dst: u16,
+    len: u32,
+    exit: f64,
+    /// The FOR ends its line and the POKE and NEXT make up the next one.
+    next_line: bool,
+}
+
+/// A 24-bit loop sum; byte 3 marks a fallback to the float variable.
+#[derive(Clone, Debug)]
+struct WideSum {
+    var: VarName,
+    slot: String,
+    top_label: String,
+    checked: bool,
 }
 
 /// Per-FOR running pointer for array accesses with one loop-var axis.
@@ -1910,6 +2154,7 @@ impl ForFrame {
             ForFrame::Float(f) => &f.var,
             ForFrame::Int(f) => &f.var,
             ForFrame::U8(f) => &f.var,
+            ForFrame::U16(f, _) => &f.var,
         }
     }
 
@@ -1918,6 +2163,7 @@ impl ForFrame {
             ForFrame::Float(f) => &f.top_label,
             ForFrame::Int(f) => &f.top_label,
             ForFrame::U8(f) => &f.top_label,
+            ForFrame::U16(f, _) => &f.top_label,
         }
     }
 
@@ -1926,6 +2172,7 @@ impl ForFrame {
             ForFrame::Float(f) => &f.exit_label,
             ForFrame::Int(f) => &f.exit_label,
             ForFrame::U8(f) => &f.exit_label,
+            ForFrame::U16(f, _) => &f.exit_label,
         }
     }
 
@@ -1945,6 +2192,11 @@ impl ForFrame {
                 let mut g = f.clone();
                 g.exit_label = exit_label;
                 ForFrame::U8(g)
+            }
+            ForFrame::U16(f, hi) => {
+                let mut g = f.clone();
+                g.exit_label = exit_label;
+                ForFrame::U16(g, *hi)
             }
         }
     }
@@ -1974,6 +2226,19 @@ impl Codegen {
             structured_loop_stack: Vec::new(),
             do_stack: Vec::new(),
             for_end_slots: 0,
+            addr_caches: Vec::new(),
+            addr_int_caches: Vec::new(),
+            wide_sum_plans: HashMap::new(),
+            dead_for_header_stores: HashSet::new(),
+            wide_sums: Vec::new(),
+            used_i24_fac: false,
+            used_ws_load: false,
+            used_cs_load_u: false,
+            used_cs_load_s: false,
+            used_cs_mf_u: false,
+            used_cs_mf_s: false,
+            copy_loop_plans: HashMap::new(),
+            pending_copy: None,
             for_step_sign_slots: 0,
             for_int_slots: 0,
             for_u8_slots: 0,
@@ -2003,6 +2268,7 @@ impl Codegen {
             used_str_left: false,
             used_str_right: false,
             used_str_mid: false,
+            used_asc_mid: false,
             heap_init_needed: false,
             used_val: false,
             used_val_heap: false,
@@ -2015,6 +2281,8 @@ impl Codegen {
             data_values: Vec::new(),
             data_line_offsets: Vec::new(),
             data_bad: Vec::new(),
+            data_unreadable: Vec::new(),
+            used_read_str_chk: false,
             compact_data_metadata: false,
             compact_data_bad: None,
             used_read_num: false,
@@ -2053,6 +2321,7 @@ impl Codegen {
             data_pool_len: 0,
             used_read_str_copy: false,
             read_targets: 0,
+            read_needs_fac: true,
             used_data_advance: false,
             used_next_no_for: false,
             used_for_oom: false,
@@ -2061,10 +2330,15 @@ impl Codegen {
             used_gosub_chk: false,
             used_jmp22: false,
             data_ints_tagged: false,
+            data_tags_kept_text: Vec::new(),
             used_read_tagged: false,
+            used_tag_text: false,
             read_tagged_text_entry: "__VAL_HELPER",
             read_digits: false,
             used_read_digits: false,
+            used_read_digits_int: false,
+            used_read_tagged_int: false,
+            read_arr_int_entry: None,
             used_val_digits: false,
             gosub_depth_free: false,
             used_for_bytes_chk: false,
@@ -2081,6 +2355,9 @@ impl Codegen {
             used_ld_arr: false,
             used_st_arr: false,
             used_st_t0: false,
+            index_context: Default::default(),
+            used_fac_to_arg: false,
+            used_arg_ops: Vec::new(),
             used_fadd_t0: false,
             used_fsub_t0: false,
             used_fcmp_t0: false,
@@ -2093,6 +2370,7 @@ impl Codegen {
             float_var_op_uses: HashMap::new(),
             float_const_op_uses: HashMap::new(),
             bnds_stub_uses: HashMap::new(),
+            bnds_state_stubs: std::collections::BTreeMap::new(),
             bnds_rt_stub_uses: HashMap::new(),
             used_strcmp: false,
             used_st_arr_int: false,
@@ -2110,7 +2388,14 @@ impl Codegen {
             used_givayf_u16: false,
             used_fac_to_int16_notrap: false,
             used_mul16: false,
+            used_mul16c: false,
             used_div16: false,
+            used_fdiv2k: false,
+            used_fmul2k: false,
+            used_pow2: false,
+            used_pow2_fac: false,
+            used_fast_rnd: false,
+            used_fast_rnd_arg: false,
             used_smul_tmp: false,
             used_hardcopy: false,
             used_read_ti: false,
@@ -2119,13 +2404,18 @@ impl Codegen {
             used_hang: false,
             last_array_addr: None,
             peek_rebase: None,
+            island_for_fac: false,
             fac_cache: Vec::new(),
             runtime_array_base_validated: HashSet::new(),
             static_arrays_undimmed: HashSet::new(),
+            array_states: None,
+            arrays_dimmed_in_stmt: HashSet::new(),
             redim_traps: HashSet::new(),
+            oom_arrays: HashSet::new(),
             runtime_array_base_zp: HashSet::new(),
             used_open: false,
             used_chkout_check: false,
+            used_chkin_check: false,
             used_input_file: false,
             used_set_ti: false,
             used_print_comma: false,
@@ -2195,6 +2485,7 @@ impl Codegen {
             used_sbuf_copy: false,
             used_str_assign_owned: false,
             used_lastvar_str: false,
+            used_arr_append: false,
             used_lvc_helper: false,
             used_lvu_helper: false,
             lvc_out_of_line: false,
@@ -2216,10 +2507,20 @@ impl Codegen {
             code_origin: CODE_ORIGIN,
             shadow_int_vars: HashMap::new(),
             omitted_float_slots: HashSet::new(),
+            checked_shadows: HashMap::new(),
+            cs_active: Vec::new(),
+            cs_hits: std::cell::Cell::new(0),
+            cs_plain_let: false,
+            cs_tight_lines: HashSet::new(),
+            cs_line: 0,
+            cs_store_stubs: Vec::new(),
+            cs_for_vars: HashSet::new(),
+            cs_dirty_loops: HashSet::new(),
             source_integer_vars: SourceIntegerVars::default(),
             bounded_accumulators: HashSet::new(),
             shadow_unsigned: HashSet::new(),
             zp_promotions: Vec::new(),
+            zp_heap_cells: Vec::new(),
             zp_int_vars: HashSet::new(),
             u8_int_vars: HashSet::new(),
             signed_byte_int_vars: HashSet::new(),
@@ -2241,6 +2542,8 @@ impl Codegen {
             for_top_curlin: None,
             for_top_restamp_sites: HashSet::new(),
             safe_sys_calls: false,
+            unchecked: false,
+            fast_float: false,
             sys_param_helper: false,
             used_sys_txt_out: false,
             sys_txt_buf_len: 0,
@@ -2339,6 +2642,9 @@ impl Codegen {
 
     /// Bounds check shared by both runtime-FOR-stack pushes.
     fn emit_for_stack_bound_check(&mut self) {
+        if self.unchecked {
+            return;
+        }
         writeln!(
             self.code,
             "    CPX #${:02X}",
@@ -2351,7 +2657,7 @@ impl Codegen {
 
     /// Check BASIC's page-1 byte budget; preserves Y and clobbers A and X.
     fn emit_for_stack_byte_check(&mut self, floor: u8) {
-        if !self.for_stack_bound.can_exhaust_page_one() {
+        if self.unchecked || !self.for_stack_bound.can_exhaust_page_one() {
             return;
         }
         let floor = floor.min(BASIC_STACK_CAP);
@@ -2616,13 +2922,231 @@ impl Codegen {
         }
     }
 
-    /// Per-dimension upper index for the bounds checks on `name`.
+    /// Per-dimension bounds, using the smaller bound when the array state varies.
     fn effective_bounds(&self, name: &VarName, dims: &[u16]) -> Vec<u16> {
-        if self.static_arrays_undimmed.contains(name) {
-            dims.iter().map(|d| (*d).min(AUTO_DIM_BOUND)).collect()
-        } else {
-            self.declared_bounds(name, dims)
+        let implicit = dims.iter().map(|d| (*d).min(AUTO_DIM_BOUND));
+        match self.array_mode(name) {
+            ArrayMode::Declared => self.declared_bounds(name, dims),
+            ArrayMode::Implicit => implicit.collect(),
+            ArrayMode::Either => self
+                .declared_bounds(name, dims)
+                .into_iter()
+                .zip(implicit)
+                .map(|(d, i)| d.min(i))
+                .collect(),
         }
+    }
+
+    /// Which bound an access to the static array `name` checks in the statement being emitted.
+    fn array_mode(&self, name: &VarName) -> ArrayMode {
+        if self.arrays_dimmed_in_stmt.contains(name) {
+            return ArrayMode::Declared;
+        }
+        let Some(st) = &self.array_states else {
+            return if self.static_arrays_undimmed.contains(name) {
+                ArrayMode::Implicit
+            } else {
+                ArrayMode::Declared
+            };
+        };
+        let Some(&i) = st.index.get(name) else {
+            return ArrayMode::Declared;
+        };
+        let mask = match self.current_stmt_node {
+            Some(n) if st.refs.get(n).is_some_and(|r| r.contains(&i)) => st.per_node[n][i],
+            _ => st.any[i],
+        };
+        if mask == 0 || mask == crate::dataflow::ARRAY_DIMMED {
+            ArrayMode::Declared
+        } else if mask & crate::dataflow::ARRAY_DIMMED == 0 {
+            ArrayMode::Implicit
+        } else {
+            ArrayMode::Either
+        }
+    }
+
+    /// Assign array state bytes and reserve storage for possible implicit dimensions.
+    fn plan_array_states(&mut self, module: &ir::Module) {
+        let implicit = match self.solve_array_states(module) {
+            Some(implicit) => implicit,
+            None if module_clears_variables(module) => {
+                literal_indices_past_bound(module, &self.arrays)
+            }
+            None => HashSet::new(),
+        };
+        self.grow_static_arrays_for_clr(&implicit);
+    }
+
+    /// Arrays that may use implicit bounds under the known control flow.
+    fn solve_array_states(&mut self, module: &ir::Module) -> Option<HashSet<VarName>> {
+        use crate::dataflow::{ARRAY_AUTO, ARRAY_DIMMED, ARRAY_NONE};
+        if module.has_on_key() || module.has_error_continuation() {
+            return None;
+        }
+        struct Dims(Vec<VarName>);
+        impl crate::visit::Visitor for Dims {
+            fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+                if let Stmt::Dim(specs) = stmt {
+                    let declared = specs.iter().filter(|s| !s.dims.is_empty());
+                    self.0.extend(declared.map(|s| s.name.clone()));
+                }
+                crate::visit::walk_stmt(self, line_no, stmt);
+            }
+        }
+        let mut dims = Dims(Vec::new());
+        crate::visit::walk_module(&mut dims, module);
+        let mut arrays: Vec<VarName> = dims
+            .0
+            .into_iter()
+            .filter(|a| self.arrays.contains_key(a) && !self.runtime_arrays.contains_key(a))
+            .collect();
+        arrays.sort_by_key(VarName::label);
+        arrays.dedup();
+        if arrays.is_empty() {
+            return Some(HashSet::new());
+        }
+        let cfg = &self.analysis.cfg;
+        let states = crate::dataflow::array_states(module, cfg, &arrays);
+        let mut any = vec![0u8; arrays.len()];
+        let mut tested = vec![false; arrays.len()];
+        for (node, refs) in states.refs.iter().enumerate() {
+            let masks = &states.per_node[node];
+            for &i in refs {
+                any[i] |= masks[i];
+            }
+            if let Stmt::Dim(specs) = cfg.stmt_at(node, module) {
+                for spec in specs.iter().filter(|s| !s.dims.is_empty()) {
+                    if let Some(i) = arrays.iter().position(|a| *a == spec.name) {
+                        tested[i] |= masks[i] & ARRAY_NONE != 0 && masks[i] & !ARRAY_NONE != 0;
+                    }
+                }
+            }
+        }
+        let mut labels = Vec::with_capacity(arrays.len());
+        for (i, name) in arrays.iter().enumerate() {
+            let either = any[i] & ARRAY_DIMMED != 0 && any[i] & !ARRAY_DIMMED != 0;
+            if either || tested[i] {
+                let label = format!("{}_ST", Self::array_label(name));
+                self.vars_order.push((label.clone(), 1));
+                labels.push(Some(label));
+            } else {
+                labels.push(None);
+            }
+        }
+        let implicit = arrays
+            .iter()
+            .zip(&any)
+            .filter(|(_, m)| *m & (ARRAY_NONE | ARRAY_AUTO) != 0)
+            .map(|(a, _)| a.clone())
+            .collect();
+        self.array_states = Some(ArrayStateInfo {
+            index: arrays
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a.clone(), i))
+                .collect(),
+            per_node: states.per_node,
+            refs: states.refs,
+            any,
+            labels,
+            dim_tested: tested,
+        });
+        Some(implicit)
+    }
+
+    /// The state byte of `name`.
+    fn array_state_label(&self, name: &VarName) -> Option<String> {
+        let st = self.array_states.as_ref()?;
+        st.labels[*st.index.get(name)?].clone()
+    }
+
+    /// Record implicit creation of arrays referenced by this statement.
+    fn emit_array_state_refs(&mut self) {
+        let (Some(st), Some(n)) = (&self.array_states, self.current_stmt_node) else {
+            return;
+        };
+        let Some(refs) = st.refs.get(n) else {
+            return;
+        };
+        let created: Vec<(String, u8)> = refs
+            .iter()
+            .filter(|&&i| st.dim_tested[i] && st.per_node[n][i] & crate::dataflow::ARRAY_NONE != 0)
+            .filter_map(|&i| Some((st.labels[i].clone()?, st.per_node[n][i])))
+            .collect();
+        for (label, mask) in created {
+            if mask & crate::dataflow::ARRAY_DIMMED == 0 {
+                writeln!(self.code, "    LDA #$01").unwrap();
+                writeln!(self.code, "    STA {label}").unwrap();
+            } else {
+                let id = self.fresh_id();
+                writeln!(self.code, "    LDA {label}").unwrap();
+                writeln!(self.code, "    BNE __AST_{id}").unwrap();
+                writeln!(self.code, "    INC {label}").unwrap();
+                writeln!(self.code, "__AST_{id}:").unwrap();
+            }
+        }
+    }
+
+    /// Emit the static DIM state check; return false if the array already exists.
+    fn emit_static_dim_state(&mut self, name: &VarName) -> bool {
+        use crate::dataflow::ARRAY_NONE;
+        let Some(st) = &self.array_states else {
+            return true;
+        };
+        let Some(&i) = st.index.get(name) else {
+            return true;
+        };
+        let mask = if self.arrays_dimmed_in_stmt.contains(name) {
+            crate::dataflow::ARRAY_DIMMED
+        } else {
+            self.current_stmt_node
+                .and_then(|n| st.per_node.get(n))
+                .map_or(st.any[i], |m| m[i])
+        };
+        let label = st.labels[i].clone();
+        if mask != 0 && mask & ARRAY_NONE == 0 {
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_REDIMD_ARRAY).unwrap();
+            self.emit_jmp_basic_error();
+            return false;
+        }
+        if let Some(label) = label {
+            if mask & !ARRAY_NONE != 0 {
+                let ok = format!("__DIM_NEW_{}", self.fresh_id());
+                writeln!(self.code, "    LDA {label}").unwrap();
+                writeln!(self.code, "    BEQ {ok}").unwrap();
+                writeln!(self.code, "    LDX #${:02X}", rt::ERR_REDIMD_ARRAY).unwrap();
+                self.emit_jmp_basic_error();
+                writeln!(self.code, "{ok}:").unwrap();
+            }
+            writeln!(self.code, "    LDA #$02").unwrap();
+            writeln!(self.code, "    STA {label}").unwrap();
+        }
+        self.arrays_dimmed_in_stmt.insert(name.clone());
+        true
+    }
+
+    /// Check LINNUM against dimension k, selecting the bound from the array state.
+    fn emit_array_bounds_check(&mut self, name: &VarName, dims: &[u16], k: usize, bound: u16) {
+        if self.unchecked {
+            return;
+        }
+        let label = match self.array_mode(name) {
+            ArrayMode::Either => self.array_state_label(name),
+            _ => None,
+        };
+        let declared = self.declared_bounds(name, dims)[k];
+        let implicit = dims[k].min(AUTO_DIM_BOUND);
+        let Some(label) = label.filter(|_| declared != implicit) else {
+            self.emit_bounds_check(bound);
+            return;
+        };
+        let stub = format!("{label}_B{k}");
+        writeln!(self.code, "    JSR {stub}").unwrap();
+        self.bnds_state_stubs
+            .insert(stub, (label, implicit, declared));
+        self.used_bnds_check = true;
+        self.used_bad_subscript = true;
+        self.used_illegal_qty = true;
     }
 
     /// Roll the stack back to the depth it had at SYS-entry, so the
@@ -2650,6 +3174,35 @@ impl Codegen {
 
     fn invalidate_fac_cache(&mut self) {
         self.fac_cache.clear();
+    }
+
+    /// Load an operand into FAC with memory-operand rounding.
+    fn emit_load_as_movfm(&mut self, e: &Expr) -> Result<(), CodegenError> {
+        match e {
+            Expr::Var(v) if self.float_slot_is_current(v) => {
+                let label = self.intern_var(v.clone());
+                writeln!(self.code, "    LDA #<{label}").unwrap();
+                writeln!(self.code, "    LDY #>{label}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+            }
+            _ => {
+                self.emit_expr_to_fac(e)?;
+                let temp = self.alloc_temp();
+                writeln!(self.code, "    LDX #<{temp}").unwrap();
+                writeln!(self.code, "    LDY #>{temp}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
+                writeln!(self.code, "    LDA #<{temp}").unwrap();
+                writeln!(self.code, "    LDY #>{temp}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                self.free_temp(&temp);
+            }
+        }
+        Ok(())
+    }
+
+    /// The speed profile's float code: under Speed, or everywhere with `--fast-float`.
+    fn fast_float_code(&self) -> bool {
+        self.profile == Profile::Speed || self.fast_float
     }
 
     /// Whether the cached FAC value has a clear rounding byte.
@@ -2919,6 +3472,460 @@ impl Codegen {
         Some(self.zp_int_reuse_slots[idx].addr)
     }
 
+    /// Plan checked 16-bit copies for float counters in short loops.
+    fn collect_checked_shadows(&mut self, module: &ir::Module) {
+        if self.profile != Profile::Speed || module.has_error_continuation() {
+            return;
+        }
+        struct Scan {
+            hot: HashSet<u16>,
+            steps: HashSet<VarName>,
+            other_writes: HashSet<VarName>,
+            for_vars: HashSet<VarName>,
+            signed: HashSet<VarName>,
+            on_key: bool,
+        }
+        impl crate::visit::Visitor for Scan {
+            fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+                match stmt {
+                    Stmt::Let { var, value } => {
+                        if self.hot.contains(&line) && counter_step(var, value).is_some() {
+                            self.steps.insert(var.clone());
+                        }
+                        if as_f64_literal(value).is_some_and(|n| n < 0.0) {
+                            self.signed.insert(var.clone());
+                        }
+                    }
+                    Stmt::For { var, .. } => {
+                        self.for_vars.insert(var.clone());
+                    }
+                    Stmt::DefFn { param, .. } => {
+                        self.other_writes.insert(param.clone());
+                    }
+                    Stmt::OnKey { .. } => self.on_key = true,
+                    _ => {}
+                }
+                crate::visit::walk_stmt(self, line, stmt);
+            }
+        }
+        self.cs_tight_lines = tight_loop_lines(module, 6);
+        let mut scan = Scan {
+            hot: self.cs_tight_lines.clone(),
+            steps: HashSet::new(),
+            other_writes: HashSet::new(),
+            for_vars: HashSet::new(),
+            signed: HashSet::new(),
+            on_key: false,
+        };
+        crate::visit::Visitor::visit_module(&mut scan, module);
+        if scan.on_key {
+            return;
+        }
+        // A loop's 24-bit sum keeps its variable in its own slot.
+        let summed: HashSet<&VarName> = self
+            .wide_sum_plans
+            .values()
+            .flatten()
+            .map(|(v, _)| v)
+            .collect();
+        let mut vars: Vec<VarName> = scan
+            .steps
+            .iter()
+            .filter(|v| {
+                v.kind == VarKind::Float
+                    && !is_pseudo_var(v)
+                    && !scan.other_writes.contains(*v)
+                    && !summed.contains(v)
+                    && !self.shadow_int_vars.contains_key(*v)
+                    && !self.omitted_float_slots.contains(*v)
+                    && !self.analysis.numeric_facts.shadow_only_vars.contains(*v)
+            })
+            .cloned()
+            .collect();
+        vars.sort_by_key(VarName::label);
+        for var in vars {
+            let label = format!("__CS_{}", var.label());
+            self.vars_order.push((label.clone(), 3));
+            let unsigned = !scan.signed.contains(&var);
+            if scan.for_vars.contains(&var) {
+                self.cs_for_vars.insert(var.clone());
+            }
+            self.checked_shadows
+                .insert(var, CheckedShadow { label, unsigned });
+        }
+    }
+
+    /// The checked copy of `v`, when the statement version being emitted may read it.
+    fn cs_active_label(&self, v: &VarName) -> Option<String> {
+        if !self.cs_active.iter().any(|(a, _)| a == v) {
+            return None;
+        }
+        self.cs_hits.set(self.cs_hits.get() + 1);
+        self.checked_shadows.get(v).map(|c| c.label.clone())
+    }
+
+    /// Variables with a checked copy that `exprs` read.
+    fn cs_reads(&self, exprs: &[&Expr]) -> Vec<VarName> {
+        if self.checked_shadows.is_empty()
+            || !self.cs_active.is_empty()
+            || !self.cs_tight_lines.contains(&self.cs_line)
+        {
+            return Vec::new();
+        }
+        let mut out: Vec<VarName> = self
+            .checked_shadows
+            .keys()
+            .filter(|v| !self.cs_in_open_loop(v))
+            .filter(|v| {
+                exprs
+                    .iter()
+                    .any(|e| exprs_use_var(std::slice::from_ref(*e), v))
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(VarName::label);
+        out
+    }
+
+    /// Whether a FOR loop over `v` is open here. Its counter is the better copy.
+    fn cs_in_open_loop(&self, v: &VarName) -> bool {
+        self.for_stack.iter().any(|f| f.var() == v)
+    }
+
+    /// Mark checked copies stale at FOR, NEXT, and control-flow boundaries.
+    fn emit_cs_before(&mut self, stmt: &Stmt, line_no: u16) {
+        let mut stale: Vec<VarName> = Vec::new();
+        match stmt {
+            Stmt::For { var, .. } => stale.push(var.clone()),
+            Stmt::Next { vars } => {
+                // A NEXT compiled against a static loop steps that loop's variable.
+                let runtime = self.current_is_orphan_next(line_no);
+                let named: Vec<Option<VarName>> = if vars.is_empty() {
+                    vec![None]
+                } else {
+                    vars.clone()
+                };
+                let mut depth = self.for_stack.len();
+                for v in named {
+                    let frame = match &v {
+                        Some(v) => self.for_stack[..depth].iter().rposition(|f| f.var() == v),
+                        None => depth.checked_sub(1),
+                    };
+                    let clean = !runtime
+                        && frame.is_some_and(|at| {
+                            !self.cs_dirty_loops.contains(self.for_stack[at].top_label())
+                        });
+                    match (v, frame) {
+                        (Some(v), _) if !clean => stale.push(v),
+                        (None, Some(at)) if !runtime && !clean => {
+                            stale.push(self.for_stack[at].var().clone());
+                        }
+                        (None, _) if runtime || frame.is_none() => {
+                            stale.extend(self.cs_for_vars.iter().cloned());
+                        }
+                        _ => {}
+                    }
+                    depth = frame.unwrap_or(0);
+                }
+            }
+            _ if !cs_straight(stmt) => {
+                let open: Vec<String> = self
+                    .for_stack
+                    .iter()
+                    .map(|f| f.top_label().to_string())
+                    .collect();
+                self.cs_dirty_loops.extend(open);
+            }
+            _ => {}
+        }
+        stale.sort_by_key(VarName::label);
+        stale.dedup();
+        for v in stale {
+            if let Some(cs) = self.checked_shadows.get(&v) {
+                writeln!(self.code, "    LDA #$01").unwrap();
+                writeln!(self.code, "    STA {}+2", cs.label).unwrap();
+            }
+        }
+    }
+
+    /// The range a guard proves for `v`: its whole range first, then 0..32767, then 0..255.
+    fn cs_trial_range(&self, v: &VarName, level: usize) -> crate::dataflow::IntRange {
+        match level {
+            0 => self.checked_shadows[v].range(),
+            1 => crate::dataflow::IntRange::new(0, 32767),
+            _ => crate::dataflow::IntRange::new(0, 255),
+        }
+    }
+
+    fn cs_state(&self) -> CsState {
+        CsState {
+            fac_cache: self.fac_cache.clone(),
+            last_array_addr: self.last_array_addr.clone(),
+            peek_rebase: self.peek_rebase.clone(),
+            runtime_array_base_validated: self.runtime_array_base_validated.clone(),
+            static_arrays_undimmed: self.static_arrays_undimmed.clone(),
+            curlin_hi_marked: self.curlin_hi_marked,
+            curlin_clobbered_by_call: self.curlin_clobbered_by_call,
+            curlin_lo_dirty: self.curlin_lo_dirty,
+        }
+    }
+
+    fn cs_restore(&mut self, s: &CsState) {
+        self.fac_cache = s.fac_cache.clone();
+        self.last_array_addr = s.last_array_addr.clone();
+        self.peek_rebase = s.peek_rebase.clone();
+        self.runtime_array_base_validated = s.runtime_array_base_validated.clone();
+        self.static_arrays_undimmed = s.static_arrays_undimmed.clone();
+        self.curlin_hi_marked = s.curlin_hi_marked;
+        self.curlin_clobbered_by_call = s.curlin_clobbered_by_call;
+        self.curlin_lo_dirty = s.curlin_lo_dirty;
+    }
+
+    /// Where two versions join: keep only what both leave true.
+    fn cs_merge(&mut self, other: CsState) {
+        self.fac_cache.retain(|e| other.fac_cache.contains(e));
+        if self.last_array_addr != other.last_array_addr {
+            self.last_array_addr = None;
+        }
+        if self.peek_rebase != other.peek_rebase {
+            self.peek_rebase = None;
+        }
+        self.runtime_array_base_validated
+            .retain(|v| other.runtime_array_base_validated.contains(v));
+        self.static_arrays_undimmed
+            .extend(other.static_arrays_undimmed);
+        self.curlin_hi_marked &= other.curlin_hi_marked;
+        self.curlin_clobbered_by_call |= other.curlin_clobbered_by_call;
+        self.curlin_lo_dirty |= other.curlin_lo_dirty;
+    }
+
+    /// Jumps to `slow` unless every copy in `guard` is current and inside its range.
+    fn emit_cs_guard(&mut self, guard: &[(VarName, crate::dataflow::IntRange)], slow: &str) {
+        let mut op = "LDA";
+        for (v, _) in guard {
+            writeln!(self.code, "    {op} {}+2", self.checked_shadows[v].label).unwrap();
+            op = "ORA";
+        }
+        writeln!(self.code, "    BNE {slow}").unwrap();
+        for (v, r) in guard {
+            let cs = &self.checked_shadows[v];
+            if *r == cs.range() {
+                continue;
+            }
+            writeln!(self.code, "    LDA {}+1", cs.label).unwrap();
+            let branch = if r.max <= 255 { "BNE" } else { "BMI" };
+            writeln!(self.code, "    {branch} {slow}").unwrap();
+        }
+    }
+
+    /// Emit guarded integer and float versions when checked copies change the code.
+    fn emit_cs_versioned(
+        &mut self,
+        reads: Vec<VarName>,
+        emit: &mut dyn FnMut(&mut Self) -> Result<(), CodegenError>,
+    ) -> Result<(), CodegenError> {
+        if reads.is_empty() {
+            return emit(self);
+        }
+        let start = self.code.len();
+        let pre = self.cs_state();
+        let mut plain: Option<(String, CsState)> = None;
+        for level in 0..3 {
+            let guard: Vec<(VarName, crate::dataflow::IntRange)> = reads
+                .iter()
+                .map(|v| (v.clone(), self.cs_trial_range(v, level)))
+                .collect();
+            self.cs_active = guard.clone();
+            self.cs_hits.set(0);
+            let fast = emit(self);
+            self.cs_active.clear();
+            fast?;
+            if self.cs_hits.get() == 0 && plain.is_none() {
+                // Nothing consulted the copies, so this is the plain version.
+                return Ok(());
+            }
+            let fast_code = self.code.split_off(start);
+            let fast_state = self.cs_state();
+            self.cs_restore(&pre);
+            if plain.is_none() {
+                emit(self)?;
+                plain = Some((self.code.split_off(start), self.cs_state()));
+                self.cs_restore(&pre);
+            }
+            let (plain_code, plain_state) = plain.clone().expect("emitted above");
+            // Limit code growth relative to the float calls saved.
+            if fast_code.matches("JSR ").count() >= plain_code.matches("JSR ").count()
+                || fast_code.lines().count() > plain_code.lines().count() + 4
+            {
+                continue;
+            }
+            let id = self.fresh_id();
+            let slow = format!("__CS_SLOW_{id}");
+            let done = format!("__CS_DONE_{id}");
+            self.emit_cs_guard(&guard, &slow);
+            self.code.push_str(&fast_code);
+            writeln!(self.code, "    JMP {done}").unwrap();
+            writeln!(self.code, "{slow}:").unwrap();
+            self.code.push_str(&plain_code);
+            writeln!(self.code, "{done}:").unwrap();
+            self.cs_restore(&plain_state);
+            self.cs_merge(fast_state);
+            return Ok(());
+        }
+        let (plain_code, plain_state) = plain.expect("a level consulted the copies");
+        self.code.push_str(&plain_code);
+        self.cs_restore(&plain_state);
+        Ok(())
+    }
+
+    fn emit_cs_branch_skip_on_false(
+        &mut self,
+        cond: &Expr,
+        skip: &str,
+    ) -> Result<(), CodegenError> {
+        let reads = self.cs_reads(&[cond]);
+        self.emit_cs_versioned(reads, &mut |s| s.emit_branch_skip_on_false(cond, skip))
+    }
+
+    /// Update a checked variable through integer steps or a float fallback.
+    fn emit_cs_let(&mut self, var: &VarName, value: &Expr) -> Result<(), CodegenError> {
+        let cs = self.checked_shadows[var].clone();
+        let label = cs.label.clone();
+        let range = cs.range();
+        if self.cs_in_open_loop(var) {
+            self.emit_cs_plain_let(var, value)?;
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA {label}+2").unwrap();
+            return Ok(());
+        }
+        if let Some(n) = as_f64_literal(value).filter(|n| {
+            n.fract() == 0.0 && *n >= f64::from(range.min) && *n <= f64::from(range.max)
+        }) {
+            let u = n as i32 as u16;
+            writeln!(self.code, "    LDY #${:02X}", u & 0xFF).unwrap();
+            writeln!(self.code, "    STY {label}").unwrap();
+            writeln!(self.code, "    LDA #${:02X}", u >> 8).unwrap();
+            writeln!(self.code, "    STA {label}+1").unwrap();
+            writeln!(self.code, "    LDX #$00").unwrap();
+            writeln!(self.code, "    STX {label}+2").unwrap();
+            self.emit_cs_float_store(var, &cs);
+            return Ok(());
+        }
+        let step = counter_step(var, value)
+            .filter(|(_, k)| cs.unsigned || *k <= 32767)
+            .filter(|_| self.cs_tight_lines.contains(&self.cs_line));
+        let Some((add, k)) = step else {
+            self.emit_cs_plain_let(var, value)?;
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA {label}+2").unwrap();
+            return Ok(());
+        };
+        let id = self.fresh_id();
+        let slow = format!("__CS_SLOW_{id}");
+        let done = format!("__CS_DONE_{id}");
+        let pre = self.cs_state();
+        let (carry, op, overflow) = match (add, cs.unsigned) {
+            (true, true) => ("CLC", "ADC", "BCS"),
+            (true, false) => ("CLC", "ADC", "BVS"),
+            (false, true) => ("SEC", "SBC", "BCC"),
+            (false, false) => ("SEC", "SBC", "BVS"),
+        };
+        writeln!(self.code, "    LDA {label}+2").unwrap();
+        writeln!(self.code, "    BNE {slow}").unwrap();
+        writeln!(self.code, "    LDA {label}").unwrap();
+        writeln!(self.code, "    {carry}").unwrap();
+        writeln!(self.code, "    {op} #${:02X}", k & 0xFF).unwrap();
+        writeln!(self.code, "    TAY").unwrap();
+        writeln!(self.code, "    LDA {label}+1").unwrap();
+        writeln!(self.code, "    {op} #${:02X}", k >> 8).unwrap();
+        writeln!(self.code, "    {overflow} {slow}").unwrap();
+        writeln!(self.code, "    STY {label}").unwrap();
+        writeln!(self.code, "    STA {label}+1").unwrap();
+        self.emit_cs_float_store(var, &cs);
+        writeln!(self.code, "    JMP {done}").unwrap();
+        let fast_state = self.cs_state();
+        self.cs_restore(&pre);
+        writeln!(self.code, "{slow}:").unwrap();
+        self.emit_cs_plain_let(var, value)?;
+        writeln!(self.code, "    LDA #$01").unwrap();
+        writeln!(self.code, "    STA {label}+2").unwrap();
+        writeln!(self.code, "{done}:").unwrap();
+        self.cs_merge(fast_state);
+        Ok(())
+    }
+
+    /// Converts the 16-bit value in A (high byte) and Y (low byte) into `var`'s float slot.
+    fn emit_cs_float_store(&mut self, var: &VarName, cs: &CheckedShadow) {
+        if cs.unsigned {
+            self.used_cs_mf_u = true;
+        } else {
+            self.used_cs_mf_s = true;
+            self.used_cs_mf_u = true;
+        }
+        if !self.cs_store_stubs.contains(var) {
+            self.intern_var(var.clone());
+            self.cs_store_stubs.push(var.clone());
+        }
+        writeln!(self.code, "    JSR __CS_ST_{}", var.label()).unwrap();
+        self.fac_cache
+            .retain(|cached| !fac_expr_reads_var(cached, var));
+    }
+
+    /// Update the checked copy after READ, or mark it stale if the value does not fit.
+    fn emit_cs_sync(&mut self, var: &VarName) {
+        let cs = self.checked_shadows[var].clone();
+        if self.cs_in_open_loop(var) {
+            writeln!(self.code, "    LDA #$01").unwrap();
+            writeln!(self.code, "    STA {}+2", cs.label).unwrap();
+            return;
+        }
+        let slot = self.intern_var(var.clone());
+        let id = self.fresh_id();
+        writeln!(self.code, "    LDA #<{slot}").unwrap();
+        writeln!(self.code, "    LDY #>{slot}").unwrap();
+        if cs.unsigned {
+            writeln!(self.code, "    JSR __CS_LOAD_U").unwrap();
+            self.used_cs_load_u = true;
+        } else {
+            writeln!(self.code, "    JSR __CS_LOAD_S").unwrap();
+            self.used_cs_load_s = true;
+        }
+        writeln!(self.code, "    BCS __CS_STALE_{id}").unwrap();
+        writeln!(self.code, "    STY {}", cs.label).unwrap();
+        writeln!(self.code, "    STA {}+1", cs.label).unwrap();
+        writeln!(self.code, "    LDA #$00").unwrap();
+        writeln!(self.code, "    BEQ __CS_SYNCED_{id}").unwrap();
+        writeln!(self.code, "__CS_STALE_{id}:").unwrap();
+        writeln!(self.code, "    LDA #$01").unwrap();
+        writeln!(self.code, "__CS_SYNCED_{id}:").unwrap();
+        writeln!(self.code, "    STA {}+2", cs.label).unwrap();
+        self.invalidate_fac_cache();
+    }
+
+    /// Mark checked copies stale after INPUT, GET, and other writes.
+    fn emit_cs_after_store(&mut self, stmt: &Stmt) {
+        if matches!(
+            stmt,
+            Stmt::Let { .. } | Stmt::Read(_) | Stmt::For { .. } | Stmt::Next { .. }
+        ) {
+            return;
+        }
+        for v in crate::dataflow::stmt_defs(stmt) {
+            if let Some(cs) = self.checked_shadows.get(&v) {
+                writeln!(self.code, "    LDA #$01").unwrap();
+                writeln!(self.code, "    STA {}+2", cs.label).unwrap();
+            }
+        }
+    }
+
+    /// The float `LET` of a variable with a checked copy, leaving the copy to the caller.
+    fn emit_cs_plain_let(&mut self, var: &VarName, value: &Expr) -> Result<(), CodegenError> {
+        self.cs_plain_let = true;
+        let result = self.emit_let(var, value);
+        self.cs_plain_let = false;
+        result
+    }
+
     /// The 2-byte shadow slot for `var`, if it has one.
     fn shadow_int_label(&self, var: &VarName) -> Option<&str> {
         self.shadow_int_vars.get(var).map(String::as_str)
@@ -2927,6 +3934,9 @@ impl Codegen {
     /// Whether the shadow slot holds an unsigned 16-bit value.
     fn shadow_is_unsigned(&self, var: &VarName) -> bool {
         self.shadow_unsigned.contains(var)
+            || self
+                .cs_active_label(var)
+                .is_some_and(|_| self.checked_shadows[var].unsigned)
     }
 
     /// Convert the shadow value to FAC; A holds the high byte and Y the low byte.
@@ -2990,6 +4000,664 @@ impl Codegen {
         }
     }
 
+    /// Find constant-bound FOR loops that copy consecutive bytes in source order.
+    fn plan_copy_loops(&mut self, module: &ir::Module) {
+        if self.used_on_key || self.used_error_continuation {
+            return;
+        }
+        // The POKE and NEXT may make up the next line when nothing can jump there.
+        let targets = collect_branch_targets(module);
+        let lines_known = !scan_module_has_runtime_computed_goto(module);
+        for (line_idx, line) in module.lines.iter().enumerate() {
+            for i in 0..line.stmts.len() {
+                let Stmt::For {
+                    var,
+                    start,
+                    end,
+                    step,
+                    ..
+                } = &line.stmts[i]
+                else {
+                    continue;
+                };
+                let (body, next_line) = if i + 2 < line.stmts.len() {
+                    (&line.stmts[i + 1..i + 3], false)
+                } else if let Some(next) = module.lines.get(line_idx + 1)
+                    && i + 1 == line.stmts.len()
+                    && next.stmts.len() == 2
+                    && lines_known
+                    && !targets.contains(&next.number)
+                {
+                    (&next.stmts[..], true)
+                } else {
+                    continue;
+                };
+                let Stmt::Poke {
+                    addr,
+                    value: Expr::Peek(src),
+                } = &body[0]
+                else {
+                    continue;
+                };
+                let Stmt::Next { vars } = &body[1] else {
+                    continue;
+                };
+                if !matches!(vars.as_slice(), [None]) && vars.as_slice() != [Some(var.clone())] {
+                    continue;
+                }
+                let int =
+                    |e: &Expr| as_f64_literal(e).filter(|n| n.fract() == 0.0 && n.abs() < 1e6);
+                let (Some(s), Some(e), Some(1.0)) = (int(start), int(end), as_f64_literal(step))
+                else {
+                    continue;
+                };
+                let (Some(to), Some(from)) = (
+                    crate::passes::match_loop_var_with_offset(addr, var),
+                    crate::passes::match_loop_var_with_offset(src, var),
+                ) else {
+                    continue;
+                };
+                let last = e.max(s);
+                let in_u16 = |off: i32| {
+                    (0.0..=65535.0).contains(&(s + f64::from(off)))
+                        && (0.0..=65535.0).contains(&(last + f64::from(off)))
+                };
+                let len = last - s + 1.0;
+                let exit = last + 1.0;
+                let counter_ok = match var.kind {
+                    VarKind::Float => is_direct_float_var(var),
+                    VarKind::Integer => exit <= 32767.0 && s >= -32768.0,
+                    VarKind::String => false,
+                };
+                if !in_u16(to) || !in_u16(from) || len > 65280.0 || !counter_ok {
+                    continue;
+                }
+                let at = [i];
+                if self.orphan_for_next.for_tier(line.number, line_idx, &at)
+                    != crate::for_next_runtime::ForTier::Static
+                    || self
+                        .orphan_for_next
+                        .static_for_needs_discard(line.number, line_idx, &at)
+                {
+                    continue;
+                }
+                let path = crate::cfg::StmtPath {
+                    line_idx,
+                    path: vec![i],
+                };
+                self.copy_loop_plans.insert(
+                    path,
+                    CopyLoop {
+                        var: var.clone(),
+                        src: (s + f64::from(from)) as u16,
+                        dst: (s + f64::from(to)) as u16,
+                        len: len as u32,
+                        exit,
+                        next_line,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Copy aligned bytes through X and Y without crossing pages during either access.
+    fn emit_copy_loop(&mut self, plan: CopyLoop) -> Result<(), CodegenError> {
+        let dropped = self.discard_active_for_with_same_var(&plan.var);
+        self.emit_for_stack_drop(dropped);
+        let id = self.fresh_id();
+        if plan.src & 0xFF == plan.dst & 0xFF {
+            self.emit_copy_loop_same_offset(&plan, id);
+        } else {
+            self.emit_copy_loop_two_offsets(&plan, id);
+        }
+        self.invalidate_fac_cache();
+        self.emit_let(&plan.var, &Expr::Number(plan.exit))
+    }
+
+    /// Copy pages with a shared Y offset, then copy the remaining bytes.
+    fn emit_copy_loop_same_offset(&mut self, plan: &CopyLoop, id: usize) {
+        let end = u32::from(plan.src) + plan.len;
+        let dst_end = u32::from(plan.dst) + plan.len;
+        let pages = (end >> 8) - (u32::from(plan.src) >> 8);
+        let tail = (end & 0xFF) as u8;
+        writeln!(self.code, "    LDY #${:02X}", plan.src & 0xFF).unwrap();
+        if pages > 0 {
+            writeln!(self.code, "    LDX #${:02X}", pages as u8).unwrap();
+            writeln!(self.code, "    LDA #${:02X}", plan.src >> 8).unwrap();
+            writeln!(self.code, "    STA __CPS_{id}+2").unwrap();
+            writeln!(self.code, "    LDA #${:02X}", plan.dst >> 8).unwrap();
+            writeln!(self.code, "    STA __CPD_{id}+2").unwrap();
+            writeln!(self.code, "__CPS_{id}:").unwrap();
+            writeln!(self.code, "    LDA $FF00,Y").unwrap();
+            writeln!(self.code, "__CPD_{id}:").unwrap();
+            writeln!(self.code, "    STA $FF00,Y").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    BNE __CPS_{id}").unwrap();
+            writeln!(self.code, "    INC __CPS_{id}+2").unwrap();
+            writeln!(self.code, "    INC __CPD_{id}+2").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BNE __CPS_{id}").unwrap();
+        }
+        if tail > 0 {
+            writeln!(self.code, "__CPT_{id}:").unwrap();
+            writeln!(self.code, "    LDA ${:04X},Y", (end >> 8) << 8).unwrap();
+            writeln!(self.code, "    STA ${:04X},Y", (dst_end >> 8) << 8).unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    CPY #${tail:02X}").unwrap();
+            writeln!(self.code, "    BNE __CPT_{id}").unwrap();
+        }
+    }
+
+    /// Source in X and destination in Y, each running over its own pages.
+    fn emit_copy_loop_two_offsets(&mut self, plan: &CopyLoop, id: usize) {
+        let (lo, hi) = (rt::LINNUM_LO, rt::LINNUM_HI);
+        let count_lo = (plan.len & 0xFF) as u8;
+        let count_hi = (plan.len >> 8) as u8 + u8::from(count_lo != 0);
+        writeln!(self.code, "    LDX #${:02X}", plan.src & 0xFF).unwrap();
+        writeln!(self.code, "    LDY #${:02X}", plan.dst & 0xFF).unwrap();
+        writeln!(self.code, "    LDA #${:02X}", plan.src >> 8).unwrap();
+        writeln!(self.code, "    STA __CPS_{id}+2").unwrap();
+        writeln!(self.code, "    LDA #${:02X}", plan.dst >> 8).unwrap();
+        writeln!(self.code, "    STA __CPD_{id}+2").unwrap();
+        writeln!(self.code, "    LDA #${count_lo:02X}").unwrap();
+        writeln!(self.code, "    STA ${lo:02X}").unwrap();
+        writeln!(self.code, "    LDA #${count_hi:02X}").unwrap();
+        writeln!(self.code, "    STA ${hi:02X}").unwrap();
+        writeln!(self.code, "__CPS_{id}:").unwrap();
+        writeln!(self.code, "    LDA $FF00,X").unwrap();
+        writeln!(self.code, "__CPD_{id}:").unwrap();
+        writeln!(self.code, "    STA $FF00,Y").unwrap();
+        writeln!(self.code, "    INX").unwrap();
+        writeln!(self.code, "    BNE __CPX_{id}").unwrap();
+        writeln!(self.code, "    INC __CPS_{id}+2").unwrap();
+        writeln!(self.code, "__CPX_{id}:").unwrap();
+        writeln!(self.code, "    INY").unwrap();
+        writeln!(self.code, "    BNE __CPY_{id}").unwrap();
+        writeln!(self.code, "    INC __CPD_{id}+2").unwrap();
+        writeln!(self.code, "__CPY_{id}:").unwrap();
+        writeln!(self.code, "    DEC ${lo:02X}").unwrap();
+        writeln!(self.code, "    BNE __CPS_{id}").unwrap();
+        writeln!(self.code, "    DEC ${hi:02X}").unwrap();
+        writeln!(self.code, "    BNE __CPS_{id}").unwrap();
+    }
+
+    /// Load the planned sums of the FOR being emitted into their 24-bit slots.
+    fn begin_wide_sums(&mut self, static_frame: bool) -> Vec<(VarName, String, bool)> {
+        if !static_frame || self.used_on_key || self.used_error_continuation {
+            return Vec::new();
+        }
+        let Some(vars) = self
+            .current_stmt_path
+            .as_ref()
+            .and_then(|p| self.wide_sum_plans.get(p))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (x, checked) in vars {
+            if self.shadow_int_label(&x).is_some()
+                || self.omitted_float_slots.contains(&x)
+                || self.wide_sums.iter().any(|w| w.var == x)
+            {
+                continue;
+            }
+            let range = self.current_for_expr_int_range(&Expr::Var(x.clone()));
+            if range.is_none() && !checked {
+                continue;
+            }
+            let slot = format!("FE_{}", self.for_end_slots);
+            self.for_end_slots += 1;
+            let Some(r) = range else {
+                // Use the float variable unless the start is an integer below 2^22.
+                let label = self.intern_var(x.clone());
+                let skip = format!("__WSL_{}", self.fresh_id());
+                writeln!(self.code, "    LDA #<{label}").unwrap();
+                writeln!(self.code, "    LDY #>{label}").unwrap();
+                writeln!(self.code, "    JSR __WS_LOAD").unwrap();
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    ROL").unwrap();
+                writeln!(self.code, "    STA {slot}+3").unwrap();
+                writeln!(self.code, "    BNE {skip}").unwrap();
+                for (k, zp) in [0x65, 0x64, 0x63].into_iter().enumerate() {
+                    writeln!(self.code, "    LDA ${zp:02X}").unwrap();
+                    writeln!(self.code, "    STA {slot}+{k}").unwrap();
+                }
+                writeln!(self.code, "{skip}:").unwrap();
+                self.used_ws_load = true;
+                out.push((x, slot, true));
+                continue;
+            };
+            if checked {
+                writeln!(self.code, "    LDA #$00").unwrap();
+                writeln!(self.code, "    STA {slot}+3").unwrap();
+            }
+            if r.min == r.max {
+                let v = r.min as u32;
+                for k in 0..3 {
+                    writeln!(self.code, "    LDA #${:02X}", (v >> (8 * k)) & 0xFF).unwrap();
+                    writeln!(self.code, "    STA {slot}+{k}").unwrap();
+                }
+            } else {
+                let label = self.intern_var(x.clone());
+                writeln!(self.code, "    LDA #<{label}").unwrap();
+                writeln!(self.code, "    LDY #>{label}").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::QINT).unwrap();
+                for (k, zp) in [0x65, 0x64, 0x63].into_iter().enumerate() {
+                    writeln!(self.code, "    LDA ${zp:02X}").unwrap();
+                    writeln!(self.code, "    STA {slot}+{k}").unwrap();
+                }
+            }
+            out.push((x, slot, checked));
+        }
+        if !out.is_empty() {
+            self.invalidate_fac_cache();
+        }
+        out
+    }
+
+    /// Add or subtract one integer term, proved 0..=32767, to a 24-bit sum.
+    fn emit_wide_sum_term(
+        &mut self,
+        slot: &str,
+        add: bool,
+        term: &Expr,
+    ) -> Result<(), CodegenError> {
+        let byte = self
+            .current_for_expr_int_range(term)
+            .is_some_and(|r| r.max <= 255);
+        let operand = if let Some(n) = as_i16_literal(term) {
+            Int16Operand::Imm(n)
+        } else if let Some(op) = self
+            .is_int_island_addsub_only(term)
+            .then(|| self.try_emit_int16_eval_addsub(term, None))
+            .flatten()
+        {
+            op
+        } else {
+            self.emit_expr_to_fac(term)?;
+            self.emit_fac_to_i16_signed();
+            Int16Operand::Mem(format!("${:02X}", rt::LINNUM_LO))
+        };
+        self.emit_wide_sum_operand(slot, add, operand, byte);
+        Ok(())
+    }
+
+    /// Add or subtract a 16-bit operand in 0..=32767 (0..=255 when `byte`) to a 24-bit sum.
+    fn emit_wide_sum_operand(&mut self, slot: &str, add: bool, operand: Int16Operand, byte: bool) {
+        let id = self.fresh_id();
+        let skip = format!("__WS_{id}");
+        let (mnem, carry_op, keep) = if add {
+            ("ADC", "CLC", "BCC")
+        } else {
+            ("SBC", "SEC", "BCS")
+        };
+        writeln!(self.code, "    {carry_op}").unwrap();
+        writeln!(self.code, "    LDA {slot}").unwrap();
+        self.emit_int16_alu_byte(&operand, false, mnem);
+        writeln!(self.code, "    STA {slot}").unwrap();
+        if byte {
+            writeln!(self.code, "    {keep} {skip}").unwrap();
+            if add {
+                writeln!(self.code, "    INC {slot}+1").unwrap();
+                writeln!(self.code, "    BNE {skip}").unwrap();
+                writeln!(self.code, "    INC {slot}+2").unwrap();
+            } else {
+                let mid = format!("__WSD_{id}");
+                writeln!(self.code, "    LDA {slot}+1").unwrap();
+                writeln!(self.code, "    BNE {mid}").unwrap();
+                writeln!(self.code, "    DEC {slot}+2").unwrap();
+                writeln!(self.code, "{mid}:").unwrap();
+                writeln!(self.code, "    DEC {slot}+1").unwrap();
+            }
+        } else {
+            writeln!(self.code, "    LDA {slot}+1").unwrap();
+            self.emit_int16_alu_byte(&operand, true, mnem);
+            writeln!(self.code, "    STA {slot}+1").unwrap();
+            writeln!(self.code, "    {keep} {skip}").unwrap();
+            let step = if add { "INC" } else { "DEC" };
+            writeln!(self.code, "    {step} {slot}+2").unwrap();
+        }
+        writeln!(self.code, "{skip}:").unwrap();
+        self.release_int16_operand(operand);
+    }
+
+    /// Store the sums of the loop with this top label back into their variables.
+    fn end_wide_sums(&mut self, top_label: &str) {
+        let (done, open): (Vec<WideSum>, Vec<WideSum>) = std::mem::take(&mut self.wide_sums)
+            .into_iter()
+            .partition(|w| w.top_label == top_label);
+        self.wide_sums = open;
+        for w in done {
+            let skip = format!("__WSE_{}", self.fresh_id());
+            if w.checked {
+                writeln!(self.code, "    LDA {}+3", w.slot).unwrap();
+                writeln!(self.code, "    BNE {skip}").unwrap();
+            }
+            self.emit_wide_sum_store(&w);
+            if w.checked {
+                writeln!(self.code, "{skip}:").unwrap();
+                self.invalidate_fac_cache();
+            }
+        }
+    }
+
+    /// Store a 24-bit sum into its float variable.
+    fn emit_wide_sum_store(&mut self, w: &WideSum) {
+        for (k, zp) in [0x65, 0x64, 0x63].into_iter().enumerate() {
+            writeln!(self.code, "    LDA {}+{k}", w.slot).unwrap();
+            writeln!(self.code, "    STA ${zp:02X}").unwrap();
+        }
+        writeln!(self.code, "    JSR __I24_FAC").unwrap();
+        self.used_i24_fac = true;
+        self.invalidate_fac_cache();
+        let label = self.intern_var(w.var.clone());
+        self.emit_store_fac_to_float_var(&w.var, &label);
+    }
+
+    /// Check all float terms before updating the integer sum, falling back when needed.
+    fn emit_checked_wide_sum(&mut self, w: &WideSum, value: &Expr) -> Result<(), CodegenError> {
+        let id = self.fresh_id();
+        let (float, bail, done) = (
+            format!("__WSF_{id}"),
+            format!("__WSB_{id}"),
+            format!("__WSD_{id}"),
+        );
+        let terms = wide_sum_terms(value, &w.var).expect("a planned sum");
+        writeln!(self.code, "    LDA {}+3", w.slot).unwrap();
+        writeln!(self.code, "    BNE {float}").unwrap();
+        // Check every float term before the first addition.
+        let mut bytes: Vec<Option<String>> = Vec::new();
+        for (_, t) in &terms {
+            let proved = self
+                .current_for_expr_int_range(t)
+                .is_some_and(|r| r.min >= 0 && r.max <= 32767);
+            let checked = match t {
+                Expr::Var(v)
+                    if !proved
+                        && self.float_slot_is_current(v)
+                        && !self.omitted_float_slots.contains(v) =>
+                {
+                    Some(v.clone())
+                }
+                _ => None,
+            };
+            if !proved && checked.is_none() {
+                writeln!(self.code, "    JMP {bail}").unwrap();
+                bytes.push(None);
+                continue;
+            }
+            let Some(v) = checked else {
+                bytes.push(None);
+                continue;
+            };
+            let label = self.intern_var(v);
+            let (shift, ok) = (
+                format!("__WSS_{}", self.fresh_id()),
+                format!("__WSK_{}", self.fresh_id()),
+            );
+            writeln!(self.code, "    LDA {label}+2").unwrap();
+            writeln!(self.code, "    ORA {label}+3").unwrap();
+            writeln!(self.code, "    ORA {label}+4").unwrap();
+            writeln!(self.code, "    BNE {bail}").unwrap();
+            writeln!(self.code, "    LDX {label}").unwrap();
+            writeln!(self.code, "    BEQ {ok}").unwrap();
+            writeln!(self.code, "    LDA {label}+1").unwrap();
+            writeln!(self.code, "    BMI {bail}").unwrap();
+            writeln!(self.code, "    ORA #$80").unwrap();
+            writeln!(self.code, "{shift}:").unwrap();
+            writeln!(self.code, "    CPX #$88").unwrap();
+            writeln!(self.code, "    BEQ {ok}").unwrap();
+            writeln!(self.code, "    BCS {bail}").unwrap();
+            writeln!(self.code, "    LSR").unwrap();
+            writeln!(self.code, "    BCS {bail}").unwrap();
+            writeln!(self.code, "    INX").unwrap();
+            writeln!(self.code, "    BNE {shift}").unwrap();
+            writeln!(self.code, "{ok}:").unwrap();
+            let temp = self.alloc_temp();
+            writeln!(self.code, "    STA {temp}").unwrap();
+            bytes.push(Some(temp));
+        }
+        for ((add, t), byte) in terms.iter().zip(&bytes) {
+            match byte {
+                Some(temp) => self.emit_wide_sum_operand(
+                    &w.slot,
+                    *add,
+                    Int16Operand::MemU8(temp.clone()),
+                    true,
+                ),
+                None => self.emit_wide_sum_term(&w.slot, *add, t)?,
+            }
+        }
+        for temp in bytes.into_iter().flatten().rev() {
+            self.free_temp(&temp);
+        }
+        writeln!(self.code, "    JMP {done}").unwrap();
+        // Both labels below join other paths, so nothing known about FAC carries over.
+        writeln!(self.code, "{bail}:").unwrap();
+        self.invalidate_fac_cache();
+        self.invalidate_array_addr_cache();
+        self.emit_wide_sum_store(w);
+        writeln!(self.code, "    LDA #$01").unwrap();
+        writeln!(self.code, "    STA {}+3", w.slot).unwrap();
+        writeln!(self.code, "{float}:").unwrap();
+        self.invalidate_fac_cache();
+        self.invalidate_array_addr_cache();
+        // The float statement, with the sum out of the way.
+        let at = self
+            .wide_sums
+            .iter()
+            .position(|o| o.var == w.var)
+            .expect("an open sum");
+        let open = self.wide_sums.remove(at);
+        let result = self.emit_let(&w.var, value);
+        self.wide_sums.insert(at, open);
+        result?;
+        writeln!(self.code, "{done}:").unwrap();
+        self.invalidate_fac_cache();
+        self.invalidate_array_addr_cache();
+        Ok(())
+    }
+
+    /// Find straight FOR loops whose integer sums fit exactly in 24 bits.
+    fn plan_wide_sums(&mut self, module: &ir::Module) {
+        // The slots and conversions cost more bytes than the float sums they replace.
+        if self.profile != Profile::Speed || scan_module_has_runtime_computed_goto(module) {
+            return;
+        }
+        let targets = collect_branch_targets(module);
+        let path_of = |line_idx: usize, path: Vec<usize>| crate::cfg::StmtPath { line_idx, path };
+        for (li, line) in module.lines.iter().enumerate() {
+            for (si, stmt) in line.stmts.iter().enumerate() {
+                let Stmt::For {
+                    var: counter,
+                    start,
+                    end,
+                    step,
+                    ..
+                } = stmt
+                else {
+                    continue;
+                };
+                let mut body: Vec<(crate::cfg::StmtPath, &Stmt)> = Vec::new();
+                let mut closed = false;
+                'scan: for (lj, l2) in module.lines.iter().enumerate().skip(li) {
+                    if lj > li && targets.contains(&l2.number) {
+                        break;
+                    }
+                    let from = if lj == li { si + 1 } else { 0 };
+                    for (sj, s2) in l2.stmts.iter().enumerate().skip(from) {
+                        if let Stmt::Next { vars } = s2 {
+                            closed = vars
+                                .first()
+                                .is_some_and(|v| v.as_ref().is_none_or(|v| v == counter));
+                            break 'scan;
+                        }
+                        body.push((path_of(lj, vec![sj]), s2));
+                    }
+                }
+                if !closed {
+                    continue;
+                }
+                let mut flat = Vec::new();
+                if !flatten_plain_body(&body, &mut flat) {
+                    continue;
+                }
+                // Trip-count bounds require the loop to retain its counter.
+                let trips = literal_for_trips(start, end, step).filter(|_| {
+                    !flat.iter().any(|(_, st)| match st {
+                        Stmt::Let { var, .. } => var == counter,
+                        Stmt::Read(targets) => {
+                            targets.iter().any(|t| read_target_names(t, counter))
+                        }
+                        _ => false,
+                    })
+                });
+                // Check float terms read by the loop body.
+                let read_here = |v: &VarName| {
+                    flat.iter().any(|(_, st)| {
+                        matches!(st, Stmt::Read(targets)
+                            if targets.iter().any(|t| matches!(t, ir::ReadTarget::Scalar(s) if s == v)))
+                    })
+                };
+                let mut sums: Vec<VarName> = Vec::new();
+                for (_, st) in &flat {
+                    if let Stmt::Let { var, value } = st
+                        && is_direct_float_var(var)
+                        && var != counter
+                        && !sums.contains(var)
+                        && wide_sum_terms(value, var).is_some()
+                    {
+                        sums.push(var.clone());
+                    }
+                }
+                let for_path = path_of(li, vec![si]);
+                let mut plans = Vec::new();
+                'sum: for x in sums {
+                    let mut adds = 0;
+                    let mut uses = WideSumUses {
+                        var: &x,
+                        reads: 0,
+                        other: false,
+                    };
+                    // Bound each iteration by the maximum addition and subtraction.
+                    let mut proved = true;
+                    let (mut add_max, mut sub_max) = (0i64, 0i64);
+                    for (p, st) in &flat {
+                        crate::visit::Visitor::visit_stmt(&mut uses, 0, st);
+                        if let Stmt::Let { var, value } = st
+                            && *var == x
+                        {
+                            let Some(terms) = wide_sum_terms(value, &x) else {
+                                continue 'sum;
+                            };
+                            let at = self.analysis.for_expr_int_range(p, &Expr::Var(x.clone()));
+                            proved &= at.is_some();
+                            let (mut lo, mut hi) =
+                                at.map_or((0, 0), |r| (i64::from(r.min), i64::from(r.max)));
+                            for (add, t) in &terms {
+                                let max = match self.analysis.for_expr_int_range(p, t) {
+                                    Some(r) if r.min >= 0 && r.max <= 32767 => i64::from(r.max),
+                                    _ if matches!(t, Expr::Var(v)
+                                        if is_direct_float_var(v) && *v != x && read_here(v)) =>
+                                    {
+                                        proved = false;
+                                        255
+                                    }
+                                    _ => continue 'sum,
+                                };
+                                if *add {
+                                    hi += max;
+                                    add_max += max;
+                                } else {
+                                    lo -= max;
+                                    sub_max += max;
+                                }
+                            }
+                            proved &= lo >= -(1 << 23) && hi < 1 << 23;
+                            adds += 1;
+                        }
+                    }
+                    if uses.other || uses.reads != adds {
+                        continue;
+                    }
+                    let entry = self
+                        .analysis
+                        .for_expr_int_range(&for_path, &Expr::Var(x.clone()));
+                    if proved && entry.is_some() {
+                        plans.push((x, false));
+                        continue;
+                    }
+                    let Some(trips) = trips else {
+                        continue;
+                    };
+                    // A checked start is a whole number of magnitude under 2^22.
+                    let (lo, hi) = entry.map_or((-(1 << 22) + 1, (1 << 22) - 1), |r| {
+                        (i64::from(r.min), i64::from(r.max))
+                    });
+                    if hi + trips * add_max < 1 << 23 && lo - trips * sub_max >= -(1 << 23) {
+                        plans.push((x, true));
+                    }
+                }
+                if !plans.is_empty() {
+                    self.wide_sum_plans.insert(for_path, plans);
+                }
+            }
+        }
+    }
+
+    /// Find loops whose exit store makes the counter start store unnecessary.
+    fn plan_dead_for_header_stores(&mut self, module: &ir::Module) {
+        if scan_module_has_runtime_computed_goto(module) {
+            return;
+        }
+        let targets = collect_branch_targets(module);
+        let path_of = |line_idx: usize, path: Vec<usize>| crate::cfg::StmtPath { line_idx, path };
+        for (li, line) in module.lines.iter().enumerate() {
+            for (si, stmt) in line.stmts.iter().enumerate() {
+                let Stmt::For { var: counter, .. } = stmt else {
+                    continue;
+                };
+                let mut body: Vec<(crate::cfg::StmtPath, &Stmt)> = Vec::new();
+                let mut closed = false;
+                'scan: for (lj, l2) in module.lines.iter().enumerate().skip(li) {
+                    if lj > li && targets.contains(&l2.number) {
+                        break;
+                    }
+                    let from = if lj == li { si + 1 } else { 0 };
+                    for (sj, s2) in l2.stmts.iter().enumerate().skip(from) {
+                        if let Stmt::Next { vars } = s2 {
+                            closed = vars
+                                .first()
+                                .is_some_and(|v| v.as_ref().is_none_or(|v| v == counter));
+                            break 'scan;
+                        }
+                        body.push((path_of(lj, vec![sj]), s2));
+                    }
+                }
+                let mut flat = Vec::new();
+                if closed
+                    && flatten_plain_body(&body, &mut flat)
+                    && !flat.iter().any(|(_, st)| stmt_calls_user_fn(st))
+                {
+                    self.dead_for_header_stores.insert(path_of(li, vec![si]));
+                }
+            }
+        }
+    }
+
+    /// Whether the FOR being emitted may skip storing its start value in the variable.
+    fn for_header_store_is_dead(&self, body_reads_loop_var: bool) -> bool {
+        !body_reads_loop_var
+            && !self.used_on_key
+            && !self.used_error_continuation
+            && self
+                .current_stmt_path
+                .as_ref()
+                .is_some_and(|p| self.dead_for_header_stores.contains(p))
+    }
+
     /// Assign counter slots from the remaining zero page.
     fn collect_zp_for_counters(&mut self, module: &ir::Module) {
         let mut int_id: usize = 0;
@@ -3031,6 +4699,23 @@ impl Codegen {
                     let e_lit = as_i16_literal(end);
                     let st_lit = as_f64_literal(step).and_then(f64_to_i16_literal);
                     if *body_int_safe
+                        && is_direct_float_var(var)
+                        && !for_bounds_read_loop_var(var, end, step)
+                        && crate::passes::u16_for_counter_range(start, end, step).is_some()
+                    {
+                        self.planned_int_for_ids.insert(
+                            crate::cfg::StmtPath {
+                                line_idx,
+                                path: path.clone(),
+                            },
+                            *int_id,
+                        );
+                        if let Some(addr) = self.alloc_zp_for_counter(var, 2) {
+                            self.zp_promotions.push((format!("FI_{int_id}"), addr, 2));
+                            self.zp_int_for_assignments.insert(*int_id, addr);
+                        }
+                        *int_id += 1;
+                    } else if *body_int_safe
                         && !for_bounds_read_loop_var(var, end, step)
                         && let (Some(s), Some(st)) = (s_lit, st_lit)
                         && st != 0
@@ -3694,6 +5379,7 @@ impl Codegen {
     fn run(&mut self, module: &ir::Module) -> Result<(), CodegenError> {
         self.equality_tail_sites = EqualityTailSites::count(module);
         self.read_targets = ReadTargets::count(module);
+        self.read_needs_fac = read_needs_fac(module);
         writeln!(self.code, "*=${:04X}", self.code_origin).unwrap();
         writeln!(self.code).unwrap();
 
@@ -3770,11 +5456,16 @@ impl Codegen {
         // header. emit_for_int / emit_for_u8 dispenses the slots
         // by counter_id during the main emission walk.
         self.collect_zp_for_counters(module);
+        self.plan_wide_sums(module);
+        self.collect_checked_shadows(module);
+        self.plan_dead_for_header_stores(module);
+        self.plan_copy_loops(module);
         // Pre-pass: collect DIM declarations so we can statically
         // allocate `__ARR_<name>` slots and validate array references.
         // Runs before ZP allocation for runtime-array BASE pointers
         // so `runtime_arrays_order` is populated.
         self.collect_dims(module)?;
+        self.plan_array_states(module);
         // Whatever zero-page is left after shadow-int / hot-int /
         // FOR-counter promotion goes to runtime-array BASE pointers.
         // Each ZP-resident BASE shrinks every access site's
@@ -3787,16 +5478,33 @@ impl Codegen {
         // most of the pool idle while those hot vars stay in absolute
         // memory. Unbounded quota — it can only claim what's left.
         self.collect_zp_int_vars(usize::MAX);
+        // Place string-heap state in unused zero page when machine-code access is known.
+        if reach.machine_code_calls == 0 {
+            for (label, width) in ZP_HEAP_CELLS {
+                let home = if width == 2 {
+                    self.alloc_zp_word()
+                } else {
+                    self.alloc_zp_byte()
+                };
+                if let Some(addr) = home {
+                    self.zp_heap_cells.push((label, addr));
+                }
+            }
+        }
 
         self.zp_pressure.pool_left = self.zp_pool.len();
         // Emit zero-page assignments now, before any code references
         // these labels — DASM's auto-ZP-detection only triggers when
         // the label resolves to a value below $0100 at first pass.
         // Putting the EQU directives at the top guarantees that.
-        if !self.zp_promotions.is_empty() {
+        if !self.zp_promotions.is_empty() || !self.zp_heap_cells.is_empty() {
             writeln!(self.code, "; --- zero-page promotions ---").unwrap();
             for (label, addr, _) in &self.zp_promotions {
                 writeln!(self.code, "{label} = ${addr:02X}").unwrap();
+            }
+            // Placed after the peephole passes, so their sequence sharing is not disturbed.
+            for (label, addr) in &self.zp_heap_cells {
+                writeln!(self.code, "{ZP_HEAP_MARKER} {label} ${addr:02X}").unwrap();
             }
             writeln!(self.code).unwrap();
         }
@@ -3894,6 +5602,7 @@ impl Codegen {
         self.used_rom_error_hook = scan_module_for_stmt(module, |stmt| {
             matches!(stmt, Stmt::OnError { target: Some(_) })
         });
+        self.unchecked &= !(self.used_on_error || self.used_error_continuation || self.used_on_key);
         if scan_module_writes_er_el(module) {
             self.er_el_as_user_var = true;
         }
@@ -3974,14 +5683,15 @@ impl Codegen {
         self.uses_gosub = scan_module_uses_gosub(module);
         self.gosub_depth_limit = gosub_depth_limit(module);
 
-        self.page1_stmt_check = page1_is_gosub_only(module);
+        self.page1_stmt_check = page1_is_gosub_only(module) && !self.unchecked;
         if self.page1_stmt_check {
             self.gosub_depth_limit = page1_gosub_push_limit();
         }
         // Remove checks only when all GOSUB frames are proved safe.
-        self.gosub_depth_free = !self.page1_stmt_check
-            && !self.used_on_key_gosub
-            && crate::gosub_depth::prove(module)
+        self.gosub_depth_free = self.unchecked
+            || !self.page1_stmt_check
+                && !self.used_on_key_gosub
+                && crate::gosub_depth::prove(module)
                 .is_some_and(|d| d.max_depth < u32::from(self.gosub_depth_limit));
         if self.gosub_depth_free {
             self.used_ret_chk = false;
@@ -4073,6 +5783,7 @@ impl Codegen {
 
         let curlin_cache_off =
             self.used_on_error || self.used_on_key || scan_module_has_runtime_computed_goto(module);
+        let mut copied_next_line: Option<usize> = None;
         for (line_idx, line) in module.lines.iter().enumerate() {
             writeln!(self.code, "L{}:", line.number).unwrap();
             if line_idx == 0 || branch_targets.contains(&line.number) || curlin_cache_off {
@@ -4153,8 +5864,30 @@ impl Codegen {
             self.curlin_clobbered_by_call = false;
             self.curlin_lo_dirty = false;
             let stmts = &line.stmts;
-            let mut i = 0;
+            // A copy loop's POKE and NEXT on this line went out with its FOR.
+            let mut i = if copied_next_line == Some(line_idx) {
+                stmts.len()
+            } else {
+                0
+            };
             while i < stmts.len() {
+                let path = crate::cfg::StmtPath {
+                    line_idx,
+                    path: vec![i],
+                };
+                if let Some(plan) = self.copy_loop_plans.get(&path).cloned() {
+                    // The FOR stands for its POKE and NEXT as well.
+                    let taken = if plan.next_line {
+                        copied_next_line = Some(line_idx + 1);
+                        1
+                    } else {
+                        3
+                    };
+                    self.pending_copy = Some(plan);
+                    self.emit_stmt_at_path(&stmts[i], line.number, path)?;
+                    i += taken;
+                    continue;
+                }
                 let needs_wrap = |s: &Stmt| {
                     self.heap_init_needed && stmt_allocates_heap(s) && !stmt_owns_heap_alloc(s)
                 };
@@ -4331,7 +6064,8 @@ impl Codegen {
                 let frame = frame.with_fresh_exit(format!("__FOR_EXIT_RT{id}"));
                 match frame {
                     ForFrame::Float(f) => self.emit_next_float(f),
-                    ForFrame::Int(f) => self.emit_next_int(f),
+                    ForFrame::Int(f) => self.emit_next_int(f, false),
+                    ForFrame::U16(f, _) => self.emit_next_int(f, true),
                     ForFrame::U8(f) => self.emit_next_u8(f),
                 }
             }
@@ -4375,7 +6109,8 @@ impl Codegen {
         // Helper subroutines, only those referenced.
         writeln!(self.code).unwrap();
         writeln!(self.code, "; --- helper subroutines ---").unwrap();
-        let fast_number_print = self.profile == Profile::Speed
+        self.emit_addr_cache_helpers();
+        let fast_number_print = self.fast_float_code()
             || (self.profile == Profile::Default && self.analysis.prints_numbers_in_a_loop);
         if fast_number_print {
             self.emit_fast_number_print();
@@ -4569,12 +6304,68 @@ impl Codegen {
             writeln!(self.code, "    LDY ${:02X}", rt::ARRAY_ADDR_HI).unwrap();
             writeln!(self.code, "    JMP ${:04X}", rt::MOVFM).unwrap();
         }
+        if self.used_read_str_chk {
+            // A string READ at an item numeric READ also refuses; the ROM reports the DATA line.
+            let rhs = rt::STR_OP_RHS_LO;
+            let (ptr_lo, ptr_hi) = (self.data_cur_lo(), self.data_cur_hi());
+            let code = format!(
+                "__READ_STR_CHK:
+    LDA #<__DATA_UNREADABLE
+    STA ${rhs:02X}
+    LDA #>__DATA_UNREADABLE
+    STA ${rhs_hi:02X}
+__RSC_LOOP:
+    LDY #$01
+    LDA (${rhs:02X}),Y
+    BEQ __RSC_OK
+    CMP {ptr_hi}
+    BNE __RSC_NEXT
+    DEY
+    LDA (${rhs:02X}),Y
+    CMP {ptr_lo}
+    BEQ __RSC_HIT
+__RSC_NEXT:
+    LDA ${rhs:02X}
+    CLC
+    ADC #$04
+    STA ${rhs:02X}
+    BCC __RSC_LOOP
+    INC ${rhs_hi:02X}
+    BNE __RSC_LOOP
+__RSC_OK:
+    RTS
+__RSC_HIT:
+    LDY #$02
+    LDA (${rhs:02X}),Y
+    STA ${curlin_lo:02X}
+    INY
+    LDA (${rhs:02X}),Y
+    STA ${curlin_hi:02X}
+    LDX #${err:02X}
+",
+                rhs_hi = rt::STR_OP_RHS_HI,
+                curlin_lo = rt::CURLIN_LO,
+                curlin_hi = rt::CURLIN_HI,
+                err = rt::ERR_SYNTAX,
+            );
+            self.code.push_str(&code);
+            self.emit_jmp_basic_error();
+        }
+        if self.used_chkin_check {
+            // `GET#` and `INPUT#`'s CHKIN, with the ROM's error check folded in.
+            writeln!(self.code, "__CHKIN_CK:").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
+            writeln!(self.code, "    BCS __CHKOUT_CK_ERR").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
         if self.used_chkout_check {
-            // `PRINT#`'s CHKOUT, with the ROM's error check folded in.
+            // `PRINT#` and `CMD`'s CHKOUT, with the ROM's error check folded in.
             writeln!(self.code, "__CHKOUT_CK:").unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::CHKOUT).unwrap();
             writeln!(self.code, "    BCS __CHKOUT_CK_ERR").unwrap();
             writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_chkout_check || self.used_chkin_check {
             writeln!(self.code, "__CHKOUT_CK_ERR:").unwrap();
             writeln!(self.code, "    TAX").unwrap();
             writeln!(self.code, "    BNE __CHKOUT_CK_RAISE").unwrap();
@@ -4582,6 +6373,33 @@ impl Codegen {
             writeln!(self.code, "__CHKOUT_CK_RAISE:").unwrap();
 
             self.emit_jmp_basic_error();
+        }
+        if self.used_fac_to_arg {
+            // MOVAF with the copy unrolled: round FAC, copy it to ARG, clear the rounding byte.
+            writeln!(self.code, "__FAC_TO_ARG:").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::ROUND).unwrap();
+            for k in 0..6 {
+                writeln!(self.code, "    LDA ${:02X}", 0x61 + k).unwrap();
+                writeln!(self.code, "    STA ${:02X}", 0x69 + k).unwrap();
+            }
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::FAC_ROUNDING).unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
+        for op in std::mem::take(&mut self.used_arg_ops) {
+            // The tail of FADD/FMULT/FDIV after their CONUPK: sign product in $6F, FAC exponent in A.
+            let (name, entry) = match op {
+                BinOp::Add => ("FADD", rt::FADDT),
+                BinOp::Mul => ("FMULT", rt::FMULTT),
+                BinOp::Div => ("FDIV", rt::FDIVT),
+                _ => continue,
+            };
+            writeln!(self.code, "__ARG_{name}:").unwrap();
+            writeln!(self.code, "    LDA $66").unwrap();
+            writeln!(self.code, "    EOR $6E").unwrap();
+            writeln!(self.code, "    STA $6F").unwrap();
+            writeln!(self.code, "    LDA $61").unwrap();
+            writeln!(self.code, "    JMP ${entry:04X}").unwrap();
         }
         if self.used_st_t0 {
             writeln!(self.code, "__ST__T0:").unwrap();
@@ -4832,6 +6650,19 @@ impl Codegen {
             writeln!(self.code, "__BNDS_{dim}:").unwrap();
             writeln!(self.code, "    LDA #<{dim}").unwrap();
             writeln!(self.code, "    LDX #>{dim}").unwrap();
+            writeln!(self.code, "    JMP __BNDS_CHECK").unwrap();
+        }
+        for (stub, (state, implicit, declared)) in std::mem::take(&mut self.bnds_state_stubs) {
+            writeln!(self.code, "{stub}:").unwrap();
+            writeln!(self.code, "    LDA {state}").unwrap();
+            writeln!(self.code, "    CMP #$02").unwrap();
+            writeln!(self.code, "    BEQ {stub}D").unwrap();
+            writeln!(self.code, "    LDA #<{implicit}").unwrap();
+            writeln!(self.code, "    LDX #>{implicit}").unwrap();
+            writeln!(self.code, "    JMP __BNDS_CHECK").unwrap();
+            writeln!(self.code, "{stub}D:").unwrap();
+            writeln!(self.code, "    LDA #<{declared}").unwrap();
+            writeln!(self.code, "    LDX #>{declared}").unwrap();
             writeln!(self.code, "    JMP __BNDS_CHECK").unwrap();
         }
         // Per-(runtime dim slot) BNDS stubs. Each 3-byte call skips
@@ -5127,6 +6958,239 @@ impl Codegen {
             writeln!(self.code, "__FTI_DONE:").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
+        if self.used_ws_load {
+            // Convert an integer below 2^22 to signed $63..$65; set carry if it does not fit.
+            self.code.push_str(
+                "__WS_LOAD:
+    JSR $BBA2
+    LDA $61
+    BEQ __WSL_ZERO
+    CMP #$97
+    BCS __WSL_FAIL
+    CMP #$81
+    BCC __WSL_FAIL
+    LDA $65
+    BNE __WSL_FAIL
+    LDA #$98
+    SEC
+    SBC $61
+    TAX
+__WSL_SHIFT:
+    LSR $62
+    ROR $63
+    ROR $64
+    BCS __WSL_FAIL
+    DEX
+    BNE __WSL_SHIFT
+    LDA $64
+    STA $65
+    LDA $63
+    STA $64
+    LDA $62
+    STA $63
+    BIT $66
+    BPL __WSL_OK
+    SEC
+    LDA #$00
+    SBC $65
+    STA $65
+    LDA #$00
+    SBC $64
+    STA $64
+    LDA #$00
+    SBC $63
+    STA $63
+__WSL_OK:
+    CLC
+    RTS
+__WSL_ZERO:
+    STA $63
+    STA $64
+    STA $65
+    CLC
+    RTS
+__WSL_FAIL:
+    SEC
+    RTS
+",
+            );
+        }
+        if self.used_cs_load_u || self.used_cs_load_s {
+            // Convert an integer to A/Y and sign $66; set carry if its magnitude exceeds 65535.
+            self.code.push_str(
+                "__CS_LOAD:
+    JSR $BBA2
+    LDA $61
+    BEQ __CSL_ZERO
+    CMP #$91
+    BCS __CSL_FAIL
+    CMP #$81
+    BCC __CSL_FAIL
+    LDA $64
+    ORA $65
+    BNE __CSL_FAIL
+    LDA #$90
+    SEC
+    SBC $61
+    TAX
+    BEQ __CSL_WHOLE
+__CSL_SHIFT:
+    LSR $62
+    ROR $63
+    BCS __CSL_FAIL
+    DEX
+    BNE __CSL_SHIFT
+__CSL_WHOLE:
+    LDY $63
+    LDA $62
+    CLC
+    RTS
+__CSL_ZERO:
+    STA $66
+    TAY
+    CLC
+    RTS
+__CSL_FAIL:
+    SEC
+    RTS
+",
+            );
+        }
+        if self.used_cs_mf_u || self.used_cs_mf_s {
+            // Convert unsigned A/Y to float bytes in X/A/Y, with two trailing zero bytes.
+            self.code.push_str(
+                "__CS_MF_U:
+    LDX #$90
+    STY $22
+    TAY
+    BNE __CSM_TOP
+    LDA $22
+    BEQ __CSM_ZERO
+    LDX #$88
+    LDY #$00
+    STY $22
+__CSM_TOP:
+    ORA #$00
+    BMI __CSM_DONE
+__CSM_SHIFT:
+    DEX
+    ASL $22
+    ROL
+    BPL __CSM_SHIFT
+__CSM_DONE:
+    AND #$7F
+    LDY $22
+    RTS
+__CSM_ZERO:
+    TAX
+    TAY
+    RTS
+",
+            );
+        }
+        if self.used_cs_mf_s {
+            // The same for -32768..32767 in two's complement.
+            self.code.push_str(
+                "__CS_MF_S:
+    CMP #$80
+    BCC __CS_MF_U
+    STY $22
+    TAX
+    LDA #$00
+    SEC
+    SBC $22
+    TAY
+    TXA
+    EOR #$FF
+    ADC #$00
+    JSR __CS_MF_U
+    ORA #$80
+    RTS
+",
+            );
+        }
+        for var in std::mem::take(&mut self.cs_store_stubs) {
+            // The 16-bit value in A (high) and Y (low) into the variable's float slot.
+            let mf = if self.checked_shadows[&var].unsigned {
+                "__CS_MF_U"
+            } else {
+                "__CS_MF_S"
+            };
+            let slot = self.intern_var(var.clone());
+            writeln!(self.code, "__CS_ST_{}:", var.label()).unwrap();
+            writeln!(self.code, "    JSR {mf}").unwrap();
+            writeln!(self.code, "    STX {slot}").unwrap();
+            writeln!(self.code, "    STA {slot}+1").unwrap();
+            writeln!(self.code, "    STY {slot}+2").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA {slot}+3").unwrap();
+            writeln!(self.code, "    STA {slot}+4").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_cs_load_u {
+            // 0..65535.
+            self.code.push_str(
+                "__CS_LOAD_U:
+    JSR __CS_LOAD
+    BCS __CSLU_RET
+    BIT $66
+    BPL __CSLU_RET
+    SEC
+__CSLU_RET:
+    RTS
+",
+            );
+        }
+        if self.used_cs_load_s {
+            // -32768..32767, in two's complement.
+            self.code.push_str(
+                "__CS_LOAD_S:
+    JSR __CS_LOAD
+    BCS __CSLS_RET
+    BIT $66
+    BMI __CSLS_NEG
+    CMP #$80
+__CSLS_RET:
+    RTS
+__CSLS_NEG:
+    LDA #$00
+    SEC
+    SBC $63
+    TAY
+    LDA #$00
+    SBC $62
+    BPL __CSLS_FAIL
+    CLC
+    RTS
+__CSLS_FAIL:
+    SEC
+    RTS
+",
+            );
+        }
+        if self.used_i24_fac {
+            // Signed 24-bit integer in $63..$65 to FAC, normalised as GIVAYF does.
+            let code = format!(
+                "__I24_FAC:
+    LDA #$00
+    BIT $63
+    BPL __I24_POS
+    LDA #$FF
+__I24_POS:
+    STA $62
+    EOR #$FF
+    ROL
+    LDA #$00
+    STA $70
+    STA $66
+    LDX #$A0
+    STX $61
+    JMP ${normalize:04X}
+",
+                normalize = rt::FADD_NORMALIZE_SIGNED,
+            );
+            self.code.push_str(&code);
+        }
         if self.used_givayf_u16 {
 
             let f65536 = self.intern_float(65536.0);
@@ -5240,6 +7304,171 @@ impl Codegen {
             writeln!(self.code, "    LDA __MUL16_TMP+1").unwrap();
             writeln!(self.code, "    STA $15").unwrap();
             writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_mul16c {
+            // Multiply signed 16-bit operands and trap when the product does not fit LINNUM.
+            for line in [
+                "__MUL16C:",
+                "    LDA $15",
+                "    EOR __MUL16_B+1",
+                "    STA __MUL16C_S",
+                "    LDA $15",
+                "    BPL __MUL16C_APOS",
+                "    LDA #$00",
+                "    SEC",
+                "    SBC $14",
+                "    STA $14",
+                "    LDA #$00",
+                "    SBC $15",
+                "    STA $15",
+                "__MUL16C_APOS:",
+                "    LDA __MUL16_B+1",
+                "    BPL __MUL16C_BPOS",
+                "    LDA #$00",
+                "    SEC",
+                "    SBC __MUL16_B",
+                "    STA __MUL16_B",
+                "    LDA #$00",
+                "    SBC __MUL16_B+1",
+                "    STA __MUL16_B+1",
+                "__MUL16C_BPOS:",
+                "    LDA #$00",
+                "    STA __MUL16C_P+2",
+                "    STA __MUL16C_P+3",
+                "    LDX #$10",
+                "__MUL16C_LOOP:",
+                "    LSR $15",
+                "    ROR $14",
+                "    BCC __MUL16C_SHIFT",
+                "    CLC",
+                "    LDA __MUL16C_P+2",
+                "    ADC __MUL16_B",
+                "    STA __MUL16C_P+2",
+                "    LDA __MUL16C_P+3",
+                "    ADC __MUL16_B+1",
+                "    STA __MUL16C_P+3",
+                "__MUL16C_SHIFT:",
+                "    ROR __MUL16C_P+3",
+                "    ROR __MUL16C_P+2",
+                "    ROR __MUL16C_P+1",
+                "    ROR __MUL16C_P",
+                "    DEX",
+                "    BNE __MUL16C_LOOP",
+                "    LDA __MUL16C_P+3",
+                "    ORA __MUL16C_P+2",
+                "    BNE __MUL16C_OVF",
+                "    BIT __MUL16C_S",
+                "    BMI __MUL16C_NEG",
+                "    LDA __MUL16C_P+1",
+                "    BMI __MUL16C_OVF",
+                "    STA $15",
+                "    LDA __MUL16C_P",
+                "    STA $14",
+                "    RTS",
+                "__MUL16C_NEG:",
+                "    LDA #$00",
+                "    SEC",
+                "    SBC __MUL16C_P",
+                "    STA $14",
+                "    LDA #$00",
+                "    SBC __MUL16C_P+1",
+                "    STA $15",
+                "    BMI __MUL16C_DONE",
+                "    ORA $14",
+                "    BNE __MUL16C_OVF",
+                "__MUL16C_DONE:",
+                "    RTS",
+                "__MUL16C_OVF:",
+                "    JMP __ILLEGAL_QTY",
+            ] {
+                writeln!(self.code, "{line}").unwrap();
+            }
+        }
+        if self.used_fdiv2k {
+            // Divide FAC by 2^X through its exponent, preserving zero and underflow behavior.
+            for line in [
+                "__FDIV2K:",
+                "    LDA #$00",
+                "    STA $70",
+                "__FDIV2K_L:",
+                "    LDA $61",
+                "    BEQ __FDIV2K_Z",
+                "    DEC $61",
+                "    DEX",
+                "    BNE __FDIV2K_L",
+                "    LDA $61",
+                "    CMP #$02",
+                "    BCS __FDIV2K_R",
+                "__FDIV2K_Z:",
+                "    LDA #$00",
+                "    STA $66",
+                "__FDIV2K_R:",
+                "    RTS",
+            ] {
+                writeln!(self.code, "{line}").unwrap();
+            }
+        }
+        if self.used_fmul2k {
+            // Multiply FAC by 2^X through its exponent, checking overflow and underflow.
+            for line in [
+                "__FMUL2K:",
+                "    LDA $61",
+                "    BEQ __FMUL2K_Z",
+                "    TXA",
+                "    BMI __FMUL2K_N",
+                "    CLC",
+                "    ADC $61",
+                "    BCS __FMUL2K_O",
+                "    CMP #$FF",
+                "    BEQ __FMUL2K_O",
+                "__FMUL2K_S:",
+                "    STA $61",
+                "    RTS",
+                "__FMUL2K_N:",
+                "    CLC",
+                "    ADC $61",
+                "    BEQ __FMUL2K_Z",
+                "    BCS __FMUL2K_S",
+                "__FMUL2K_Z:",
+                "    LDA #$00",
+                "    STA $61",
+                "    STA $66",
+                "    RTS",
+                "__FMUL2K_O:",
+                "    JMP $B97E",
+            ] {
+                writeln!(self.code, "{line}").unwrap();
+            }
+        }
+        if self.used_pow2_fac {
+            writeln!(self.code, "__POW2_FAC:").unwrap();
+            writeln!(self.code, "    JSR __FAC_BYTE_OK").unwrap();
+        }
+        if self.used_pow2 {
+            // FAC = 2^A for A in 0..126, as the ROM's FPWRT leaves it.
+            for line in [
+                "__POW2:",
+                "    CLC",
+                "    ADC #$81",
+                "    STA $61",
+                "    LDA #$80",
+                "    STA $62",
+                "    LDA #$00",
+                "    STA $63",
+                "    STA $64",
+                "    STA $65",
+                "    STA $66",
+                "    STA $70",
+                "    RTS",
+            ] {
+                writeln!(self.code, "{line}").unwrap();
+            }
+        }
+        if self.used_fast_rnd_arg {
+            self.code.push_str(FAST_RND_ARG);
+        }
+        if self.used_fast_rnd {
+            self.code.push_str(FAST_RND);
         }
         if self.used_div16 {
             // Signed 16-bit floor-division helper. Inputs: dividend in
@@ -9803,6 +12032,56 @@ impl Codegen {
             writeln!(self.code, "    RTS").unwrap();
         }
 
+        if self.used_arr_append {
+            // The slot in ARRAY_ADDR takes over LASTVAR; its own chunk on top is reused.
+            let (lo, hi) = (rt::ARRAY_ADDR_LO, rt::ARRAY_ADDR_HI);
+            self.code.push_str(&format!(
+                "__ARR_APPEND_PRE:
+    LDA ${lo:02X}
+    LDY ${hi:02X}
+    CMP __LAST_STR_VAR_LO
+    BNE __AAP_NEW
+    CPY __LAST_STR_VAR_HI
+    BNE __AAP_NEW
+    LDA __LAST_STR_PTR_LO
+    STA __HEAP_PTR
+    LDA __LAST_STR_PTR_HI
+    STA __HEAP_PTR+1
+    RTS
+__AAP_NEW:
+    STA __LAST_STR_VAR_LO
+    STY __LAST_STR_VAR_HI
+    RTS
+__ARR_APPEND_POST:
+    STA __LAST_STR_PTR_LO
+    STY __LAST_STR_PTR_HI
+    LDA __LAST_STR_VAR_LO
+    STA ${lo:02X}
+    LDA __LAST_STR_VAR_HI
+    STA ${hi:02X}
+    LDY #$00
+    LDA __LAST_STR_PTR_LO
+    STA (${lo:02X}),Y
+    INY
+    LDA __LAST_STR_PTR_HI
+    STA (${lo:02X}),Y
+    SEC
+    LDA __HEAP_PTR
+    SBC #$02
+    STA ${lo:02X}
+    LDA __HEAP_PTR+1
+    SBC #$00
+    STA ${hi:02X}
+    DEY
+    LDA __LAST_STR_VAR_LO
+    STA (${lo:02X}),Y
+    INY
+    LDA __LAST_STR_VAR_HI
+    STA (${lo:02X}),Y
+    RTS
+"
+            ));
+        }
         if self.used_lvc_helper {
 
             writeln!(self.code, "__LVAR_CHECK:").unwrap();
@@ -9859,33 +12138,31 @@ impl Codegen {
             writeln!(self.code, "    STA $FD").unwrap();
             writeln!(self.code, "    LDA __MEMZERO_PTR_HI").unwrap();
             writeln!(self.code, "    STA $FE").unwrap();
-            writeln!(self.code, "__FES_LOOP:").unwrap();
-            writeln!(self.code, "    LDA __MEMZERO_CNT_LO").unwrap();
-            writeln!(self.code, "    ORA __MEMZERO_CNT_HI").unwrap();
-            writeln!(self.code, "    BNE __FES_GO").unwrap();
-            writeln!(self.code, "    RTS").unwrap();
-            writeln!(self.code, "__FES_GO:").unwrap();
+            // X counts the low byte down; a partial first round costs one more high round.
+            writeln!(self.code, "    LDX __MEMZERO_CNT_LO").unwrap();
+            writeln!(self.code, "    BEQ __FES_HI").unwrap();
+            writeln!(self.code, "    INC __MEMZERO_CNT_HI").unwrap();
+            writeln!(self.code, "__FES_HI:").unwrap();
+            writeln!(self.code, "    LDA __MEMZERO_CNT_HI").unwrap();
+            writeln!(self.code, "    BEQ __FES_DONE").unwrap();
+            // Y stays even, so a slot's two bytes are one page step apart at most.
             writeln!(self.code, "    LDY #$00").unwrap();
+            writeln!(self.code, "__FES_LOOP:").unwrap();
             writeln!(self.code, "    LDA #<__EMPTY_STR").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
             writeln!(self.code, "    INY").unwrap();
             writeln!(self.code, "    LDA #>__EMPTY_STR").unwrap();
             writeln!(self.code, "    STA ($FD),Y").unwrap();
-            // Advance ptr by 2.
-            writeln!(self.code, "    LDA $FD").unwrap();
-            writeln!(self.code, "    CLC").unwrap();
-            writeln!(self.code, "    ADC #$02").unwrap();
-            writeln!(self.code, "    STA $FD").unwrap();
-            writeln!(self.code, "    LDA $FE").unwrap();
-            writeln!(self.code, "    ADC #$00").unwrap();
-            writeln!(self.code, "    STA $FE").unwrap();
-            // Decrement count.
-            writeln!(self.code, "    LDA __MEMZERO_CNT_LO").unwrap();
-            writeln!(self.code, "    BNE __FES_DLO").unwrap();
+            writeln!(self.code, "    INY").unwrap();
+            writeln!(self.code, "    BNE __FES_NEXT").unwrap();
+            writeln!(self.code, "    INC $FE").unwrap();
+            writeln!(self.code, "__FES_NEXT:").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BNE __FES_LOOP").unwrap();
             writeln!(self.code, "    DEC __MEMZERO_CNT_HI").unwrap();
-            writeln!(self.code, "__FES_DLO:").unwrap();
-            writeln!(self.code, "    DEC __MEMZERO_CNT_LO").unwrap();
-            writeln!(self.code, "    JMP __FES_LOOP").unwrap();
+            writeln!(self.code, "    BNE __FES_LOOP").unwrap();
+            writeln!(self.code, "__FES_DONE:").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_gc {
             // Self-modifying memory copy used by owner assignment and
@@ -10318,6 +12595,28 @@ impl Codegen {
             writeln!(self.code, "    LDA __HEAP_RESULT").unwrap();
             writeln!(self.code, "    LDY __HEAP_RESULT+1").unwrap();
             writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_asc_mid {
+            // Read the string byte at X from A/Y, checking for zero or out-of-range indices.
+            for line in [
+                "__ASC_MID:",
+                "    STA $FD",
+                "    STY $FE",
+                "    TXA",
+                "    BEQ __ASC_MID_BAD",
+                "    LDY #$00",
+                "    CMP ($FD),Y",
+                "    BEQ __ASC_MID_OK",
+                "    BCS __ASC_MID_BAD",
+                "__ASC_MID_OK:",
+                "    TAY",
+                "    LDA ($FD),Y",
+                "    RTS",
+                "__ASC_MID_BAD:",
+                "    JMP __ILLEGAL_QTY",
+            ] {
+                writeln!(self.code, "{line}").unwrap();
+            }
         }
         if self.used_str_mid {
             // MID$(s$, start [, n]): caller stashes start (1-indexed)
@@ -11917,7 +14216,38 @@ impl Codegen {
         if self.used_read_tagged {
             self.emit_read_tagged();
         }
-        if self.used_read_digits || self.used_val_digits {
+        if self.used_tag_text {
+            self.emit_tag_text();
+        }
+        if self.used_read_tagged_int {
+            self.emit_read_tagged_int();
+        }
+        if let Some(entry) = self.read_arr_int_entry {
+            // READ into an integer array element: the element address survives the read.
+            let (alo, ahi) = (rt::ARRAY_ADDR_LO, rt::ARRAY_ADDR_HI);
+            let (lo, hi) = (rt::LINNUM_LO, rt::LINNUM_HI);
+            self.code.push_str(&format!(
+                "__READ_ARR_INT:
+    LDA ${alo:02X}
+    PHA
+    LDA ${ahi:02X}
+    PHA
+    JSR {entry}
+    PLA
+    STA ${ahi:02X}
+    PLA
+    STA ${alo:02X}
+    LDY #$00
+    LDA ${lo:02X}
+    STA (${alo:02X}),Y
+    INY
+    LDA ${hi:02X}
+    STA (${alo:02X}),Y
+    RTS
+"
+            ));
+        }
+        if self.used_read_digits || self.used_read_digits_int || self.used_val_digits {
             self.emit_digits_fac();
         }
         if self.used_val {
@@ -12053,9 +14383,8 @@ impl Codegen {
             } else {
                 writeln!(self.code, "    JMP ${:04X}", rt::VAL_PARSE).unwrap();
             }
+            // A and Y are already 0 here.
             writeln!(self.code, "__VAL_ZERO:").unwrap();
-            writeln!(self.code, "    LDA #$00").unwrap();
-            writeln!(self.code, "    TAY").unwrap();
             writeln!(self.code, "    JMP ${:04X}", rt::GIVAYF).unwrap();
         }
         if self.used_input_redo {
@@ -12071,9 +14400,9 @@ impl Codegen {
             writeln!(self.code, "    STA __FIELD_BUF,X").unwrap();
             writeln!(self.code, "    STA __IN_REDO").unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::VALTYPE).unwrap();
-            writeln!(self.code, "    LDA #<__FIELD_TXT").unwrap();
+            writeln!(self.code, "    LDA #<(__FIELD_BUF+1)").unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::TXTPTR_LO).unwrap();
-            writeln!(self.code, "    LDA #>__FIELD_TXT").unwrap();
+            writeln!(self.code, "    LDA #>(__FIELD_BUF+1)").unwrap();
             writeln!(self.code, "    STA ${:02X}", rt::TXTPTR_HI).unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::CHRGOT).unwrap();
             writeln!(self.code, "    JSR ${:04X}", rt::FIN).unwrap();
@@ -12400,6 +14729,17 @@ impl Codegen {
                     writeln!(self.code, "    .byte $00").unwrap();
                 }
             }
+            if !self.addr_caches.is_empty() || !self.addr_int_caches.is_empty() {
+                writeln!(self.code, "; --- address caches ---").unwrap();
+                for id in 0..self.addr_caches.len() {
+                    writeln!(self.code, "__ACC_{id}:").unwrap();
+                    emit_byte_run(&mut self.code, &[0u8; 7], false);
+                }
+                for id in 0..self.addr_int_caches.len() {
+                    writeln!(self.code, "__ACIC_{id}:").unwrap();
+                    emit_byte_run(&mut self.code, &[0u8; 8], false);
+                }
+            }
             // DEF FN binding vectors.
             let vectors = self.dispatched_vector_labels();
             if !vectors.is_empty() {
@@ -12467,6 +14807,9 @@ impl Codegen {
             let mut handlers: Vec<(u8, ForFrame)> =
                 self.runtime_for_frames.drain().collect();
             handlers.sort_by_key(|(id, _)| *id);
+            // A handler runs for any NEXT that finds its frame: no statement's facts apply.
+            self.current_stmt_node = None;
+            self.current_stmt_path = None;
             let max_id = handlers.last().map(|(id, _)| *id).unwrap_or(0);
             for (id, frame) in &handlers {
                 writeln!(self.code, "__FOR_NEXT_HANDLER_{id}:").unwrap();
@@ -12474,7 +14817,8 @@ impl Codegen {
                 let frame = frame.with_fresh_exit(runtime_exit);
                 match frame {
                     ForFrame::Float(f) => self.emit_next_float(f),
-                    ForFrame::Int(f) => self.emit_next_int(f),
+                    ForFrame::Int(f) => self.emit_next_int(f, false),
+                    ForFrame::U16(f, _) => self.emit_next_int(f, true),
                     ForFrame::U8(f) => self.emit_next_u8(f),
                 }
                 writeln!(self.code, "    DEC __FOR_STACK_PTR").unwrap();
@@ -12554,6 +14898,9 @@ impl Codegen {
                             emitted.insert(*line_no);
                         }
                     }
+                    if self.used_read_str_chk && self.data_unreadable.iter().any(|(k, _)| *k == i) {
+                        writeln!(self.code, "__DUNR_{i}:").unwrap();
+                    }
                     if self.used_read_num && self.compact_data_bad.is_none() {
                         if self.data_bad.iter().any(|(first, _, _)| *first == i) {
                             writeln!(self.code, "__DBAD_S{i}:").unwrap();
@@ -12562,7 +14909,7 @@ impl Codegen {
                             writeln!(self.code, "__DBAD_E{}:", i - 1).unwrap();
                         }
                     }
-                    let bytes = self.data_item_bytes(v);
+                    let bytes = self.data_item_bytes(i, v);
                     write!(self.code, "    .byte ").unwrap();
                     for b in &bytes {
                         write!(self.code, "${b:02X},").unwrap();
@@ -12615,6 +14962,19 @@ impl Codegen {
                         "    .word __DBAD_S{first}, __DBAD_E{last}, {line_no}"
                     )
                     .unwrap();
+                }
+                writeln!(self.code, "    .word $0000").unwrap();
+            }
+            if self.used_read_str_chk {
+                writeln!(self.code).unwrap();
+                writeln!(
+                    self.code,
+                    "; --- DATA items every READ refuses (?SYNTAX ERROR) ---"
+                )
+                .unwrap();
+                writeln!(self.code, "__DATA_UNREADABLE:").unwrap();
+                for (i, line_no) in &self.data_unreadable {
+                    writeln!(self.code, "    .word __DUNR_{i}, {line_no}").unwrap();
                 }
                 writeln!(self.code, "    .word $0000").unwrap();
             }
@@ -12934,17 +15294,13 @@ impl Codegen {
             writeln!(self.code, "    .byte $00,$00").unwrap();
             // The mask image the fields overwrite and __USE_SHOW prints.
             writeln!(self.code, "__USE_BUF:").unwrap();
-            for _ in 0..self.use_buf_len {
-                writeln!(self.code, "    .byte $00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(self.use_buf_len.into())).unwrap();
         }
         if self.used_use_dyn {
             // Runtime scanner workspace. __USE_SRC is the pristine control image:
             // __USE_BUF is overwritten as digits go in.
             writeln!(self.code, "__USE_SRC:").unwrap();
-            for _ in 0..USE_DYN_BUF_LEN {
-                writeln!(self.code, "    .byte $00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(USE_DYN_BUF_LEN.into())).unwrap();
             for slot in [
                 "__UF_NF", "__UF_LEN", "__RS_I", "__RS_N", "__RS_RS", "__RS_RE", "__RS_BS",
                 "__RS_BE", "__RS_SEPAT", "__RS_SGN", "__RS_SGNAT", "__RS_PAD", "__RS_HASD",
@@ -13166,9 +15522,7 @@ impl Codegen {
                     writeln!(self.code, "__TSB_RESUME_FOR_PTR:\n    .byte $00").unwrap();
                     for slot in ["__TSB_RESUME_FOR", "__TSB_RESUME_FOR_VAR"] {
                         writeln!(self.code, "{slot}:").unwrap();
-                        for _ in 0..self.for_stack_bound.entries {
-                            writeln!(self.code, "    .byte $00").unwrap();
-                        }
+                        writeln!(self.code, "{}", zero_run(self.for_stack_bound.entries)).unwrap();
                     }
                 }
             }
@@ -13197,10 +15551,7 @@ impl Codegen {
             writeln!(self.code, "__FETCH_INT:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__FETCH_BUF:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            for _ in 0..11 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(1 + 11 * 8)).unwrap();
         }
         if self.used_key_table {
             writeln!(self.code).unwrap();
@@ -13277,9 +15628,7 @@ impl Codegen {
             writeln!(self.code, "__MUSIC_HELPVEC:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__MUSIC_BUF:").unwrap();
-            for _ in 0..256 / 8 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(256)).unwrap();
         }
         if self.used_flash {
             writeln!(self.code).unwrap();
@@ -13390,11 +15739,17 @@ impl Codegen {
             writeln!(self.code, "__FOR_DIFF_LO:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
         }
-        if self.used_mul16 {
+        if self.used_mul16 || self.used_mul16c {
             writeln!(self.code, "__MUL16_TMP:").unwrap();
             writeln!(self.code, "    .byte $00,$00").unwrap();
             writeln!(self.code, "__MUL16_B:").unwrap();
             writeln!(self.code, "    .byte $00,$00").unwrap();
+        }
+        if self.used_mul16c {
+            writeln!(self.code, "__MUL16C_P:").unwrap();
+            writeln!(self.code, "    .byte $00,$00,$00,$00").unwrap();
+            writeln!(self.code, "__MUL16C_S:").unwrap();
+            writeln!(self.code, "    .byte $00").unwrap();
         }
         if self.used_div16 {
             writeln!(self.code, "__DIV16_DEN:").unwrap();
@@ -13803,9 +16158,7 @@ impl Codegen {
             writeln!(self.code, "__PT_R:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__PAINT_STK:").unwrap();
-            for _ in 0..24 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(24 * 8)).unwrap();
         }
         if self.used_hires_angl {
             writeln!(self.code, "__ANGL_CX:").unwrap();
@@ -13844,10 +16197,7 @@ impl Codegen {
             writeln!(self.code, "__INPUT_LEN:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
             writeln!(self.code, "__INPUT_BUF:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap();
-            for _ in 0..256 / 8 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00",).unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(1 + 256)).unwrap();
         }
         // Multi-var INPUT scratch — cursor into __INPUT_BUF and the
         // length-prefixed field buffer the parser dumps each value into
@@ -13855,16 +16205,14 @@ impl Codegen {
         if self.used_input_field {
             writeln!(self.code, "__INPUT_POS:").unwrap();
             writeln!(self.code, "    .byte $00").unwrap();
+            // Length, 80 characters, and the terminator FIN stops at on a redo.
             writeln!(self.code, "__FIELD_BUF:").unwrap();
-            writeln!(self.code, "    .byte $00").unwrap(); // length
-            writeln!(self.code, "__FIELD_TXT:").unwrap();
-            for _ in 0..80 / 8 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00",).unwrap();
-            }
-            if self.used_input_redo {
-
-                writeln!(self.code, "    .byte $00").unwrap();
-            }
+            writeln!(
+                self.code,
+                "{}",
+                zero_run(1 + 80 + usize::from(self.used_input_redo))
+            )
+            .unwrap();
             if self.used_input_extra {
                 writeln!(self.code, "__FIELD_COMMA:").unwrap();
                 writeln!(self.code, "    .byte $00").unwrap();
@@ -13887,17 +16235,13 @@ impl Codegen {
         if self.used_val && self.used_val_heap {
             writeln!(self.code, "{VAL_BUF_OPEN}").unwrap();
             writeln!(self.code, "__VAL_BUF:").unwrap();
-            for _ in 0..256 / 8 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(256)).unwrap();
             writeln!(self.code, "{VAL_BUF_CLOSE}").unwrap();
         }
 
         if self.data_relocated && self.data_relocate == Some(DataBuf::Bss) {
             writeln!(self.code, "{DATA_BUF_LABEL}:").unwrap();
-            for _ in 0..256 / 8 {
-                writeln!(self.code, "    .byte $00,$00,$00,$00,$00,$00,$00,$00").unwrap();
-            }
+            writeln!(self.code, "{}", zero_run(256)).unwrap();
         }
 
         // Mark the start of the string heap. The label stays at offset
@@ -13910,7 +16254,11 @@ impl Codegen {
 
         // Everything is emitted: find the trailing run of stored zeros, bracket it, and trade
         // it for a fill loop at entry.
-        install_bss_tail_fill(&mut self.code, rt::DATA_PTR_LO);
+        install_bss_tail_fill(
+            &mut self.code,
+            rt::DATA_PTR_LO,
+            self.profile == Profile::Speed,
+        );
         let state = self.state_zero_labels();
         install_state_zero(&mut self.code, &state, rt::DATA_PTR_LO);
 
@@ -13975,6 +16323,7 @@ impl Codegen {
             self.static_arrays_undimmed.clear();
         }
         self.emit_page1_stmt_check(stmt);
+        self.emit_array_state_refs();
         let result = self.emit_stmt(stmt, line_no);
         self.current_stmt_node = prev_node;
         self.current_stmt_path = prev_path;
@@ -14015,6 +16364,9 @@ impl Codegen {
 
     /// Whether a page-1 trap can fire on or inside `stmt`, `THEN`/`ELSE` bodies included.
     fn page1_check_reaches(&self, stmt: &Stmt) -> bool {
+        if self.unchecked {
+            return false;
+        }
         if self.page1_check_depth(stmt).is_some() {
             return true;
         }
@@ -14035,6 +16387,23 @@ impl Codegen {
     }
 
     fn current_expr_int_range(&self, expr: &Expr) -> Option<crate::dataflow::IntRange> {
+        if self
+            .cs_active
+            .iter()
+            .any(|(v, _)| exprs_use_var(std::slice::from_ref(expr), v))
+        {
+            // A guarded version: its checked copies hold whole numbers in the guarded ranges.
+            self.cs_hits.set(self.cs_hits.get() + 1);
+            let mut state = self
+                .current_stmt_node
+                .and_then(|id| self.analysis.numeric_facts.state_in_at(id))
+                .cloned()
+                .unwrap_or_default();
+            for (v, r) in &self.cs_active {
+                state = state.with_var(v, *r);
+            }
+            return crate::dataflow::expr_int_range(expr, &state);
+        }
         self.current_stmt_node
             .and_then(|id| self.analysis.numeric_facts.expr_int_range_in(id, expr))
     }
@@ -14130,6 +16499,10 @@ impl Codegen {
     /// prove safe. Saying "no error" wrongly would point error
     /// messages at the wrong line.
     fn stmt_cannot_error(&self, s: &Stmt) -> bool {
+        // Unchecked: an error may report any line. STOP still prints its own.
+        if self.unchecked {
+            return !stmt_reaches_stop(s);
+        }
         // GOTO/GOSUB to a non-existent line emits the UNDEF'D
         // STATEMENT trap, which needs CURLIN to point at the right
         // line — so override the free-function blanket "cannot error".
@@ -14223,7 +16596,8 @@ impl Codegen {
             // An integer ALU address can still be an invalid ROM address: -1 is a legal LET value, but emit_peek traps it through emit_addr_range_trap.
             Expr::Peek(addr) => {
                 !self.addr_literal_out_of_rom_range(addr)
-                    && (self.int_let_value_safe(addr) || address_literal(addr))
+                    && (self.int_let_value_safe(addr) && self.addr_cannot_be_negative(addr)
+                        || address_literal(addr))
             }
             _ => false,
         }
@@ -14270,7 +16644,14 @@ impl Codegen {
         if let Some(n) = as_f64_literal(addr) {
             return n.is_finite() && (0.0..=65535.0).contains(&n);
         }
-        self.int_let_value_safe(addr)
+        // An integer address below zero is an ?ILLEGAL QUANTITY too.
+        self.int_let_value_safe(addr) && self.addr_cannot_be_negative(addr)
+    }
+
+    /// Whether the range analysis keeps an address at or above zero.
+    fn addr_cannot_be_negative(&self, addr: &Expr) -> bool {
+        self.current_expr_int_range(addr)
+            .is_some_and(|r| r.min >= 0)
     }
 
     /// True when `value` will lower to a byte producer that doesn't
@@ -14428,7 +16809,10 @@ impl Codegen {
 
     /// Raise OUT OF MEMORY when FOR frames exhaust expression stack space.
     fn emit_for_nest_budget_trap(&mut self, stmt: &Stmt, line_no: u16) {
-        if self.for_stack.len() <= FOR_NEST_EXPR_MAX || !stmt_evaluates_expression(stmt) {
+        if self.unchecked
+            || self.for_stack.len() <= FOR_NEST_EXPR_MAX
+            || !stmt_evaluates_expression(stmt)
+        {
             return;
         }
         // The per-line stamp is skipped for lines judged error-free, and this statement may
@@ -14440,6 +16824,17 @@ impl Codegen {
     }
 
     fn emit_stmt(&mut self, stmt: &Stmt, line_no: u16) -> Result<(), CodegenError> {
+        if !self.checked_shadows.is_empty() {
+            self.emit_cs_before(stmt, line_no);
+        }
+        self.emit_stmt_body(stmt, line_no)?;
+        if !self.checked_shadows.is_empty() {
+            self.emit_cs_after_store(stmt);
+        }
+        Ok(())
+    }
+
+    fn emit_stmt_body(&mut self, stmt: &Stmt, line_no: u16) -> Result<(), CodegenError> {
         // Selectively invalidate the array-addr cache before this
         // statement: anything that could change the address it points
         // at — control transfer (GOTO/GOSUB/RETURN), loop boundaries
@@ -14457,6 +16852,7 @@ impl Codegen {
             self.pending_curlin = Some(*n);
             return Ok(());
         }
+        self.cs_line = line_no;
         // Flush the pending mark ahead of anything that can raise.
         if self.pending_curlin.is_some()
             && (self.curlin_observable || !self.stmt_cannot_error(stmt))
@@ -14473,6 +16869,9 @@ impl Codegen {
         }
 
         self.emit_for_nest_budget_trap(stmt, line_no);
+        if let Some(plan) = self.pending_copy.take() {
+            return self.emit_copy_loop(plan);
+        }
         match stmt {
             Stmt::Print { items, newline } => self.emit_print(items, *newline)?,
             Stmt::Goto { target } => self.emit_goto_or_undef_trap(*target, false),
@@ -14649,6 +17048,7 @@ impl Codegen {
                     self.for_top_restamp_sites.contains(&(p.line_idx, p.path.clone()))
                 });
                 self.for_top_curlin = (self.curlin_observable || restamp_site).then_some(line_no);
+                let sums = self.begin_wide_sums(runtime_id.is_none() && !entered);
                 self.emit_for(
                     var,
                     start,
@@ -14658,12 +17058,22 @@ impl Codegen {
                     *body_reads_loop_var || entered,
                     if entered { None } else { *induction_const },
                     if entered { &[] } else { array_inductions },
+                    runtime_id.is_none() && !entered,
                 )?;
                 let frame = self
                     .for_stack
                     .last()
                     .cloned()
                     .expect("emit_for pushed a frame onto self.for_stack");
+                for (var, slot, checked) in sums {
+                    let top_label = frame.top_label().to_string();
+                    self.wide_sums.push(WideSum {
+                        var,
+                        slot,
+                        top_label,
+                        checked,
+                    });
+                }
                 if entered {
                     self.externally_entered_for_tops
                         .insert(frame.top_label().to_string());
@@ -14703,7 +17113,10 @@ impl Codegen {
                     }
                 }
             }
-            Stmt::Poke { addr, value } => self.emit_poke(addr, value)?,
+            Stmt::Poke { addr, value } => {
+                let reads = self.cs_reads(&[addr, value]);
+                self.emit_cs_versioned(reads, &mut |s| s.emit_poke(addr, value))?
+            }
             Stmt::Dpoke { addr, value } => self.emit_dpoke(addr, value)?,
             Stmt::PokeFill {
                 dst_start,
@@ -15024,7 +17437,8 @@ impl Codegen {
                 self.emit_facword_rom();
                 writeln!(self.code, "    LDX ${:02X}", rt::LINNUM_LO).unwrap();
                 writeln!(self.code, "    STX ${:02X}", rt::CHANNL).unwrap();
-                writeln!(self.code, "    JSR ${:04X}", rt::CHKOUT).unwrap();
+                writeln!(self.code, "    JSR __CHKOUT_CK").unwrap();
+                self.used_chkout_check = true;
                 self.emit_print(items, *newline)?;
             }
             Stmt::Load {
@@ -15212,7 +17626,7 @@ impl Codegen {
     fn stmt_invalidates_fac_cache_after_emit(&self, stmt: &Stmt) -> bool {
         if matches!(
             stmt,
-            Stmt::Let { .. } | Stmt::Rem(_) | Stmt::Data(_) | Stmt::DefFn { .. }
+            Stmt::Let { .. } | Stmt::Rem(_) | Stmt::Data(_) | Stmt::DefFn { .. } | Stmt::Read(_)
         ) {
             return false;
         }
@@ -15574,9 +17988,17 @@ impl Codegen {
         targets: &[u16],
         line_no: u16,
     ) -> Result<(), CodegenError> {
-        self.emit_expr_to_fac(value)?;
-
-        self.emit_fac_byte_for_value(value);
+        // An integer variable gives its byte, or ?ILLEGAL QUANTITY, as POKE's value does.
+        if let Expr::Var(v) = value
+            && v.kind == VarKind::Integer
+            && v.base != "TI"
+            && v.base != "ST"
+        {
+            self.emit_int_var_byte_to_a(v);
+        } else {
+            self.emit_expr_to_fac(value)?;
+            self.emit_fac_byte_for_value(value);
+        }
         let id = self.fresh_id();
         let done = format!("__ON_DONE_{id}");
         // Use tables when they improve the selected size or speed profile.
@@ -16070,6 +18492,36 @@ impl Codegen {
         // `__STR_MID` traps a start index of 0 into `__ILLEGAL_QTY`.
         self.used_illegal_qty = true;
         Ok(())
+    }
+
+    /// `ASC(MID$(s$,i[,n]))` reads the byte in place instead of copying it to the heap.
+    fn try_emit_asc_mid_to_a(&mut self, s: &StrExpr) -> Result<bool, CodegenError> {
+        let Some((source, start)) = asc_mid_parts(s) else {
+            return Ok(false);
+        };
+        if matches!(source, StrExpr::Literal(_))
+            || matches!(source, StrExpr::Var(v) if v.base != "TI")
+        {
+            // Evaluating the start cannot change a literal or a string variable.
+            self.emit_byte_expr_to_a(start)?;
+            writeln!(self.code, "    TAX").unwrap();
+            self.emit_strexpr_pointer_to_ay(source)?;
+        } else {
+            self.emit_strexpr_pointer_to_ay(source)?;
+            writeln!(self.code, "    PHA").unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            writeln!(self.code, "    PHA").unwrap();
+            self.emit_byte_expr_to_a(start)?;
+            writeln!(self.code, "    TAX").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    PLA").unwrap();
+        }
+        writeln!(self.code, "    JSR __ASC_MID").unwrap();
+        self.used_asc_mid = true;
+        self.used_illegal_qty = true;
+        self.invalidate_array_addr_cache();
+        Ok(true)
     }
 
     fn emit_str_dup(&mut self, source: &StrExpr, count: &Expr) -> Result<(), CodegenError> {
@@ -17102,6 +19554,9 @@ impl Codegen {
                     line = self.data_line_offsets[next].0;
                     next += 1;
                 }
+                if *v == DataValue::Unreadable {
+                    self.data_unreadable.push((i, line));
+                }
                 if data_item_reads_as_a_number(v) {
                     continue;
                 }
@@ -17119,6 +19574,7 @@ impl Codegen {
             let texts_fit = self.data_values.iter().all(|v| match v {
                 DataValue::Float(n) => format_data_float(*n).len() < 0xC0,
                 DataValue::String(b) | DataValue::Quoted(b) => b.len() < 0xC0,
+                DataValue::Unreadable => true,
             });
             let saving: usize = self
                 .data_values
@@ -17133,15 +19589,53 @@ impl Codegen {
             if self.profile == Profile::Speed {
                 cost += READ_TAGGED_ADVANCE_COST * self.read_targets.saturating_sub(1);
             }
+            if self.profile == Profile::Default
+                && self.read_needs_fac
+                && read_takes_kind(module, VarKind::Integer)
+            {
+                cost += READ_TAGGED_INT_COST;
+            }
             if string_reads > 0 {
-                if !module_uses_str_and_mid(module) {
-                    cost += READ_TAGGED_TEXT_COST;
-                }
+                cost += READ_TAGGED_TEXT_COST;
                 if !(scan_needs_heap(module) || scan_reads_string_storage(module)) {
                     cost += READ_TAGGED_HEAP_COST;
                 }
             }
             self.data_ints_tagged = texts_fit && saving > cost;
+            if texts_fit
+                && saving <= cost
+                && self.profile == Profile::Speed
+                && self.read_targets > string_reads
+            {
+                // Keep short hexadecimal DATA lines as text for string READ targets.
+                let number = |v: &DataValue| match v {
+                    DataValue::String(b) => {
+                        !(b.len() <= 4
+                            && b.iter().all(u8::is_ascii_hexdigit)
+                            && b.iter().any(u8::is_ascii_alphabetic))
+                    }
+                    _ => true,
+                };
+                let mut numeric = vec![true; self.data_values.len()];
+                for (k, &(_, from)) in self.data_line_offsets.iter().enumerate() {
+                    let to = self
+                        .data_line_offsets
+                        .get(k + 1)
+                        .map_or(self.data_values.len(), |o| o.1);
+                    if !self.data_values[from..to].iter().all(number) {
+                        numeric[from..to].fill(false);
+                    }
+                }
+                if self
+                    .data_values
+                    .iter()
+                    .zip(&numeric)
+                    .any(|(v, &n)| n && tagged_int_bytes(v).is_some())
+                {
+                    self.data_ints_tagged = true;
+                    self.data_tags_kept_text = numeric.iter().map(|n| !n).collect();
+                }
+            }
             if self.data_ints_tagged && string_reads > 0 {
                 // A string READ of a binary item makes its text on the heap.
                 self.heap_init_needed = true;
@@ -17149,30 +19643,53 @@ impl Codegen {
         }
         if self.data_pool_layout == DataPoolLayout::AsciiTagged && self.profile != Profile::Size {
             let tagged = self.data_ints_tagged;
-            let short_digits = |v: &DataValue| {
-                if tagged && tagged_int_bytes(v).is_some() {
+            let kept = &self.data_tags_kept_text;
+            let short_digits = |i: usize, v: &DataValue| {
+                if tagged && !kept.get(i).copied().unwrap_or(false) && tagged_int_bytes(v).is_some()
+                {
                     return false;
                 }
+                // FIN skips spaces anywhere in a number, and so does `__DIGITS_LIN`.
                 let text = data_value_pool_bytes(v, DataPoolLayout::AsciiTagged);
-                (2..=1 + DIGITS_FAC_MAX).contains(&text.len())
-                    && text[1..].iter().all(u8::is_ascii_digit)
+                let body = text.get(1..).unwrap_or_default();
+                let body = if self.profile == Profile::Speed {
+                    body.strip_prefix(b"-").unwrap_or(body)
+                } else {
+                    body
+                };
+                let digits = body.iter().filter(|b| b.is_ascii_digit()).count();
+                text.len() <= 1 + DIGITS_FAC_MAX
+                    && digits > 0
+                    && body.iter().all(|&b| b.is_ascii_digit() || b == b' ')
             };
-            let digit_items = self.data_values.iter().filter(|v| short_digits(v)).count();
-            let from = if self.profile == Profile::Speed { 1 } else { READ_DIGITS_FROM };
-            let bad_digits = self
-                .data_bad
+            let digit_items = self
+                .data_values
                 .iter()
-                .any(|&(first, last, _)| self.data_values[first..=last].iter().any(short_digits));
+                .enumerate()
+                .filter(|&(i, v)| short_digits(i, v))
+                .count();
+            let from = if self.profile == Profile::Speed { 1 } else { READ_DIGITS_FROM };
+            let bad_digits = self.data_bad.iter().any(|&(first, last, _)| {
+                (first..=last).any(|i| short_digits(i, &self.data_values[i]))
+            });
             self.read_digits = digit_items >= from && !bad_digits;
         }
         if self.compact_data_metadata && self.data_pool_layout == DataPoolLayout::AsciiTagged {
-            let lengths: Vec<_> = self.data_values.iter()
-                .map(|v| self.data_item_bytes(v).len()).collect();
-            self.compact_data_bad = crate::compact_data_bad::CompactDataBad::new(
-                &lengths, &self.data_bad,
-            );
+            let lengths: Vec<_> = self
+                .data_values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| self.data_item_bytes(i, v).len())
+                .collect();
+            self.compact_data_bad =
+                crate::compact_data_bad::CompactDataBad::new(&lengths, &self.data_bad);
         }
-        self.data_pool_len = self.data_values.iter().map(|v| self.data_item_bytes(v).len()).sum();
+        self.data_pool_len = self
+            .data_values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| self.data_item_bytes(i, v).len())
+            .sum();
         self.data_relocated = self.data_relocate.is_some()
             && self.data_pool_len > 0
             && self.code_origin == CODE_ORIGIN
@@ -17195,6 +19712,12 @@ impl Codegen {
                 &mut active_static_arrays,
             )?;
         }
+        // Use an unreachable array rank to trap implicit allocations that cannot fit.
+        for (name, n) in module.arrays_the_rom_cannot_auto_dim() {
+            self.arrays.insert(name.clone(), vec![0; n + 1]);
+            self.arrays_order.push(name.clone());
+            self.oom_arrays.insert(name);
+        }
         // BASIC v2 auto-DIMs any array referenced without an explicit
         // DIM, sized to 10 per dimension. Walk every statement looking
         // for ArrayRef / ArrayLet / ArrayLetStr / StrExpr::ArrayRef and
@@ -17208,23 +19731,18 @@ impl Codegen {
                 &self.runtime_arrays,
             );
         }
-        self.grow_static_arrays_for_clr(module);
         self.redim_traps = dims_that_always_redim(module);
         Ok(())
     }
 
-    /// Allow static arrays to use auto-DIM bounds after CLR, within the allocation budget.
-    fn grow_static_arrays_for_clr(&mut self, module: &ir::Module) {
-        if !module_clears_variables(module) {
-            return;
-        }
-        let past_bound = literal_indices_past_bound(module, &self.arrays);
+    /// Reserve implicit array dimensions within the allocation budget.
+    fn grow_static_arrays_for_clr(&mut self, implicit: &HashSet<VarName>) {
         let mut budget = CLR_REDIM_GROWTH_BUDGET;
         for name in &self.arrays_order {
             let Some(alloc) = self.arrays.get(name) else {
                 continue;
             };
-            if !past_bound.contains(name) {
+            if !implicit.contains(name) || self.oom_arrays.contains(name) {
                 continue;
             }
             if !alloc.iter().any(|d| *d < AUTO_DIM_BOUND) {
@@ -17335,6 +19853,28 @@ impl Codegen {
             } else {
                 writeln!(self.code, "    LDA {src_label}+{k}").unwrap();
                 writeln!(self.code, "    STA {dst_label}+{k}").unwrap();
+            }
+        }
+    }
+
+    /// Store the five rounded bytes of a float constant directly into its slot.
+    fn emit_float_const_store(&mut self, value: f64, label: &str) {
+        let bytes = f64_to_mflpt(value);
+        let mut done = [false; 5];
+        for i in 0..5 {
+            if done[i] {
+                continue;
+            }
+            writeln!(self.code, "    LDA #${:02X}", bytes[i]).unwrap();
+            for j in i..5 {
+                if bytes[j] == bytes[i] {
+                    done[j] = true;
+                    if j == 0 {
+                        writeln!(self.code, "    STA {label}").unwrap();
+                    } else {
+                        writeln!(self.code, "    STA {label}+{j}").unwrap();
+                    }
+                }
             }
         }
     }
@@ -17550,7 +20090,7 @@ impl Codegen {
             .ok_or_else(|| CodegenError::UndimensionedArray(name.label()))?
             .clone();
         if indices.len() != dims.len() {
-            return self.emit_array_arity_trap(name, dims.len(), indices.len());
+            return self.emit_array_arity_trap(name, dims.len(), indices);
         }
         let label = Self::array_label(name);
         let elem_size = Self::array_elem_size(name);
@@ -17655,7 +20195,7 @@ impl Codegen {
                     self.emit_facword_rom();
                 }
                 if !bounds_ok {
-                    self.emit_bounds_check(bounds[0]);
+                    self.emit_array_bounds_check(name, &dims, 0, bounds[0]);
                 }
             }
             n if n >= 2 => {
@@ -17664,10 +20204,10 @@ impl Codegen {
                 // int-island add/sub/mul-pot expressions. Computes
                 // `linear = (((i0 << k1) + i1) << k2) + i2 ...` in
                 // LINNUM directly via ASL/ROL + ADC chains, no FAC.
-                if self.try_emit_int16_md_index_to_linnum(&indices, &dims, &bounds)? {
+                if self.try_emit_int16_md_index_to_linnum(name, indices, &dims, &bounds)? {
                     // Already left linear in LINNUM and ran bounds
                     // checks. Skip the FAC/Horner block below.
-                } else if self.try_emit_md_index_hybrid(indices, &dims, &bounds)? {
+                } else if self.try_emit_md_index_hybrid(name, indices, &dims, &bounds)? {
                     // Subscripts converted through FAC, Horner chain done natively.
                 } else {
 
@@ -17679,7 +20219,7 @@ impl Codegen {
                     writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
                     if !self.index_provably_in_bounds(&indices[0], bounds[0]) {
                         self.emit_facword_rom();
-                        self.emit_bounds_check(bounds[0]);
+                        self.emit_array_bounds_check(name, &dims, 0, bounds[0]);
                     }
                     for k in 1..n {
                         let stride_label = self.intern_float((dims[k] as f64) + 1.0);
@@ -17693,7 +20233,7 @@ impl Codegen {
                         writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
                         if !self.index_provably_in_bounds(&indices[k], bounds[k]) {
                             self.emit_facword_rom();
-                            self.emit_bounds_check(bounds[k]);
+                            self.emit_array_bounds_check(name, &dims, k, bounds[k]);
                         }
                         // acc = acc * stride_k + idx_k
                         writeln!(self.code, "    LDA #<{tmp_i}").unwrap();
@@ -17773,8 +20313,27 @@ impl Codegen {
         &mut self,
         name: &VarName,
         expected: usize,
-        got: usize,
+        indices: &[Expr],
     ) -> Result<(), CodegenError> {
+        self.last_array_addr = None;
+        if self.oom_arrays.contains(name) {
+            // The ROM reads every subscript as INTIDX does, then fails to make room.
+            writeln!(
+                self.code,
+                "    ; {}: auto-DIM the ROM can never hold — ?OUT OF MEMORY",
+                name.label(),
+            )
+            .unwrap();
+            for idx in indices {
+                self.emit_expr_to_fac(idx)?;
+                writeln!(self.code, "    JSR ${:04X}", rt::INTIDX_CHECK).unwrap();
+                self.invalidate_fac_cache();
+            }
+            writeln!(self.code, "    LDX #${:02X}", rt::ERR_OUT_OF_MEMORY).unwrap();
+            self.emit_jmp_basic_error();
+            return Ok(());
+        }
+        let got = indices.len();
         writeln!(
             self.code,
             "    ; {}: DIM'd with {expected} dimension(s), used with {got} — \
@@ -17784,8 +20343,6 @@ impl Codegen {
         .unwrap();
         self.used_bad_subscript = true;
         writeln!(self.code, "    JMP __BAD_SUBSCRIPT").unwrap();
-
-        self.last_array_addr = None;
         Ok(())
     }
 
@@ -17801,7 +20358,7 @@ impl Codegen {
     ) -> Result<(), CodegenError> {
         let dim_count = self.runtime_arrays[name].len();
         if indices.len() != dim_count {
-            return self.emit_array_arity_trap(name, dim_count, indices.len());
+            return self.emit_array_arity_trap(name, dim_count, indices);
         }
         let elem_size = Self::array_elem_size(name);
         let base_lbl = self.runtime_array_base_label(name);
@@ -17981,6 +20538,9 @@ impl Codegen {
     /// site shrinks from ~12 bytes inline to a 3-byte `JSR`.
     /// Each stub is shared by all checks for the same dimension.
     fn emit_bounds_check_runtime(&mut self, dim_label: &str) {
+        if self.unchecked {
+            return;
+        }
         writeln!(self.code, "    JSR __BNDS_RT_{dim_label}").unwrap();
         *self
             .bnds_rt_stub_uses
@@ -17997,6 +20557,9 @@ impl Codegen {
     /// short JSR to a single-emission trap helper rather than inlining
     /// to keep array references compact.
     fn emit_bounds_check(&mut self, dim_value: u16) {
+        if self.unchecked {
+            return;
+        }
         // Per-dim stub: `__BNDS_<dim>` does `LDA #<dim; LDX #>dim;
         // JMP __BNDS_CHECK`. Single-byte dims are extremely common
         // (every array access in array-heavy programs), so the 3-byte
@@ -18016,7 +20579,8 @@ impl Codegen {
         if indices.len() != 1 {
             return None;
         }
-        if self.runtime_arrays.contains_key(name) {
+        // Its checks compare with one constant bound.
+        if self.runtime_arrays.contains_key(name) || self.array_mode(name) == ArrayMode::Either {
             return None;
         }
         let dims = self.arrays.get(name)?;
@@ -18050,12 +20614,14 @@ impl Codegen {
     /// Element count this access may address, which is *not* the layout count
     /// `absx_int_array_count` returns.
     fn absx_bound_count(&self, name: &VarName, count: u16) -> u16 {
-        if self.static_arrays_undimmed.contains(name) {
-            count.min(AUTO_DIM_BOUND + 1)
-        } else if let Some(declared) = self.array_declared_dims.get(name) {
-            count.min(declared[0].saturating_add(1))
-        } else {
-            count
+        let declared = match self.array_declared_dims.get(name) {
+            Some(declared) => count.min(declared[0].saturating_add(1)),
+            None => count,
+        };
+        match self.array_mode(name) {
+            ArrayMode::Declared => declared,
+            ArrayMode::Implicit => count.min(AUTO_DIM_BOUND + 1),
+            ArrayMode::Either => declared.min(AUTO_DIM_BOUND + 1),
         }
     }
 
@@ -18180,6 +20746,10 @@ impl Codegen {
     }
 
     fn index_provably_in_bounds(&self, expr: &Expr, dim_value: u16) -> bool {
+        // Unchecked: only a program that would stop with ?BAD SUBSCRIPT has one out of bounds.
+        if self.unchecked {
+            return true;
+        }
         if let Some(range) = self.current_expr_int_range(expr) {
             if range.min >= 0 && range.max <= dim_value as i32 {
                 return true;
@@ -18250,6 +20820,13 @@ impl Codegen {
     /// dim expressions, compute total byte count, decrement the
     /// array-heap floor, and zero/empty-init the new chunk.
     fn emit_dim(&mut self, specs: &[ir::DimSpec], line_no: u16) -> Result<(), CodegenError> {
+        let result = self.emit_dim_specs(specs, line_no);
+        self.arrays_dimmed_in_stmt.clear();
+        result
+    }
+
+    /// [`Codegen::emit_dim`] up to the statement's own bookkeeping.
+    fn emit_dim_specs(&mut self, specs: &[ir::DimSpec], line_no: u16) -> Result<(), CodegenError> {
         for spec in specs {
 
             if self.redim_traps.remove(&(line_no, spec.name.clone())) {
@@ -18264,6 +20841,9 @@ impl Codegen {
                 self.static_arrays_undimmed.remove(&spec.name);
             }
             if !self.runtime_arrays.contains_key(&spec.name) {
+                if !spec.dims.is_empty() && !self.emit_static_dim_state(&spec.name) {
+                    return Ok(());
+                }
                 continue;
             }
             // The descriptor layout is defined by the first DIM's
@@ -18520,6 +21100,22 @@ impl Codegen {
             return Ok(());
         }
 
+        if self.array_appends_in_place(name, indices, value) {
+            // Speed: the element's chunk, when it is the last one stored, grows where it is.
+            writeln!(self.code, "    JSR __HEAP_GC_IF_LOW").unwrap();
+            self.emit_array_address(name, indices)?;
+            writeln!(self.code, "    JSR __ARR_APPEND_PRE").unwrap();
+            self.emit_strexpr_pointer_to_ay(value)?;
+            writeln!(self.code, "    JSR __ARR_APPEND_POST").unwrap();
+            self.used_arr_append = true;
+            self.used_lastvar_str = true;
+            self.concat_appends_in_place = true;
+            self.used_gc = true;
+            self.heap_init_needed = true;
+            self.invalidate_fac_cache();
+            self.invalidate_array_addr_cache();
+            return Ok(());
+        }
         writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
         self.invalidate_fac_cache();
         self.emit_array_address(name, indices)?;
@@ -18538,6 +21134,29 @@ impl Codegen {
         self.used_array_let_str = true;
         self.use_str_assign_owned();
         Ok(())
+    }
+
+    /// `A$(i) = A$(i) + x` where `x` leaves the array alone and no index touches the heap.
+    fn array_appends_in_place(&self, name: &VarName, indices: &[Expr], value: &StrExpr) -> bool {
+        if self.profile != Profile::Speed || self.fretop_observable {
+            return false;
+        }
+        let StrExpr::Concat(l, r) = value else {
+            return false;
+        };
+        let StrExpr::ArrayRef(n, idx) = l.as_ref() else {
+            return false;
+        };
+        let rhs_ok = match r.as_ref() {
+            StrExpr::Literal(_) | StrExpr::Var(_) => true,
+            StrExpr::ArrayRef(_, ri) => ri.iter().all(plain_index),
+            _ => false,
+        };
+        n == name
+            && idx.as_slice() == indices
+            && indices.iter().all(plain_index)
+            && rhs_ok
+            && !str_expr_may_read_str_var(r, name)
     }
 
     /// Operand for the low byte of the live DATA cursor.
@@ -18569,18 +21188,40 @@ impl Codegen {
 
     /// Read each target, store its value, and advance the DATA cursor.
     fn emit_read(&mut self, targets: &[ir::ReadTarget]) -> Result<(), CodegenError> {
-        if self.data_values.is_empty() {
-            // No DATA at all: the first READ is unconditionally ?OUT OF DATA, so skip the pool
-            // machinery entirely.
-            self.used_data_chk = true;
-            writeln!(self.code, "    JMP __OUT_OF_DATA").unwrap();
-            return Ok(());
-        }
         for tgt in targets {
+            // The ROM finds the target before it looks for DATA.
+            if let ir::ReadTarget::Array { name, indices } = tgt
+                && self.oom_arrays.contains(name)
+            {
+                self.emit_array_address(name, indices)?;
+                self.invalidate_fac_cache();
+                return Ok(());
+            }
+            if self.data_values.is_empty() {
+                // READ without DATA always raises OUT OF DATA.
+                self.used_data_chk = true;
+                writeln!(self.code, "    JMP __OUT_OF_DATA").unwrap();
+                self.invalidate_fac_cache();
+                return Ok(());
+            }
             // BASIC v2 raises ?OUT OF DATA when READ runs past the last item; see `__DATA_CHK`.
-            self.used_data_chk = true;
-            writeln!(self.code, "    JSR __DATA_CHK").unwrap();
+            // Unchecked keeps only the fetch a relocated pool does there.
+            if !self.unchecked {
+                self.used_data_chk = true;
+                writeln!(self.code, "    JSR __DATA_CHK").unwrap();
+            } else if self.data_relocated {
+                self.used_data_chk = true;
+                writeln!(self.code, "    JSR __DATA_CHK_OK").unwrap();
+            }
 
+            let into_string = match tgt {
+                ir::ReadTarget::Scalar(v) => v.kind == VarKind::String,
+                ir::ReadTarget::Array { name, .. } => name.kind == VarKind::String,
+            };
+            if into_string && !self.data_unreadable.is_empty() {
+                self.used_read_str_chk = true;
+                writeln!(self.code, "    JSR __READ_STR_CHK").unwrap();
+            }
             if self.datlin_track {
                 self.used_datlin = true;
                 writeln!(self.code, "    JSR __DATA_SETLINE").unwrap();
@@ -18597,9 +21238,17 @@ impl Codegen {
                 ir::ReadTarget::Scalar(v) => {
                     let label = self.intern_var(v.clone());
                     self.emit_read_scalar(v, &label);
+                    self.invalidate_fac_cache();
+                    if self.checked_shadows.contains_key(v) {
+                        self.emit_cs_sync(v);
+                    } else if v.kind == VarKind::Float && self.shadow_int_label(v).is_none() {
+                        // The float paths leave the stored value in FAC; the cursor update keeps it.
+                        self.note_fac_contains_var(v);
+                    }
                 }
                 ir::ReadTarget::Array { name, indices } => {
                     self.emit_read_array(name, indices)?;
+                    self.invalidate_fac_cache();
                 }
             }
             self.emit_data_advance();
@@ -18701,6 +21350,9 @@ __DREL_END:
                     writeln!(self.code, "__DATA_LINE_{line_no} = ${at:04X}").unwrap();
                 }
             }
+            if self.used_read_str_chk && self.data_unreadable.iter().any(|(k, _)| *k == i) {
+                writeln!(self.code, "__DUNR_{i} = ${at:04X}").unwrap();
+            }
             if bad_anchors {
                 if self.data_bad.iter().any(|(first, _, _)| *first == i) {
                     writeln!(self.code, "__DBAD_S{i} = ${at:04X}").unwrap();
@@ -18709,7 +21361,7 @@ __DREL_END:
                     writeln!(self.code, "__DBAD_E{} = ${at:04X}", i - 1).unwrap();
                 }
             }
-            blob.extend(self.data_item_bytes(v));
+            blob.extend(self.data_item_bytes(i, v));
         }
         let end = run + blob.len() as u32;
         if bad_anchors {
@@ -18916,7 +21568,7 @@ __DF_DONE:
         }
     }
 
-    /// Convert short digit strings to FAC. Set carry on unsupported input.
+    /// Parse short digit strings into LINNUM or FAC; set carry on unsupported input.
     fn emit_digits_fac(&mut self) {
         let text = rt::STR_OP_LHS_LO;
         let (lo, hi) = (rt::LINNUM_LO, rt::LINNUM_HI);
@@ -18924,18 +21576,47 @@ __DF_DONE:
         if self.used_read_digits {
             let slow = if self.used_read_num { "__READ_NUM" } else { "__VAL_HELPER" };
             writeln!(self.code, "__READ_DIGITS:").unwrap();
-            writeln!(self.code, "    JSR __DIGITS_FAC").unwrap();
-            writeln!(self.code, "    BCC __DIGITS_DONE").unwrap();
+            writeln!(self.code, "    JSR __DIGITS_LIN").unwrap();
+            writeln!(self.code, "    BCC __DIGITS_GIVAYF").unwrap();
             writeln!(self.code, "    JMP {slow}").unwrap();
+        }
+        if self.used_read_digits_int {
+            let slow = if self.used_read_num { "__READ_NUM" } else { "__VAL_HELPER" };
+            writeln!(self.code, "__READ_DIGITS_INT:").unwrap();
+            writeln!(self.code, "    JSR __DIGITS_LIN").unwrap();
+            writeln!(self.code, "    BCC __DIGITS_DONE").unwrap();
+            writeln!(self.code, "    JSR {slow}").unwrap();
+            writeln!(self.code, "    JMP __AYINT_RND").unwrap();
         }
         if self.used_val_digits {
             writeln!(self.code, "__VAL_DIGITS:").unwrap();
-            writeln!(self.code, "    JSR __DIGITS_FAC").unwrap();
-            writeln!(self.code, "    BCC __DIGITS_DONE").unwrap();
+            writeln!(self.code, "    JSR __DIGITS_LIN").unwrap();
+            writeln!(self.code, "    BCC __DIGITS_GIVAYF").unwrap();
             writeln!(self.code, "    JMP __VAL_HELPER").unwrap();
         }
+        if self.used_read_digits || self.used_val_digits {
+            writeln!(self.code, "__DIGITS_GIVAYF:").unwrap();
+            writeln!(self.code, "    LDY ${lo:02X}").unwrap();
+            writeln!(self.code, "    LDA ${hi:02X}").unwrap();
+            writeln!(self.code, "    JMP ${:04X}", rt::GIVAYF).unwrap();
+        }
+        // A leading minus, as FIN takes it; the speed profile only, for its bytes.
+        let neg = rt::INDEX2_HI;
+        let (neg_init, neg_apply, neg_parse) = if self.profile == Profile::Speed {
+            (
+                format!("    STY ${neg:02X}\n"),
+                format!(
+                    "    LDA ${neg:02X}\n    BEQ __DIGITS_POS\n    SEC\n    LDA #$00\n    SBC ${lo:02X}\n    STA ${lo:02X}\n    LDA #$00\n    SBC ${hi:02X}\n    STA ${hi:02X}\n__DIGITS_POS:\n"
+                ),
+                format!(
+                    "    CMP #$1D\n    BNE __DIGITS_NO\n    CPY #$01\n    BNE __DIGITS_NO\n    INC ${neg:02X}\n    BNE __DIGITS_NEXT\n"
+                ),
+            )
+        } else {
+            (String::new(), String::new(), String::new())
+        };
         let code = format!(
-            "__DIGITS_FAC:
+            "__DIGITS_LIN:
     LDY #$00
     LDA (${text:02X}),Y
     BEQ __DIGITS_NO
@@ -18944,12 +21625,12 @@ __DF_DONE:
     TAX
     STY ${lo:02X}
     STY ${hi:02X}
-__DIGITS_LOOP:
+{neg_init}__DIGITS_LOOP:
     INY
     LDA (${text:02X}),Y
     EOR #$30
     CMP #$0A
-    BCS __DIGITS_NO
+    BCS __DIGITS_SPACE
     STA ${digit:02X}
     LDA ${hi:02X}
     STA ${old_hi:02X}
@@ -18973,18 +21654,17 @@ __DIGITS_LOOP:
 __DIGITS_NEXT:
     DEX
     BNE __DIGITS_LOOP
-    LDY ${lo:02X}
-    LDA ${hi:02X}
-    JSR ${givayf:04X}
-    CLC
+{neg_apply}    CLC
 __DIGITS_DONE:
     RTS
-__DIGITS_NO:
+__DIGITS_SPACE:
+    CMP #$10
+    BEQ __DIGITS_NEXT
+{neg_parse}__DIGITS_NO:
     SEC
     RTS
 ",
             too_long = DIGITS_FAC_MAX + 1,
-            givayf = rt::GIVAYF,
         );
         self.code.push_str(&code);
     }
@@ -19011,9 +21691,31 @@ __DIGITS_NO:
         text
     }
 
-    /// An item's bytes in the DATA pool.
-    fn data_item_bytes(&self, v: &DataValue) -> Vec<u8> {
-        if self.data_ints_tagged && self.data_pool_layout == DataPoolLayout::AsciiTagged {
+    /// Integer READ entry that loads supported items directly into LINNUM.
+    fn read_int_entry(&mut self) -> Option<&'static str> {
+        let entry = match self.read_num_entry() {
+            "__READ_DIGITS" => {
+                self.used_read_digits_int = true;
+                "__READ_DIGITS_INT"
+            }
+            // Next to the FAC reader it costs more bytes than it saves, which only Size minds.
+            "__READ_TAGGED" if self.profile != Profile::Size || !self.read_needs_fac => {
+                self.used_read_tagged_int = true;
+                "__READ_TAGGED_INT"
+            }
+            _ => return None,
+        };
+        self.used_ayint = true;
+        self.used_ayint_rnd = true;
+        Some(entry)
+    }
+
+    /// Item `i`'s bytes in the DATA pool.
+    fn data_item_bytes(&self, i: usize, v: &DataValue) -> Vec<u8> {
+        if self.data_ints_tagged
+            && self.data_pool_layout == DataPoolLayout::AsciiTagged
+            && !self.data_tags_kept_text.get(i).copied().unwrap_or(false)
+        {
             if let Some(bytes) = tagged_int_bytes(v) {
                 return bytes;
             }
@@ -19063,12 +21765,169 @@ __READ_TAGGED_WORD:
         self.code.push_str(&code);
     }
 
-    /// The hidden float a string READ of a binary item floats its value into.
+    /// Tagged integers straight into LINNUM; text items through FAC and AYINT.
+    fn emit_read_tagged_int(&mut self) {
+        let text = rt::STR_OP_LHS_LO;
+        let (lo, hi) = (rt::LINNUM_LO, rt::LINNUM_HI);
+        // Digit text goes straight to LINNUM.
+        let text_item = if self.read_tagged_text_entry == "__READ_DIGITS" {
+            self.used_read_digits_int = true;
+            "    JMP __READ_DIGITS_INT".to_string()
+        } else {
+            format!(
+                "    JSR {}\n    JMP __AYINT_RND",
+                self.read_tagged_text_entry
+            )
+        };
+        // Outside Speed the wide items share the tails, three bytes for a branch each.
+        let tails = if self.profile == Profile::Speed {
+            format!(
+                "    STA ${lo:02X}
+    LDA #$00
+    STA ${hi:02X}
+    RTS
+__RTI_WIDE:
+    BNE __RTI_WORD
+    INY
+    LDA (${text:02X}),Y
+    STA ${lo:02X}
+    LDA #$00
+    STA ${hi:02X}
+    RTS
+__RTI_WORD:
+    INY
+    LDA (${text:02X}),Y
+    STA ${lo:02X}
+    INY
+    LDA (${text:02X}),Y
+    STA ${hi:02X}
+    RTS
+"
+            )
+        } else {
+            format!(
+                "__RTI_LO:
+    STA ${lo:02X}
+    LDA #$00
+__RTI_HI:
+    STA ${hi:02X}
+    RTS
+__RTI_WIDE:
+    BNE __RTI_WORD
+    INY
+    LDA (${text:02X}),Y
+    BCS __RTI_LO
+__RTI_WORD:
+    INY
+    LDA (${text:02X}),Y
+    STA ${lo:02X}
+    INY
+    LDA (${text:02X}),Y
+    BCS __RTI_HI
+"
+            )
+        };
+        let code = format!(
+            "__READ_TAGGED_INT:
+    LDY #$00
+    LDA (${text:02X}),Y
+    CMP #$C0
+    BCS __RTI_BIN
+{text_item}
+__RTI_BIN:
+    CMP #$FE
+    BCS __RTI_WIDE
+    SBC #$BF
+{tails}"
+        );
+        self.code.push_str(&code);
+    }
+
+    /// The hidden string a string READ of a binary item takes its digits from.
     fn data_text_var() -> VarName {
         VarName {
             base: "__DTXT".to_string(),
-            kind: VarKind::Float,
+            kind: VarKind::String,
         }
+    }
+
+    /// Write tagged integer digits to __TAG_BUF and point the DATA text variable at them.
+    fn emit_tag_text(&mut self) {
+        let text = rt::STR_OP_LHS_LO;
+        let (lo, hi) = (rt::LINNUM_LO, rt::LINNUM_HI);
+        let var = self.intern_var(Self::data_text_var());
+        let code = format!(
+            "__TAG_TEXT:
+    LDY #$00
+    LDX #$00
+    LDA (${text:02X}),Y
+    CMP #$FE
+    BCC __TT_TINY
+    BEQ __TT_BYTE
+    LDY #$02
+    LDA (${text:02X}),Y
+    TAX
+__TT_BYTE:
+    LDY #$01
+    LDA (${text:02X}),Y
+    BCS __TT_SET
+__TT_TINY:
+    SBC #$BF
+__TT_SET:
+    STA ${lo:02X}
+    STX ${hi:02X}
+    LDA #$00
+    STA __TAG_BUF
+    LDY #$03
+    TXA
+    BNE __TT_PLACE
+    LDY #$01
+__TT_PLACE:
+    LDX #$30
+__TT_SUB:
+    LDA ${lo:02X}
+    CMP __TT_LO,Y
+    LDA ${hi:02X}
+    SBC __TT_HI,Y
+    BCC __TT_DIGIT
+    STA ${hi:02X}
+    LDA ${lo:02X}
+    SBC __TT_LO,Y
+    STA ${lo:02X}
+    INX
+    BNE __TT_SUB
+__TT_DIGIT:
+    TXA
+    LDX __TAG_BUF
+    BNE __TT_PUT
+    CMP #$30
+    BEQ __TT_NEXT
+__TT_PUT:
+    STA __TAG_BUF+1,X
+    INC __TAG_BUF
+__TT_NEXT:
+    DEY
+    BPL __TT_PLACE
+    LDA ${lo:02X}
+    ORA #$30
+    LDX __TAG_BUF
+    STA __TAG_BUF+1,X
+    INX
+    STX __TAG_BUF
+    LDA #<__TAG_BUF
+    STA {var}
+    LDA #>__TAG_BUF
+    STA {var}+1
+    RTS
+__TT_LO:
+    .byte $0A,$64,$E8,$10
+__TT_HI:
+    .byte $00,$00,$03,$27
+__TAG_BUF:
+    .byte $00,$00,$00,$00,$00,$00
+"
+        );
+        self.code.push_str(&code);
     }
 
     /// Read text directly or format a tagged integer as a string.
@@ -19094,20 +21953,11 @@ __READ_TAGGED_WORD:
         self.static_arrays_undimmed = saved_static_undimmed.clone();
         self.last_array_addr = saved_last_array_addr.clone();
         self.invalidate_fac_cache();
-        self.used_read_tagged = true;
-        self.used_val = true;
-        // Settles the text entry `__READ_TAGGED` falls back to and marks it used.
-        let _ = self.read_num_entry();
-        writeln!(self.code, "    JSR __READ_TAGGED").unwrap();
+        self.used_tag_text = true;
+        writeln!(self.code, "    JSR __TAG_TEXT").unwrap();
         let dtxt = Self::data_text_var();
-        let label = self.intern_var(dtxt.clone());
-        self.emit_store_fac_to_float_var(&dtxt, &label);
-        let value = StrExpr::Mid(
-            Box::new(StrExpr::Str(Box::new(Expr::Var(dtxt)))),
-            Box::new(Expr::Number(2.0)),
-            None,
-        );
-        bin(self, value)?;
+        self.intern_var(dtxt.clone());
+        bin(self, StrExpr::Var(dtxt))?;
         self.emit_restage_data_item();
         writeln!(self.code, "{done}:").unwrap();
         self.runtime_array_base_validated = saved_runtime_validated;
@@ -19169,9 +22019,13 @@ __READ_TAGGED_WORD:
                 self.emit_sync_shadow_from_fac(var);
             }
             (DataPoolLayout::AsciiTagged, VarKind::Integer) => {
-                let entry = self.read_num_entry();
-                writeln!(self.code, "    JSR {entry}").unwrap();
-                writeln!(self.code, "    JSR __AYINT_RND").unwrap();
+                if let Some(entry) = self.read_int_entry() {
+                    writeln!(self.code, "    JSR {entry}").unwrap();
+                } else {
+                    let entry = self.read_num_entry();
+                    writeln!(self.code, "    JSR {entry}").unwrap();
+                    writeln!(self.code, "    JSR __AYINT_RND").unwrap();
+                }
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
                 writeln!(self.code, "    STA {label}").unwrap();
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
@@ -19306,11 +22160,21 @@ __READ_TAGGED_WORD:
             }
             (DataPoolLayout::AsciiTagged, VarKind::Integer) => {
                 self.emit_array_address(name, indices)?;
-                let entry = self.read_num_entry();
-                writeln!(self.code, "    JSR {entry}").unwrap();
-                writeln!(self.code, "    JSR __ST_ARR_INT").unwrap();
-                self.used_ayint = true;
-                self.used_st_arr_int = true;
+                let tagged_alone = self.data_ints_tagged
+                    && (self.profile == Profile::Default || !self.read_needs_fac);
+                if let Some(entry) = (self.profile == Profile::Speed || tagged_alone)
+                    .then(|| self.read_int_entry())
+                    .flatten()
+                {
+                    self.read_arr_int_entry = Some(entry);
+                    writeln!(self.code, "    JSR __READ_ARR_INT").unwrap();
+                } else {
+                    let entry = self.read_num_entry();
+                    writeln!(self.code, "    JSR {entry}").unwrap();
+                    writeln!(self.code, "    JSR __ST_ARR_INT").unwrap();
+                    self.used_ayint = true;
+                    self.used_st_arr_int = true;
+                }
             }
             (DataPoolLayout::BinaryI16, VarKind::Integer) => {
                 // Two-byte direct copy from DATA into the array
@@ -19546,6 +22410,30 @@ __READ_TAGGED_WORD:
                 "write to ER/EL (error pseudo-variables are read-only)",
             ));
         }
+        if !self.cs_plain_let && self.checked_shadows.contains_key(var) {
+            return self.emit_cs_let(var, value);
+        }
+        if let Some(w) = self
+            .wide_sums
+            .iter()
+            .find(|w| &w.var == var && w.checked)
+            .cloned()
+        {
+            return self.emit_checked_wide_sum(&w, value);
+        }
+        if let Some(slot) = self
+            .wide_sums
+            .iter()
+            .find(|w| &w.var == var)
+            .map(|w| w.slot.clone())
+        {
+            let terms = wide_sum_terms(value, var).expect("a planned sum");
+            for (add, term) in &terms {
+                self.emit_wide_sum_term(&slot, *add, term)?;
+            }
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
         // Pure-inline int16 fast path: when the LHS is `%`-typed and
         // the RHS reduces to int16 leaves we skip FAC entirely. Both
         // smaller AND faster than the FAC roundtrip — always on.
@@ -19564,13 +22452,21 @@ __READ_TAGGED_WORD:
                     self.invalidate_fac_cache();
                     return Ok(());
                 }
-            } else if (self.bounded_accumulators.contains(var) || self.expr_proves_ayint_i16(value))
+            } else if (self.unchecked
+                || self.bounded_accumulators.contains(var)
+                || self.expr_proves_ayint_i16(value))
                 && self.try_emit_int16_let(value, &label)
             {
 
                 self.invalidate_fac_cache();
                 return Ok(());
             } else if self.try_emit_int16_self_step_trapping(var, value, &label) {
+                self.invalidate_fac_cache();
+                return Ok(());
+            } else if self.try_emit_int16_addsub_let_trapping(value, &label) {
+                self.invalidate_fac_cache();
+                return Ok(());
+            } else if self.profile == Profile::Speed && self.try_emit_int16_mul_let_trapping(value, &label) {
                 self.invalidate_fac_cache();
                 return Ok(());
             }
@@ -19615,6 +22511,15 @@ __READ_TAGGED_WORD:
         self.emit_expr_to_fac(value)?;
         let label = self.intern_var(var.clone());
         match var.kind {
+            VarKind::Integer
+                if self.int_var_is_u8_storage(var)
+                    && self.expr_proves_u8(value)
+                    && (fac_rounding_byte_clear(value) || self.expr_proves_ayint_safe(value)) =>
+            {
+                // A proved byte in a one-byte slot: the byte helper instead of FACWORD.
+                self.emit_fac_byte_for_value(value);
+                writeln!(self.code, "    STA {label}").unwrap();
+            }
             VarKind::Integer => {
                 // FAC → signed 16-bit at LINNUM, then store the two
                 // bytes into the variable slot.
@@ -19775,6 +22680,146 @@ __READ_TAGGED_WORD:
         false
     }
 
+    /// Evaluate bounded integer expressions in 16 bits before one conversion to FAC.
+    fn try_emit_int_island_to_fac(&mut self, e: &Expr) -> bool {
+        if self.profile != Profile::Speed
+            || !matches!(
+                e,
+                Expr::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul, ..) | Expr::Neg(_)
+            )
+            || self.int16_leaf(e).is_some()
+            || !self.int_island_ring_tree(e)
+            || count_string_leaves(e) > 1
+        {
+            return false;
+        }
+        let Some(r) = self.current_expr_int_range(e) else {
+            return false;
+        };
+        let unsigned = r.max > 32767;
+        if r.min < if unsigned { 0 } else { -32768 } || r.max > 65535 {
+            return false;
+        }
+        let mark = self.code.len();
+        let outer = std::mem::replace(&mut self.island_for_fac, true);
+        let done = self.emit_int_island_to_ay(e);
+        self.island_for_fac = outer;
+        if !done {
+            self.code.truncate(mark);
+            return false;
+        }
+        if unsigned {
+            writeln!(self.code, "    JSR __GIVAYF_U16").unwrap();
+            self.used_givayf_u16 = true;
+        } else {
+            writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+        }
+        true
+    }
+
+    /// Leave the integer value of `e` with its low byte in Y and its high byte in A.
+    fn emit_int_island_to_ay(&mut self, e: &Expr) -> bool {
+        // `PEEK(lo)+PEEK(hi)*256` loads the two bytes, in source order.
+        if let Expr::Bin(BinOp::Add, l, r) = e {
+            let peek = |x: &Expr| match x {
+                Expr::Peek(addr) => as_u16_literal(addr),
+                _ => None,
+            };
+            let times_256 = |x: &Expr| match x {
+                Expr::Bin(BinOp::Mul, a, b) if as_u16_literal(b) == Some(256) => peek(a),
+                Expr::Bin(BinOp::Mul, a, b) if as_u16_literal(a) == Some(256) => peek(b),
+                _ => None,
+            };
+            if let (Some(lo), Some(hi)) = (peek(l), times_256(r)) {
+                writeln!(self.code, "    LDY ${lo:04X}").unwrap();
+                writeln!(self.code, "    LDA ${hi:04X}").unwrap();
+                return true;
+            }
+            if let (Some(hi), Some(lo)) = (times_256(l), peek(r)) {
+                writeln!(self.code, "    LDA ${hi:04X}").unwrap();
+                writeln!(self.code, "    LDY ${lo:04X}").unwrap();
+                return true;
+            }
+        }
+        if let Expr::Bin(op @ (BinOp::Add | BinOp::Sub), l, r) = e {
+            let add = *op == BinOp::Add;
+            // ASC or LEN against a plain operand works on the byte in A.
+            let byte_side = if matches!(**l, Expr::Asc(_) | Expr::Len(_)) {
+                Some((l, r))
+            } else if add && matches!(**r, Expr::Asc(_) | Expr::Len(_)) {
+                Some((r, l))
+            } else {
+                None
+            };
+            if let Some((byte, other)) = byte_side
+                && let Some(b) = self.int16_leaf(other)
+                && self.precompute_signed_u8_hi_needed(&b).is_none()
+            {
+                if !self.emit_island_string_byte(byte) {
+                    return false;
+                }
+                writeln!(self.code, "    {}", if add { "CLC" } else { "SEC" }).unwrap();
+                self.emit_int16_op_byte(&b, false, add);
+                writeln!(self.code, "    TAY").unwrap();
+                writeln!(self.code, "    LDA #$00").unwrap();
+                self.emit_int16_op_byte(&b, true, add);
+                return true;
+            }
+            let Some(a) = self.try_emit_int16_eval_addsub(l, None) else {
+                return false;
+            };
+            let Some(b) = self.try_emit_int16_eval_addsub(r, None) else {
+                return false;
+            };
+            self.emit_int16_addsub_to_bytes(add, &a, &b, None, None);
+            self.release_int16_operand(b);
+            self.release_int16_operand(a);
+            return true;
+        }
+        let Some(op) = self.try_emit_int16_eval_addsub(e, None) else {
+            return false;
+        };
+        self.emit_int16_load_byte(&op, false);
+        writeln!(self.code, "    TAY").unwrap();
+        self.emit_int16_load_byte(&op, true);
+        self.release_int16_operand(op);
+        true
+    }
+
+    /// ASC or LEN into A. The string code is ordinary codegen, outside the island's FAC mode.
+    fn emit_island_string_byte(&mut self, e: &Expr) -> bool {
+        let outer = std::mem::replace(&mut self.island_for_fac, false);
+        let done = matches!(self.try_emit_byte_no_fac(e), Ok(true));
+        self.island_for_fac = outer;
+        done
+    }
+
+    /// Integer expressions evaluated modulo 65536 without LINNUM or a scratch pointer.
+    fn int_island_ring_tree(&self, e: &Expr) -> bool {
+        let exact = self
+            .current_expr_int_range(e)
+            .is_some_and(|r| r.min > -(1 << 23) && r.max < (1 << 23));
+        exact
+            && match e {
+                Expr::Number(_) => as_u16_literal(e).is_some() || self.int16_leaf(e).is_some(),
+                Expr::Var(_) => self.int16_leaf(e).is_some() && self.is_int_island_addsub_only(e),
+                Expr::Peek(addr) => as_u16_literal(addr).is_some(),
+                Expr::Asc(_) | Expr::Len(_) => true,
+                Expr::Neg(inner) => self.int_island_ring_tree(inner),
+                Expr::Bin(BinOp::Add | BinOp::Sub, l, r) => {
+                    self.int_island_ring_tree(l) && self.int_island_ring_tree(r)
+                }
+                Expr::Bin(BinOp::Mul, l, r) => {
+                    let by_const = |c: &Expr| {
+                        mul_pot_exponent(c).is_some() || mul_small_const_plan(c).is_some()
+                    };
+                    (by_const(r) && self.int_island_ring_tree(l))
+                        || (by_const(l) && self.int_island_ring_tree(r))
+                }
+                _ => false,
+            }
+    }
+
     /// Predicate: the expression is in the integer island and uses
     /// only operators that we can lower with native 6502 ADC/SBC
     /// (i.e. `+`, `-`, plus `*` by a power-of-two constant which
@@ -19787,6 +22832,7 @@ __READ_TAGGED_WORD:
             Expr::Var(v) => {
                 (v.kind == VarKind::Integer && v.base != "TI" && v.base != "ST")
                     || self.shadow_int_label(v).is_some()
+                    || self.cs_active_label(v).is_some()
                     // Active int-FOR counter: the FI_<n> slot
                     // mirrors V_var byte-for-byte through the body,
                     // so the var is a valid int leaf for the
@@ -19798,6 +22844,7 @@ __READ_TAGGED_WORD:
                     || self.int_for_counter_label(v).is_some()
                     || (self.u8_for_counter_label(v).is_some()
                         && (self.profile == Profile::Speed
+                            || self.index_context.get()
                             || self.u8_for_counter_int_routable(v)))
             }
             Expr::Neg(inner) => match inner.as_ref() {
@@ -20168,6 +23215,24 @@ __READ_TAGGED_WORD:
         // Leaf — return without emitting code; caller will load it.
         if let Some(op) = self.int16_leaf(e) {
             return Some(op);
+        }
+        if self.island_for_fac
+            && let Some(v) = as_u16_literal(e)
+        {
+            return Some(Int16Operand::Imm(v as i16));
+        }
+        if self.island_for_fac && matches!(e, Expr::Asc(_) | Expr::Len(_)) {
+            if !self.emit_island_string_byte(e) {
+                return None;
+            }
+            let dest = match final_dest {
+                Some(fd) => fd.to_string(),
+                None => self.alloc_temp(),
+            };
+            writeln!(self.code, "    STA {dest}").unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA {dest}+1").unwrap();
+            return Some(Int16Operand::Mem(dest));
         }
         // Integer-array element read: compute the address, then load both bytes via (zp),Y into
         // the destination slot.
@@ -20661,10 +23726,12 @@ __READ_TAGGED_WORD:
     /// Multi-dim int-island array index.
     fn try_emit_int16_md_index_to_linnum(
         &mut self,
+        name: &VarName,
         indices: &[Expr],
         dims: &[u16],
         bounds: &[u16],
     ) -> Result<bool, CodegenError> {
+        let _ctx = self.enter_index_context();
         if indices.len() != dims.len() || indices.len() < 2 {
             return Ok(false);
         }
@@ -20725,7 +23792,7 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    STA ${:02X}", rt::LINNUM_LO).unwrap();
             self.emit_int16_load_byte(&ops[k], true);
             writeln!(self.code, "    STA ${:02X}", rt::LINNUM_HI).unwrap();
-            self.emit_bounds_check(bounds[k]);
+            self.emit_array_bounds_check(name, dims, k, bounds[k]);
         }
         // Compute the linear index in LINNUM. acc starts as i0.
         self.emit_int16_load_byte(&ops[0], false);
@@ -20789,6 +23856,7 @@ __READ_TAGGED_WORD:
     /// Evaluate subscripts in FAC and compute their row-major index with integer arithmetic.
     fn try_emit_md_index_hybrid(
         &mut self,
+        name: &VarName,
         indices: &[Expr],
         dims: &[u16],
         bounds: &[u16],
@@ -20811,7 +23879,7 @@ __READ_TAGGED_WORD:
 
             self.emit_md_subscript_to_linnum(index, k > 0)?;
             if !self.index_provably_in_bounds(index, bounds[k]) {
-                self.emit_bounds_check(bounds[k]);
+                self.emit_array_bounds_check(name, dims, k, bounds[k]);
             }
             if k == 0 {
                 writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
@@ -20854,6 +23922,7 @@ __READ_TAGGED_WORD:
     /// 6-12 bytes per array access for any 1D index that's an
     /// int-typed leaf or add/sub tree. Returns true on success.
     fn try_emit_int16_index_to_linnum(&mut self, e: &Expr) -> bool {
+        let _ctx = self.enter_index_context();
         // Keep this path to add/sub trees. Direct u8-FOR routing
         // can bloat repeated array sites after other peephole passes.
         if !self.is_int_island_addsub_only(e) {
@@ -21128,7 +24197,7 @@ __READ_TAGGED_WORD:
                 if let Some(label) = self.shadow_int_label(v) {
                     return Some(Int16Operand::Mem(label.to_string()));
                 }
-                None
+                self.cs_active_label(v).map(Int16Operand::Mem)
             }
             Expr::Neg(inner) => {
                 if let Expr::Number(n) = inner.as_ref() {
@@ -21288,6 +24357,13 @@ __READ_TAGGED_WORD:
     /// of `Var(loop_var)` MUST source from the counter slot instead.
     /// Returns None when V_var is the source of truth (no active
     /// loop, or sync wasn't elided).
+    /// Whether the float variable slot holds the current value.
+    fn float_slot_is_current(&self, v: &VarName) -> bool {
+        is_direct_float_var(v)
+            && self.for_counter_label_when_v_var_stale(v).is_none()
+            && self.u16_counter_when_v_var_stale(v).is_none()
+    }
+
     fn for_counter_label_when_v_var_stale(&self, var: &VarName) -> Option<Int16Operand> {
 
         let var_label = var.label();
@@ -21394,6 +24470,57 @@ __READ_TAGGED_WORD:
     }
 
     /// Increment or decrement an integer variable with an AYINT overflow check.
+    /// Add or subtract 16-bit operands and trap on signed overflow.
+    fn try_emit_int16_addsub_let_trapping(&mut self, value: &Expr, dest: &str) -> bool {
+        let Expr::Bin(op @ (BinOp::Add | BinOp::Sub), a, b) = value else {
+            return false;
+        };
+        // Store the sum before the overflow check terminates an invalid assignment.
+        if self.used_error_continuation {
+            return false;
+        }
+        // An unsigned shadow holds 32768..=65535 too, which a signed add would misread.
+        if self.expr_reads_unsigned_shadow(a) || self.expr_reads_unsigned_shadow(b) {
+            return false;
+        }
+        let (Some(a_op), Some(b_op)) = (self.int16_leaf(a), self.int16_leaf(b)) else {
+            return false;
+        };
+        let ok = format!("__ADD_OK_{}", self.fresh_id());
+        self.used_illegal_qty = true;
+        self.emit_int16_addsub(*op == BinOp::Add, &a_op, &b_op, dest);
+        writeln!(self.code, "    BVC {ok}").unwrap();
+        writeln!(self.code, "    JMP __ILLEGAL_QTY").unwrap();
+        writeln!(self.code, "{ok}:").unwrap();
+        true
+    }
+
+    /// Use checked 16-bit multiplication for integer assignments in the speed profile.
+    fn try_emit_int16_mul_let_trapping(&mut self, value: &Expr, dest: &str) -> bool {
+        let Expr::Bin(BinOp::Mul, a, b) = value else {
+            return false;
+        };
+        if self.used_error_continuation {
+            return false;
+        }
+        if self.expr_reads_unsigned_shadow(a) || self.expr_reads_unsigned_shadow(b) {
+            return false;
+        }
+        let (Some(a_op), Some(b_op)) = (self.int16_leaf(a), self.int16_leaf(b)) else {
+            return false;
+        };
+        self.emit_int16_load_to(&a_op, "$14");
+        self.emit_int16_load_to(&b_op, "__MUL16_B");
+        writeln!(self.code, "    JSR __MUL16C").unwrap();
+        self.used_mul16c = true;
+        self.used_illegal_qty = true;
+        writeln!(self.code, "    LDA $14").unwrap();
+        writeln!(self.code, "    STA {dest}").unwrap();
+        writeln!(self.code, "    LDA $15").unwrap();
+        writeln!(self.code, "    STA {dest}+1").unwrap();
+        true
+    }
+
     fn try_emit_int16_self_step_trapping(
         &mut self,
         var: &VarName,
@@ -21500,20 +24627,51 @@ __READ_TAGGED_WORD:
     /// `dest := A + B` (when add=true) or `dest := A - B` (when false)
     /// using a CLC/SEC + ADC/SBC pair on the byte halves.
     fn emit_int16_addsub(&mut self, add: bool, a: &Int16Operand, b: &Int16Operand, dest: &str) {
-        self.emit_int16_addsub_to_bytes(add, a, b, dest, &format!("{dest}+1"));
+        self.emit_int16_addsub_to_bytes(add, a, b, Some(dest), Some(&format!("{dest}+1")));
     }
 
+    /// Without destinations the low byte ends in Y and the high byte in A, as GIVAYF takes them.
     fn emit_int16_addsub_to_bytes(
         &mut self,
         add: bool,
         a: &Int16Operand,
         b: &Int16Operand,
-        dest_lo: &str,
-        dest_hi: &str,
+        dest_lo: Option<&str>,
+        dest_hi: Option<&str>,
     ) {
+        let store_lo = |code: &mut String| match dest_lo {
+            Some(d) => writeln!(code, "    STA {d}").unwrap(),
+            None => writeln!(code, "    TAY").unwrap(),
+        };
+        let store_hi = |code: &mut String| {
+            if let Some(d) = dest_hi {
+                writeln!(code, "    STA {d}").unwrap();
+            }
+        };
         // Signed-u8 storage needs an explicit sign-extended high byte.
         // The ADC/SBC high operand comes from a scratch slot so carry
         // survives from the low-byte operation.
+        // A constant whose low byte is zero only touches the high byte; an add takes it second.
+        let (a, b) = match (a, b) {
+            (Int16Operand::Imm(k), other)
+                if add && (*k as u16) & 0xFF == 0 && !matches!(other, Int16Operand::Imm(_)) =>
+            {
+                (b, a)
+            }
+            _ => (a, b),
+        };
+        if let Int16Operand::Imm(k) = b
+            && (*k as u16) & 0xFF == 0
+            && self.precompute_signed_u8_hi_needed(a).is_none()
+        {
+            self.emit_int16_load_byte(a, false);
+            store_lo(&mut self.code);
+            writeln!(self.code, "    {}", if add { "CLC" } else { "SEC" }).unwrap();
+            self.emit_int16_load_byte(a, true);
+            self.emit_int16_op_byte(b, true, add);
+            store_hi(&mut self.code);
+            return;
+        }
         let a_sxt = self.precompute_signed_u8_hi(a);
         let b_sxt = self.precompute_signed_u8_hi(b);
         if add {
@@ -21524,11 +24682,11 @@ __READ_TAGGED_WORD:
         // Lo byte
         self.emit_int16_load_byte(a, false);
         self.emit_int16_op_byte_with_sxt(b, false, add, b_sxt.as_deref());
-        writeln!(self.code, "    STA {dest_lo}").unwrap();
+        store_lo(&mut self.code);
         // Hi byte (carry chains automatically)
         self.emit_int16_load_byte_with_sxt(a, true, a_sxt.as_deref());
         self.emit_int16_op_byte_with_sxt(b, true, add, b_sxt.as_deref());
-        writeln!(self.code, "    STA {dest_hi}").unwrap();
+        store_hi(&mut self.code);
     }
 
     /// When `op` is a signed-u8 Var operand, materialise its
@@ -21538,6 +24696,14 @@ __READ_TAGGED_WORD:
     /// operand that doesn't need the workaround (immediates, regular
     /// 2-byte vars, unsigned u8 storage, MemU8 with non-negative
     /// range guarantees).
+    /// The signed one-byte variable `op` is, when its high byte must be sign-extended.
+    fn precompute_signed_u8_hi_needed(&self, op: &Int16Operand) -> Option<VarName> {
+        let Int16Operand::Var(v) = op else {
+            return None;
+        };
+        (self.int_var_is_u8_storage(v) && self.int_var_byte_is_signed(v)).then(|| v.clone())
+    }
+
     fn precompute_signed_u8_hi(&mut self, op: &Int16Operand) -> Option<String> {
         let Int16Operand::Var(v) = op else {
             return None;
@@ -21822,7 +24988,7 @@ __READ_TAGGED_WORD:
         let skip_label = format!("__IF_END_{id}");
         if self.uses_rcomp {
             let false_label = format!("__IF_FALSE_{id}");
-            self.emit_branch_skip_on_false(cond, &false_label)?;
+            self.emit_cs_branch_skip_on_false(cond, &false_label)?;
             writeln!(self.code, "    LDA #$FF").unwrap();
             writeln!(self.code, "    STA __LAST_IF").unwrap();
             self.invalidate_fac_cache();
@@ -21834,7 +25000,7 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "{skip_label}:").unwrap();
             return Ok(());
         }
-        self.emit_branch_skip_on_false(cond, &skip_label)?;
+        self.emit_cs_branch_skip_on_false(cond, &skip_label)?;
         self.invalidate_fac_cache();
         self.emit_then_body(then, line_no, &skip_label)?;
         writeln!(self.code, "{skip_label}:").unwrap();
@@ -21864,7 +25030,7 @@ __READ_TAGGED_WORD:
             }
             return Ok(());
         }
-        self.emit_branch_skip_on_false(cond, &else_label)?;
+        self.emit_cs_branch_skip_on_false(cond, &else_label)?;
         if self.uses_rcomp {
             writeln!(self.code, "    LDA #$FF").unwrap();
             writeln!(self.code, "    STA __LAST_IF").unwrap();
@@ -22141,7 +25307,7 @@ __READ_TAGGED_WORD:
         }
         // Var truthiness — branch on non-zero exponent.
         if let Expr::Var(v) = cond {
-            if is_direct_float_var(v) {
+            if self.float_slot_is_current(v) {
                 let label = self.intern_var(v.clone());
                 writeln!(self.code, "    LDA {label}").unwrap();
                 writeln!(self.code, "    BNE {take_label}").unwrap();
@@ -22178,6 +25344,9 @@ __READ_TAGGED_WORD:
     }
 
     fn skippable_value(&self, e: &Expr) -> bool {
+        if self.unchecked {
+            return crate::passes::expr_effect_free(e);
+        }
         match e {
             Expr::ArrayRef(name, indices) => self.static_array_read_cannot_trap(name, indices),
             // FCOMP yields -1/0 and cannot overflow.
@@ -22329,7 +25498,7 @@ __READ_TAGGED_WORD:
         }
         // Truthiness on a float var: just read the exponent byte.
         if let Expr::Var(v) = cond {
-            if is_direct_float_var(v) {
+            if self.float_slot_is_current(v) {
                 let label = self.intern_var(v.clone());
                 writeln!(self.code, "    LDA {label}").unwrap();
                 writeln!(self.code, "    BEQ {skip_label}").unwrap();
@@ -22986,15 +26155,15 @@ __READ_TAGGED_WORD:
         }
         // Float scalar: needs an i16 alias slot we can read the
         // low byte from. Shadow-int / int-FOR / u8-FOR counters
-        // all qualify.
-        if let Some(label) = self.shadow_int_label(v) {
-            return Some(label.to_string());
-        }
+        // qualify; the active loop counter holds the current value.
         if let Some(label) = self.int_for_counter_label(v) {
             return Some(label);
         }
         if let Some(label) = self.u8_for_counter_label(v) {
             return Some(label);
+        }
+        if let Some(label) = self.shadow_int_label(v) {
+            return Some(label.to_string());
         }
         None
     }
@@ -23286,7 +26455,7 @@ __READ_TAGGED_WORD:
     fn expr_reads_unsigned_shadow(&self, e: &Expr) -> bool {
         // Cheap bail-out: the overwhelming majority of programs have no unsigned shadows at
         // all.
-        if self.shadow_unsigned.is_empty() {
+        if self.shadow_unsigned.is_empty() && self.cs_active.is_empty() {
             return false;
         }
         match e {
@@ -23330,13 +26499,35 @@ __READ_TAGGED_WORD:
         ) {
             return Ok(false);
         }
-        if let Some((zero_op, var)) = float_zero_compare_var(*op, lhs, rhs) {
-            self.emit_if_float_zero_compare(zero_op, &var, skip_label);
+        if let Some((zero_op, var)) = float_zero_compare_var(*op, lhs, rhs)
+            && self.float_slot_is_current(&var)
+        {
+            let label = self.intern_var(var);
+            self.emit_if_float_zero_compare(zero_op, &label, &format!("{label}+1"), skip_label);
             return Ok(true);
         }
         // Mirror emit_if's heap-wrap discipline: the eval of either
         // operand may allocate transient strings (e.g. `LEN(A$+B$)`).
         let wrap = self.heap_init_needed && expr_uses_heap(cond);
+        // Round the left operand and compare FAC with zero through its sign and exponent.
+        if !wrap
+            && let Some((zero_op, expr, left)) = float_zero_compare_expr(*op, lhs, rhs)
+        {
+            self.emit_expr_to_fac(expr)?;
+            if left && !self.unchecked && !self.fac_rounding_clear() {
+                writeln!(self.code, "    JSR ${:04X}", rt::ROUND).unwrap();
+            }
+            if self.fast_float_code() || matches!(zero_op, BinOp::Eq | BinOp::Ne) {
+                let (exp, sign) = (format!("${:02X}", rt::FAC_EXP), format!("${:02X}", rt::FAC_SIGN));
+                self.emit_if_float_zero_compare(zero_op, &exp, &sign, skip_label);
+            } else {
+                // SIGN leaves A and the flags as FCOMP of FAC with 0 does.
+                writeln!(self.code, "    JSR ${:04X}", rt::SIGN).unwrap();
+                self.emit_fcomp_skip_branch(swap_compare_op(zero_op), skip_label);
+            }
+            self.invalidate_fac_cache();
+            return Ok(true);
+        }
         if wrap {
             writeln!(self.code, "    JSR __HEAP_BEGIN_STMT").unwrap();
             self.invalidate_fac_cache();
@@ -23350,6 +26541,12 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    PLP").unwrap();
             self.invalidate_fac_cache();
         }
+        self.emit_fcomp_skip_branch(*op, skip_label);
+        Ok(true)
+    }
+
+    /// Skip unless `lhs op rhs`, given FCOMP's sign of rhs - lhs in A and the flags.
+    fn emit_fcomp_skip_branch(&mut self, op: BinOp, skip_label: &str) {
         match op {
             BinOp::Eq => writeln!(self.code, "    BNE {skip_label}").unwrap(),
             BinOp::Ne => writeln!(self.code, "    BEQ {skip_label}").unwrap(),
@@ -23365,11 +26562,10 @@ __READ_TAGGED_WORD:
             }
             _ => unreachable!(),
         }
-        Ok(true)
     }
 
-    fn emit_if_float_zero_compare(&mut self, op: BinOp, var: &VarName, skip_label: &str) {
-        let label = self.intern_var(var.clone());
+    /// Branch on a float's exponent byte (zero means 0) and sign byte.
+    fn emit_if_float_zero_compare(&mut self, op: BinOp, label: &str, sign: &str, skip_label: &str) {
         match op {
             BinOp::Eq => {
                 writeln!(self.code, "    LDA {label}").unwrap();
@@ -23382,20 +26578,20 @@ __READ_TAGGED_WORD:
             BinOp::Lt => {
                 writeln!(self.code, "    LDA {label}").unwrap();
                 writeln!(self.code, "    BEQ {skip_label}").unwrap();
-                writeln!(self.code, "    LDA {label}+1").unwrap();
+                writeln!(self.code, "    LDA {sign}").unwrap();
                 writeln!(self.code, "    BPL {skip_label}").unwrap();
             }
             BinOp::Gt => {
                 writeln!(self.code, "    LDA {label}").unwrap();
                 writeln!(self.code, "    BEQ {skip_label}").unwrap();
-                writeln!(self.code, "    LDA {label}+1").unwrap();
+                writeln!(self.code, "    LDA {sign}").unwrap();
                 writeln!(self.code, "    BMI {skip_label}").unwrap();
             }
             BinOp::Le => {
                 let keep = format!("__IF_FZERO_KEEP_{}", self.fresh_id());
                 writeln!(self.code, "    LDA {label}").unwrap();
                 writeln!(self.code, "    BEQ {keep}").unwrap();
-                writeln!(self.code, "    LDA {label}+1").unwrap();
+                writeln!(self.code, "    LDA {sign}").unwrap();
                 writeln!(self.code, "    BPL {skip_label}").unwrap();
                 writeln!(self.code, "{keep}:").unwrap();
             }
@@ -23403,7 +26599,7 @@ __READ_TAGGED_WORD:
                 let keep = format!("__IF_FZERO_KEEP_{}", self.fresh_id());
                 writeln!(self.code, "    LDA {label}").unwrap();
                 writeln!(self.code, "    BEQ {keep}").unwrap();
-                writeln!(self.code, "    LDA {label}+1").unwrap();
+                writeln!(self.code, "    LDA {sign}").unwrap();
                 writeln!(self.code, "    BMI {skip_label}").unwrap();
                 writeln!(self.code, "{keep}:").unwrap();
             }
@@ -23421,6 +26617,7 @@ __READ_TAGGED_WORD:
         body_reads_loop_var: bool,
         induction_const: Option<f64>,
         array_inductions: &[ArrayInduction],
+        allow_u16: bool,
     ) -> Result<(), CodegenError> {
 
         debug_assert!(
@@ -23484,6 +26681,7 @@ __READ_TAGGED_WORD:
                                 induction_const,
                                 start,
                                 array_inductions,
+                                None,
                             );
                         }
                     } else if let Some(range) = self.current_for_expr_int_range(end)
@@ -23549,6 +26747,7 @@ __READ_TAGGED_WORD:
                             induction_const,
                             start,
                             array_inductions,
+                            None,
                         );
                     }
                 }
@@ -23601,6 +26800,7 @@ __READ_TAGGED_WORD:
                         induction_const,
                         start,
                         array_inductions,
+                        None,
                     );
                 }
             } else if step_const.is_none()
@@ -23669,9 +26869,38 @@ __READ_TAGGED_WORD:
                         induction_const,
                         start,
                         array_inductions,
+                        None,
                     );
                 }
             }
+        }
+
+        if allow_u16
+            && body_int_safe
+            && is_direct_float_var(var)
+            && (self.shadow_int_label(var).is_none() || self.shadow_is_unsigned(var))
+            && !for_bounds_read_loop_var(var, end, step)
+            && let Some((_, hi)) = crate::passes::u16_for_counter_range(start, end, step)
+            && let (Some(s), Some(e), Some(st)) = (
+                as_u16_literal(start),
+                as_u16_literal(end),
+                step_const.and_then(f64_to_i16_literal),
+            )
+        {
+            return self.emit_for_int(
+                var,
+                IntForStart::Literal(s as i16),
+                IntForEnd::Literal(e as i16),
+                st,
+                None,
+                top_label,
+                exit_label,
+                body_reads_loop_var,
+                None,
+                start,
+                &[],
+                Some(hi),
+            );
         }
 
         // Fallback: float counter via FAC math.
@@ -23746,6 +26975,9 @@ __READ_TAGGED_WORD:
         self.for_stack.push(ForFrame::Float(FloatForFrame {
             var: var.clone(),
             end_slot_label,
+            end_literal: as_i16_literal(end)
+                .map(i32::from)
+                .or_else(|| as_u16_literal(end).map(i32::from)),
             step_loc,
             top_label,
             exit_label,
@@ -23987,6 +27219,7 @@ __READ_TAGGED_WORD:
                 ForFrame::Int(f) => (&f.var, &f.array_pointers),
                 ForFrame::U8(f) => (&f.var, &f.array_pointers),
                 ForFrame::Float(f) => (&f.var, &f.array_pointers),
+                ForFrame::U16(f, _) => (&f.var, &f.array_pointers),
             };
             for ap in frame_aps.iter().filter(|a| &a.array_name == name) {
                 if ap.indices.len() != indices.len() {
@@ -24042,6 +27275,7 @@ __READ_TAGGED_WORD:
                 ForFrame::Int(f) => (&f.var, &f.induction),
                 ForFrame::U8(f) => (&f.var, &f.induction),
                 ForFrame::Float(f) => (&f.var, &f.induction),
+                ForFrame::U16(f, _) => (&f.var, &f.induction),
             };
             if frame_var == var {
                 return induction
@@ -24070,6 +27304,7 @@ __READ_TAGGED_WORD:
         induction_const: Option<f64>,
         start_expr: &Expr,
         array_inductions: &[ArrayInduction],
+        unsigned_hi: Option<u16>,
     ) -> Result<(), CodegenError> {
         // Force the variable into the symbol table early so its slot is allocated.
         let var_label = self.intern_var(var.clone());
@@ -24097,9 +27332,12 @@ __READ_TAGGED_WORD:
             }
             IntForStart::Dynamic => self.emit_int_for_bound_to_slot(start_expr, &counter_label)?,
         }
-        // Deposit the start value into the variable's own storage UNCONDITIONALLY, even when
-        // the body never reads it.
-        self.emit_int_counter_to_var(&counter_label, var);
+        // Store the counter start unless a straight loop body guarantees the exit store.
+        if self.for_header_store_is_dead(body_reads_loop_var) {
+            self.emit_shadow_from_int_counter(&counter_label, var);
+        } else {
+            self.emit_for_counter_sync(&counter_label, var, unsigned_hi.is_some());
+        }
         // Induction and running-array-pointer slots need a known start
         // offset and a literal stride; a dynamic start or dynamic step
         // has neither, so skip both (the detection pass only proposes
@@ -24126,7 +27364,7 @@ __READ_TAGGED_WORD:
         // For the index_provably_in_bounds shortcut we still want a
         // representative end-value for the literal path. Dynamic
         // slots give up that proof.
-        self.for_stack.push(ForFrame::Int(IntForFrame {
+        let frame = IntForFrame {
             var: var.clone(),
             counter_label,
             start_value,
@@ -24139,7 +27377,11 @@ __READ_TAGGED_WORD:
             body_reads_loop_var,
             array_pointers,
             induction,
-        }));
+        };
+        self.for_stack.push(match unsigned_hi {
+            Some(hi) => ForFrame::U16(frame, hi),
+            None => ForFrame::Int(frame),
+        });
         Ok(())
     }
 
@@ -24174,7 +27416,13 @@ __READ_TAGGED_WORD:
         writeln!(self.code, "    LDA #${:02X}", start).unwrap();
         writeln!(self.code, "    STA {counter_label}").unwrap();
 
-        self.emit_u8_counter_to_var(&counter_label, var);
+        if self.for_header_store_is_dead(body_reads_loop_var) {
+            if counter_label != self.intern_var(var.clone()) {
+                self.emit_shadow_from_u8_counter(&counter_label, var);
+            }
+        } else {
+            self.emit_u8_counter_to_var(&counter_label, var);
+        }
         let induction = self.emit_induction_init(induction_const, start_expr);
         let array_pointers = self.emit_array_pointers_init(start as i32, array_inductions);
         writeln!(self.code, "{top_label}:").unwrap();
@@ -24234,6 +27482,8 @@ __READ_TAGGED_WORD:
                 writeln!(self.code, "    LDA #${:02X}", (u >> 8) & 0xFF).unwrap();
                 writeln!(self.code, "    STA {var_label}+1").unwrap();
             }
+        } else if self.fast_float_code() {
+            self.emit_float_const_store(f64::from(value), &var_label);
         } else {
             writeln!(self.code, "    LDA #${:02X}", (u >> 8) & 0xFF).unwrap();
             writeln!(self.code, "    LDY #${:02X}", u & 0xFF).unwrap();
@@ -24403,6 +27653,22 @@ __READ_TAGGED_WORD:
     /// MOVMF (int → FAC → 5-byte MFLPT); for integer-kind vars the
     /// counter and the variable slot have the same shape, so we just
     /// copy the two bytes directly.
+    fn emit_for_counter_sync(&mut self, counter_label: &str, var: &VarName, unsigned: bool) {
+        if !unsigned {
+            self.emit_int_counter_to_var(counter_label, var);
+            return;
+        }
+        let var_label = self.intern_var(var.clone());
+        writeln!(self.code, "    LDA {counter_label}+1").unwrap();
+        writeln!(self.code, "    LDY {counter_label}").unwrap();
+        writeln!(self.code, "    JSR __GIVAYF_U16").unwrap();
+        self.used_givayf_u16 = true;
+        writeln!(self.code, "    LDX #<{var_label}").unwrap();
+        writeln!(self.code, "    LDY #>{var_label}").unwrap();
+        writeln!(self.code, "    JSR ${:04X}", rt::MOVMF).unwrap();
+        self.emit_shadow_from_int_counter(counter_label, var);
+    }
+
     fn emit_int_counter_to_var(&mut self, counter_label: &str, var: &VarName) {
         let var_label = self.intern_var(var.clone());
         // Aliased counter: nothing to copy, the slots are the same.
@@ -24554,7 +27820,8 @@ __READ_TAGGED_WORD:
                             self.runtime_for_top_labels.contains(frame.top_label());
                         match frame {
                             ForFrame::Float(f) => self.emit_next_float(f),
-                            ForFrame::Int(f) => self.emit_next_int(f),
+                            ForFrame::Int(f) => self.emit_next_int(f, false),
+                            ForFrame::U16(f, _) => self.emit_next_int(f, true),
                             ForFrame::U8(f) => self.emit_next_u8(f),
                         }
 
@@ -24592,11 +27859,14 @@ __READ_TAGGED_WORD:
                     frame
                 };
                 self.emitted_for_exits.insert(frame.exit_label().to_string());
+                let top = frame.top_label().to_string();
                 match frame {
                     ForFrame::Float(f) => self.emit_next_float(f),
-                    ForFrame::Int(f) => self.emit_next_int(f),
+                    ForFrame::Int(f) => self.emit_next_int(f, false),
+                    ForFrame::U16(f, _) => self.emit_next_int(f, true),
                     ForFrame::U8(f) => self.emit_next_u8(f),
                 }
+                self.end_wide_sums(&top);
                 // The FOR pushed onto the runtime stack at its header; the loop-exit path pops
                 // it back.
                 self.emit_for_stack_drop(usize::from(pops_runtime_stack));
@@ -24622,6 +27892,9 @@ __READ_TAGGED_WORD:
     }
 
     fn emit_next_float(&mut self, frame: FloatForFrame) {
+        if self.try_emit_next_float_on_shadow(&frame) {
+            return;
+        }
         let var_label = self.intern_var(frame.var.clone());
         let integer_counter = frame.var.kind == VarKind::Integer;
         let (step_addr_label, step_const_value) = match &frame.step_loc {
@@ -24753,6 +28026,96 @@ __READ_TAGGED_WORD:
         writeln!(self.code, "{}:", frame.exit_label).unwrap();
     }
 
+    /// Step a float counter through its integer copy when the stepped range fits.
+    fn try_emit_next_float_on_shadow(&mut self, frame: &FloatForFrame) -> bool {
+        let StepLoc::Const { value: step, .. } = frame.step_loc else {
+            return false;
+        };
+        let (Some(end), Some(step)) = (frame.end_literal, f64_to_i16_literal(step)) else {
+            return false;
+        };
+        let Some(shadow) = self.shadow_int_label(&frame.var).map(str::to_string) else {
+            return false;
+        };
+        if step == 0 || frame.induction.is_some() || frame.var.kind != VarKind::Float {
+            return false;
+        }
+        let Some(r) = self
+            .current_expr_int_range(&Expr::Var(frame.var.clone()))
+            .or_else(|| {
+                let bounds = &self.analysis.numeric_facts.shadow_value_bounds;
+                bounds.get(&frame.var).copied()
+            })
+        else {
+            return false;
+        };
+        let unsigned = self.shadow_is_unsigned(&frame.var);
+        let (lo, hi) = if unsigned {
+            (0, 0xFFFF)
+        } else {
+            (-0x8000, 0x7FFF)
+        };
+        let step = i32::from(step);
+        // The shadow holds the current value, so only the side the step moves towards can leave it.
+        let stepped_fits = if step > 0 {
+            r.max + step <= hi
+        } else {
+            r.min + step >= lo
+        };
+        if !stepped_fits || !(lo..=hi).contains(&end) {
+            return false;
+        }
+        if step == 1 {
+            let skip = format!("__FOR_INC_NC_{}", self.fresh_id());
+            writeln!(self.code, "    INC {shadow}").unwrap();
+            writeln!(self.code, "    BNE {skip}").unwrap();
+            writeln!(self.code, "    INC {shadow}+1").unwrap();
+            writeln!(self.code, "{skip}:").unwrap();
+        } else {
+            let k = step as u16;
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    LDA {shadow}").unwrap();
+            writeln!(self.code, "    ADC #${:02X}", k & 0xFF).unwrap();
+            writeln!(self.code, "    STA {shadow}").unwrap();
+            writeln!(self.code, "    LDA {shadow}+1").unwrap();
+            writeln!(self.code, "    ADC #${:02X}", k >> 8).unwrap();
+            writeln!(self.code, "    STA {shadow}+1").unwrap();
+        }
+        let var_label = self.intern_var(frame.var.clone());
+        self.emit_shadow_to_float_var(&shadow, &frame.var, &var_label);
+        // Past the end: end - counter < 0 for a positive step, counter - end < 0 otherwise.
+        let e = end as u16;
+        if step > 0 {
+            writeln!(self.code, "    LDA #${:02X}", e & 0xFF).unwrap();
+            writeln!(self.code, "    CMP {shadow}").unwrap();
+            writeln!(self.code, "    LDA #${:02X}", e >> 8).unwrap();
+            writeln!(self.code, "    SBC {shadow}+1").unwrap();
+        } else {
+            writeln!(self.code, "    LDA {shadow}").unwrap();
+            writeln!(self.code, "    CMP #${:02X}", e & 0xFF).unwrap();
+            writeln!(self.code, "    LDA {shadow}+1").unwrap();
+            writeln!(self.code, "    SBC #${:02X}", e >> 8).unwrap();
+        }
+        if unsigned {
+            writeln!(self.code, "    BCC {}", frame.exit_label).unwrap();
+        } else {
+            let id = self.fresh_id();
+            writeln!(self.code, "    BVC __FOR_SGN_{id}").unwrap();
+            writeln!(self.code, "    EOR #$80").unwrap();
+            writeln!(self.code, "__FOR_SGN_{id}:").unwrap();
+            writeln!(self.code, "    BMI {}", frame.exit_label).unwrap();
+        }
+        self.invalidate_fac_cache();
+        let cont_label = format!(
+            "__FOR_CONT_{}",
+            frame.exit_label.trim_start_matches("__FOR_EXIT_")
+        );
+        writeln!(self.code, "{cont_label}:").unwrap();
+        writeln!(self.code, "    JMP {}", frame.top_label).unwrap();
+        writeln!(self.code, "{}:", frame.exit_label).unwrap();
+        true
+    }
+
     /// Whether literal bounds keep the integer counter within 0..=32767.
     fn int_for_counter_stays_non_negative(&self, frame: &IntForFrame) -> bool {
         let IntForEnd::Literal(end) = frame.end else {
@@ -24775,7 +28138,7 @@ __READ_TAGGED_WORD:
         lo >= 0 && hi <= 0x7FFF
     }
 
-    fn emit_next_int(&mut self, frame: IntForFrame) {
+    fn emit_next_int(&mut self, frame: IntForFrame, unsigned: bool) {
         let counter = frame.counter_label.clone();
         let step = frame.step_value as u16;
         let exit = frame.exit_label.clone();
@@ -24796,7 +28159,7 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    ADC {step_label}+1").unwrap();
             writeln!(self.code, "    STA {counter}+1").unwrap();
             if frame.body_reads_loop_var {
-                self.emit_int_counter_to_var(&counter, &frame.var);
+                self.emit_for_counter_sync(&counter, &frame.var, unsigned);
             }
             // diff = counter - end (signed, overflow-corrected high in A).
             writeln!(self.code, "    SEC").unwrap();
@@ -24830,7 +28193,7 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    JMP {top}").unwrap();
             writeln!(self.code, "{exit}:").unwrap();
             if !frame.body_reads_loop_var {
-                self.emit_int_counter_to_var(&counter, &frame.var);
+                self.emit_int_for_exit_store(&frame, unsigned);
             }
             return;
         }
@@ -24872,7 +28235,7 @@ __READ_TAGGED_WORD:
         // unconditional sync at the exit label below handles the
         // post-loop case.
         if frame.body_reads_loop_var {
-            self.emit_int_counter_to_var(&counter, &frame.var);
+            self.emit_for_counter_sync(&counter, &frame.var, unsigned);
         }
         // Advance the strength-reduced `var * K` slot in lockstep
         // with the counter. step is always a literal i16 here.
@@ -24885,6 +28248,33 @@ __READ_TAGGED_WORD:
             let aps = frame.array_pointers.clone();
             self.emit_array_pointers_update(&aps, frame.step_value);
         }
+        // Compare literal unit-step counters with the exit value, low byte first.
+        if self.profile == Profile::Speed
+            && !unsigned
+            && !frame.dynamic_start
+            && let IntForEnd::Literal(end) = frame.end
+            && let Some(stop) = match frame.step_value {
+                1 if frame.start_value <= end => end.checked_add(1),
+                -1 if frame.start_value >= end => end.checked_sub(1),
+                _ => None,
+            }
+        {
+            let cont = format!("__FOR_CONT_{id}");
+            let stop = stop as u16;
+            writeln!(self.code, "    LDA {counter}").unwrap();
+            writeln!(self.code, "    CMP #${:02X}", stop & 0xFF).unwrap();
+            writeln!(self.code, "    BNE {cont}").unwrap();
+            writeln!(self.code, "    LDA {counter}+1").unwrap();
+            writeln!(self.code, "    CMP #${:02X}", stop >> 8).unwrap();
+            writeln!(self.code, "    BEQ {exit}").unwrap();
+            writeln!(self.code, "{cont}:").unwrap();
+            writeln!(self.code, "    JMP {top}").unwrap();
+            writeln!(self.code, "{exit}:").unwrap();
+            if !frame.body_reads_loop_var {
+                self.emit_int_for_exit_store(&frame, unsigned);
+            }
+            return;
+        }
         // Order the signed comparison by the step direction.
         let end_byte = |hi: bool| match &frame.end {
             IntForEnd::Literal(e) => {
@@ -24893,13 +28283,13 @@ __READ_TAGGED_WORD:
             IntForEnd::Slot(label) if hi => format!("{label}+1"),
             IntForEnd::Slot(label) => label.clone(),
         };
-        if frame.step_value < 0 && matches!(frame.end, IntForEnd::Literal(0)) {
+        if !unsigned && frame.step_value < 0 && matches!(frame.end, IntForEnd::Literal(0)) {
             writeln!(self.code, "    LDA {counter}+1").unwrap();
             writeln!(self.code, "    BMI {exit}").unwrap();
             writeln!(self.code, "    JMP {top}").unwrap();
             writeln!(self.code, "{exit}:").unwrap();
             if !frame.body_reads_loop_var {
-                self.emit_int_counter_to_var(&counter, &frame.var);
+                self.emit_int_for_exit_store(&frame, unsigned);
             }
             return;
         }
@@ -24912,7 +28302,7 @@ __READ_TAGGED_WORD:
         writeln!(self.code, "    CMP {subtrahend_lo}").unwrap();
         writeln!(self.code, "    LDA {minuend_hi}").unwrap();
         writeln!(self.code, "    SBC {subtrahend_hi}").unwrap();
-        if self.int_for_counter_stays_non_negative(&frame) {
+        if unsigned || self.int_for_counter_stays_non_negative(&frame) {
             writeln!(self.code, "    BCC {exit}").unwrap();
         } else {
             writeln!(self.code, "    BVC {nv_label}").unwrap();
@@ -24927,7 +28317,39 @@ __READ_TAGGED_WORD:
         // per-iteration sync was skipped, we still need to deposit that
         // value here for any code after NEXT to read.
         if !frame.body_reads_loop_var {
-            self.emit_int_counter_to_var(&counter, &frame.var);
+            self.emit_int_for_exit_store(&frame, unsigned);
+        }
+    }
+
+    /// Store the counter at a natural loop exit, using constant bytes when known.
+    fn emit_int_for_exit_store(&mut self, frame: &IntForFrame, unsigned: bool) {
+        let known = match frame.end {
+            IntForEnd::Literal(end)
+                if self.profile == Profile::Speed
+                    && !unsigned
+                    && !frame.dynamic_start
+                    && frame.step_slot.is_none()
+                    && frame.step_value != 0
+                    && frame.var.kind == VarKind::Float =>
+            {
+                let (start, end, step) = (
+                    i32::from(frame.start_value),
+                    i32::from(end),
+                    i32::from(frame.step_value),
+                );
+                let past = if step > 0 { end < start } else { end > start };
+                let trips = if past { 1 } else { (end - start) / step + 1 };
+                i16::try_from(start + trips * step).ok()
+            }
+            _ => None,
+        };
+        let label = self.intern_var(frame.var.clone());
+        match known {
+            Some(value) if frame.counter_label != label => {
+                self.emit_float_const_store(f64::from(value), &label);
+                self.emit_shadow_from_int_counter(&frame.counter_label, &frame.var);
+            }
+            _ => self.emit_for_counter_sync(&frame.counter_label, &frame.var, unsigned),
         }
     }
 
@@ -24957,6 +28379,9 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
             return Ok(());
         }
+        if self.try_emit_int_island_to_fac(e) {
+            return Ok(());
+        }
         match e {
             Expr::Number(n) => {
                 if *n == 1.0 {
@@ -24966,7 +28391,7 @@ __READ_TAGGED_WORD:
                     writeln!(self.code, "    JSR ${:04X}", rt::MOVFM).unwrap();
                 } else if let Some((lo, hi)) = i16_split_if_integral(*n)
                     && (*n == 0.0
-                        || (self.profile != Profile::Speed
+                        || (!self.fast_float_code()
                             && !self.floats_index.contains_key(&n.to_bits())))
                 {
                     // GIVAYF wants the HIGH byte in .A and LOW in .Y —
@@ -25079,6 +28504,13 @@ __READ_TAGGED_WORD:
                     // fall back to the FAC Horner expansion — read
                     // pre-loop V_var values. Caught by edge11 nested
                     // FOR with `dim a(5,5)` strides not power of 2.)
+                    if let Some(counter) = self.u16_counter_when_v_var_stale(v) {
+                        writeln!(self.code, "    LDA {counter}+1").unwrap();
+                        writeln!(self.code, "    LDY {counter}").unwrap();
+                        writeln!(self.code, "    JSR __GIVAYF_U16").unwrap();
+                        self.used_givayf_u16 = true;
+                        return Ok(());
+                    }
                     if let Some(counter) = self.for_counter_label_when_v_var_stale(v) {
                         match counter {
                             Int16Operand::Mem(label) => {
@@ -25161,6 +28593,26 @@ __READ_TAGGED_WORD:
                 if matches!(f, Func1::Sgn) && self.try_emit_sgn_int_to_fac(arg) {
                     return Ok(());
                 }
+                if matches!(f, Func1::Rnd) && self.fast_float_code() {
+                    // A literal 0 or below seeds from the clock or itself, through the ROM.
+                    let seeds = match &**arg {
+                        Expr::Number(n) => *n <= 0.0,
+                        Expr::Neg(inner) => matches!(**inner, Expr::Number(n) if n >= 0.0),
+                        _ => false,
+                    };
+                    if !seeds {
+                        self.used_fast_rnd = true;
+                        // A positive literal only picks the seed path.
+                        if matches!(**arg, Expr::Number(n) if n > 0.0) {
+                            writeln!(self.code, "    JSR __RND_POS").unwrap();
+                        } else {
+                            self.used_fast_rnd_arg = true;
+                            self.emit_expr_to_fac(arg)?;
+                            writeln!(self.code, "    JSR __RND").unwrap();
+                        }
+                        return Ok(());
+                    }
+                }
                 self.emit_expr_to_fac(arg)?;
                 // INT(x) is identity when `x` is statically integer:
                 // the FAC value's mantissa already has zero
@@ -25222,6 +28674,10 @@ __READ_TAGGED_WORD:
                 writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
                 self.invalidate_array_addr_cache();
             }
+            Expr::Asc(s) if self.try_emit_asc_mid_to_a(s)? => {
+                writeln!(self.code, "    TAY").unwrap();
+                writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
+            }
             Expr::Asc(s) => {
                 // First char's PETSCII code.
                 self.emit_strexpr_pointer_to_ay(s)?;
@@ -25252,7 +28708,7 @@ __READ_TAGGED_WORD:
                 self.emit_strexpr_pointer_to_ay(s)?;
                 writeln!(self.code, "    STA ${:02X}", rt::STR_OP_LHS_LO).unwrap();
                 writeln!(self.code, "    STY ${:02X}", rt::STR_OP_LHS_HI).unwrap();
-                if self.read_digits || self.profile == Profile::Speed {
+                if self.read_digits || self.fast_float_code() {
                     writeln!(self.code, "    JSR __VAL_DIGITS").unwrap();
                     self.used_val_digits = true;
                 } else {
@@ -25499,7 +28955,13 @@ __READ_TAGGED_WORD:
                 self.invalidate_array_addr_cache_for_var(&info.param);
                 self.note_fac_contains_var(&info.param);
                 writeln!(self.code, "    ; inline {}", name.label()).unwrap();
-                self.emit_expr_to_fac(&info.body)?;
+                // The call site's facts describe the outer variable, not the parameter.
+                let node = self.current_stmt_node.take();
+                let path = self.current_stmt_path.take();
+                let body = self.emit_expr_to_fac(&info.body);
+                self.current_stmt_node = node;
+                self.current_stmt_path = path;
+                body?;
                 // Restore param slot — PLA preserves the FAC bytes
                 // ($61-$66) so the result is intact.
                 writeln!(self.code, "    PLA").unwrap();
@@ -25637,7 +29099,64 @@ __READ_TAGGED_WORD:
     /// Predicate: `try_emit_int16_addr_patch` will succeed for
     /// `addr`. Mirrors the three accepted shapes:
     /// i16 int-island, u16 literal, and `Number(u16) + int-island`.
+    /// Whether an address may leave 0..65535 and require a range check.
+    fn addr_range_may_leave_u16(&self, addr: &Expr) -> bool {
+        !self.unchecked
+            && self
+                .current_expr_int_range(addr)
+            .is_some_and(|r| r.min < 0 || r.max > 65535)
+    }
+
+    /// The counter slot and offset of an address `J` or `J+K` on an active unsigned FOR counter.
+    fn u16_counter_addr(&self, addr: &Expr) -> Option<(String, u16)> {
+        let (base, k) = match addr {
+            Expr::Var(v) => (v, 0.0),
+            Expr::Bin(BinOp::Add, l, r) => match (l.as_ref(), r.as_ref()) {
+                (Expr::Var(v), Expr::Number(k)) | (Expr::Number(k), Expr::Var(v)) => (v, *k),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let frame = self.for_stack.iter().rev().find(|f| f.var() == base)?;
+        let ForFrame::U16(f, hi) = frame else {
+            return None;
+        };
+        crate::passes::is_u16_counter_addr(addr, base, *hi)
+            .then(|| (f.counter_label.clone(), k as u16))
+    }
+
+    /// `J+K` with K below 256 on an unsigned counter in zero page, for `STA (FI),Y`.
+    fn u16_counter_zp_offset(&self, addr: &Expr) -> Option<(String, u8)> {
+        let (counter, k) = self.u16_counter_addr(addr)?;
+        let zp = self
+            .zp_int_for_assignments
+            .keys()
+            .any(|id| format!("FI_{id}") == counter);
+        (zp && k <= 255).then_some((counter, k as u8))
+    }
+
+    /// The counter slot of an active unsigned FOR whose variable is not kept current.
+    fn u16_counter_when_v_var_stale(&self, var: &VarName) -> Option<String> {
+        match self.for_stack.iter().rev().find(|f| f.var() == var)? {
+            ForFrame::U16(f, _) if !f.body_reads_loop_var => Some(f.counter_label.clone()),
+            _ => None,
+        }
+    }
+
+    /// Marks the lowering of an index or address until the guard drops.
+    fn enter_index_context(&self) -> IndexContextGuard {
+        let previous = self.index_context.replace(true);
+        IndexContextGuard(self.index_context.clone(), previous)
+    }
+
     fn is_addr_island(&self, addr: &Expr) -> bool {
+        let _ctx = self.enter_index_context();
+        if self.u16_counter_addr(addr).is_some() {
+            return true;
+        }
+        if self.addr_range_may_leave_u16(addr) {
+            return false;
+        }
         if self.is_int_island_addsub_only(addr) {
             return true;
         }
@@ -25646,16 +29165,55 @@ __READ_TAGGED_WORD:
         }
         if let Expr::Bin(BinOp::Add, l, r) = addr {
             let var_side = match (as_u16_literal(l), as_u16_literal(r)) {
-                (Some(_), _) => r.as_ref(),
-                (_, Some(_)) => l.as_ref(),
-                _ => return false,
+                (Some(_), _) => Some(r.as_ref()),
+                (_, Some(_)) => Some(l.as_ref()),
+                _ => None,
             };
-            return self.is_int_island_addsub_only(var_side);
+            if let Some(var_side) = var_side {
+                return self.is_int_island_addsub_only(var_side);
+            }
         }
-        false
+        crate::passes::split_u16_address(&self.fold_pinned_vars(addr))
+            .is_some_and(|(_, rest)| self.is_int_island_addsub_only(&rest))
+    }
+
+    /// Substitute float variables whose range proves one constant value.
+    fn fold_pinned_vars(&self, e: &Expr) -> Expr {
+        match e {
+            Expr::Var(v) if is_direct_float_var(v) && self.float_slot_is_current(v) => {
+                match self.current_expr_int_range(e) {
+                    Some(r) if r.min == r.max => Expr::Number(f64::from(r.min)),
+                    _ => e.clone(),
+                }
+            }
+            Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => Expr::Bin(
+                *op,
+                Box::new(self.fold_pinned_vars(l)),
+                Box::new(self.fold_pinned_vars(r)),
+            ),
+            _ => e.clone(),
+        }
     }
 
     fn try_emit_int16_addr_patch(&mut self, addr: &Expr, patch: &str) -> bool {
+        let _ctx = self.enter_index_context();
+        if let Some((counter, k)) = self.u16_counter_addr(addr) {
+            if k != 0 {
+                writeln!(self.code, "    CLC").unwrap();
+            }
+            for (byte, at) in [(k & 0xFF, ""), (k >> 8, "+1")] {
+                writeln!(self.code, "    LDA {counter}{at}").unwrap();
+                if k != 0 {
+                    writeln!(self.code, "    ADC #${byte:02X}").unwrap();
+                }
+                let at_patch = if at.is_empty() { 1 } else { 2 };
+                writeln!(self.code, "    STA {patch}+{at_patch}").unwrap();
+            }
+            return true;
+        }
+        if self.addr_range_may_leave_u16(addr) {
+            return false;
+        }
         if self.is_int_island_addsub_only(addr) {
             if let Expr::Bin(op @ (BinOp::Add | BinOp::Sub), left, right) = addr
                 && let Some(left) = self.int16_leaf(left)
@@ -25666,21 +29224,23 @@ __READ_TAGGED_WORD:
                     *op == BinOp::Add,
                     &left,
                     &right,
-                    &format!("{patch}+1"),
-                    &format!("{patch}+2"),
+                    Some(&format!("{patch}+1")),
+                    Some(&format!("{patch}+2")),
                 );
                 return true;
             }
-            // General compounds retain the established temporary route; direct leaves return without emitting and are copied here.
-            let Some(top) = self.try_emit_int16_eval_addsub(addr, None) else {
-                return false;
-            };
-            self.emit_int16_load_byte(&top, false);
-            writeln!(self.code, "    STA {patch}+1").unwrap();
-            self.emit_int16_load_byte(&top, true);
-            writeln!(self.code, "    STA {patch}+2").unwrap();
-            self.release_int16_operand(top);
-            return true;
+            // Compound values fill operand bytes directly; leaves are copied here.
+            let operand = format!("{patch}+1");
+            if let Some(top) = self.try_emit_int16_eval_addsub(addr, Some(&operand)) {
+                if top != Int16Operand::Mem(operand) {
+                    self.emit_int16_load_byte(&top, false);
+                    writeln!(self.code, "    STA {patch}+1").unwrap();
+                    self.emit_int16_load_byte(&top, true);
+                    writeln!(self.code, "    STA {patch}+2").unwrap();
+                }
+                self.release_int16_operand(top);
+                return true;
+            }
         }
         // u16 fast path: addresses past i16 range (color RAM at
         // $D800, KERNAL vectors at $E000+, etc.) commonly appear as
@@ -25689,12 +29249,13 @@ __READ_TAGGED_WORD:
         // identically for u16 ADC. Handle it by computing the
         // var-side via the int island and adding the u16 literal
         // byte-by-byte.
-        if let Expr::Bin(BinOp::Add, l, r) = addr {
-            let (lit, var_side) = match (as_u16_literal(l), as_u16_literal(r)) {
-                (Some(lit), _) => (lit, r.as_ref()),
-                (_, Some(lit)) => (lit, l.as_ref()),
-                _ => return false,
-            };
+        if let Expr::Bin(BinOp::Add, l, r) = addr
+            && let Some((lit, var_side)) = match (as_u16_literal(l), as_u16_literal(r)) {
+                (Some(lit), _) => Some((lit, r.as_ref())),
+                (_, Some(lit)) => Some((lit, l.as_ref())),
+                _ => None,
+            }
+        {
             if !self.is_int_island_addsub_only(var_side) {
                 return false;
             }
@@ -25710,6 +29271,19 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    STA {patch}+2").unwrap();
             self.release_int16_operand(top);
             return true;
+        }
+        // Split a large constant address base from the remaining terms.
+        if !matches!(addr, Expr::Bin(BinOp::Add, l, _) if matches!(l.as_ref(), Expr::Number(_)))
+            && let Some((base, rest)) =
+                crate::passes::split_u16_address(&self.fold_pinned_vars(addr))
+            && self.is_int_island_addsub_only(&rest)
+        {
+            let split = Expr::Bin(
+                BinOp::Add,
+                Box::new(Expr::Number(f64::from(base))),
+                Box::new(rest),
+            );
+            return self.try_emit_int16_addr_patch(&split, patch);
         }
         false
     }
@@ -25781,6 +29355,268 @@ __READ_TAGGED_WORD:
             .is_some_and(|n| n.is_finite() && n.fract() == 0.0 && !(0.0..=65535.0).contains(&n))
     }
 
+    /// Cache V or V+K addresses while the loop leaves the float variable unchanged.
+    fn addr_cache_id(&mut self, addr: &Expr) -> Option<usize> {
+        if self.profile != Profile::Speed {
+            return None;
+        }
+        let (v, k) = match addr {
+            Expr::Var(v) => (v, 0.0),
+            Expr::Bin(BinOp::Add, l, r) => match (l.as_ref(), r.as_ref()) {
+                (Expr::Var(v), Expr::Number(k)) | (Expr::Number(k), Expr::Var(v)) => (v, *k),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // A variable the loop changes would miss every time.
+        let kept = self
+            .current_stmt_path
+            .as_ref()
+            .is_some_and(|path| self.analysis.innermost_loop_keeps(path, v));
+        if !kept
+            || !(k.fract() == 0.0 && (0.0..=65535.0).contains(&k))
+            || !self.float_slot_is_current(v)
+            || self.omitted_float_slots.contains(v)
+            || self.shadow_int_label(v).is_some()
+        {
+            return None;
+        }
+        let key = (self.intern_var(v.clone()), k as u16);
+        Some(match self.addr_caches.iter().position(|c| *c == key) {
+            Some(id) => id,
+            None => {
+                self.addr_caches.push(key);
+                self.addr_caches.len() - 1
+            }
+        })
+    }
+
+    /// Combine an invariant float base with an active integer FOR counter.
+    fn addr_counter_cache(&mut self, addr: &Expr) -> Option<(usize, String, bool)> {
+        if self.profile != Profile::Speed {
+            return None;
+        }
+        let Expr::Bin(BinOp::Add, l, r) = addr else {
+            return None;
+        };
+        let (Expr::Var(a), Expr::Var(b)) = (l.as_ref(), r.as_ref()) else {
+            return None;
+        };
+        let (v, counter, byte) = [(a, b), (b, a)].into_iter().find_map(|(v, c)| {
+            if let Some(label) = self.u8_for_counter_label(c) {
+                return Some((v, label, true));
+            }
+            let label = self.int_for_counter_label(c)?;
+            self.int_for_counter_non_negative(c)
+                .then_some((v, label, false))
+        })?;
+        let kept = self
+            .current_stmt_path
+            .as_ref()
+            .is_some_and(|path| self.analysis.innermost_loop_keeps(path, v));
+        if !kept
+            || !self.float_slot_is_current(v)
+            || self.omitted_float_slots.contains(v)
+            || self.shadow_int_label(v).is_some()
+        {
+            return None;
+        }
+        let label = self.intern_var(v.clone());
+        let id = match self.addr_int_caches.iter().position(|c| *c == label) {
+            Some(id) => id,
+            None => {
+                self.addr_int_caches.push(label);
+                self.addr_int_caches.len() - 1
+            }
+        };
+        Some((id, counter, byte))
+    }
+
+    /// Whether the active integer FOR on `var` keeps its counter at zero or above in the body.
+    fn int_for_counter_non_negative(&self, var: &VarName) -> bool {
+        for frame in self.for_stack.iter().rev() {
+            if let ForFrame::Int(f) = frame
+                && f.var == *var
+            {
+                if !f.dynamic_start
+                    && f.step_slot.is_none()
+                    && let IntForEnd::Literal(end) = f.end
+                {
+                    return f.start_value >= 0 && end >= 0;
+                }
+                return self
+                    .current_stmt_path
+                    .as_ref()
+                    .and_then(|p| self.analysis.for_expr_int_range(p, &Expr::Var(var.clone())))
+                    .is_some_and(|r| r.min >= 0);
+            }
+        }
+        false
+    }
+
+    /// Convert an address to LINNUM, reusing the cached conversion of unchanged variables.
+    fn emit_addr_to_linnum(&mut self, addr: &Expr) -> Result<(), CodegenError> {
+        // Use the cached integer base only when the base and sum fit 0..65535.
+        if let Some((id, counter, byte)) = self.addr_counter_cache(addr) {
+            let slow = format!("__ACIS_{}", self.fresh_id());
+            let done = format!("__ACID_{}", self.fresh_id());
+            writeln!(self.code, "    JSR __ACI_{id}").unwrap();
+            writeln!(self.code, "    BCS {slow}").unwrap();
+            writeln!(self.code, "    ADC {counter}").unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::LINNUM_LO).unwrap();
+            writeln!(self.code, "    TYA").unwrap();
+            if byte {
+                writeln!(self.code, "    ADC #$00").unwrap();
+            } else {
+                writeln!(self.code, "    ADC {counter}+1").unwrap();
+            }
+            writeln!(self.code, "    STA ${:02X}", rt::LINNUM_HI).unwrap();
+            writeln!(self.code, "    BCC {done}").unwrap();
+            writeln!(self.code, "{slow}:").unwrap();
+            self.emit_expr_to_fac(addr)?;
+            self.emit_facword_rom();
+            writeln!(self.code, "{done}:").unwrap();
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
+        if let Some(id) = self.addr_cache_id(addr) {
+            let done = format!("__ACD_{}", self.fresh_id());
+            writeln!(self.code, "    JSR __AC_{id}").unwrap();
+            writeln!(self.code, "    BCC {done}").unwrap();
+            self.emit_expr_to_fac(addr)?;
+            self.emit_facword_rom();
+            writeln!(self.code, "    JSR __ACS_{id}").unwrap();
+            writeln!(self.code, "{done}:").unwrap();
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
+        self.emit_expr_to_fac(addr)?;
+        self.emit_facword_rom();
+        Ok(())
+    }
+
+    /// Emit address caches keyed by the float bytes and the address offset.
+    fn emit_addr_cache_helpers(&mut self) {
+        // Return an unsigned cached integer in A/Y with carry clear, or set carry on failure.
+        for (id, var) in self.addr_int_caches.clone().into_iter().enumerate() {
+            let c = format!("__ACIC_{id}");
+            for line in [
+                format!("__ACI_{id}:"),
+                "    LDX #$04".to_string(),
+                format!("__ACI_{id}_CMP:"),
+                format!("    LDA {var},X"),
+                format!("    CMP {c},X"),
+                format!("    BNE __ACI_{id}_MISS"),
+                "    DEX".to_string(),
+                format!("    BPL __ACI_{id}_CMP"),
+                format!("__ACI_{id}_HIT:"),
+                format!("    LDA {c}+7"),
+                format!("    BNE __ACI_{id}_NO"),
+                format!("    LDY {c}+6"),
+                format!("    LDA {c}+5"),
+                "    CLC".to_string(),
+                "    RTS".to_string(),
+                format!("__ACI_{id}_MISS:"),
+                "    LDX #$04".to_string(),
+                format!("__ACI_{id}_CPY:"),
+                format!("    LDA {var},X"),
+                format!("    STA {c},X"),
+                "    DEX".to_string(),
+                format!("    BPL __ACI_{id}_CPY"),
+                // The value is the top n = E-$80 mantissa bits; every bit below must be clear.
+                "    LDA #$00".to_string(),
+                format!("    STA {c}+5"),
+                format!("    STA {c}+6"),
+                format!("    STA {c}+7"),
+                format!("    LDA {var}"),
+                format!("    BEQ __ACI_{id}_HIT"),
+                format!("    INC {c}+7"),
+                "    CMP #$91".to_string(),
+                format!("    BCS __ACI_{id}_NO"),
+                "    CMP #$81".to_string(),
+                format!("    BCC __ACI_{id}_NO"),
+                format!("    LDA {var}+3"),
+                format!("    ORA {var}+4"),
+                format!("    BNE __ACI_{id}_NO"),
+                format!("    LDA {var}+1"),
+                format!("    BMI __ACI_{id}_NO"),
+                "    ORA #$80".to_string(),
+                format!("    STA {c}+6"),
+                format!("    LDA {var}+2"),
+                format!("    STA {c}+5"),
+                "    LDA #$90".to_string(),
+                "    SEC".to_string(),
+                format!("    SBC {var}"),
+                "    TAX".to_string(),
+                format!("    BEQ __ACI_{id}_WHOLE"),
+                format!("__ACI_{id}_SHIFT:"),
+                format!("    LSR {c}+6"),
+                format!("    ROR {c}+5"),
+                format!("    BCS __ACI_{id}_NO"),
+                "    DEX".to_string(),
+                format!("    BNE __ACI_{id}_SHIFT"),
+                format!("__ACI_{id}_WHOLE:"),
+                format!("    DEC {c}+7"),
+                format!("    JMP __ACI_{id}_HIT"),
+                format!("__ACI_{id}_NO:"),
+                "    SEC".to_string(),
+                "    RTS".to_string(),
+            ] {
+                writeln!(self.code, "{line}").unwrap();
+            }
+        }
+        for (id, (var, k)) in self.addr_caches.clone().into_iter().enumerate() {
+            let (lo, hi) = (k & 0xFF, k >> 8);
+            writeln!(self.code, "__AC_{id}:").unwrap();
+            writeln!(self.code, "    LDX #$04").unwrap();
+            writeln!(self.code, "__AC_{id}_CMP:").unwrap();
+            writeln!(self.code, "    LDA {var},X").unwrap();
+            writeln!(self.code, "    CMP __ACC_{id},X").unwrap();
+            writeln!(self.code, "    BNE __AC_{id}_MISS").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BPL __AC_{id}_CMP").unwrap();
+            writeln!(self.code, "    LDA __ACC_{id}+5").unwrap();
+            if k != 0 {
+                writeln!(self.code, "    CLC").unwrap();
+                writeln!(self.code, "    ADC #${lo:02X}").unwrap();
+            }
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    LDA __ACC_{id}+6").unwrap();
+            if k != 0 {
+                writeln!(self.code, "    ADC #${hi:02X}").unwrap();
+            }
+            writeln!(self.code, "    STY ${:02X}", rt::LINNUM_LO).unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::LINNUM_HI).unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__AC_{id}_MISS:").unwrap();
+            writeln!(self.code, "    SEC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__ACS_{id}:").unwrap();
+            writeln!(self.code, "    LDX #$04").unwrap();
+            writeln!(self.code, "__ACS_{id}_CPY:").unwrap();
+            writeln!(self.code, "    LDA {var},X").unwrap();
+            writeln!(self.code, "    STA __ACC_{id},X").unwrap();
+            writeln!(self.code, "    DEX").unwrap();
+            writeln!(self.code, "    BPL __ACS_{id}_CPY").unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
+            if k != 0 {
+                writeln!(self.code, "    SEC").unwrap();
+                writeln!(self.code, "    SBC #${lo:02X}").unwrap();
+            }
+            writeln!(self.code, "    STA __ACC_{id}+5").unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+            if k != 0 {
+                writeln!(self.code, "    SBC #${hi:02X}").unwrap();
+            }
+            writeln!(self.code, "    STA __ACC_{id}+6").unwrap();
+            writeln!(self.code, "    LDY ${:02X}", rt::LINNUM_LO).unwrap();
+            writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_HI).unwrap();
+            writeln!(self.code, "    CLC").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
+    }
+
     fn emit_peek(&mut self, addr: &Expr) -> Result<(), CodegenError> {
         if self.emit_addr_range_trap(addr) {
             return Ok(());
@@ -25817,8 +29653,7 @@ __READ_TAGGED_WORD:
         let patch = format!("__PEEK_{id}");
         if !self.try_emit_int16_addr_patch(addr, &patch) {
             // Read through LINNUM, where FACWORD left the address, as the ROM's PEEK does.
-            self.emit_expr_to_fac(addr)?;
-            self.emit_facword_rom();
+            self.emit_addr_to_linnum(addr)?;
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA (${:02X}),Y", rt::LINNUM_LO).unwrap();
             writeln!(self.code, "    TAY").unwrap();
@@ -25862,10 +29697,7 @@ __READ_TAGGED_WORD:
         }
         // Resolve the var to the actual single-byte slot that's live
         // here. Same priority as other byte-eval paths so we agree
-        // on which label is canonical for this context.
-        if let Some(label) = self.shadow_int_label(&var) {
-            return Some((base, label.to_string()));
-        }
+        // on the active FOR counter first, then the shadow.
         if let Some(label) = self.int_for_counter_label(&var) {
             // Counter slot is the live value during the FOR; only
             // safe as a 1-byte X-index when the range fits u8. If it
@@ -25879,6 +29711,9 @@ __READ_TAGGED_WORD:
             return None;
         }
         if let Some(label) = self.u8_for_counter_label(&var) {
+            return Some((base, label.to_string()));
+        }
+        if let Some(label) = self.shadow_int_label(&var) {
             return Some((base, label.to_string()));
         }
         if self.int_var_is_u8_storage(&var) && !self.int_var_byte_is_signed(&var) {
@@ -25990,6 +29825,7 @@ __READ_TAGGED_WORD:
         if let Some((zp_label, off)) = self
             .expr_zp_pointer_label(addr)
             .map(|label| (label, 0u8))
+            .or_else(|| self.u16_counter_zp_offset(addr))
         {
             // Pick the cheapest byte producer that's available.
             if let Expr::Var(v) = value {
@@ -26017,8 +29853,7 @@ __READ_TAGGED_WORD:
         let patch = format!("__POKE_{id}");
         let via_linnum = !self.try_emit_int16_addr_patch(addr, &patch);
         if via_linnum {
-            self.emit_expr_to_fac(addr)?;
-            self.emit_facword_rom();
+            self.emit_addr_to_linnum(addr)?;
         }
         let value_start = self.code.len();
         if let Expr::Var(v) = value
@@ -26292,6 +30127,11 @@ __READ_TAGGED_WORD:
             writeln!(self.code, "    LDY #$00").unwrap();
             writeln!(self.code, "    LDA (${:02X}),Y", rt::ARRAY_ADDR_LO).unwrap();
             self.invalidate_array_addr_cache();
+            return Ok(true);
+        }
+        if let Expr::Asc(s) = value
+            && self.try_emit_asc_mid_to_a(s)?
+        {
             return Ok(true);
         }
         // ASC(s$) — first PETSCII byte of the string. Mirrors the
@@ -28990,7 +32830,7 @@ __READ_TAGGED_WORD:
     /// enough that PH301 factoring of surrounding load+convert
     /// pairs would win on size.
     fn emit_fac_byte_for_value(&mut self, value: &Expr) {
-        if self.expr_proves_u8(value) {
+        if self.unchecked || self.expr_proves_u8(value) {
             writeln!(self.code, "    JSR __FAC_BYTE_OK").unwrap();
             self.used_fac_byte_ok = true;
             self.invalidate_fac_cache();
@@ -29117,6 +32957,15 @@ __READ_TAGGED_WORD:
                     BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor
                 ) =>
             {
+                // AND/OR/EXOR apply AYINT to each operand, which traps outside -32768..32767.
+                let fits = |range: Option<(i64, i64)>| {
+                    range.is_some_and(|(lo, hi)| lo >= -32768 && hi <= 32767)
+                };
+                if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor)
+                    && !(fits(self.byte_operand_range(l)) && fits(self.byte_operand_range(r)))
+                {
+                    return false;
+                }
                 let r_op = self.byte_simple_operand(r);
                 let l_op = self.byte_simple_operand(l);
                 let commutative = matches!(op, BinOp::Add | BinOp::And | BinOp::Or | BinOp::Xor);
@@ -29159,7 +33008,17 @@ __READ_TAGGED_WORD:
     /// the cleanest lowering for `PEEK(I)` / `POKE I, ...` shapes
     /// when `I` is a hot loop counter.
     fn expr_zp_pointer_label(&self, e: &Expr) -> Option<String> {
+        if self.addr_range_may_leave_u16(e) {
+            return None;
+        }
         let Expr::Var(v) = e else { return None };
+        if let Some((counter, 0)) = self.u16_counter_addr(e) {
+            let zp = self
+                .zp_int_for_assignments
+                .keys()
+                .any(|id| format!("FI_{id}") == counter);
+            return zp.then_some(counter);
+        }
         // Active FOR-counter redirection. When V_var is not synced
         // per iteration, indirect-Y must read the live FI_ counter slot.
         if let Some(operand) = self.for_counter_label_when_v_var_stale(v) {
@@ -29214,6 +33073,9 @@ __READ_TAGGED_WORD:
 
     /// Resolve a zero-page pointer and nonnegative byte displacement.
     fn expr_zp_pointer_label_offset(&self, e: &Expr) -> Option<(String, u8)> {
+        if self.addr_range_may_leave_u16(e) {
+            return None;
+        }
         // Bare `base` ; the case that already existed, offset zero.
         if let Some(label) = self.expr_zp_pointer_label(e) {
             return Some((label, 0));
@@ -29230,6 +33092,9 @@ __READ_TAGGED_WORD:
         }
         let (base, off) = split_base_plus_const(e)?;
         if !(0..=255).contains(&off) {
+            return None;
+        }
+        if self.u16_counter_addr(base).is_some() && self.u16_counter_addr(e).is_none() {
             return None;
         }
         let label = self.expr_zp_pointer_label(base)?;
@@ -29303,6 +33168,37 @@ __READ_TAGGED_WORD:
     /// `V_X`, `$0400`). Returns `None` for shapes that need their
     /// own evaluator first — those are handled via the recursive
     /// dispatch in `try_emit_byte_eval_to_a`.
+    /// Integer bounds narrowed by the operand storage and active FOR counter.
+    fn byte_operand_range(&self, e: &Expr) -> Option<(i64, i64)> {
+        let fact = self.current_expr_int_range(e).map(|r| (r.min as i64, r.max as i64));
+        let shape = match e {
+            Expr::Number(n) if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e9 => {
+                Some((*n as i64, *n as i64))
+            }
+            Expr::Var(v) if v.kind == VarKind::Integer && self.int_var_is_u8_storage(v) => {
+                Some(if self.int_var_byte_is_signed(v) { (-128, 127) } else { (0, 255) })
+            }
+            Expr::Var(v) if v.kind == VarKind::Float && self.u8_for_counter_label(v).is_some() => {
+                Some((0, 255))
+            }
+            Expr::Var(v) if v.kind == VarKind::Float && self.int_for_counter_label(v).is_some() => {
+                Some((-32768, 32767))
+            }
+            Expr::Peek(_) | Expr::MemPeek(_) => Some((0, 255)),
+            Expr::Bin(op @ (BinOp::Add | BinOp::Sub), l, r) => self
+                .byte_operand_range(l)
+                .zip(self.byte_operand_range(r))
+                .map(|((a, b), (c, d))| {
+                    if *op == BinOp::Add { (a + c, b + d) } else { (a - d, b - c) }
+                }),
+            _ => self.expr_proves_ayint_i16(e).then_some((-32768, 32767)),
+        };
+        match (fact, shape) {
+            (Some((a, b)), Some((c, d))) => Some((a.max(c), b.min(d))),
+            (fact, shape) => fact.or(shape),
+        }
+    }
+
     fn byte_simple_operand(&mut self, e: &Expr) -> Option<String> {
         match e {
             Expr::Number(n) if n.is_finite() && n.fract() == 0.0 => {
@@ -29324,15 +33220,15 @@ __READ_TAGGED_WORD:
                 // Float-with-i16-alias — same set the loader-arm
                 // recognises. The shadow / FOR-counter slot's low
                 // byte sits at the label's `+0` so it works as a
-                // direct ADC/AND/ORA operand.
-                if let Some(label) = self.shadow_int_label(v) {
-                    return Some(label.to_string());
-                }
+                // direct arithmetic operand; the active loop counter holds the current value.
                 if let Some(label) = self.int_for_counter_label(v) {
                     return Some(label);
                 }
                 if let Some(label) = self.u8_for_counter_label(v) {
                     return Some(label);
+                }
+                if let Some(label) = self.shadow_int_label(v) {
+                    return Some(label.to_string());
                 }
                 None
             }
@@ -29352,6 +33248,14 @@ __READ_TAGGED_WORD:
     /// with 7 bytes inline. Used by POKE/CHR$/CharOut/etc. fast
     /// paths.
     fn emit_int_var_byte_to_a(&mut self, var: &VarName) {
+        if self.unchecked {
+            let label = match self.for_counter_label_when_v_var_stale(var) {
+                Some(Int16Operand::MemU8(label) | Int16Operand::Mem(label)) => label,
+                _ => self.intern_var(var.clone()),
+            };
+            writeln!(self.code, "    LDA {label}").unwrap();
+            return;
+        }
         // Active FOR counters may live in FI_/FU_ while V_var is stale.
         // Byte reads must use the live counter slot.
         if let Some(operand) = self.for_counter_label_when_v_var_stale(var) {
@@ -29629,7 +33533,8 @@ __READ_TAGGED_WORD:
         writeln!(self.code, "    LDX ${:02X}", rt::LINNUM_LO).unwrap();
 
         writeln!(self.code, "    STX ${:02X}", rt::CHANNL).unwrap();
-        writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
+        writeln!(self.code, "    JSR __CHKIN_CK").unwrap();
+        self.used_chkin_check = true;
         for var in vars {
             if var.kind == VarKind::String {
                 self.emit_let_str(var, &StrExpr::GetKey)?;
@@ -29657,7 +33562,8 @@ __READ_TAGGED_WORD:
         writeln!(self.code, "    TAX").unwrap();
 
         writeln!(self.code, "    STX ${:02X}", rt::CHANNL).unwrap();
-        writeln!(self.code, "    JSR ${:04X}", rt::CHKIN).unwrap();
+        writeln!(self.code, "    JSR __CHKIN_CK").unwrap();
+        self.used_chkin_check = true;
         writeln!(self.code, "    JSR __INPUT_LINE_FILE").unwrap();
         writeln!(self.code, "    JSR ${:04X}", rt::CLRCHN).unwrap();
         for tgt in targets {
@@ -30106,6 +34012,31 @@ __READ_TAGGED_WORD:
         if matches!(op, BinOp::Pow) {
             return self.emit_pow(lhs, rhs);
         }
+        // Divide by a power of two with the exponent helper in the speed profile.
+        if op == BinOp::Div
+            && self.fast_float_code()
+            && let Some(k) = mul_pot_exponent(rhs)
+            && k <= 16
+        {
+            self.emit_load_as_movfm(lhs)?;
+            writeln!(self.code, "    LDX #${k:02X}").unwrap();
+            writeln!(self.code, "    JSR __FDIV2K").unwrap();
+            self.used_fdiv2k = true;
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
+        // Multiply by a power of two by adjusting the loaded operand exponent.
+        if op == BinOp::Mul
+            && self.fast_float_code()
+            && let Some(k) = pot_scale_exponent(rhs)
+        {
+            self.emit_load_as_movfm(lhs)?;
+            writeln!(self.code, "    LDX #${:02X}", k as u8).unwrap();
+            writeln!(self.code, "    JSR __FMUL2K").unwrap();
+            self.used_fmul2k = true;
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
         // Var-mem-operand fast path: FAC-arithmetic ops (Add/Sub/Mul/Div)
         // can take the memory operand directly when one side is a Var,
         // skipping the temp-stash + reload entirely. Per-var stubs
@@ -30113,7 +34044,10 @@ __READ_TAGGED_WORD:
         // used 2+ times.
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
             if let Some(var) = pick_var_mem_operand(op, lhs, rhs) {
-                if var.kind == VarKind::Float {
+                if var.kind == VarKind::Float
+                    && self.for_counter_label_when_v_var_stale(var).is_none()
+                    && self.u16_counter_when_v_var_stale(var).is_none()
+                {
                     let other = if matches!(lhs, Expr::Var(v) if v == var) {
                         rhs
                     } else {
@@ -30156,6 +34090,37 @@ __READ_TAGGED_WORD:
         let (first, second) = if lhs_first { (lhs, rhs) } else { (rhs, lhs) };
 
         self.emit_expr_to_fac(first)?;
+        // Keep the rounded first operand in ARG while the second loads into FAC.
+        let loads_plainly = match second {
+            Expr::Number(_) => true,
+            Expr::Var(v) => self.float_slot_is_current(v),
+            _ => false,
+        };
+        if self.fast_float_code()
+            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+            && loads_plainly
+        {
+            let was_clear = self.fac_rounding_clear();
+            writeln!(self.code, "    JSR __FAC_TO_ARG").unwrap();
+            self.used_fac_to_arg = true;
+            self.note_fac_rounded_by_store(was_clear);
+            self.emit_expr_to_fac(second)?;
+            if op == BinOp::Sub {
+                writeln!(self.code, "    JSR ${:04X}", rt::FSUBT).unwrap();
+            } else {
+                let name = match op {
+                    BinOp::Add => "FADD",
+                    BinOp::Mul => "FMULT",
+                    _ => "FDIV",
+                };
+                writeln!(self.code, "    JSR __ARG_{name}").unwrap();
+                if !self.used_arg_ops.contains(&op) {
+                    self.used_arg_ops.push(op);
+                }
+            }
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
         let temp = self.alloc_temp();
         self.emit_stash_to_temp(&temp);
         let dedup_second = first == second
@@ -30322,7 +34287,7 @@ __READ_TAGGED_WORD:
     /// Compare a rounded left operand in memory with the right operand in FAC.
     fn emit_fcomp_operands(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), CodegenError> {
         match lhs {
-            Expr::Var(lv) if is_direct_float_var(lv) => {
+            Expr::Var(lv) if self.float_slot_is_current(lv) => {
                 self.emit_expr_to_fac(rhs)?;
                 self.emit_fac_op_with_var(BinOp::Eq, lv);
             }
@@ -30594,6 +34559,23 @@ __READ_TAGGED_WORD:
     /// before calling FPWRT. The temp-slot dance mirrors the standard
     /// binop pattern; the only added instruction is the FAC→ARG copy.
     fn emit_pow(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), CodegenError> {
+        // Integer exponents in -127..126 give exact powers of two.
+        if matches!(lhs, Expr::Number(b) if *b == 2.0)
+            && self
+                .current_expr_int_range(rhs)
+                .is_some_and(|r| r.min >= 0 && r.max <= 126)
+        {
+            if self.try_emit_byte_no_fac(rhs)? {
+                writeln!(self.code, "    JSR __POW2").unwrap();
+            } else {
+                self.emit_byte_fallback_to_fac(rhs)?;
+                writeln!(self.code, "    JSR __POW2_FAC").unwrap();
+                self.used_pow2_fac = true;
+                self.used_fac_byte_ok = true;
+            }
+            self.used_pow2 = true;
+            return Ok(());
+        }
         self.emit_expr_to_fac(rhs)?;
         let temp = self.alloc_temp();
         writeln!(self.code, "    LDX #<{temp}").unwrap();
@@ -31491,64 +35473,133 @@ fn stmt_page1_floor(stmt: &Stmt, def_fns: &HashMap<FnName, DefFnInfo>) -> Option
     }
 }
 
+/// Count definitely open FOR frames at recursive backward GOSUB calls.
 fn for_frames_at_recursive_gosub(module: &ir::Module) -> Vec<(u32, u32)> {
-
-    fn record(open: &[u16], line_no: u16, target: u16, sites: &mut Vec<(u32, u32, u16)>) {
-        if target > line_no {
-            return;
-        }
-        let inside = open.iter().filter(|&&f| f >= target).count() as u32;
-        sites.push((inside, open.len() as u32 - inside, target));
+    /// Open FOR line, variable, and conditional depth; None marks an uncertain frame.
+    type Open = (u16, VarName, Option<u32>);
+    struct Walk {
+        /// Reachable statements indexed by line and statement path.
+        reached: HashSet<(usize, Vec<usize>)>,
+        line_idx: usize,
+        line_no: u16,
+        path: Vec<usize>,
+        open: Vec<Open>,
+        sites: Vec<(u32, u32, u16)>,
     }
-    fn walk(line_no: u16, stmts: &[Stmt], open: &mut Vec<u16>, sites: &mut Vec<(u32, u32, u16)>) {
-        for stmt in stmts {
+    impl Walk {
+        fn record(&mut self, target: u16) {
+            if target > self.line_no {
+                return;
+            }
+            let sure = || self.open.iter().filter(|(_, _, d)| d.is_some());
+            let inside = sure().filter(|(f, _, _)| *f >= target).count() as u32;
+            self.sites
+                .push((inside, sure().count() as u32 - inside, target));
+        }
+        fn stmts(&mut self, stmts: &[Stmt], base: usize, depth: u32) {
+            for (k, stmt) in stmts.iter().enumerate() {
+                self.path.push(base + k);
+                self.stmt(stmt, depth);
+                self.path.pop();
+            }
+        }
+        fn stmt(&mut self, stmt: &Stmt, depth: u32) {
+            let reached = self.reached.contains(&(self.line_idx, self.path.clone()));
             match stmt {
-                Stmt::For { .. } => open.push(line_no),
+                // Reopening a FOR variable removes its frame and all inner frames.
+                Stmt::For { var, .. } if reached => {
+                    if let Some(i) = self.open.iter().rposition(|(_, v, _)| v == var) {
+                        self.open.truncate(i);
+                    }
+                    self.open.push((self.line_no, var.clone(), Some(depth)));
+                }
+                // A named NEXT closes the loops opened inside its own as well.
                 Stmt::Next { vars } => {
-
-                    for _ in vars {
-                        open.pop();
+                    for v in vars {
+                        match v
+                            .as_ref()
+                            .and_then(|v| self.open.iter().rposition(|(_, o, _)| o == v))
+                        {
+                            Some(i) => self.open.truncate(i),
+                            None => {
+                                self.open.pop();
+                            }
+                        }
                     }
                 }
-                Stmt::GoSub { target } => record(open, line_no, *target, sites),
+                Stmt::GoSub { target } if reached => self.record(*target),
                 Stmt::OnBranch {
                     kind: crate::ast::OnBranchKind::GoSub,
                     targets,
                     ..
-                } => {
+                } if reached => {
                     for t in targets {
-                        record(open, line_no, *t, sites);
+                        self.record(*t);
                     }
                 }
-                Stmt::If { then, .. } => walk_then(line_no, then, open, sites),
+                Stmt::If { then, .. } => {
+                    self.then(then, 0, depth);
+                }
                 Stmt::IfElse {
                     then, else_then, ..
                 } => {
-                    walk_then(line_no, then, open, sites);
-                    walk_then(line_no, else_then, open, sites);
+                    let n = self.then(then, 0, depth);
+                    self.then(else_then, n, depth);
                 }
                 Stmt::Rcomp { then, else_then } => {
-                    walk_then(line_no, then, open, sites);
+                    let n = self.then(then, 0, depth);
                     if let Some(e) = else_then {
-                        walk_then(line_no, e, open, sites);
+                        self.then(e, n, depth);
                     }
                 }
                 _ => {}
             }
         }
-    }
-    fn walk_then(line_no: u16, then: &ThenIr, open: &mut Vec<u16>, sites: &mut Vec<(u32, u32, u16)>) {
-        if let ThenIr::Stmts(inner) = then {
-            walk(line_no, inner, open, sites);
+        /// Walks one branch whose statements are numbered from `base`; returns how many it has.
+        fn then(&mut self, then: &ThenIr, base: usize, depth: u32) -> usize {
+            let ThenIr::Stmts(inner) = then else {
+                return 0;
+            };
+            self.stmts(inner, base, depth + 1);
+            // A loop opened inside the THEN is open after it only when the condition held.
+            for (_, _, d) in self.open.iter_mut() {
+                if d.is_some_and(|d| d > depth) {
+                    *d = None;
+                }
+            }
+            inner.len()
         }
     }
-    let mut open = Vec::new();
-    let mut sites = Vec::new();
-    for line in &module.lines {
-        walk(line.number, &line.stmts, &mut open, &mut sites);
+    let cfg = crate::cfg::Cfg::build(module);
+    let mut seen = vec![false; cfg.nodes.len()];
+    let mut work = vec![cfg.entry];
+    while let Some(id) = work.pop() {
+        if id < seen.len() && !std::mem::replace(&mut seen[id], true) {
+            work.extend(cfg.nodes[id].successors.iter().copied());
+        }
+    }
+    let reached = cfg
+        .nodes
+        .iter()
+        .zip(&seen)
+        .filter(|(_, s)| **s)
+        .map(|(n, _)| (n.stmt.line_idx, n.stmt.path.clone()))
+        .collect();
+    let mut walk = Walk {
+        reached,
+        line_idx: 0,
+        line_no: 0,
+        path: Vec::new(),
+        open: Vec::new(),
+        sites: Vec::new(),
+    };
+    for (line_idx, line) in module.lines.iter().enumerate() {
+        walk.line_idx = line_idx;
+        walk.line_no = line.number;
+        walk.stmts(&line.stmts, 0, 0);
     }
     let lines: HashSet<u16> = module.lines.iter().map(|l| l.number).collect();
-    sites
+    walk.sites
         .into_iter()
         .filter(|(_, _, target)| lines.contains(target))
         .map(|(inside, outside, _)| (inside, outside))
@@ -32506,6 +36557,17 @@ fn then_uses_heap(then: &ThenIr) -> bool {
     matches!(then, ThenIr::Stmts(inner) if stmts_use_heap(inner))
 }
 
+/// String and start index for MID$ expressions whose ASC reads one byte.
+fn asc_mid_parts(s: &StrExpr) -> Option<(&StrExpr, &Expr)> {
+    match s {
+        StrExpr::Mid(source, start, None) => Some((source, start)),
+        StrExpr::Mid(source, start, Some(n)) if matches!(as_byte_literal(n), Some(1..)) => {
+            Some((source, start))
+        }
+        _ => None,
+    }
+}
+
 fn str_uses_heap(s: &StrExpr) -> bool {
     match s {
         StrExpr::Concat(_, _) => true,
@@ -32669,6 +36731,9 @@ fn expr_uses_heap(e: &Expr) -> bool {
         Expr::Func1(_, arg) => expr_uses_heap(arg),
         Expr::Peek(addr) | Expr::MemPeek(addr) => expr_uses_heap(addr),
         Expr::ArrayRef(_, idx) => idx.iter().any(expr_uses_heap),
+        Expr::Asc(s) if let Some((source, start)) = asc_mid_parts(s) => {
+            str_uses_heap(source) || expr_uses_heap(start)
+        }
         Expr::Len(s) | Expr::Asc(s) => str_uses_heap(s),
         Expr::StrCompare(_, l, r) => str_uses_heap(l) || str_uses_heap(r),
         Expr::Val(s) | Expr::Nrm(s) => str_uses_heap(s),
@@ -32865,6 +36930,20 @@ fn curlin_hi_invariant(module: &ir::Module) -> Option<u8> {
         .chain(marks.0)
         .all(|n| (n >> 8) as u8 == hi)
         .then_some(hi)
+}
+
+/// Whether `s` is a STOP or holds one in a THEN or ELSE branch.
+fn stmt_reaches_stop(s: &Stmt) -> bool {
+    let inner = |t: &ThenIr| matches!(t, ThenIr::Stmts(v) if v.iter().any(stmt_reaches_stop));
+    match s {
+        Stmt::Stop => true,
+        Stmt::If { then, .. } => inner(then),
+        Stmt::IfElse {
+            then, else_then, ..
+        } => inner(then) || inner(else_then),
+        Stmt::Rcomp { then, else_then } => inner(then) || else_then.as_ref().is_some_and(inner),
+        _ => false,
+    }
 }
 
 fn stmt_cannot_error(s: &Stmt) -> bool {
@@ -33407,6 +37486,19 @@ fn for_each_str_in_expr(e: &Expr, cb: &mut impl FnMut(&StrExpr)) {
     }
 }
 
+/// An index of numbers, numeric variables and arithmetic: no call, string or heap use.
+fn plain_index(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) | Expr::Var(_) => true,
+        Expr::Bin(op, l, r) => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) && plain_index(l) && plain_index(r)
+        }
+        Expr::Neg(inner) => plain_index(inner),
+        Expr::ArrayRef(_, idx) => idx.iter().all(plain_index),
+        _ => false,
+    }
+}
+
 /// Is the LASTVAR heap rewind sound for `var$ = value`?
 fn lastvar_rewind_safe(value: &StrExpr, var: &VarName) -> bool {
     if !str_expr_may_read_str_var(value, var) {
@@ -33610,6 +37702,12 @@ __GIVAYF_MAG:
     LDA $63
     BEQ __GIVAYF_ZERO
     STY $63
+    BMI __GIVAYF_SET
+__GIVAYF_BYTE_SHIFT:
+    DEX
+    ASL
+    BPL __GIVAYF_BYTE_SHIFT
+    BMI __GIVAYF_SET
 __GIVAYF_TOP:
     BMI __GIVAYF_SET
 __GIVAYF_SHIFT:
@@ -33729,6 +37827,296 @@ __FACWORD_ROM:
     JMP $B7F7
 ";
 
+/// Multiply positive RND seeds with nibble tables, using the ROM for other cases.
+pub const FAST_RND: &str = "\
+__RND_ROM:
+    LDA #$81
+    STA $61
+    LDA #$00
+    STA $66
+    JMP $E097
+__RND_POS:
+    LDA $68
+    BNE __RND_ROM
+    LDA $8D
+    ORA $8E
+    BEQ __RND_ROM
+    LDA $8B
+    CMP #$79
+    BCC __RND_ROM
+    CMP #$E8
+    BCS __RND_ROM
+    LDA $8C
+    BMI __RND_ROM
+    ORA #$80
+    STA $8C
+    LDA #$00
+    STA $6C
+    STA $6D
+    STA $6E
+    STA $6F
+    LDY #$03
+__RND_BYTE:
+    LDA $8C,Y
+    AND #$0F
+    TAX
+    CLC
+    LDA $6C,Y
+    ADC __RND_T0,X
+    STA $6C,Y
+    LDA $6B,Y
+    ADC __RND_T1,X
+    STA $6B,Y
+    LDA $6A,Y
+    ADC __RND_T2,X
+    STA $6A,Y
+    LDA $69,Y
+    ADC __RND_T3,X
+    STA $69,Y
+    LDA #$00
+    ADC #$00
+    STA $68,Y
+    LDA $8C,Y
+    LSR
+    LSR
+    LSR
+    LSR
+    TAX
+    CLC
+    LDA $6C,Y
+    ADC __RND_H0,X
+    STA $6C,Y
+    LDA $6B,Y
+    ADC __RND_H1,X
+    STA $6B,Y
+    LDA $6A,Y
+    ADC __RND_H2,X
+    STA $6A,Y
+    LDA $69,Y
+    ADC __RND_H3,X
+    STA $69,Y
+    LDA $68,Y
+    ADC #$00
+    STA $68,Y
+    DEY
+    BPL __RND_BYTE
+    LDX $8B
+    LDA $69
+    BMI __RND_NORM
+    ASL $6D
+    ROL $6C
+    ROL $6B
+    ROL $6A
+    ROL $69
+    DEX
+__RND_NORM:
+    TXA
+    CLC
+    ADC #$18
+    STA $61
+    LDA $6C
+    STA $62
+    LDA $6B
+    STA $63
+    LDA $6A
+    STA $64
+    LDA $69
+    STA $65
+    JMP $E0E3
+__RND_T0:
+    .byte $00,$7A,$F4,$6E,$E8,$62,$DC,$56,$D0,$4A,$C4,$3E,$B8,$32,$AC,$26
+__RND_T1:
+    .byte $00,$44,$88,$CD,$11,$56,$9A,$DF,$23,$68,$AC,$F1,$35,$7A,$BE,$03
+__RND_T2:
+    .byte $00,$B5,$6A,$1F,$D5,$8A,$3F,$F4,$AA,$5F,$14,$C9,$7F,$34,$E9,$9F
+__RND_T3:
+    .byte $00,$00,$01,$02,$02,$03,$04,$04,$05,$06,$07,$07,$08,$09,$09,$0A
+__RND_H0:
+    .byte $00,$A0,$40,$E0,$80,$20,$C0,$60,$00,$A0,$40,$E0,$80,$20,$C0,$60
+__RND_H1:
+    .byte $00,$47,$8F,$D6,$1E,$66,$AD,$F5,$3D,$84,$CC,$13,$5B,$A3,$EA,$32
+__RND_H2:
+    .byte $00,$54,$A8,$FC,$51,$A5,$F9,$4D,$A2,$F6,$4A,$9F,$F3,$47,$9B,$F0
+__RND_H3:
+    .byte $00,$0B,$16,$21,$2D,$38,$43,$4F,$5A,$65,$71,$7C,$87,$93,$9E,$A9
+";
+
+/// The entry of `FAST_RND` for an argument in FAC, placed right before it.
+pub const FAST_RND_ARG: &str = "\
+__RND:
+    LDA $61
+    BEQ __RND_ARG
+    LDA $66
+    BPL __RND_POS
+__RND_ARG:
+    JMP $E097
+";
+
+/// Clear fractional bits for nonnegative INT arguments; delegate other cases to ROM.
+pub const FAST_INT: &str = "\
+__INT:
+    LDA $61
+    BEQ __INT_ZERO
+    CMP #$A0
+    BCS __INT_DONE
+    LDY $66
+    BMI __INT_ROM
+    LDY $68
+    BNE __INT_ROM
+    STY $66
+    STY $70
+    SBC #$80
+    BCC __INT_ZERO
+    EOR #$1F
+    LDY #$03
+__INT_BYTE:
+    CMP #$08
+    BCC __INT_PART
+    TAX
+    LDA #$00
+    STA $62,Y
+    TXA
+    SBC #$08
+    DEY
+    BPL __INT_BYTE
+__INT_PART:
+    TAX
+    LDA $62,Y
+    AND __INT_MASK,X
+    STA $62,Y
+__INT_DONE:
+    RTS
+__INT_ZERO:
+    LDY #$00
+    STY $61
+    STY $62
+    STY $63
+    STY $64
+    STY $65
+    STY $66
+    STY $70
+    RTS
+__INT_ROM:
+    JMP $BCCC
+__INT_MASK:
+    .byte $FF,$FE,$FC,$F8,$F0,$E0,$C0,$80
+";
+
+/// Align close FADD operands locally before ROM addition and normalization.
+pub const FAST_FADD: &str = "\
+__FADD:
+    JSR $BA8C
+__FADDT:
+    LDA $61
+    BNE __FA_GO
+    JMP $BBFC
+__FA_GO:
+    LDX $70
+    STX $56
+    LDX #$69
+    LDA $69
+    TAY
+    BEQ __FA_RTS
+    SEC
+    SBC $61
+    BEQ __FA_TAIL
+    BCC __FA_ARG
+    CMP #$08
+    BCS __FA_FROM
+    STY $61
+    LDY $6E
+    STY $66
+    LDY #$00
+    STY $56
+    TAY
+    LDA $70
+__FA_FBIT:
+    LSR $62
+    ROR $63
+    ROR $64
+    ROR $65
+    ROR
+    DEY
+    BNE __FA_FBIT
+    LDX #$61
+    CLC
+__FA_TAIL:
+    JMP $B8A3
+__FA_ARG:
+    CMP #$F9
+    BCC __FA_AROM
+    LDY #$00
+    STY $70
+    EOR #$FF
+    TAY
+    INY
+    LDA #$00
+__FA_ABIT:
+    LSR $6A
+    ROR $6B
+    ROR $6C
+    ROR $6D
+    ROR
+    DEY
+    BNE __FA_ABIT
+    LDX #$69
+    CLC
+    JMP $B8A3
+__FA_FROM:
+    JMP $B881
+__FA_AROM:
+    JMP $B893
+__FA_RTS:
+    RTS
+";
+
+/// FSUB in front of [`FAST_FADD`].
+pub const FAST_FSUB: &str = "\
+__FSUB:
+    JSR $BA8C
+__FSUBT:
+    LDA $66
+    EOR #$FF
+    STA $66
+    EOR $6E
+    STA $6F
+    JMP __FADDT
+";
+
+/// Route FADD and FSUB through the speed profile's helper.
+pub(crate) fn route_fadd_through_own_code(asm: &str) -> Option<String> {
+    let renames = [
+        ("$B867", "__FADD"),
+        ("$B86A", "__FADDT"),
+        ("$B850", "__FSUB"),
+        ("$B853", "__FSUBT"),
+    ];
+    let fsub = ["$B850", "$B853"]
+        .iter()
+        .any(|a| asm.contains(&format!("JSR {a}\n")) || asm.contains(&format!("JMP {a}\n")));
+    let helper = if fsub {
+        format!("{FAST_FSUB}{FAST_FADD}")
+    } else {
+        FAST_FADD.to_string()
+    };
+    route_rom_calls(asm, &renames, &helper)
+}
+
+/// Skip ROUND when the rounding byte is below $80 before storing FAC.
+pub const FAST_MOVMF: &str = "\
+__MOVMF:
+    LDA $70
+    BMI __MM_ROM
+    JMP $BBD7
+__MM_ROM:
+    JMP $BBD4
+";
+
+/// Route MOVMF through the speed profile's helper.
+pub(crate) fn route_movmf_through_own_code(asm: &str) -> Option<String> {
+    route_rom_calls(asm, &[("$BBD4", "__MOVMF")], FAST_MOVMF)
+}
+
 /// Route integer conversion calls through the supplied helper.
 pub(crate) fn route_int_to_fac_through_own_code(asm: &str, helper: &str) -> Option<String> {
     route_rom_calls(asm, &[("$B391", "__GIVAYF"), ("$B3A2", "__BYTEFAC")], helper)
@@ -33739,16 +38127,31 @@ pub(crate) fn route_facword_through_own_code(asm: &str) -> Option<String> {
     route_rom_calls(asm, &[("$B7F7", "__FACWORD")], FAST_FACWORD)
 }
 
+/// Route INT calls through the local helper.
+pub(crate) fn route_int_through_own_code(asm: &str) -> Option<String> {
+    route_rom_calls(asm, &[("$BCCC", "__INT")], FAST_INT)
+}
+
 /// Place conversion helpers after code that cannot fall through.
-fn route_rom_calls(asm: &str, renames: &[(&str, &str)], helper: &str) -> Option<String> {
+pub(crate) fn route_rom_calls(asm: &str, renames: &[(&str, &str)], helper: &str) -> Option<String> {
     let marker = "; --- helper subroutines ---\n";
     let from = asm.find(marker)? + marker.len();
     let mut at = None;
     let mut offset = from;
     let mut prev_exits = false;
+    // Keep INT outside optional float blocks so it survives their removal.
+    let mut in_block = false;
     for line in asm[from..].split_inclusive('\n') {
+        match line.trim() {
+            crate::fast_float::BLOCK_OPEN => in_block = true,
+            crate::fast_float::BLOCK_CLOSE => {
+                in_block = false;
+                prev_exits = true;
+            }
+            _ => {}
+        }
         let t = line.split(';').next().unwrap_or("").trim();
-        if !t.is_empty() {
+        if !t.is_empty() && !in_block {
             if prev_exits && t.ends_with(':') {
                 at = Some(offset);
                 break;
@@ -33814,32 +38217,38 @@ const READ_TAGGED_STRING_COST: usize = 48;
 /// Extra code cost of testing a tag during cursor advance.
 const READ_TAGGED_ADVANCE_COST: usize = 9;
 
-/// Estimated formatting code cost for tagged integer string reads.
-const READ_TAGGED_TEXT_COST: usize = 700;
-
-/// Does the program already use STR$ and MID$ somewhere?
-fn module_uses_str_and_mid(module: &ir::Module) -> bool {
-    struct Uses {
-        str_: bool,
-        mid: bool,
-    }
-    impl crate::visit::Visitor for Uses {
-        fn visit_str_expr(&mut self, s: &StrExpr) {
-            match s {
-                StrExpr::Str(_) => self.str_ = true,
-                StrExpr::Mid(..) => self.mid = true,
-                _ => {}
-            }
-            crate::visit::walk_str_expr(self, s);
-        }
-    }
-    let mut uses = Uses { str_: false, mid: false };
-    crate::visit::walk_module(&mut uses, module);
-    uses.str_ && uses.mid
-}
+/// Size of `__TAG_TEXT`, which writes a tagged integer's digits for a string READ.
+const READ_TAGGED_TEXT_COST: usize = 125;
 
 /// The heap and its collector, for a program that otherwise has none.
 const READ_TAGGED_HEAP_COST: usize = 1500;
+
+/// Size of `__READ_TAGGED_INT` next to `__READ_TAGGED`, which Default keeps for integer READs.
+const READ_TAGGED_INT_COST: usize = 50;
+
+/// Whether any READ target needs FAC rather than integer or text decoding.
+fn read_needs_fac(module: &ir::Module) -> bool {
+    read_takes_kind(module, VarKind::Float)
+}
+
+/// Whether any READ target has the given kind.
+fn read_takes_kind(module: &ir::Module, kind: VarKind) -> bool {
+    struct Find(bool, VarKind);
+    impl crate::visit::Visitor for Find {
+        fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+            if let Stmt::Read(targets) = stmt {
+                self.0 |= targets.iter().any(|t| match t {
+                    ir::ReadTarget::Scalar(v) => v.kind == self.1,
+                    ir::ReadTarget::Array { name, .. } => name.kind == self.1,
+                });
+            }
+            crate::visit::walk_stmt(self, line_no, stmt);
+        }
+    }
+    let mut find = Find(false, kind);
+    crate::visit::walk_module(&mut find, module);
+    find.0
+}
 
 /// Count string READ targets that need the item text.
 pub(crate) fn string_read_target_count(module: &ir::Module) -> usize {
@@ -33864,10 +38273,10 @@ pub(crate) fn string_read_target_count(module: &ir::Module) -> usize {
     count.0
 }
 
-/// Four decimal digits keep the sum below signed overflow.
+/// Four characters keep the sum below signed overflow.
 const DIGITS_FAC_MAX: usize = 4;
 
-/// How many short all-digit DATA items pay for `__DIGITS_FAC` under the Default profile.
+/// How many short all-digit DATA items pay for `__DIGITS_LIN` under the Default profile.
 const READ_DIGITS_FROM: usize = 64;
 
 fn data_value_pool_bytes(v: &DataValue, layout: DataPoolLayout) -> Vec<u8> {
@@ -33876,6 +38285,7 @@ fn data_value_pool_bytes(v: &DataValue, layout: DataPoolLayout) -> Vec<u8> {
             let text = match v {
                 DataValue::Float(n) => format_data_float(*n).into_bytes(),
                 DataValue::String(b) | DataValue::Quoted(b) => b.clone(),
+                DataValue::Unreadable => Vec::new(),
             };
             let len = text.len().min(255) as u8;
             let mut out = Vec::with_capacity(1 + len as usize);
@@ -34000,7 +38410,7 @@ pub(crate) fn data_item_reads_as_a_number(v: &DataValue) -> bool {
 
         DataValue::Float(_) => true,
         // TXTPTR lands on the `"`, which FIN cannot consume.
-        DataValue::Quoted(_) => false,
+        DataValue::Quoted(_) | DataValue::Unreadable => false,
         DataValue::String(b) => fin_consumes_whole_item(b),
     }
 }
@@ -34078,7 +38488,7 @@ pub(crate) fn data_item_numeric_value(v: &DataValue) -> Option<f64> {
     match v {
         DataValue::Float(n) => Some(*n),
         // TXTPTR lands on the `"`, which FIN cannot consume.
-        DataValue::Quoted(_) => None,
+        DataValue::Quoted(_) | DataValue::Unreadable => None,
         DataValue::String(b) => fin_scan(b),
     }
 }
@@ -34191,6 +38601,7 @@ fn data_value_label(v: &DataValue) -> String {
         DataValue::Float(n) => format!("Float {n}"),
         DataValue::String(b) => format!("String {:?}", String::from_utf8_lossy(b)),
         DataValue::Quoted(b) => format!("Quoted {:?}", String::from_utf8_lossy(b)),
+        DataValue::Unreadable => "Unreadable".to_string(),
     }
 }
 
@@ -35735,6 +40146,89 @@ fn rename_relocated_pool_labels(asm: &str) -> String {
     out
 }
 
+/// String-heap cells worth zero page, with their widths, most used first.
+const ZP_HEAP_CELLS: [(&str, u8); 8] = [
+    ("__HEAP_PTR", 2),
+    ("__HEAP_SAVE", 2),
+    ("__GC_NEW_TOP_LO", 1),
+    ("__GC_LOW_LO", 1),
+    ("__GC_CHUNK_SIZE_LO", 1),
+    ("__GC_NEW_TOP_HI", 1),
+    ("__GC_CHUNK_SIZE_HI", 1),
+    ("__GC_LOW_HI", 1),
+];
+/// Prefix that gives a moved heap cell a name the assembler takes as an equate.
+const ZP_HEAP_PREFIX: &str = "Z";
+/// Comment that hands a heap cell's zero-page home from codegen to [`place_heap_cells_in_zero_page`].
+const ZP_HEAP_MARKER: &str = "; @zp-heap";
+
+/// Move marked heap cells to zero page after peephole optimization.
+pub fn place_heap_cells_in_zero_page(asm: &str) -> String {
+    if !asm.contains(ZP_HEAP_MARKER) {
+        return asm.to_string();
+    }
+    let cells: Vec<(&str, &str)> = asm
+        .lines()
+        .filter_map(|l| l.strip_prefix(ZP_HEAP_MARKER)?.trim().split_once(' '))
+        .filter(|(label, _)| asm.lines().any(|l| l.strip_suffix(':') == Some(label)))
+        .collect();
+    let mut out = String::with_capacity(asm.len());
+    let mut lines = asm.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(rest) = line.strip_prefix(ZP_HEAP_MARKER) {
+            if let Some((label, addr)) = rest.trim().split_once(' ')
+                && cells.contains(&(label, addr))
+            {
+                writeln!(out, "{ZP_HEAP_PREFIX}{label} = {addr}").unwrap();
+            }
+            continue;
+        }
+        if cells
+            .iter()
+            .any(|(label, _)| line.strip_suffix(':') == Some(label))
+        {
+            // The storage: its label and the one `.byte` line after it.
+            if lines
+                .peek()
+                .is_some_and(|next| next.trim_start().starts_with(".byte "))
+            {
+                lines.next();
+            }
+            continue;
+        }
+        let mut rest = line;
+        while let Some((at, label)) = cells
+            .iter()
+            .filter_map(|(label, _)| find_token(rest, label).map(|at| (at, *label)))
+            .min()
+        {
+            out.push_str(&rest[..at]);
+            out.push_str(ZP_HEAP_PREFIX);
+            out.push_str(label);
+            rest = &rest[at + label.len()..];
+        }
+        out.push_str(rest);
+        out.push('\n');
+    }
+    out
+}
+
+/// Byte offset of `token` in `line` as a whole identifier.
+fn find_token(line: &str, token: &str) -> Option<usize> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(off) = line[from..].find(token) {
+        let at = from + off;
+        let before = line[..at].chars().next_back();
+        let after = line[at + token.len()..].chars().next();
+        if !before.is_some_and(is_ident) && !after.is_some_and(is_ident) {
+            return Some(at);
+        }
+        from = at + token.len();
+    }
+    None
+}
+
 fn relocate_zp_operands(asm: &str, remap: &[(u8, u8)]) -> String {
     let mut map = [None; 256];
     for &(from, to) in remap {
@@ -35787,6 +40281,162 @@ fn relocate_zp_operands(asm: &str, remap: &[(u8, u8)]) -> String {
         out.push_str(comment);
     }
     out
+}
+
+/// Whether `stmt` calls a `DEF FN` function, whose body may read any variable.
+fn stmt_calls_user_fn(stmt: &Stmt) -> bool {
+    struct Finder(bool);
+    impl crate::visit::Visitor for Finder {
+        fn visit_expr(&mut self, e: &Expr) {
+            if matches!(e, Expr::FnCall(..)) {
+                self.0 = true;
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    let mut f = Finder(false);
+    crate::visit::Visitor::visit_stmt(&mut f, 0, stmt);
+    f.0
+}
+
+/// The statements of a loop body, IF bodies included, when nothing there can jump.
+fn flatten_plain_body<'a>(
+    stmts: &[(crate::cfg::StmtPath, &'a Stmt)],
+    out: &mut Vec<(crate::cfg::StmtPath, &'a Stmt)>,
+) -> bool {
+    for (path, stmt) in stmts {
+        match stmt {
+            Stmt::Let { .. }
+            | Stmt::LetStr { .. }
+            | Stmt::ArrayLet { .. }
+            | Stmt::ArrayLetStr { .. }
+            | Stmt::Poke { .. }
+            | Stmt::Print { .. }
+            | Stmt::Read(_)
+            | Stmt::Rem(_)
+            | Stmt::LineMark(_)
+            | Stmt::Data(_) => out.push((path.clone(), *stmt)),
+            Stmt::If {
+                then: ThenIr::Stmts(inner),
+                ..
+            } => {
+                out.push((path.clone(), *stmt));
+                let nested: Vec<_> = inner
+                    .iter()
+                    .enumerate()
+                    .map(|(k, s)| {
+                        let mut p = path.clone();
+                        p.path.push(k);
+                        (p, s)
+                    })
+                    .collect();
+                let mut inner_out = Vec::new();
+                if !flatten_plain_body(&nested, &mut inner_out) {
+                    return false;
+                }
+                out.extend(inner_out);
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Bound literal FOR iterations, allowing one extra pass for fractional rounding.
+fn literal_for_trips(start: &Expr, end: &Expr, step: &Expr) -> Option<i64> {
+    let lit = |e: &Expr| match e {
+        Expr::Number(n) => Some(*n),
+        Expr::Neg(inner) => match **inner {
+            Expr::Number(n) => Some(-n),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (s, e, st) = (lit(start)?, lit(end)?, lit(step)?);
+    if st == 0.0 || !(s.is_finite() && e.is_finite() && st.is_finite()) {
+        return None;
+    }
+    let n = ((e - s) / st).floor() + 1.0;
+    (n < 1e7).then(|| n.max(1.0) as i64 + 1)
+}
+
+/// `X + t1 - t2 ...` or `t + X`: the terms added (true) or subtracted, in evaluation order.
+fn wide_sum_terms(value: &Expr, x: &VarName) -> Option<Vec<(bool, Expr)>> {
+    let is_x = |e: &Expr| matches!(e, Expr::Var(v) if v == x);
+    match value {
+        Expr::Bin(op @ (BinOp::Add | BinOp::Sub), l, r) => {
+            if expr_reads_scalar(r, x) {
+                return (*op == BinOp::Add && is_x(r) && !expr_reads_scalar(l, x))
+                    .then(|| vec![(true, (**l).clone())]);
+            }
+            let mut terms = if is_x(l) {
+                Vec::new()
+            } else {
+                wide_sum_terms(l, x)?
+            };
+            terms.push((*op == BinOp::Add, (**r).clone()));
+            Some(terms)
+        }
+        _ => None,
+    }
+}
+
+fn expr_reads_scalar(e: &Expr, x: &VarName) -> bool {
+    struct Reads<'a>(&'a VarName, bool);
+    impl crate::visit::Visitor for Reads<'_> {
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.1 |= v == self.0;
+        }
+    }
+    let mut r = Reads(x, false);
+    crate::visit::walk_expr(&mut r, e);
+    r.1
+}
+
+/// Track reads and writes of a variable accumulated by a loop.
+struct WideSumUses<'a> {
+    var: &'a VarName,
+    reads: usize,
+    other: bool,
+}
+
+impl crate::visit::Visitor for WideSumUses<'_> {
+    fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+        match stmt {
+            Stmt::Read(targets) => {
+                self.other |= targets.iter().any(|t| read_target_names(t, self.var));
+            }
+            Stmt::ArrayLet { name, .. } => self.other |= name == self.var,
+            // IF bodies are visited as statements of their own.
+            Stmt::If { cond, .. } => {
+                self.visit_expr(cond);
+                return;
+            }
+            _ => {}
+        }
+        crate::visit::walk_stmt(self, line_no, stmt);
+    }
+    fn visit_expr(&mut self, e: &Expr) {
+        match e {
+            Expr::ArrayRef(name, _) => self.other |= name == self.var,
+            // A function body or machine code may read the variable.
+            Expr::FnCall(..) | Expr::Usr(_) => self.other = true,
+            _ => {}
+        }
+        crate::visit::walk_expr(self, e);
+    }
+    fn visit_var_read(&mut self, v: &VarName) {
+        if v == self.var {
+            self.reads += 1;
+        }
+    }
+}
+
+fn read_target_names(t: &ir::ReadTarget, var: &VarName) -> bool {
+    match t {
+        ir::ReadTarget::Scalar(v) => v == var,
+        ir::ReadTarget::Array { name, .. } => name == var,
+    }
 }
 
 fn collect_branch_targets(module: &ir::Module) -> HashSet<u16> {
@@ -36126,6 +40776,17 @@ fn float_zero_compare_var(op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<(BinOp, V
         && is_zero_number(lhs)
     {
         return Some((swap_compare_op(op), v.clone()));
+    }
+    None
+}
+
+/// Normalize a float comparison with zero and record the operand side.
+fn float_zero_compare_expr<'a>(op: BinOp, lhs: &'a Expr, rhs: &'a Expr) -> Option<(BinOp, &'a Expr, bool)> {
+    if is_zero_number(rhs) && !matches!(lhs, Expr::Number(_)) {
+        return Some((op, lhs, true));
+    }
+    if is_zero_number(lhs) && !matches!(rhs, Expr::Number(_)) {
+        return Some((swap_compare_op(op), rhs, false));
     }
     None
 }
@@ -36753,6 +41414,58 @@ fn i16_const(n: f64) -> Option<i16> {
 /// weights them up: a PEEK/POKE bubble sort whose inner loop reads `C`
 /// and `D` just twice each in the source executes those reads tens of
 /// thousands of times.
+/// Lines inside backward branches or FOR loops spanning at most span lines.
+fn tight_loop_lines(module: &ir::Module, span: usize) -> HashSet<u16> {
+    fn fors(stmts: &[Stmt], at: usize, open: &mut Vec<usize>, closed: &mut Vec<(usize, usize)>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::For { .. } => open.push(at),
+                Stmt::Next { vars } => {
+                    for _ in 0..vars.len().max(1) {
+                        if let Some(start) = open.pop() {
+                            closed.push((start, at));
+                        }
+                    }
+                }
+                Stmt::If {
+                    then: ThenIr::Stmts(body),
+                    ..
+                } => fors(body, at, open, closed),
+                Stmt::IfElse {
+                    then, else_then, ..
+                } => {
+                    for branch in [then, else_then] {
+                        if let ThenIr::Stmts(body) = branch {
+                            fors(body, at, open, closed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let lines = &module.lines;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if let Some(target) = line_min_back_target(&line.stmts, line.number)
+            && let Some(start) = lines.iter().position(|l| l.number >= target)
+        {
+            spans.push((start, at));
+        }
+    }
+    let mut open = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        fors(&line.stmts, at, &mut open, &mut spans);
+    }
+    let mut tight = HashSet::new();
+    for (start, end) in spans {
+        if start <= end && end - start < span {
+            tight.extend(lines[start..=end].iter().map(|l| l.number));
+        }
+    }
+    tight
+}
+
 fn loop_hot_lines(module: &ir::Module) -> HashSet<u16> {
     let mut hot: HashSet<u16> = HashSet::new();
 
@@ -37783,6 +42496,80 @@ fn peek_const_addr(e: &Expr) -> Option<u16> {
     as_u16_literal(arg.as_ref())
 }
 
+/// Emit zero bytes as one item so reserved-range bridges keep the buffer whole.
+fn zero_run(len: usize) -> String {
+    if len == 0 {
+        return String::new();
+    }
+    format!("    .byte {}", vec!["$00"; len].join(","))
+}
+
+/// Statements that cannot leave the loop they are in.
+fn cs_straight(stmt: &Stmt) -> bool {
+    let body = |t: &ThenIr| matches!(t, ThenIr::Stmts(_));
+    match stmt {
+        Stmt::If { then, .. } => body(then),
+        Stmt::IfElse {
+            then, else_then, ..
+        } => body(then) && body(else_then),
+        _ => matches!(
+            stmt,
+            Stmt::Let { .. }
+                | Stmt::LetStr { .. }
+                | Stmt::ArrayLet { .. }
+                | Stmt::ArrayLetStr { .. }
+                | Stmt::Poke { .. }
+                | Stmt::Print { .. }
+                | Stmt::Read(_)
+                | Stmt::Data(_)
+                | Stmt::Rem(_)
+                | Stmt::LineMark(_)
+                | Stmt::Restore
+        ),
+    }
+}
+
+/// `V=V+k`, `V=k+V` or `V=V-k` for a whole literal k in 1..=65535, as (adds, k).
+fn counter_step(var: &VarName, value: &Expr) -> Option<(bool, u16)> {
+    let Expr::Bin(op, l, r) = value else {
+        return None;
+    };
+    let step = |e: &Expr| {
+        as_f64_literal(e)
+            .filter(|n| n.fract() == 0.0 && (1.0..=65535.0).contains(n))
+            .map(|n| n as u16)
+    };
+    let is_var = |e: &Expr| matches!(e, Expr::Var(v) if v == var);
+    match op {
+        BinOp::Add if is_var(l) => step(r).map(|k| (true, k)),
+        BinOp::Add if is_var(r) => step(l).map(|k| (true, k)),
+        BinOp::Sub if is_var(l) => step(r).map(|k| (false, k)),
+        _ => None,
+    }
+}
+
+/// ASC and LEN leaves in an integer tree; one at most keeps the string work in ROM order.
+fn count_string_leaves(e: &Expr) -> usize {
+    match e {
+        Expr::Asc(_) | Expr::Len(_) => 1,
+        Expr::Neg(inner) => count_string_leaves(inner),
+        Expr::Bin(_, l, r) => count_string_leaves(l) + count_string_leaves(r),
+        _ => 0,
+    }
+}
+
+/// `k` for a literal exactly 2^k, k = -64..=64 but 0, that loads with a clear rounding byte.
+fn pot_scale_exponent(e: &Expr) -> Option<i32> {
+    let Expr::Number(n) = e else {
+        return None;
+    };
+    if !n.is_finite() || *n <= 0.0 || crate::romfloat::rounding_byte(*n) != 0 {
+        return None;
+    }
+    let k = n.log2().round() as i32;
+    ((k != 0) && (-64..=64).contains(&k) && 2f64.powi(k) == *n).then_some(k)
+}
+
 /// If `e` is a power-of-two integer constant in `[2, 32768]`,
 /// return its log2 (`k` in `2^k`). Used by the integer-island
 /// MUL fast path to choose ASL/ROL chain length: `X * 2^k` lowers
@@ -37992,6 +42779,82 @@ fn zero_data_line_bytes(trimmed: &str) -> Option<usize> {
     Some(count * width)
 }
 
+/// Bytes of [`bss_fill_unrolled_block`] for `bytes` zeros.
+fn bss_fill_unrolled_bytes(bytes: usize) -> usize {
+    let (pages, tail) = (bytes / 256, bytes % 256);
+    2 + if pages > 0 { 4 + 3 * pages } else { 0 } + if tail > 0 { 8 } else { 0 }
+}
+
+/// Clear pages in one Y loop, then clear the final partial page.
+fn bss_fill_unrolled_block(bytes: usize) -> String {
+    let start = BSS_START_LABEL;
+    let (pages, tail) = (bytes / 256, bytes % 256);
+    let mut out =
+        format!("; --- BSS zero-fill ---\n{BSS_FILL_SPAN_LABEL} = ${bytes:04X}\n\x20   LDA #$00\n");
+    if pages > 0 {
+        out.push_str("    TAY\n__BSS_FILL_PAGE:\n");
+        for page in 0..pages {
+            writeln!(out, "    STA {start}+${:04X},Y", page * 256).unwrap();
+        }
+        out.push_str("    INY\n    BNE __BSS_FILL_PAGE\n");
+    }
+    if tail > 0 {
+        writeln!(out, "    LDY #${tail:02X}").unwrap();
+        out.push_str("__BSS_FILL_BYTE:\n    DEY\n");
+        writeln!(out, "    STA {start}+${:04X},Y", pages * 256).unwrap();
+        out.push_str("    BNE __BSS_FILL_BYTE\n");
+    }
+    out.push_str("__BSS_FILL_DONE:\n; --- end BSS zero-fill ---");
+    out
+}
+
+/// Recalculate the unrolled fill for the final zero-data span when needed.
+pub(crate) fn settle_bss_fill(asm: &str) -> Option<String> {
+    let span = format!("{BSS_FILL_SPAN_LABEL} = $");
+    if !asm.contains(&span) {
+        return None;
+    }
+    let lines: Vec<&str> = asm.lines().collect();
+    let position = |text: &str| lines.iter().position(|l| l.trim() == text);
+    let start = position(&format!("{BSS_START_LABEL}:"))?;
+    let end = position(&format!("{BSS_END_LABEL}:"))?;
+    let mut bytes = 0;
+    for line in &lines[start + 1..end] {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(';') || t.ends_with(':') {
+            continue;
+        }
+        // Anything but zeros is for the check after assembly to refuse.
+        bytes += zero_data_line_bytes(t)?;
+    }
+    let open = position("; --- BSS zero-fill ---")?;
+    let done = open
+        + lines[open..]
+            .iter()
+            .position(|l| l.trim() == "__BSS_FILL_DONE:")?;
+    let laid_out = lines[open + 1].trim().strip_prefix(&span)?;
+    if usize::from_str_radix(laid_out, 16).ok()? == bytes {
+        return None;
+    }
+    let block = bss_fill_unrolled_block(bytes);
+    let head = block.strip_suffix("\n; --- end BSS zero-fill ---")?;
+    let mut out = String::with_capacity(asm.len() + 64);
+    for line in &lines[..open] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(head);
+    out.push('\n');
+    for line in &lines[done + 1..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !asm.ends_with('\n') {
+        out.pop();
+    }
+    Some(out)
+}
+
 /// The `LDA #$00` / page loop / partial-page loop that replaces the stored zeros. 37 bytes.
 fn bss_fill_block(zp_lo: u8) -> String {
     let zp_hi = zp_lo.wrapping_add(1);
@@ -38026,8 +42889,8 @@ fn bss_fill_block(zp_lo: u8) -> String {
     )
 }
 
-/// Mark trailing zero data and emit its startup initialization loop.
-fn install_bss_tail_fill(code: &mut String, zp_lo: u8) -> usize {
+/// Initialize trailing zero data with inline stores or a page loop.
+fn install_bss_tail_fill(code: &mut String, zp_lo: u8, speed: bool) -> usize {
     let lines: Vec<&str> = code.lines().collect();
     let mut run_start = lines.len();
     let mut run_bytes = 0usize;
@@ -38086,7 +42949,13 @@ fn install_bss_tail_fill(code: &mut String, zp_lo: u8) -> usize {
         *code = out;
         return 0;
     }
-    let fill = bss_fill_block(zp_lo);
+    let unrolled = bss_fill_unrolled_bytes(run_bytes) <= BSS_FILL_LOOP_BYTES
+        || (speed && run_bytes / 256 <= BSS_FILL_UNROLL_PAGES);
+    let fill = if unrolled {
+        bss_fill_unrolled_block(run_bytes)
+    } else {
+        bss_fill_block(zp_lo)
+    };
     let mut out = String::with_capacity(code.len() + fill.len() + 64);
     for (idx, line) in lines.iter().enumerate() {
         if idx == run_start {
@@ -38485,7 +43354,7 @@ mod tests {
         let mut code = bss_fixture(&format!(
             "__MUSIC_TEMPO:\n    .byte $06\n__MUSIC_TIMER:\n{zeros}__HEAP_BOTTOM:\n"
         ));
-        let bytes = install_bss_tail_fill(&mut code, 0xFB);
+        let bytes = install_bss_tail_fill(&mut code, 0xFB, false);
         assert_eq!(bytes, 200, "the $06 must not be part of the run");
         let lines: Vec<&str> = code.lines().collect();
         let tempo = lines.iter().position(|l| *l == "__MUSIC_TEMPO:").unwrap();
@@ -38500,7 +43369,7 @@ mod tests {
         let mut code = bss_fixture(&format!(
             "; --- numeric arrays ---\n__ARR_A:\n{zeros}__HEAP_BOTTOM:\n"
         ));
-        install_bss_tail_fill(&mut code, 0xFB);
+        install_bss_tail_fill(&mut code, 0xFB, false);
         let lines: Vec<&str> = code.lines().collect();
         let anchor = lines.iter().position(|l| *l == "__BSS_START:").unwrap();
         assert_eq!(
@@ -38517,7 +43386,7 @@ mod tests {
         let mut code = bss_fixture(&format!(
             "__VARS_END:\n__SAVED_SP:\n{zeros}__HEAP_BOTTOM:\n"
         ));
-        install_bss_tail_fill(&mut code, 0xFB);
+        install_bss_tail_fill(&mut code, 0xFB, false);
         let lines: Vec<&str> = code.lines().collect();
         let anchor = lines.iter().position(|l| *l == "__BSS_START:").unwrap();
         assert_eq!(lines[anchor - 1], "__VARS_END:");
@@ -38527,7 +43396,7 @@ mod tests {
     #[test]
     fn a_short_run_gets_no_fill_and_no_marker() {
         let mut code = bss_fixture("__VARS_START:\n    .byte $00,$00,$00\n__HEAP_BOTTOM:\n");
-        let bytes = install_bss_tail_fill(&mut code, 0xFB);
+        let bytes = install_bss_tail_fill(&mut code, 0xFB, false);
         assert_eq!(bytes, 0);
         assert!(!code.contains("__BSS_START"));
         assert!(!code.contains("__BSS_END"));
@@ -38539,7 +43408,7 @@ mod tests {
     fn an_installed_fill_replaces_the_marker_in_place() {
         let zeros = "    .byte $00,$00,$00,$00,$00,$00,$00,$00\n".repeat(20);
         let mut code = bss_fixture(&format!("__VARS_START:\n{zeros}__HEAP_BOTTOM:\n"));
-        let bytes = install_bss_tail_fill(&mut code, 0xFB);
+        let bytes = install_bss_tail_fill(&mut code, 0xFB, false);
         assert_eq!(bytes, 160);
         assert!(!code.contains(BSS_FILL_MARKER));
         let cld = code.find("    CLD\n").unwrap();
@@ -38555,7 +43424,7 @@ mod tests {
         let mut code = bss_fixture(&format!(
             "TABLE:\n    .word TABLE, $1234\n; table terminator\n    .word $0000\n\n    .byte $00,$00\nTABLE_END:\nARRAY:\n{zeros}__HEAP_BOTTOM:\n"
         ));
-        assert_eq!(install_bss_tail_fill(&mut code, 0xFB), 80);
+        assert_eq!(install_bss_tail_fill(&mut code, 0xFB, false), 80);
         let anchor = code.find("__BSS_START:").unwrap();
         assert!(code.find("TABLE_END:").unwrap() < anchor);
         assert!(anchor < code.find("ARRAY:").unwrap());
@@ -38570,7 +43439,7 @@ mod tests {
             format!("TABLE:\n    .byte $01\n{zeros}ARRAY:\n    .word $0000\n__HEAP_BOTTOM:\n"),
         ] {
             let mut code = bss_fixture(&tail);
-            assert_eq!(install_bss_tail_fill(&mut code, 0xFB), 0);
+            assert_eq!(install_bss_tail_fill(&mut code, 0xFB, false), 0);
             assert!(!code.contains("__BSS_START:"));
             assert!(!code.contains(BSS_FILL_MARKER));
             assert!(code.contains(&tail));
@@ -38583,7 +43452,7 @@ mod tests {
         let mut code = bss_fixture(&format!(
             "PREVIOUS_END:\n; a new zero block\nARRAY:\n\n; same-address alias\nALIAS:\n; first bytes\n{zeros}__HEAP_BOTTOM:\n"
         ));
-        assert_eq!(install_bss_tail_fill(&mut code, 0xFB), 80);
+        assert_eq!(install_bss_tail_fill(&mut code, 0xFB, false), 80);
         let end = code.find("PREVIOUS_END:").unwrap();
         let anchor = code.find("__BSS_START:").unwrap();
         let start = code.find("ARRAY:").unwrap();
@@ -39406,17 +44275,24 @@ __LOOP:
         );
         assert_assembles(&asm);
 
+        // `Y%` starts at 0 after RUN, so it gets a value no analysis bounds.
         let unbounded = Module {
             lines: vec![Line {
                 number: 10,
-                stmts: vec![Stmt::Let {
-                    var: x,
-                    value: Expr::Bin(
-                        BinOp::Mul,
-                        Box::new(Expr::Var(y)),
-                        Box::new(Expr::Number(11.0)),
-                    ),
-                }],
+                stmts: vec![
+                    Stmt::Let {
+                        var: y.clone(),
+                        value: Expr::Fre(Box::new(Expr::Number(0.0))),
+                    },
+                    Stmt::Let {
+                        var: x,
+                        value: Expr::Bin(
+                            BinOp::Mul,
+                            Box::new(Expr::Var(y)),
+                            Box::new(Expr::Number(11.0)),
+                        ),
+                    },
+                ],
             }],
         };
         let asm2 = emit_with_profile(&unbounded, Profile::default()).unwrap();
@@ -40893,7 +45769,7 @@ __LOOP:
     }
 
     #[test]
-    fn codegen_keeps_array_bounds_after_next_kills_range_fact() {
+    fn codegen_keeps_array_bounds_after_the_loop() {
         let a = fvar("A");
         let i = fvar("I");
         let m = Module {
@@ -40935,8 +45811,11 @@ __LOOP:
             ],
         };
         let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        // The post-loop index 11 must raise BAD SUBSCRIPT.
         assert!(
-            asm.contains("JSR __BNDS_10"),
+            ["JSR __BNDS_10", "BCS __BAD_SUBSCRIPT", "JMP __BAD_SUBSCRIPT"]
+                .iter()
+                .any(|form| asm.contains(form)),
             "post-NEXT A(I) must keep the dim-10 bounds check\n{asm}"
         );
     }
@@ -43669,9 +48548,7 @@ __LOOP:
     #[test]
     fn for_counter_indirect_poke_sets_y_after_float_rhs() {
         // FOR I=12288 TO 12415 / READ A / POKE I, A / NEXT.
-        // A is a Float scalar (no `%` suffix) — the byte producer
-        // therefore goes through MOVFM + __FAC_BYTE, both of which
-        // clobber Y.
+        // Float byte conversion clobbers Y.
         let i = fvar("I");
         let a = fvar("A");
         let mut m = Module {
@@ -43708,7 +48585,7 @@ __LOOP:
                 Line {
                     number: 40,
                     stmts: vec![Stmt::Data(vec![
-                        crate::ast::DataValue::Float(1.0),
+                        crate::ast::DataValue::Float(1.5),
                         crate::ast::DataValue::Float(2.0),
                     ])],
                 },

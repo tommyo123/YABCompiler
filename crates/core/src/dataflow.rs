@@ -9,6 +9,7 @@
 //!     path before being killed) at each CFG node's entry/exit.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use crate::ast::{BinOp, Func1, VarKind, VarName};
 use crate::cfg::{Cfg, CfgNode, StmtPath};
@@ -80,6 +81,16 @@ pub trait DataflowAnalysis {
     ) -> Option<Vec<Self::Lattice>> {
         None
     }
+
+    /// Widen the previous and joined input states to a stable over-approximation.
+    fn widen(&self, _prev: &Self::Lattice, _next: &Self::Lattice) -> Self::Lattice {
+        Self::Lattice::bottom()
+    }
+
+    /// Drop facts from unstable widened input while preserving all possible values.
+    fn freeze(&self, _prev: &Self::Lattice, _next: &Self::Lattice) -> Self::Lattice {
+        Self::Lattice::bottom()
+    }
 }
 
 /// Worklist solver. Returns a map from node id to (in, out) lattice
@@ -118,10 +129,18 @@ pub fn solve<D: DataflowAnalysis>(
             }
         }
     }
-    // Initial worklist: every node, since nothing is computed yet.
-    let mut work: VecDeque<usize> = (0..n).collect();
-    let mut in_queue: Vec<bool> = vec![true; n];
+    // Start forward analysis at entry and backward analysis at every node.
+    let mut work: VecDeque<usize> = match dir {
+        Direction::Forward => VecDeque::from([cfg.entry]),
+        Direction::Backward => (0..n).collect(),
+    };
+    let mut in_queue: Vec<bool> = vec![false; n];
+    for &id in &work {
+        in_queue[id] = true;
+    }
     let mut visit_counts: Vec<u64> = vec![0; n];
+    // Join only predecessor outputs that have been computed.
+    let mut computed: Vec<bool> = vec![false; n];
 
     // Helper: pull the OUT state coming OUT of `pred` toward `target`.
     // When `pred` has per-successor refinement, use the entry whose
@@ -145,27 +164,22 @@ pub fn solve<D: DataflowAnalysis>(
     // more than this many times the analysis is no longer converging
     // along a narrow lattice path (typically a `V=V+1` GOTO-loop whose
     // refined back-edge keeps shifting one endpoint by 1 per round).
-    // Replace its IN state with `bottom()` — which for the range
-    // lattice means "no facts known", i.e. top in analysis semantics —
-    // so the next transfer over-approximates and the fixpoint settles.
+    // Widen repeatedly changing inputs, then discard unstable facts to bound the work.
     const VISIT_WIDEN_THRESHOLD: u64 = 32;
-    let mut widened: Vec<bool> = vec![false; n];
+    const VISIT_FREEZE_THRESHOLD: u64 = 64;
     while let Some(id) = work.pop_front() {
         in_queue[id] = false;
         visit_counts[id] += 1;
         let node = &cfg.nodes[id];
         match dir {
             Direction::Forward => {
-                if !widened[id] && visit_counts[id] > VISIT_WIDEN_THRESHOLD {
-                    widened[id] = true;
-                }
-                let new_in = if id == cfg.entry {
-                    analysis.boundary()
-                } else if widened[id] {
-                    // Once a node is widened, freeze its IN at "no
-                    // facts known" so the back-edge join can't keep
-                    // crawling the bounds one value at a time.
-                    D::Lattice::bottom()
+                let joined = if id == cfg.entry {
+                    // The program start, joined with any jump back to the first statement.
+                    let mut acc = analysis.boundary();
+                    for p in node.predecessors.iter().copied().filter(|&p| computed[p]) {
+                        acc.join_into(&edge_out(&state, &per_succ_out, p, id));
+                    }
+                    acc
                 } else {
                     // Only join predecessors that have already been
                     // visited at least once. For must-style lattices
@@ -184,7 +198,7 @@ pub fn solve<D: DataflowAnalysis>(
                         .predecessors
                         .iter()
                         .copied()
-                        .filter(|&p| visit_counts[p] > 0);
+                        .filter(|&p| computed[p]);
                     if let Some(first) = preds.next() {
                         let mut acc = edge_out(&state, &per_succ_out, first, id);
                         for p in preds {
@@ -194,6 +208,13 @@ pub fn solve<D: DataflowAnalysis>(
                     } else {
                         D::Lattice::bottom()
                     }
+                };
+                let new_in = if visit_counts[id] > VISIT_FREEZE_THRESHOLD {
+                    analysis.freeze(&state[id].0, &joined)
+                } else if visit_counts[id] > VISIT_WIDEN_THRESHOLD {
+                    analysis.widen(&state[id].0, &joined)
+                } else {
+                    joined
                 };
                 let new_out = analysis.transfer(module, cfg, node, id, &new_in);
                 let new_per_succ = analysis.transfer_per_successor(module, cfg, node, id, &new_in);
@@ -208,6 +229,7 @@ pub fn solve<D: DataflowAnalysis>(
                     || new_out != state[id].1
                     || per_succ_changed;
                 state[id] = (new_in, new_out);
+                computed[id] = true;
                 match new_per_succ {
                     Some(v) => {
                         per_succ_out.insert(id, v);
@@ -587,6 +609,467 @@ impl crate::analysis::Analysis for DefinedBeforeUse {
     }
 }
 
+// Static array states.
+
+/// A static array no statement has created yet: at the start and after `CLR` or `RUN`.
+pub const ARRAY_NONE: u8 = 1;
+/// A static array a reference created at the implicit bound of 10.
+pub const ARRAY_AUTO: u8 = 2;
+/// A static array its `DIM` created.
+pub const ARRAY_DIMMED: u8 = 4;
+
+/// Possible ARRAY_* state bits and array references at each CFG node.
+pub struct ArrayStates {
+    pub per_node: Vec<Vec<u8>>,
+    pub refs: Vec<Vec<usize>>,
+}
+
+/// One state mask per array; the join is the union.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ArrayMasks(Vec<u8>);
+
+impl Lattice for ArrayMasks {
+    fn bottom() -> Self {
+        Self::default()
+    }
+    fn join(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        out.join_into(other);
+        out
+    }
+    fn join_into(&mut self, other: &Self) {
+        if self.0.len() < other.0.len() {
+            self.0.resize(other.0.len(), 0);
+        }
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            *a |= b;
+        }
+    }
+}
+
+struct ArrayStateFlow<'a> {
+    index: &'a HashMap<VarName, usize>,
+    /// Per node of the original CFG; the graph the solver runs on has two copies of each.
+    refs: &'a [Vec<usize>],
+    /// Referenced arrays and return point for calls that preserve array allocation state.
+    calls: &'a HashMap<usize, (Vec<usize>, usize)>,
+}
+
+impl DataflowAnalysis for ArrayStateFlow<'_> {
+    type Lattice = ArrayMasks;
+    fn direction(&self) -> Direction {
+        Direction::Forward
+    }
+    fn boundary(&self) -> ArrayMasks {
+        ArrayMasks(vec![ARRAY_NONE; self.index.len()])
+    }
+    fn transfer(
+        &self,
+        module: &Module,
+        cfg: &Cfg,
+        _node: &CfgNode,
+        node_id: usize,
+        in_state: &ArrayMasks,
+    ) -> ArrayMasks {
+        let mut out = in_state.clone();
+        if out.0.is_empty() {
+            return out;
+        }
+        // A reference to an array that does not exist creates it at the implicit bound.
+        for &i in &self.refs[node_id % self.refs.len()] {
+            if out.0[i] & ARRAY_NONE != 0 {
+                out.0[i] = (out.0[i] & !ARRAY_NONE) | ARRAY_AUTO;
+            }
+        }
+        match cfg.stmt_at(node_id, module) {
+            // Only a DIM of an array that does not exist yet goes on; the rest are ?REDIM'D ARRAY.
+            Stmt::Dim(specs) => {
+                for spec in specs.iter().filter(|s| !s.dims.is_empty()) {
+                    if let Some(&i) = self.index.get(&spec.name) {
+                        out.0[i] = ARRAY_DIMMED;
+                    }
+                }
+            }
+            Stmt::Clr | Stmt::Run(_) => out.0.fill(ARRAY_NONE),
+            _ => {}
+        }
+        out
+    }
+    fn transfer_per_successor(
+        &self,
+        module: &Module,
+        cfg: &Cfg,
+        node: &CfgNode,
+        node_id: usize,
+        in_state: &ArrayMasks,
+    ) -> Option<Vec<ArrayMasks>> {
+        let (touched, back_to) = self.calls.get(&node_id)?;
+        let out = self.transfer(module, cfg, node, node_id, in_state);
+        // A reference in the subroutine may or may not have run.
+        let mut back = out.clone();
+        for &i in touched {
+            if let Some(m) = back.0.get_mut(i)
+                && *m & ARRAY_NONE != 0
+            {
+                *m |= ARRAY_AUTO;
+            }
+        }
+        Some(
+            node.successors
+                .iter()
+                .map(|s| {
+                    if s == back_to {
+                        back.clone()
+                    } else {
+                        out.clone()
+                    }
+                })
+                .collect(),
+        )
+    }
+    // The lattice is finite, so the union always settles.
+    fn widen(&self, prev: &ArrayMasks, next: &ArrayMasks) -> ArrayMasks {
+        prev.join(next)
+    }
+    fn freeze(&self, prev: &ArrayMasks, next: &ArrayMasks) -> ArrayMasks {
+        prev.join(next)
+    }
+}
+
+/// Collect direct array references, including function calls but excluding branch bodies.
+struct OwnArrayRefs<'a> {
+    fn_arrays: &'a HashMap<crate::ast::FnName, HashSet<VarName>>,
+    fns: HashSet<crate::ast::FnName>,
+    out: HashSet<VarName>,
+}
+
+impl crate::visit::Visitor for OwnArrayRefs<'_> {
+    fn visit_expr(&mut self, e: &Expr) {
+        match e {
+            Expr::ArrayRef(name, _) => {
+                self.out.insert(name.clone());
+            }
+            Expr::FnCall(name, _) => {
+                self.fns.insert(name.clone());
+                if let Some(arrays) = self.fn_arrays.get(name) {
+                    self.out.extend(arrays.iter().cloned());
+                }
+            }
+            _ => {}
+        }
+        crate::visit::walk_expr(self, e);
+    }
+    fn visit_str_expr(&mut self, s: &StrExpr) {
+        if let StrExpr::ArrayRef(name, _) = s {
+            self.out.insert(name.clone());
+        }
+        crate::visit::walk_str_expr(self, s);
+    }
+    fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+        match stmt {
+            Stmt::If { cond, .. } | Stmt::IfElse { cond, .. } => {
+                self.visit_expr(cond);
+                return;
+            }
+            Stmt::Rcomp { .. } | Stmt::DefFn { .. } => return,
+            Stmt::ArrayLet { name, .. } | Stmt::ArrayLetStr { name, .. } => {
+                self.out.insert(name.clone());
+            }
+            Stmt::Read(targets) | Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+                for t in targets {
+                    if let ReadTarget::Array { name, .. } = t {
+                        self.out.insert(name.clone());
+                    }
+                }
+            }
+            Stmt::Get { var, indices } if !indices.is_empty() => {
+                self.out.insert(var.clone());
+            }
+            Stmt::Fetch {
+                target,
+                target_indices,
+                ..
+            } if !target_indices.is_empty() => {
+                self.out.insert(target.clone());
+            }
+            _ => {}
+        }
+        crate::visit::walk_stmt(self, line_no, stmt);
+    }
+}
+
+/// The arrays each `DEF FN` body reads, with those of the functions it calls.
+fn fn_body_arrays(module: &Module) -> HashMap<crate::ast::FnName, HashSet<VarName>> {
+    struct Defs(Vec<(crate::ast::FnName, Expr)>);
+    impl crate::visit::Visitor for Defs {
+        fn visit_stmt(&mut self, line_no: u16, stmt: &Stmt) {
+            if let Stmt::DefFn { name, body, .. } = stmt {
+                self.0.push((name.clone(), body.clone()));
+            }
+            crate::visit::walk_stmt(self, line_no, stmt);
+        }
+    }
+    let mut defs = Defs(Vec::new());
+    crate::visit::walk_module(&mut defs, module);
+    let empty = HashMap::new();
+    let mut direct: HashMap<crate::ast::FnName, (HashSet<VarName>, HashSet<crate::ast::FnName>)> =
+        HashMap::new();
+    for (name, body) in &defs.0 {
+        let mut refs = OwnArrayRefs {
+            fn_arrays: &empty,
+            fns: HashSet::new(),
+            out: HashSet::new(),
+        };
+        crate::visit::Visitor::visit_expr(&mut refs, body);
+        let entry = direct.entry(name.clone()).or_default();
+        entry.0.extend(refs.out);
+        entry.1.extend(refs.fns);
+    }
+    let mut out: HashMap<crate::ast::FnName, HashSet<VarName>> = direct
+        .iter()
+        .map(|(name, (arrays, _))| (name.clone(), arrays.clone()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (name, (_, calls)) in &direct {
+            let mut add: Vec<VarName> = Vec::new();
+            for callee in calls {
+                if let Some(arrays) = out.get(callee) {
+                    add.extend(arrays.iter().filter(|a| !out[name].contains(*a)).cloned());
+                }
+            }
+            if !add.is_empty() {
+                out.get_mut(name).unwrap().extend(add);
+                changed = true;
+            }
+        }
+        if !changed {
+            return out;
+        }
+    }
+}
+
+/// What a subroutine does between its entry and its RETURN, nested calls included.
+#[derive(Clone, Default)]
+struct SubEffect {
+    /// RETURN nodes that end this call, not a nested one.
+    returns: Vec<usize>,
+    /// Arrays it may reference.
+    touched: Vec<usize>,
+    /// It may run `CLR`, `RUN` or a `DIM` of a listed array, or calls itself.
+    opaque: bool,
+}
+
+fn call_targets(stmt: &Stmt) -> Vec<u16> {
+    match stmt {
+        Stmt::GoSub { target } => vec![*target],
+        Stmt::OnBranch { targets, .. } => targets.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Walk a subroutine and its nested calls to collect effects and its own returns.
+fn sub_effect(
+    module: &Module,
+    cfg: &Cfg,
+    index: &HashMap<VarName, usize>,
+    refs: &[Vec<usize>],
+    entry: usize,
+    memo: &mut HashMap<usize, Option<SubEffect>>,
+) -> SubEffect {
+    match memo.get(&entry) {
+        Some(Some(done)) => return done.clone(),
+        // A call back into a subroutine still being walked.
+        Some(None) => {
+            return SubEffect {
+                opaque: true,
+                ..SubEffect::default()
+            };
+        }
+        None => {}
+    }
+    memo.insert(entry, None);
+    let mut effect = SubEffect::default();
+    let mut seen = vec![false; cfg.nodes.len()];
+    let mut work = vec![entry];
+    while let Some(id) = work.pop() {
+        if std::mem::replace(&mut seen[id], true) {
+            continue;
+        }
+        let stmt = cfg.stmt_at(id, module);
+        match stmt {
+            Stmt::Clr | Stmt::Run(_) => effect.opaque = true,
+            Stmt::Dim(specs) if specs.iter().any(|s| index.contains_key(&s.name)) => {
+                effect.opaque = true;
+            }
+            Stmt::Return => {
+                effect.returns.push(id);
+                continue;
+            }
+            _ => {}
+        }
+        effect.touched.extend(&refs[id]);
+        if let Some(&back) = cfg.gosub_continuations.get(&id) {
+            for t in call_targets(stmt) {
+                if let Some(&e) = cfg.line_first.get(&t) {
+                    let inner = sub_effect(module, cfg, index, refs, e, memo);
+                    effect.touched.extend(inner.touched);
+                    effect.opaque |= inner.opaque;
+                }
+            }
+            work.push(back);
+            continue;
+        }
+        work.extend(&cfg.nodes[id].successors);
+    }
+    effect.touched.sort_unstable();
+    effect.touched.dedup();
+    memo.insert(entry, Some(effect.clone()));
+    effect
+}
+
+/// Separate call bodies from return-flow nodes to keep caller array states independent.
+fn summarize_calls(
+    module: &Module,
+    cfg: &Cfg,
+    index: &HashMap<VarName, usize>,
+    refs: &[Vec<usize>],
+) -> (Cfg, HashMap<usize, (Vec<usize>, usize)>) {
+    let n = cfg.nodes.len();
+    let mut memo: HashMap<usize, Option<SubEffect>> = HashMap::new();
+    // Per call: the subroutine entries, its effect and its return point.
+    let mut effects: HashMap<usize, (Vec<usize>, SubEffect, usize)> = HashMap::new();
+    for (&call, &back) in &cfg.gosub_continuations {
+        let mut effect = SubEffect::default();
+        let mut entries = Vec::new();
+        for t in call_targets(cfg.stmt_at(call, module)) {
+            if let Some(&e) = cfg.line_first.get(&t) {
+                let inner = sub_effect(module, cfg, index, refs, e, &mut memo);
+                effect.returns.extend(inner.returns);
+                effect.touched.extend(inner.touched);
+                effect.opaque |= inner.opaque;
+                entries.push(e);
+            }
+        }
+        effect.touched.sort_unstable();
+        effect.touched.dedup();
+        effects.insert(call, (entries, effect, back));
+    }
+    // RETURN edges of the outer copy: from each opaque call's own RETURNs to its return point.
+    let mut return_edges: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (entries, effect, back) in effects.values() {
+        if effect.opaque && !entries.is_empty() {
+            for &r in &effect.returns {
+                return_edges.entry(r).or_default().push(*back);
+            }
+        }
+    }
+    let mut nodes: Vec<CfgNode> = cfg
+        .nodes
+        .iter()
+        .chain(cfg.nodes.iter())
+        .map(|node| CfgNode {
+            successors: Vec::new(),
+            predecessors: Vec::new(),
+            ..node.clone()
+        })
+        .collect();
+    let mut calls: HashMap<usize, (Vec<usize>, usize)> = HashMap::new();
+    for (copy, base) in [(0usize, 0usize), (1, n)] {
+        for id in 0..n {
+            let succ: Vec<usize> = if matches!(cfg.stmt_at(id, module), Stmt::Return) {
+                if copy == 0 {
+                    return_edges.get(&id).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else if let Some((entries, effect, back)) = effects.get(&id) {
+                if effect.opaque {
+                    cfg.nodes[id].successors.clone()
+                } else {
+                    calls.insert(base + id, (effect.touched.clone(), base + back));
+                    let mut s: Vec<usize> = entries.iter().map(|e| n + e).collect();
+                    s.push(*back);
+                    for t in cfg.nodes[id].successors.iter() {
+                        if !entries.contains(t) && t != back {
+                            s.push(*t);
+                        }
+                    }
+                    let mut out: Vec<usize> = Vec::new();
+                    for t in s {
+                        // Entries are already in the body copy; the rest stay in this copy.
+                        let t = if t >= n { t } else { base + t };
+                        if !out.contains(&t) {
+                            out.push(t);
+                        }
+                    }
+                    nodes[base + id].successors = out;
+                    continue;
+                }
+            } else {
+                cfg.nodes[id].successors.clone()
+            };
+            nodes[base + id].successors = succ.into_iter().map(|t| base + t).collect();
+        }
+    }
+    for id in 0..nodes.len() {
+        for s in nodes[id].successors.clone() {
+            nodes[s].predecessors.push(id);
+        }
+    }
+    let graph = Cfg {
+        nodes,
+        ..cfg.clone()
+    };
+    (graph, calls)
+}
+
+/// Solve the states of `arrays` over `cfg`.
+pub fn array_states(module: &Module, cfg: &Cfg, arrays: &[VarName]) -> ArrayStates {
+    let index: HashMap<VarName, usize> = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.clone(), i))
+        .collect();
+    let fn_arrays = fn_body_arrays(module);
+    let refs: Vec<Vec<usize>> = (0..cfg.nodes.len())
+        .map(|id| {
+            let mut v = OwnArrayRefs {
+                fn_arrays: &fn_arrays,
+                fns: HashSet::new(),
+                out: HashSet::new(),
+            };
+            crate::visit::Visitor::visit_stmt(
+                &mut v,
+                cfg.nodes[id].line_no,
+                cfg.stmt_at(id, module),
+            );
+            let mut ids: Vec<usize> = v.out.iter().filter_map(|a| index.get(a).copied()).collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+    let (cfg2, calls) = summarize_calls(module, cfg, &index, &refs);
+    let solved = solve(
+        module,
+        &cfg2,
+        &ArrayStateFlow {
+            index: &index,
+            refs: &refs,
+            calls: &calls,
+        },
+    );
+    let n = cfg.nodes.len();
+    let per_node = (0..n)
+        .map(|id| {
+            let mut masks = solved[id].0.join(&solved[n + id].0).0;
+            masks.resize(arrays.len(), 0);
+            masks
+        })
+        .collect();
+    ArrayStates { per_node, refs }
+}
+
 // ===== Numeric range facts =================================================
 
 /// Inclusive integer range for expressions/variables that are known to
@@ -729,21 +1212,31 @@ fn clamp_fact_i64(v: i64) -> Option<i32> {
     }
 }
 
-/// Known integer facts at a program point. Missing key = unknown.
+/// Shared integer facts at a program point; missing variables have unknown ranges.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NumericState {
-    pub vars: HashMap<VarName, IntRange>,
+    pub vars: Rc<HashMap<VarName, IntRange>>,
 }
 
 impl NumericState {
     pub fn get(&self, v: &VarName) -> Option<IntRange> {
         self.vars.get(v).copied()
     }
+    /// This state with `v` known to hold a whole number in `r`.
+    pub fn with_var(&self, v: &VarName, r: IntRange) -> Self {
+        let mut out = self.clone();
+        out.set(v.clone(), r);
+        out
+    }
     fn set(&mut self, v: VarName, r: IntRange) {
-        self.vars.insert(v, r);
+        if self.vars.get(&v) != Some(&r) {
+            Rc::make_mut(&mut self.vars).insert(v, r);
+        }
     }
     fn kill(&mut self, v: &VarName) {
-        self.vars.remove(v);
+        if self.vars.contains_key(v) {
+            Rc::make_mut(&mut self.vars).remove(v);
+        }
     }
 }
 
@@ -753,13 +1246,27 @@ impl Lattice for NumericState {
     }
 
     fn join(&self, other: &Self) -> Self {
-        let mut vars = HashMap::new();
-        for (v, a) in &self.vars {
-            if let Some(b) = other.vars.get(v) {
-                vars.insert(v.clone(), a.join(*b));
-            }
+        let mut out = self.clone();
+        out.join_into(other);
+        out
+    }
+
+    fn join_into(&mut self, other: &Self) {
+        if Rc::ptr_eq(&self.vars, &other.vars) {
+            return;
         }
-        Self { vars }
+        let same = self.vars.len() <= other.vars.len()
+            && self.vars.iter().all(|(v, a)| other.vars.get(v).is_some_and(|b| a.join(*b) == *a));
+        if same {
+            return;
+        }
+        Rc::make_mut(&mut self.vars).retain(|v, a| match other.vars.get(v) {
+            Some(b) => {
+                *a = a.join(*b);
+                true
+            }
+            None => false,
+        });
     }
 }
 
@@ -788,18 +1295,43 @@ impl crate::analysis::Analysis for NumericFactAnalysis {
                 shadow_int_read_counts: HashMap::new(),
                 shadow_only_vars: HashSet::new(),
                 shadow_unsigned_vars: HashSet::new(),
+                shadow_value_bounds: HashMap::new(),
             };
         }
         let data_range = compute_data_range(module);
-        let per_node = solve(module, &cfg, &NumericFactsFlow { data_range });
+        let entry = zeroed_numeric_scalars(module);
+        let for_vars = for_loop_vars(module);
+        let mut flow = NumericFactsFlow { entry, for_vars, data_range, caps: HashMap::new() };
+        let mut per_node = solve(module, &cfg, &flow);
+        // Refine loop-entry bounds until no further loop bounds are found.
+        const CAP_ROUNDS: usize = 4;
+        for _ in 0..CAP_ROUNDS {
+            let mut caps = eq_exit_caps(module, &cfg, &per_node, &flow.entry);
+            for (node, more) in for_trip_caps(module, &cfg, &per_node, &flow.for_vars) {
+                caps.entry(node).or_default().extend(more);
+            }
+            for list in caps.values_mut() {
+                list.sort_by(|a, b| (&a.0.base, a.1.min, a.1.max).cmp(&(&b.0.base, b.1.min, b.1.max)));
+            }
+            if caps == flow.caps {
+                break;
+            }
+            flow.caps = caps;
+            per_node = solve(module, &cfg, &flow);
+        }
         let node_by_stmt = cfg
             .nodes
             .iter()
             .enumerate()
             .map(|(id, node)| (node.stmt.clone(), id))
             .collect();
-        let (shadow_int_vars, shadow_int_read_counts, shadow_only_vars, shadow_unsigned_vars) =
-            compute_shadow_int_vars(module, &cfg, &per_node, data_range);
+        let (
+            shadow_int_vars,
+            shadow_int_read_counts,
+            shadow_only_vars,
+            shadow_unsigned_vars,
+            shadow_value_bounds,
+        ) = compute_shadow_int_vars(module, &cfg, &per_node, data_range);
         NumericFactsResult {
             per_node,
             node_by_stmt,
@@ -807,6 +1339,7 @@ impl crate::analysis::Analysis for NumericFactAnalysis {
             shadow_int_read_counts,
             shadow_only_vars,
             shadow_unsigned_vars,
+            shadow_value_bounds,
         }
     }
 }
@@ -837,6 +1370,8 @@ pub struct NumericFactsResult {
     /// needs the sign tag when converting the shadow back to FAC
     /// (signed via `$B391` GIVAYF / unsigned via `$B3A2` SNGFLT-pair).
     pub shadow_unsigned_vars: HashSet<VarName>,
+    /// Join shadow-variable writes and bound the NEXT steps of simultaneously open frames.
+    pub shadow_value_bounds: HashMap<VarName, IntRange>,
 }
 
 #[allow(dead_code)] // codegen consumes the entry-range subset first; the rest is analysis API.
@@ -880,6 +1415,10 @@ impl NumericFactsResult {
 }
 
 struct NumericFactsFlow {
+    /// Initial numeric state: RUN sets every scalar to zero.
+    entry: NumericState,
+    /// Every FOR statement's variable: the ones a bare NEXT can step.
+    for_vars: Vec<VarName>,
     /// Range of `int(value)` over every numeric DATA entry in the
     /// module, or `None` when the module has no DATA / any DATA value
     /// is non-finite or doesn't truncate to i16. Used by READ to
@@ -887,6 +1426,8 @@ struct NumericFactsFlow {
     /// to kill the target's range, blocking shadow-int promotion for
     /// READ-fed Float vars.
     data_range: Option<IntRange>,
+    /// Range bounds that hold at node output independently of the transfer result.
+    caps: HashMap<usize, Vec<(VarName, IntRange)>>,
 }
 
 impl DataflowAnalysis for NumericFactsFlow {
@@ -895,17 +1436,66 @@ impl DataflowAnalysis for NumericFactsFlow {
         Direction::Forward
     }
 
+    fn boundary(&self) -> NumericState {
+        self.entry.clone()
+    }
+
+    /// Keep only the facts that did not change; the state can then only shrink.
+    fn freeze(&self, prev: &NumericState, next: &NumericState) -> NumericState {
+        let mut out = prev.clone();
+        Rc::make_mut(&mut out.vars).retain(|v, p| next.vars.get(v) == Some(p));
+        out
+    }
+
+    /// Widen moving bounds to thresholds while keeping unknown inputs unknown.
+    fn widen(&self, prev: &NumericState, next: &NumericState) -> NumericState {
+        let grows = next
+            .vars
+            .iter()
+            .any(|(v, n)| prev.vars.get(v).is_none_or(|p| n.min < p.min || n.max > p.max));
+        if !grows && next.vars.len() == prev.vars.len() {
+            return prev.clone();
+        }
+        let mut out = next.clone();
+        Rc::make_mut(&mut out.vars).retain(|v, n| {
+            let Some(p) = prev.vars.get(v) else {
+                return false;
+            };
+            let lo = if n.min < p.min { far_threshold_below(n.min) } else { Some(p.min) };
+            let hi = if n.max > p.max { far_threshold_above(n.max) } else { Some(p.max) };
+            match (lo, hi) {
+                (Some(lo), Some(hi)) => {
+                    *n = IntRange::new(lo, hi);
+                    true
+                }
+                _ => false,
+            }
+        });
+        out
+    }
+
     fn transfer(
         &self,
         module: &Module,
         cfg: &Cfg,
-        node: &CfgNode,
+        _node: &CfgNode,
         node_id: usize,
         in_state: &Self::Lattice,
     ) -> Self::Lattice {
         let stmt = cfg.stmt_at(node_id, module);
-        let mut out = transfer_numeric_stmt(stmt, in_state, self.data_range);
-        apply_monotone_inc_loop_cap(&mut out, stmt, cfg, module, node, node_id, in_state);
+        let mut out = transfer_numeric_stmt(stmt, in_state, self.data_range, &self.for_vars);
+        if let Some((var, step)) = next_step(cfg, module, node_id, in_state) {
+            out.set(var.clone(), step.any);
+        }
+        for (var, cap) in self.caps.get(&node_id).into_iter().flatten() {
+            let capped = match out.get(var) {
+                Some(r) if r.min.max(cap.min) <= r.max.min(cap.max) => {
+                    IntRange::new(r.min.max(cap.min), r.max.min(cap.max))
+                }
+                _ => *cap,
+            };
+            out.set(var.clone(), capped);
+        }
         out
     }
 
@@ -924,7 +1514,25 @@ impl DataflowAnalysis for NumericFactsFlow {
             if vars.is_empty() || vars.iter().any(Option::is_none) {
                 return None; // bare NEXT — leave to the uniform kill
             }
-            let killed = transfer_numeric_stmt(stmt, in_state, self.data_range);
+            // Bound literal-step counters separately on loop-back and exit edges.
+            if let Some((var, step)) = next_step(cfg, module, node_id, in_state) {
+                let mut outs = Vec::with_capacity(node.successors.len());
+                for &succ in &node.successors {
+                    let mut edge = in_state.clone();
+                    let range = if !for_body_start(cfg, module, succ, var) {
+                        step.out
+                    } else if succ == node_id + 1 {
+                        // A body start that is also where NEXT falls through: either way.
+                        step.any
+                    } else {
+                        step.back
+                    };
+                    edge.set(var.clone(), range);
+                    outs.push(edge);
+                }
+                return Some(outs);
+            }
+            let killed = transfer_numeric_stmt(stmt, in_state, self.data_range, &self.for_vars);
             let preserved = in_state.clone();
             let mut outs = Vec::with_capacity(node.successors.len());
             let mut any_back_edge = false;
@@ -947,17 +1555,109 @@ impl DataflowAnalysis for NumericFactsFlow {
         // CFG-builder lays out differently and the refinement gain
         // there is small enough that we leave them at uniform.
         if node.successors.len() != 2 {
+            // A final conditional jump has one edge when its false branch ends the program.
+            if node.successors.len() == 1
+                && node_id + 1 == cfg.nodes.len()
+                && let Stmt::If { cond, then: crate::ir::ThenIr::Goto(_) } = stmt
+            {
+                let base = transfer_numeric_stmt(stmt, in_state, self.data_range, &self.for_vars);
+                return Some(vec![refine_state_for_cond(&base, cond, true)]);
+            }
             return None;
         }
         let cond = match stmt {
             Stmt::If { cond, .. } => cond,
             _ => return None,
         };
-        let base = transfer_numeric_stmt(stmt, in_state, self.data_range);
+        let base = transfer_numeric_stmt(stmt, in_state, self.data_range, &self.for_vars);
         let then_state = refine_state_for_cond(&base, cond, true);
         let fall_state = refine_state_for_cond(&base, cond, false);
         Some(vec![then_state, fall_state])
     }
+}
+
+/// NEXT ranges after the statement, on a loop-back edge, and at loop exit.
+struct NextStep {
+    any: IntRange,
+    back: IntRange,
+    out: IntRange,
+}
+
+/// Whether `succ` is the first body statement of a FOR over `var`.
+fn for_body_start(cfg: &Cfg, module: &Module, succ: usize, var: &VarName) -> bool {
+    cfg.nodes[succ].predecessors.iter().any(|&p| {
+        matches!(cfg.stmt_at(p, module), Stmt::For { var: v, .. } if v == var)
+            && cfg.nodes[p].successors == [succ]
+    })
+}
+
+/// Bound named NEXT results using known integer steps and a shared literal end.
+fn next_step<'a>(
+    cfg: &Cfg,
+    module: &'a Module,
+    node_id: usize,
+    in_state: &NumericState,
+) -> Option<(&'a VarName, NextStep)> {
+    let Stmt::Next { vars } = cfg.stmt_at(node_id, module) else {
+        return None;
+    };
+    let [Some(var)] = vars.as_slice() else {
+        return None;
+    };
+    let r = in_state.get(var)?;
+    let mut found: Option<(i32, i32)> = None;
+    for &succ in &cfg.nodes[node_id].successors {
+        for &f in &cfg.nodes[succ].predecessors {
+            let Stmt::For { var: v, end, step, .. } = cfg.stmt_at(f, module) else {
+                continue;
+            };
+            if v != var || cfg.nodes[f].successors != [succ] {
+                continue;
+            }
+            let k = (expr_as_int_literal(step)?, expr_as_int_literal(end)?);
+            if k.0 == 0 || found.is_some_and(|x| x != k) {
+                return None;
+            }
+            found = Some(k);
+        }
+    }
+    let (step, end) = found?;
+    let any = IntRange::new(clamp_fact_i64(i64::from(r.min) + i64::from(step))?, clamp_fact_i64(i64::from(r.max) + i64::from(step))?);
+    // A side no value takes may carry any fact: the bound nearest the values.
+    let part = |lo: i32, hi: i32, empty: i32| {
+        if lo <= hi { IntRange::new(lo, hi) } else { IntRange::singleton(empty) }
+    };
+    let (back, out) = if step > 0 {
+        (part(any.min, any.max.min(end), end), part(any.min.max(end + 1), any.max, end + 1))
+    } else {
+        (part(any.min.max(end), any.max, end), part(any.min, any.max.min(end - 1), end - 1))
+    };
+    Some((var, NextStep { any, back, out }))
+}
+
+/// Initialize all numeric scalars to zero.
+fn zeroed_numeric_scalars(module: &Module) -> NumericState {
+    struct Names(HashSet<VarName>);
+    impl crate::visit::Visitor for Names {
+        fn visit_stmt(&mut self, line: u16, stmt: &Stmt) {
+            self.0.extend(stmt_defs(stmt));
+            crate::visit::walk_stmt(self, line, stmt);
+        }
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.0.insert(v.clone());
+        }
+    }
+    let mut names = Names(HashSet::new());
+    crate::visit::Visitor::visit_module(&mut names, module);
+    let mut state = NumericState::default();
+    for v in names.0 {
+        if matches!(v.kind, VarKind::Float | VarKind::Integer)
+            && !matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL")
+        {
+            state.set(v, IntRange::singleton(0));
+        }
+    }
+    state
 }
 
 /// Apply a guard refinement to `state` based on `cond` evaluated to
@@ -1080,11 +1780,8 @@ fn refine_range(prev: IntRange, op: BinOp, n: i32) -> Option<IntRange> {
     let lo = prev.min.max(new.min);
     let hi = prev.max.min(new.max);
     if lo > hi {
-        // The intersection is empty — the branch is unreachable,
-        // and no fact we add here is sound for downstream consumers.
-        // Return `prev` unchanged so the dataflow doesn't widen
-        // toward a meaningless interval.
-        return None;
+        // Use the nearest bound for an unreachable branch until its range becomes reachable.
+        return Some(IntRange::singleton(if prev.max < new.min { new.min } else { new.max }));
     }
     Some(IntRange::new(lo, hi))
 }
@@ -1107,7 +1804,7 @@ fn expr_as_int_literal(e: &Expr) -> Option<i32> {
 
 /// Walk every Stmt::Data in source order and compute the i32 range covering every numeric
 /// entry.
-fn compute_data_range(module: &Module) -> Option<IntRange> {
+pub(crate) fn compute_data_range(module: &Module) -> Option<IntRange> {
     let mut min = i32::MAX;
     let mut max = i32::MIN;
     let mut any = false;
@@ -1151,6 +1848,7 @@ fn transfer_numeric_stmt(
     stmt: &Stmt,
     in_state: &NumericState,
     data_range: Option<IntRange>,
+    for_vars: &[VarName],
 ) -> NumericState {
     let mut out = in_state.clone();
     match stmt {
@@ -1184,12 +1882,14 @@ fn transfer_numeric_stmt(
             // value is generally end+step (float/int FOR) or otherwise
             // depends on the selected codegen route, so the body
             // envelope from FOR is not a sound post-NEXT fact.
+            // A bare NEXT may step any variable used by a FOR statement.
             if vars.is_empty() || vars.iter().any(Option::is_none) {
-                out.vars.clear();
-            } else {
-                for v in vars.iter().flatten() {
+                for v in for_vars {
                     out.kill(v);
                 }
+            }
+            for v in vars.iter().flatten() {
+                out.kill(v);
             }
         }
 
@@ -1254,53 +1954,14 @@ fn transfer_numeric_stmt(
         Stmt::Input { targets, .. } => kill_read_targets(&mut out, targets),
         Stmt::InputFile { targets, .. } => kill_read_targets(&mut out, targets),
         Stmt::Clr => {
-            for r in out.vars.values_mut() {
+            for r in Rc::make_mut(&mut out.vars).values_mut() {
                 *r = IntRange::singleton(0);
             }
         }
-        Stmt::Run(_) => out.vars.clear(),
+        Stmt::Run(_) => out.vars = Rc::default(),
         _ => {}
     }
     out
-}
-
-/// Detect the `var = var ± Number(k)` pattern with `|k| ≤ 1024` —
-/// the typical FOR-counter-loop step shape that the range-clamp
-/// in `assign_expr_range` ends up killing once the fixpoint widens
-/// enough. We trust that real BASIC programs bound such loops via
-/// an IF exit, even though the dataflow doesn't model conditions,
-/// so the runtime range stays inside i16. Used by the shadow-int
-/// gate to opt out of the otherwise-too-strict `all_i16` check.
-fn stmt_self_modify_small_step(stmt: &Stmt, target: &VarName) -> bool {
-    let Stmt::Let { var, value } = stmt else {
-        return false;
-    };
-    if var != target {
-        return false;
-    }
-    fn matches(e: &Expr, target: &VarName) -> bool {
-        matches!(e, Expr::Var(v) if v == target)
-    }
-    fn const_fits(n: f64) -> bool {
-        n.is_finite() && n.fract() == 0.0 && n.abs() <= 1024.0
-    }
-    match value {
-        Expr::Bin(BinOp::Add, l, r) | Expr::Bin(BinOp::Sub, l, r) => {
-            if matches(l, target) {
-                if let Expr::Number(n) = r.as_ref() {
-                    return const_fits(*n);
-                }
-            }
-            if let Expr::Bin(BinOp::Add, _, _) = value
-                && matches(r, target)
-                && let Expr::Number(n) = l.as_ref()
-            {
-                return const_fits(*n);
-            }
-            false
-        }
-        _ => false,
-    }
 }
 
 fn assign_expr_range(out: &mut NumericState, var: &VarName, value: &Expr, in_state: &NumericState) {
@@ -1312,16 +1973,12 @@ fn assign_expr_range(out: &mut NumericState, var: &VarName, value: &Expr, in_sta
             // Self-modify with a multi-value range: try the small-step
             // shape `var = var ± SmallConst` first so we keep the bound
             // across loop iterations (e.g. `M = M - 1` in a 240→0 down-
-            // counter); killing it here would leave the path-sensitive
-            // refinement nothing to tighten. Anything else falls back to
-            // kill.
+            // counter). Other expressions use bounded widening below.
             Some(r) => {
                 if let Some(stepped) = self_modify_step_range(value, var, r) {
                     out.set(var.clone(), stepped);
                     return;
                 }
-                out.kill(var);
-                return;
             }
             None => {
                 out.kill(var);
@@ -1329,10 +1986,18 @@ fn assign_expr_range(out: &mut NumericState, var: &VarName, value: &Expr, in_sta
             }
         }
     }
-    if let Some(r) = expr_int_range(value, in_state) {
-        out.set(var.clone(), r);
-    } else {
-        out.kill(var);
+    match expr_int_range(value, in_state) {
+        // Integer variables contain only values accepted by the signed range check.
+        Some(r) if var.kind == VarKind::Integer => {
+            let (lo, hi) = (r.min.max(i16::MIN as i32), r.max.min(i16::MAX as i32));
+            if lo <= hi {
+                out.set(var.clone(), IntRange::new(lo, hi));
+            } else {
+                out.kill(var);
+            }
+        }
+        Some(r) => out.set(var.clone(), r),
+        None => out.kill(var),
     }
 }
 
@@ -1345,9 +2010,7 @@ fn assign_expr_range(out: &mut NumericState, var: &VarName, value: &Expr, in_sta
 /// crawl forward one value per iteration until it hit the i32
 /// hard-clamp at ±1,000,000 — that's millions of dataflow rounds
 /// for any unbounded down-counter like `Y = Y - 1` inside a
-/// `GOTO`-loop. Detect the i16-overflow case up front and widen to
-/// the full i16 range (the largest BASIC v2 integer range we model
-/// anyway) so the lattice stabilises in a single step instead.
+/// `GOTO` loop. Keep i16 bounds for integers; discard overflowing float ranges.
 fn self_modify_step_range(value: &Expr, var: &VarName, prev: IntRange) -> Option<IntRange> {
     let (op, lit) = match value {
         Expr::Bin(op @ (BinOp::Add | BinOp::Sub), l, r) => match (l.as_ref(), r.as_ref()) {
@@ -1371,13 +2034,9 @@ fn self_modify_step_range(value: &Expr, var: &VarName, prev: IntRange) -> Option
         BinOp::Sub => prev.max as i64 - k as i64,
         _ => return None,
     };
-    // Widening: once the stepped range straddles outside i16, jump
-    // straight to the full i16 interval. Without this the fixpoint
-    // walks the range outward one value per iteration through every
-    // monotone loop, taking up to 2 million rounds before
-    // `clamp_fact_i64` finally drops the var.
+    // Keep the full i16 range for overflowing integer counters; float ranges become unknown.
     if lo < i16::MIN as i64 || hi > i16::MAX as i64 {
-        return Some(IntRange::i16());
+        return (var.kind == VarKind::Integer).then(IntRange::i16);
     }
     // Monotone-step widening with thresholds: when the step pushes a
     // bound past its previous value, snap to the nearest "interesting"
@@ -1408,138 +2067,322 @@ fn self_modify_step_range(value: &Expr, var: &VarName, prev: IntRange) -> Option
     Some(IntRange::new(widened_lo, widened_hi))
 }
 
-/// Narrow `var`'s OUT range after a `var = var + 1` step when the
-/// CFG successor is `IF var = Other THEN ...` AND there's a clear
-/// loop back to this LET. In that shape `var` is a monotone counter
-/// approaching `Other` for the eq-exit; the loop terminates when
-/// `var = Other`, so `var` never exceeds `Other.max` at the LET's
-/// OUT. Without this, dataflow widening on `X = X + 1` runs `X`'s
-/// upper bound up to `i16::MAX` and downstream u8/abs-X fast paths
-/// can't fire.
-///
-/// Soundness gate: a predecessor of the LET node must have a line
-/// number >= the LET node's own line — that's the structural sign
-/// of a back edge into this line (a `GOTO N` or `IF ... THEN N` from
-/// a later line). Without the back edge we can't conclude this is a
-/// loop counter; falls back to the normal widened range.
-fn apply_monotone_inc_loop_cap(
-    out: &mut NumericState,
-    stmt: &Stmt,
-    cfg: &Cfg,
+/// Bound unit-step counters whose equality branch exits the loop at an invariant value.
+fn eq_exit_caps(
     module: &Module,
-    node: &CfgNode,
-    node_id: usize,
-    in_state: &NumericState,
-) {
-    let Stmt::Let { var, value } = stmt else {
-        return;
-    };
-    // Must be `var = var + 1` or `1 + var`. Step magnitude > 1 can
-    // overshoot the eq-exit and is unsound for this cap.
-    let is_inc1 = match value {
-        Expr::Bin(BinOp::Add, l, r) => match (l.as_ref(), r.as_ref()) {
-            (Expr::Var(v), Expr::Number(n)) if v == var && *n == 1.0 => true,
-            (Expr::Number(n), Expr::Var(v)) if v == var && *n == 1.0 => true,
+    cfg: &Cfg,
+    per_node: &[(NumericState, NumericState)],
+    entry: &NumericState,
+) -> HashMap<usize, Vec<(VarName, IntRange)>> {
+    let mut caps: HashMap<usize, Vec<(VarName, IntRange)>> = HashMap::new();
+    for (step, node) in cfg.nodes.iter().enumerate() {
+        let Stmt::Let { var, value } = cfg.stmt_at(step, module) else {
+            continue;
+        };
+        let Expr::Bin(BinOp::Add, l, r) = value else {
+            continue;
+        };
+        let is_inc1 = match (l.as_ref(), r.as_ref()) {
+            (Expr::Var(v), Expr::Number(n)) | (Expr::Number(n), Expr::Var(v)) => v == var && *n == 1.0,
             _ => false,
-        },
-        _ => false,
-    };
-    if !is_inc1 {
-        return;
-    }
-    // Unique CFG successor must be `IF var = Other` (eq).
-    if node.successors.len() != 1 {
-        return;
-    }
-    let succ_id = node.successors[0];
-    let succ_stmt = cfg.stmt_at(succ_id, module);
-    let Stmt::If { cond, .. } = succ_stmt else {
-        return;
-    };
-    let Expr::Bin(BinOp::Eq, l, r) = cond else {
-        return;
-    };
-    let other = if matches!(l.as_ref(), Expr::Var(v) if v == var) {
-        r.as_ref()
-    } else if matches!(r.as_ref(), Expr::Var(v) if v == var) {
-        l.as_ref()
-    } else {
-        return;
-    };
-    // The "this is a loop" gate: at least one CFG predecessor of
-    // the LET node must come from a line >= this one (back edge).
-    // For a one-shot `X=X+1: IF X=M` outside any loop, every pred
-    // sits on a strictly earlier line — the cap doesn't apply and
-    // X stays at its full widened range.
-    let self_line = node.line_no;
-    let has_back_edge = node
-        .predecessors
-        .iter()
-        .any(|&p| cfg.nodes[p].line_no >= self_line);
-    if !has_back_edge {
-        return;
-    }
-    // Cap using Other's range from the LET's IN state. Other isn't
-    // modified by the LET itself, so this is the value that drives
-    // the IF in the successor.
-    let Some(other_range) = expr_int_range(other, in_state) else {
-        return;
-    };
-    let cap = other_range.max;
-    let Some(prev) = out.get(var) else {
-        return;
-    };
-    if prev.max <= cap {
-        return;
-    }
-
-    if prev.min > cap {
-        return;
-    }
-    // Find the loop associated with the backward branch.
-    let region = natural_loop(cfg, node_id);
-
-    let other_vars = expr_vars(other);
-    for &n in &region {
-        if n == node_id {
+        };
+        if !is_inc1 || node.successors.len() != 1 {
             continue;
         }
-        for d in stmt_defs(cfg.stmt_at(n, module)) {
-            if &d == var || other_vars.contains(&d) {
-                return;
+        let test = node.successors[0];
+        let Stmt::If {
+            cond: Expr::Bin(BinOp::Eq, l, r),
+            then: crate::ir::ThenIr::Goto(_),
+        } = cfg.stmt_at(test, module)
+        else {
+            continue;
+        };
+        let other = if matches!(l.as_ref(), Expr::Var(v) if v == var) {
+            r.as_ref()
+        } else if matches!(r.as_ref(), Expr::Var(v) if v == var) {
+            l.as_ref()
+        } else {
+            continue;
+        };
+        let (other_range, other_var) = match other {
+            Expr::Number(n) => match expr_as_int_literal(other) {
+                Some(k) if n.fract() == 0.0 => (IntRange::singleton(k), None),
+                _ => continue,
+            },
+            Expr::Var(o) => match per_node[test].0.get(o) {
+                Some(range) => (range, Some(o)),
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Successors of an IF: the THEN jump first, then the fall-through.
+        let test_succs = &cfg.nodes[test].successors;
+        if test_succs.len() != 2 {
+            continue;
+        }
+        let jump = (test, test_succs[0]);
+        let fwd = reach_without(cfg, step, jump, true);
+        let bwd = reach_without(cfg, step, jump, false);
+        let lp: HashSet<usize> = fwd.intersection(&bwd).copied().collect();
+        let cycles = node
+            .predecessors
+            .iter()
+            .any(|&p| lp.contains(&p) && (p, step) != jump);
+        if !cycles || lp.contains(&jump.1) {
+            continue;
+        }
+        let clean = lp.iter().all(|&n| {
+            let s = cfg.stmt_at(n, module);
+            if matches!(s, Stmt::Clr | Stmt::Run(_) | Stmt::Load { .. })
+                || crate::analysis::effect_summary_for_stmt(s).opaque_write
+            {
+                return false;
+            }
+            let defs = stmt_defs(s);
+            (n == step || !defs.contains(var)) && other_var.is_none_or(|o| !defs.contains(o))
+        });
+        if !clean {
+            continue;
+        }
+        let mut lowest = i32::MAX;
+        let mut below = true;
+        for &n in &lp {
+            let mut ins: Vec<Option<IntRange>> = cfg.nodes[n]
+                .predecessors
+                .iter()
+                .filter(|p| !lp.contains(p))
+                .map(|&p| per_node[p].1.get(var))
+                .collect();
+            if n == cfg.entry {
+                ins.push(entry.get(var));
+            }
+            for x in ins {
+                match x {
+                    Some(x) if x.max < other_range.min => lowest = lowest.min(x.min),
+                    _ => below = false,
+                }
+            }
+        }
+        if below && lowest < other_range.max {
+            caps.entry(step)
+                .or_default()
+                .push((var.clone(), IntRange::new(lowest + 1, other_range.max)));
+        }
+    }
+    caps
+}
+
+/// Bound variable steps by a FOR trip count when each write runs at most once per round.
+fn for_trip_caps(
+    module: &Module,
+    cfg: &Cfg,
+    per_node: &[(NumericState, NumericState)],
+    for_vars: &[VarName],
+) -> HashMap<usize, Vec<(VarName, IntRange)>> {
+    let mut caps: HashMap<usize, Vec<(VarName, IntRange)>> = HashMap::new();
+    for (f, node) in cfg.nodes.iter().enumerate() {
+        let Stmt::For {
+            var: counter,
+            start,
+            end,
+            step,
+            ..
+        } = cfg.stmt_at(f, module)
+        else {
+            continue;
+        };
+        let Some(step) = expr_as_int_literal(step).filter(|&k| k != 0).map(i64::from) else {
+            continue;
+        };
+        let at_for = &per_node[f].0;
+        let (Some(first), Some(last)) = (expr_int_range(start, at_for), expr_int_range(end, at_for))
+        else {
+            continue;
+        };
+        // BASIC runs the body once even when the start is already past the end.
+        let span = if step > 0 {
+            i64::from(last.max) - i64::from(first.min)
+        } else {
+            i64::from(first.max) - i64::from(last.min)
+        };
+        let trips = span.max(0) / step.abs() + 1;
+        if node.successors.len() != 1 {
+            continue;
+        }
+        let body = node.successors[0];
+        let back: Vec<usize> = cfg.nodes[body]
+            .predecessors
+            .iter()
+            .copied()
+            .filter(|&p| p != f)
+            .collect();
+        // Only a NEXT may jump back to the body's start: each jump then ends a round.
+        if back
+            .iter()
+            .any(|&p| !matches!(cfg.stmt_at(p, module), Stmt::Next { .. }))
+        {
+            continue;
+        }
+        let is_back = |from: usize, to: usize| to == body && back.contains(&from);
+        let mut fwd = HashSet::from([body]);
+        let mut work = vec![body];
+        while let Some(n) = work.pop() {
+            for &m in &cfg.nodes[n].successors {
+                if m != f && !is_back(n, m) && fwd.insert(m) {
+                    work.push(m);
+                }
+            }
+        }
+        let mut inside: HashSet<usize> = back.iter().copied().filter(|n| fwd.contains(n)).collect();
+        let mut work: Vec<usize> = inside.iter().copied().collect();
+        while let Some(n) = work.pop() {
+            for &p in &cfg.nodes[n].predecessors {
+                if p != f && fwd.contains(&p) && !is_back(p, n) && inside.insert(p) {
+                    work.push(p);
+                }
+            }
+        }
+        if !inside.contains(&body) {
+            continue;
+        }
+        let sealed = inside.iter().all(|&n| {
+            cfg.nodes[n]
+                .predecessors
+                .iter()
+                .all(|&p| inside.contains(&p) || (p == f && n == body))
+        });
+        if !sealed {
+            continue;
+        }
+        let mut steps: HashMap<VarName, Vec<(usize, IntRange)>> = HashMap::new();
+        let mut spoiled: HashSet<VarName> = HashSet::new();
+        let mut counter_kept = true;
+        for &n in &inside {
+            let s = cfg.stmt_at(n, module);
+            if matches!(s, Stmt::Clr | Stmt::Run(_) | Stmt::Load { .. })
+                || crate::analysis::effect_summary_for_stmt(s).opaque_write
+            {
+                counter_kept = false;
+                break;
+            }
+            let mut defs = stmt_defs(s);
+            if let Stmt::Next { vars } = s
+                && vars.iter().any(Option::is_none)
+            {
+                defs.extend(for_vars.iter().cloned());
+            }
+            for d in defs {
+                if &d == counter {
+                    if !back.contains(&n) {
+                        counter_kept = false;
+                    }
+                    continue;
+                }
+                match loop_step_range(s, &d, &per_node[n].0) {
+                    Some(k) => steps.entry(d).or_default().push((n, k)),
+                    None => {
+                        spoiled.insert(d);
+                    }
+                }
+            }
+        }
+        if !counter_kept {
+            continue;
+        }
+        for (v, writes) in steps {
+            if spoiled.contains(&v) {
+                continue;
+            }
+            let Some(at) = at_for.get(&v) else {
+                continue;
+            };
+            if writes.iter().any(|&(w, _)| on_cycle_within(cfg, w, &inside, &is_back)) {
+                continue;
+            }
+            let up: i64 = writes.iter().map(|(_, k)| i64::from(k.max.max(0))).sum();
+            let down: i64 = writes.iter().map(|(_, k)| i64::from(k.min.min(0))).sum();
+            let (Some(lo), Some(hi)) = (
+                clamp_fact_i64(i64::from(at.min) + trips.saturating_mul(down)),
+                clamp_fact_i64(i64::from(at.max) + trips.saturating_mul(up)),
+            ) else {
+                continue;
+            };
+            for (w, _) in writes {
+                caps.entry(w).or_default().push((v.clone(), IntRange::new(lo, hi)));
             }
         }
     }
-    out.set(var.clone(), IntRange::new(prev.min, cap));
+    caps
 }
 
-fn natural_loop(cfg: &Cfg, header: usize) -> HashSet<usize> {
-    let mut region: HashSet<usize> = HashSet::new();
-    region.insert(header);
-    let self_line = cfg.nodes[header].line_no;
-    let mut work: Vec<usize> = cfg.nodes[header]
-        .predecessors
-        .iter()
-        .copied()
-        .filter(|&p| cfg.nodes[p].line_no >= self_line)
-        .collect();
-    while let Some(n) = work.pop() {
-        if !region.insert(n) {
-            continue;
-        }
-        work.extend(cfg.nodes[n].predecessors.iter().copied());
-    }
-    region
-}
-
-/// Every scalar variable read by `e`.
-fn expr_vars(e: &Expr) -> HashSet<VarName> {
-    let mut c = UseCollector {
-        uses: Vec::new(),
-        fns: None,
+/// Return the range of an additive variable step, or None for other writes.
+fn loop_step_range(stmt: &Stmt, var: &VarName, state: &NumericState) -> Option<IntRange> {
+    let Stmt::Let { var: target, value } = stmt else {
+        return None;
     };
-    crate::visit::Visitor::visit_expr(&mut c, e);
-    c.uses.into_iter().collect()
+    if target != var {
+        return None;
+    }
+    let Expr::Bin(op, l, r) = value else {
+        return None;
+    };
+    let is_var = |e: &Expr| matches!(e, Expr::Var(v) if v == var);
+    let (k, negate) = match op {
+        BinOp::Add if is_var(l) => (r.as_ref(), false),
+        BinOp::Add if is_var(r) => (l.as_ref(), false),
+        BinOp::Sub if is_var(l) => (r.as_ref(), true),
+        _ => return None,
+    };
+    if expr_reads_var(k, var) {
+        return None;
+    }
+    let k = expr_int_range(k, state)?;
+    Some(if negate { IntRange::new(-k.max, -k.min) } else { k })
+}
+
+/// Whether `node` reaches itself inside `region` without an edge `skip` accepts.
+fn on_cycle_within(
+    cfg: &Cfg,
+    node: usize,
+    region: &HashSet<usize>,
+    skip: &dyn Fn(usize, usize) -> bool,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut work = vec![node];
+    while let Some(n) = work.pop() {
+        for &m in &cfg.nodes[n].successors {
+            if !region.contains(&m) || skip(n, m) {
+                continue;
+            }
+            if m == node {
+                return true;
+            }
+            if seen.insert(m) {
+                work.push(m);
+            }
+        }
+    }
+    false
+}
+
+/// Reachable nodes in either graph direction without crossing excluded edges.
+fn reach_without(cfg: &Cfg, start: usize, skip: (usize, usize), forward: bool) -> HashSet<usize> {
+    let mut seen = HashSet::from([start]);
+    let mut work = vec![start];
+    while let Some(n) = work.pop() {
+        let next = if forward {
+            &cfg.nodes[n].successors
+        } else {
+            &cfg.nodes[n].predecessors
+        };
+        for &m in next {
+            let edge = if forward { (n, m) } else { (m, n) };
+            if edge != skip && seen.insert(m) {
+                work.push(m);
+            }
+        }
+    }
+    seen
 }
 
 /// Widening thresholds for [`self_modify_step_range`]. Sorted
@@ -1550,6 +2393,20 @@ fn expr_vars(e: &Expr) -> HashSet<VarName> {
 /// loop-exit guards re-narrow the range instead of running away to
 /// ±i16.
 const WIDENING_THRESHOLDS: [i32; 8] = [i16::MIN as i32, -128, -1, 0, 1, 127, 255, i16::MAX as i32];
+
+/// Additional widening thresholds for unsigned words and the fact limit.
+const FAR_THRESHOLDS: [i32; 12] =
+    [-1_000_000, -65535, i16::MIN as i32, -128, -1, 0, 1, 127, 255, i16::MAX as i32, 65535, 1_000_000];
+
+/// Largest widening threshold at or below v, or None.
+fn far_threshold_below(v: i32) -> Option<i32> {
+    FAR_THRESHOLDS.iter().copied().filter(|&t| t <= v).max()
+}
+
+/// Smallest widening threshold at or above v, or None.
+fn far_threshold_above(v: i32) -> Option<i32> {
+    FAR_THRESHOLDS.iter().copied().filter(|&t| t >= v).min()
+}
 
 /// Largest threshold `≤ v`. Used when widening a range's lower bound
 /// — the widened bound must stay `≤` the actual computed bound for
@@ -1605,6 +2462,37 @@ fn kill_read_targets(out: &mut NumericState, targets: &[ReadTarget]) {
             out.kill(v);
         }
     }
+}
+
+/// Bounds for numeric facts, literals, RND, and arithmetic expressions.
+fn expr_real_bounds(e: &Expr, state: &NumericState) -> Option<(f64, f64)> {
+    if let Some(r) = expr_int_range(e, state) {
+        return Some((f64::from(r.min), f64::from(r.max)));
+    }
+    let (lo, hi) = match e {
+        Expr::Number(n) if n.is_finite() => (*n, *n),
+        Expr::Func1(Func1::Rnd, _) => (0.0, 1.0),
+        Expr::Neg(inner) => {
+            let (lo, hi) = expr_real_bounds(inner, state)?;
+            (-hi, -lo)
+        }
+        Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div), l, r) => {
+            let (a, b) = expr_real_bounds(l, state)?;
+            let (c, d) = expr_real_bounds(r, state)?;
+            let corners = match op {
+                BinOp::Add => [a + c, b + d, a + c, b + d],
+                BinOp::Sub => [a - d, b - c, a - d, b - c],
+                BinOp::Mul => [a * c, a * d, b * c, b * d],
+                _ if c > 0.0 || d < 0.0 => [a / c, a / d, b / c, b / d],
+                _ => return None,
+            };
+            let lo = corners.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = corners.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            (lo, hi)
+        }
+        _ => return None,
+    };
+    (lo.abs() <= 1e6 && hi.abs() <= 1e6).then_some((lo, hi))
 }
 
 pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
@@ -1725,6 +2613,21 @@ pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
                 let a = expr_int_range(l, state)?;
                 let b = expr_int_range(r, state)?;
                 return a.div_floor(b);
+            }
+            if matches!(f, Func1::Int) && expr_int_range(arg, state).is_none() {
+                // Floor fractional bounds with room for float rounding.
+                let (lo, hi) = expr_real_bounds(arg, state)?;
+                let widen = |b: f64, by: f64| {
+                    if b.fract() == 0.0 {
+                        b
+                    } else {
+                        b + by * b.abs().max(1.0)
+                    }
+                };
+                let lo = widen(lo, -1e-6).floor();
+                let hi = widen(hi, 1e-6).floor();
+                let (lo, hi) = (clamp_fact_i64(lo as i64)?, clamp_fact_i64(hi as i64)?);
+                return Some(IntRange::new(lo, hi));
             }
             let r = expr_int_range(arg, state)?;
             match f {
@@ -1859,6 +2762,7 @@ fn compute_shadow_int_vars(
     HashMap<VarName, usize>,
     HashSet<VarName>,
     HashSet<VarName>,
+    HashMap<VarName, IntRange>,
 ) {
     let mut info = ShadowWriteInfo::default();
     for (id, _node) in cfg.nodes.iter().enumerate() {
@@ -1872,6 +2776,7 @@ fn compute_shadow_int_vars(
 
     let mut out = HashSet::new();
     let mut unsigned_out = HashSet::new();
+    let mut joined: HashMap<VarName, IntRange> = HashMap::new();
     let trace_shadow = std::env::var("SHADOW_DEBUG").is_ok();
     let mut trace_writes: HashMap<VarName, Vec<String>> = HashMap::new();
     for (var, writes) in &info.writes {
@@ -1910,22 +2815,33 @@ fn compute_shadow_int_vars(
             };
             let direct_i16 = range.map_or(false, IntRange::fits_i16);
             let direct_u16 = range.map_or(false, IntRange::fits_u16);
-            let self_step_ok = stmt_self_modify_small_step(stmt, var);
             let input_escape = input_fed && matches!(stmt, Stmt::Input { .. });
-            // Self-step and INPUT are i16-safe by construction
-            // (small-constant increment, or non-trapping helper that
-            // clamps to 0 on overflow). They don't help the unsigned
-            // path on their own — a self-step that ranges past i16
-            // would also blow past u16 unless we widen the analysis.
-            let i16_ok = direct_i16 || self_step_ok || input_escape;
-            let u16_ok = direct_u16 || self_step_ok || input_escape;
+            // INPUT clamps integer overflow to zero; other writes need a proven range.
+            let i16_ok = direct_i16 || input_escape;
+            let u16_ok = direct_u16 || input_escape;
+            match range.filter(|_| !input_escape) {
+                Some(r) => {
+                    joined
+                        .entry(var.clone())
+                        .and_modify(|j| *j = j.join(r))
+                        .or_insert(r);
+                }
+                None => {
+                    joined.insert(
+                        var.clone(),
+                        IntRange {
+                            min: i32::MIN / 2,
+                            max: i32::MAX / 2,
+                        },
+                    );
+                }
+            }
             if trace_shadow {
 
                 trace_writes.entry(var.clone()).or_default().push(format!(
-                    "{}{}{}{}",
+                    "{}{}{}",
                     if direct_i16 { "i16 " } else { "" },
                     if direct_u16 && !direct_i16 { "u16 " } else { "" },
-                    if self_step_ok { "self-step " } else { "" },
                     if input_escape { "input " } else { "" },
                 ));
             }
@@ -2035,7 +2951,39 @@ fn compute_shadow_int_vars(
             );
         }
     }
-    (out, info.int_ctx_reads, shadow_only_vars, unsigned_out)
+    // Bound post-loop NEXT steps by the number of simultaneously open frames.
+    let mut max_step: HashMap<VarName, Option<i32>> = HashMap::new();
+    for (id, _) in cfg.nodes.iter().enumerate() {
+        if let Stmt::For { var, step, .. } = cfg.stmt_at(id, module) {
+            let r = per_node
+                .get(id)
+                .and_then(|(in_state, _)| expr_int_range(step, in_state));
+            let m = r.map(|r| r.min.unsigned_abs().max(r.max.unsigned_abs()) as i32);
+            let e = max_step.entry(var.clone()).or_insert(Some(0));
+            *e = e.zip(m).map(|(a, b)| a.max(b));
+        }
+    }
+    let bounds = out
+        .iter()
+        .filter_map(|v| {
+            let r = joined.get(v)?;
+            let m = (*max_step.get(v)?)?.checked_mul(256)?;
+            Some((
+                v.clone(),
+                IntRange {
+                    min: r.min.checked_sub(m)?,
+                    max: r.max.checked_add(m)?,
+                },
+            ))
+        })
+        .collect();
+    (
+        out,
+        info.int_ctx_reads,
+        shadow_only_vars,
+        unsigned_out,
+        bounds,
+    )
 }
 
 fn collect_shadow_stmt(
@@ -3652,7 +4600,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_facts_next_kills_loop_var_range_after_loop() {
+    fn numeric_facts_next_leaves_end_plus_step_after_loop() {
         let i = fvar("I");
         let m = Module {
             lines: vec![
@@ -3690,7 +4638,10 @@ mod tests {
             line_idx: 2,
             path: vec![0],
         };
-        assert_eq!(facts.expr_int_range_before_path(&path, &Expr::Var(i)), None);
+        assert_eq!(
+            facts.expr_int_range_before_path(&path, &Expr::Var(i)),
+            Some(IntRange::singleton(11))
+        );
     }
 
     #[test]
@@ -3798,6 +4749,26 @@ mod tests {
         let mut reg = Registry::new();
         let facts = reg.get(&m, &NumericFactAnalysis).clone();
         assert!(!facts.shadow_int_vars.contains(&x));
+    }
+
+    #[test]
+    fn a_frozen_node_keeps_the_facts_that_settled() {
+        let flow = NumericFactsFlow {
+            entry: NumericState::default(),
+            for_vars: Vec::new(),
+            data_range: None,
+            caps: HashMap::new(),
+        };
+        let mut prev = NumericState::default();
+        prev.set(fvar("T"), IntRange::new(1, 21));
+        prev.set(fvar("X"), IntRange::new(0, 10));
+        let mut next = prev.clone();
+        next.set(fvar("X"), IntRange::new(0, 11));
+        next.set(fvar("Y"), IntRange::new(0, 1));
+        let frozen = flow.freeze(&prev, &next);
+        assert_eq!(frozen.get(&fvar("T")), Some(IntRange::new(1, 21)));
+        assert_eq!(frozen.get(&fvar("X")), None);
+        assert_eq!(frozen.get(&fvar("Y")), None);
     }
 
     #[test]

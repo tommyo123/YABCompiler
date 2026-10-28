@@ -451,6 +451,101 @@ fn is_statement_start_byte(b: u8) -> bool {
     b >= 0x80 || b == TOK_TSB_PREFIX
 }
 
+/// Handle trailing statement bytes and report whether the remaining branch is unreachable.
+fn junk_after_statement(p: &mut Cursor<'_>, out: &mut Vec<Statement>, start: usize) -> bool {
+    let byte = p.peek().unwrap_or(0);
+    let mut quoted = false;
+    let calls_usr = p.bytes[start..p.pos].iter().any(|&b| {
+        quoted ^= b == b'"';
+        !quoted && b == TOK_USR
+    });
+    // GOTO and RUN never return, so the bytes are not read. SYS and USR routines may read them.
+    if calls_usr
+        || matches!(
+            out.last(),
+            Some(Statement::Goto(_) | Statement::Run(_) | Statement::Sys { .. })
+        )
+    {
+        while let Some(b) = p.peek() {
+            if b == b':' {
+                break;
+            }
+            p.advance(1);
+        }
+        return false;
+    }
+    match out.last() {
+        // RETURN skips to the next unquoted colon; READ validates DATA when reached.
+        Some(
+            Statement::GoSub(_)
+            | Statement::OnBranch {
+                kind: OnBranchKind::GoSub,
+                ..
+            }
+            | Statement::Data(_),
+        ) => {
+            let mut quoted = false;
+            while let Some(b) = p.peek() {
+                if !quoted && (b == b':' || peek_tsb(p, TSB_ELSE)) {
+                    break;
+                }
+                quoted ^= b == b'"';
+                p.advance(1);
+            }
+            false
+        }
+        // The ROM tests for more arguments before doing anything.
+        Some(
+            Statement::Wait { .. }
+            | Statement::Open { .. }
+            | Statement::Load { .. }
+            | Statement::Save { .. }
+            | Statement::Verify { .. },
+        ) => {
+            p.note_trap(
+                BASIC_ERR_SYNTAX,
+                &ParseError::BadStatementBoundary { line: p.line, byte },
+            );
+            *out.last_mut().expect("matched") = Statement::RaiseError(BASIC_ERR_SYNTAX);
+            true
+        }
+        Some(Statement::Cmd { body, .. }) if body.items.is_empty() => {
+            p.note_trap(
+                BASIC_ERR_SYNTAX,
+                &ParseError::BadStatementBoundary { line: p.line, byte },
+            );
+            *out.last_mut().expect("matched") = Statement::RaiseError(BASIC_ERR_SYNTAX);
+            true
+        }
+        // These test for the end of the statement before doing anything.
+        Some(Statement::End | Statement::Stop | Statement::Clr | Statement::Return) => {
+            p.note_trap(
+                BASIC_ERR_SYNTAX,
+                &ParseError::BadStatementBoundary { line: p.line, byte },
+            );
+            *out.last_mut().expect("matched") = Statement::RaiseError(BASIC_ERR_SYNTAX);
+            true
+        }
+        _ => {
+            p.note_trap(
+                BASIC_ERR_SYNTAX,
+                &ParseError::BadStatementBoundary { line: p.line, byte },
+            );
+            // PRINT takes the bytes for one more item and raises before its closing newline.
+            if let Some(
+                Statement::Print(body)
+                | Statement::PrintFile { body, .. }
+                | Statement::Cmd { body, .. },
+            ) = out.last_mut()
+            {
+                body.trailing_newline = false;
+            }
+            out.push(Statement::RaiseError(BASIC_ERR_SYNTAX));
+            true
+        }
+    }
+}
+
 fn peek_tsb(p: &Cursor<'_>, token: u8) -> bool {
     p.peek() == Some(TOK_TSB_PREFIX) && p.peek_at(1).map(normalize_tsb_token) == Some(token)
 }
@@ -663,10 +758,22 @@ fn line_body_inner(
             p.advance(1);
             p.skip_spaces();
         }
-        // Stray control bytes at the start of a statement are ignored
-        // by BASIC v2, so we skip them here too.
-        while matches!(p.peek(), Some(b) if (0x01..0x20).contains(&b)) {
-            p.advance(1);
+        // Reject statement-leading control bytes unless lenient parsing is enabled.
+        if let Some(byte) = p.peek().filter(|b| (0x01..0x20).contains(b)) {
+            if !p.lenient_syntax {
+                p.note_trap(
+                    BASIC_ERR_SYNTAX,
+                    &ParseError::NotAStatementStart {
+                        line: line_no,
+                        byte,
+                    },
+                );
+                out.push(Statement::RaiseError(BASIC_ERR_SYNTAX));
+                break;
+            }
+            while matches!(p.peek(), Some(b) if (0x01..0x20).contains(&b)) {
+                p.advance(1);
+            }
         }
         p.skip_spaces();
         if p.eof() {
@@ -727,6 +834,7 @@ fn line_body_inner(
                 | Statement::Goto(_)
         );
         out.push(stmt);
+        out.append(&mut p.extra_stmts);
 
         if let Some((code, detail)) = p.pending_trap.take() {
             p.note_trap_detail(code, detail);
@@ -734,10 +842,19 @@ fn line_body_inner(
             break;
         }
         p.skip_spaces();
-        // Stray control bytes ($00-$1F) at end of line are common in
-        // hand-edited tokenised sources and the v2 interpreter just
-        // ignores them once a statement has finished. Drop runs of
-        // them so the boundary check below doesn't reject the line.
+        if !p.lenient_syntax {
+            match p.peek() {
+                None => break,
+                Some(b':') => p.advance(1),
+                Some(_) => {
+                    if junk_after_statement(&mut p, &mut out, saved) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        // Drop trailing control bytes in lenient mode.
         while matches!(p.peek(), Some(b) if (0x01..0x20).contains(&b)) {
             p.advance(1);
         }
@@ -755,25 +872,16 @@ fn line_body_inner(
         }
         match p.peek() {
             None => break,
-            // `:` is the proper separator; `;` here is V2 ROM laxity
-            // — outside of PRINT/INPUT it's silently treated as a
-            // no-op separator and is common as a stray byte at the
-            // end of legacy program lines.
+            // A stray `;` is taken as a separator.
             Some(b':') | Some(b';') => {
                 p.advance(1);
             }
             // A token byte ($80+) directly after a statement that ended
             // on a numeric argument starts the next statement with no
-            // `:` separator. Accept it so legacy tokenised listings parse
-            // without modification.
+            // `:` separator.
             Some(b) if is_statement_start_byte(b) => { /* fall through, no advance */ }
             Some(_) => {
-                // Trailing-junk recovery. Stray bytes after a valid
-                // statement do not affect runtime execution once the
-                // tokenized line terminates. Skip to the next colon or
-                // end-of-line and continue, rather than
-                // refusing to compile the whole program over a
-                // single bad byte.
+                // Skip trailing text up to the next colon or line end.
                 while let Some(b) = p.peek() {
                     if b == b':' || b == b';' {
                         p.advance(1);
@@ -1017,7 +1125,9 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                 return Ok(Statement::GoSub(0));
             }
             let target = line_number(p)?;
-            skip_line_target_label(p);
+            if p.lenient_syntax {
+                skip_line_target_label(p);
+            }
             Ok(Statement::GoSub(target))
         }
         TOK_GO => {
@@ -1232,44 +1342,87 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
                     });
                 }
                 p.advance(1);
-                let mut vars = vec![var_name(p)?];
-                // `GET#n, A$, B$, C$` — one byte per var.
+                // GET# reads one byte per variable, using a scalar for array elements.
+                let mut stmts = Vec::new();
+                let mut vars = Vec::new();
                 loop {
+                    let var = var_name(p)?;
+                    p.skip_spaces();
+                    if p.peek() == Some(b'(') {
+                        p.advance(1);
+                        let indices = index_list(p)?;
+                        let byte = VarName {
+                            base: "__GET".to_string(),
+                            kind: var.kind,
+                        };
+                        vars.push(byte.clone());
+                        stmts.push(Statement::GetFile {
+                            file_num: file_num.clone(),
+                            vars: std::mem::take(&mut vars),
+                        });
+                        stmts.push(if var.kind == VarKind::String {
+                            Statement::ArrayLetStr {
+                                name: var,
+                                indices,
+                                value: StrExpr::Var(byte),
+                            }
+                        } else {
+                            Statement::ArrayLet {
+                                name: var,
+                                indices,
+                                value: Expr::Var(byte),
+                            }
+                        });
+                    } else {
+                        vars.push(var);
+                    }
                     p.skip_spaces();
                     if p.peek() != Some(TOK_COMMA) {
                         break;
                     }
                     p.advance(1);
-                    vars.push(var_name(p)?);
                 }
-                return Ok(Statement::GetFile { file_num, vars });
+                if !vars.is_empty() {
+                    stmts.push(Statement::GetFile { file_num, vars });
+                }
+                let first = stmts.remove(0);
+                p.extra_stmts.extend(stmts);
+                return Ok(first);
             }
-            let var = var_name(p)?;
-
-            p.skip_spaces();
-            let indices = if p.peek() == Some(b'(') {
-                p.advance(1);
-                index_list(p)?
-            } else {
-                Vec::new()
-            };
-
-            if var.kind == VarKind::String {
-                if indices.is_empty() {
-                    Ok(Statement::LetStr {
+            // `GET A$, B$` reads one key per variable.
+            let mut stmts = Vec::new();
+            loop {
+                let var = var_name(p)?;
+                p.skip_spaces();
+                let indices = if p.peek() == Some(b'(') {
+                    p.advance(1);
+                    index_list(p)?
+                } else {
+                    Vec::new()
+                };
+                stmts.push(if var.kind != VarKind::String {
+                    Statement::Get { var, indices }
+                } else if indices.is_empty() {
+                    Statement::LetStr {
                         var,
                         value: StrExpr::GetKey,
-                    })
+                    }
                 } else {
-                    Ok(Statement::ArrayLetStr {
+                    Statement::ArrayLetStr {
                         name: var,
                         indices,
                         value: StrExpr::GetKey,
-                    })
+                    }
+                });
+                p.skip_spaces();
+                if p.peek() != Some(TOK_COMMA) {
+                    break;
                 }
-            } else {
-                Ok(Statement::Get { var, indices })
+                p.advance(1);
             }
+            let first = stmts.remove(0);
+            p.extra_stmts.extend(stmts);
+            Ok(first)
         }
         TOK_DIM => {
             p.advance(1);
@@ -1334,11 +1487,9 @@ fn statement(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             Ok(Statement::End)
         }
         TOK_NEW => {
-            // Same reasoning as `LIST`: `NEW` would clear the live
-            // BASIC program but is a no-op in compiled output. Accept
-            // and discard rather than reject.
+            // NEW clears the running program and ends execution.
             p.advance(1);
-            Ok(Statement::Rem(Vec::new()))
+            Ok(Statement::End)
         }
         TOK_CONT => {
             // `CONT` is the one direct-mode keyword whose run-time behaviour splits in two, and only one half is reproducible.
@@ -5279,6 +5430,15 @@ fn dim_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             });
         }
         p.advance(1);
+        if let Some(code) = rom_dim_error(&name, &dims) {
+            // The ROM stops here, so the rest of the statement is never read.
+            p.skip_def_fn_body();
+            if specs.is_empty() {
+                return Ok(Statement::RaiseError(code));
+            }
+            p.extra_stmts.push(Statement::RaiseError(code));
+            break;
+        }
         specs.push(DimSpec { name, dims });
         p.skip_spaces();
         if p.peek() == Some(TOK_COMMA) {
@@ -5288,6 +5448,21 @@ fn dim_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
         }
     }
     Ok(Statement::Dim(specs))
+}
+
+/// Detect DIM bounds or allocation sizes that always raise a runtime error.
+fn rom_dim_error(name: &VarName, dims: &[Expr]) -> Option<u8> {
+    let mut bounds = Vec::with_capacity(dims.len());
+    for d in dims {
+        let Expr::Number(n) = d else { return None };
+        bounds.push(*n);
+    }
+    if bounds.iter().any(|&n| n >= 32768.0) {
+        return Some(crate::runtime::ERR_ILLEGAL_QUANTITY);
+    }
+    let counts: Vec<f64> = bounds.iter().map(|n| n.trunc() + 1.0).collect();
+    (crate::ir::rom_array_bytes(name.kind, &counts) > crate::ir::ROM_FREE_BYTES)
+        .then_some(crate::runtime::ERR_OUT_OF_MEMORY)
 }
 
 /// Parse `(<expr> [, <expr> ...])` index list. Caller has already
@@ -5454,6 +5629,7 @@ fn skip_after_then_line_number(p: &mut Cursor<'_>) -> Vec<Statement> {
             continue;
         }
         if b == TOK_REM {
+            p.take_rest();
             break;
         }
         if b == TOK_DATA {
@@ -5495,7 +5671,10 @@ fn inline_stmts(p: &mut Cursor<'_>, stop_at_else: bool) -> Result<Vec<Statement>
         }
         let saved = p.pos;
         match statement(p) {
-            Ok(s) => stmts.push(s),
+            Ok(s) => {
+                stmts.push(s);
+                stmts.append(&mut p.extra_stmts);
+            }
 
             Err(err) => match err.runtime_error_code() {
                 Some(code) => {
@@ -5529,13 +5708,28 @@ fn inline_stmts(p: &mut Cursor<'_>, stop_at_else: bool) -> Result<Vec<Statement>
         p.skip_spaces();
         match p.peek() {
             None => break,
-            Some(b':') | Some(b';') => {
+            Some(b':') => {
                 p.advance(1);
             }
             Some(_) if stop_at_else && peek_tsb(p, TSB_ELSE) => {}
+            Some(_) if !p.lenient_syntax => {
+                if junk_after_statement(p, &mut stmts, saved) {
+                    // The rest of the branch is dead.
+                    while let Some(b) = p.peek() {
+                        if stop_at_else && b == TOK_TSB_PREFIX && peek_tsb(p, TSB_ELSE) {
+                            break;
+                        }
+                        p.advance(1);
+                    }
+                    break;
+                }
+            }
+            Some(b';') => {
+                p.advance(1);
+            }
             Some(b) if is_statement_start_byte(b) => { /* implicit separator after numeric arg */ }
             Some(_) => {
-                // Same trailing-junk recovery as `parse_line` —
+                // Lenient mode: the same trailing-junk recovery as `parse_line` —
                 // skip a stray byte and continue. Frequently fires
                 // for corrupt sources where a tail like `THEN…{$04}`
                 // or `THEN…EADY.` (truncated READY.) bleeds onto
@@ -5638,7 +5832,14 @@ fn data_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             // at the statement boundary).
             Some(b'"') => {
                 p.advance(1);
-                values.push(DataValue::Quoted(p.take_string_body()));
+                let text = p.take_string_body();
+                p.skip_spaces();
+                // A quoted DATA item permits only a comma or line end after its closing quote.
+                if !p.lenient_syntax && !matches!(p.peek(), None | Some(TOK_COMMA) | Some(b':')) {
+                    values.push(DataValue::Unreadable);
+                    break;
+                }
+                values.push(DataValue::Quoted(text));
             }
             // Optional unary minus on a numeric literal.
             Some(TOK_MINUS) => {
@@ -5864,7 +6065,10 @@ fn on_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
             break;
         }
     }
-    skip_line_target_label(p);
+    // Only a jump leaves bytes after the list unread; a fall-through raises ?SYNTAX ERROR on them.
+    if p.lenient_syntax {
+        skip_line_target_label(p);
+    }
     Ok(Statement::OnBranch {
         value,
         kind,
@@ -6088,7 +6292,25 @@ fn def_fn_stmt(p: &mut Cursor<'_>) -> Result<Statement, ParseError> {
     p.advance(1);
     let body_start = p.pos;
     match expression(p) {
-        Ok(body) => Ok(Statement::DefFn { name, param, body }),
+        Ok(body) => {
+            p.skip_spaces();
+            match p.peek() {
+                // A call evaluates the body and then wants the end of the statement.
+                Some(byte) if byte != b':' && !p.lenient_syntax && !peek_tsb(p, TSB_ELSE) => {
+                    let detail =
+                        ParseError::BadStatementBoundary { line: p.line, byte }.to_string();
+                    p.skip_def_fn_body();
+                    p.deferred_fn_bodies.push(DeferredFnBody {
+                        line: p.line,
+                        name,
+                        code: BASIC_ERR_SYNTAX,
+                        detail,
+                    });
+                    Ok(Statement::Rem(Vec::new()))
+                }
+                _ => Ok(Statement::DefFn { name, param, body }),
+            }
+        }
         // The header is good and the body is not.
         Err(err) if err.runtime_error_code().is_some() => {
             let code = err.runtime_error_code().expect("just checked");
@@ -7365,6 +7587,8 @@ struct Cursor<'a> {
     deferred_fn_bodies: Vec<DeferredFnBody>,
 
     pending_trap: Option<(u8, String)>,
+    /// Statements that follow the one just parsed (`GET A$,B$` is two GETs).
+    extra_stmts: Vec<Statement>,
 }
 
 impl<'a> Cursor<'a> {
@@ -7387,6 +7611,7 @@ impl<'a> Cursor<'a> {
             traps: Vec::new(),
             deferred_fn_bodies: Vec::new(),
             pending_trap: None,
+            extra_stmts: Vec::new(),
         }
     }
 

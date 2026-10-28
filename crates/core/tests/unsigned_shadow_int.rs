@@ -78,13 +78,13 @@ fn comparisons_against_an_unsigned_shadow_are_unsigned() {
     );
 }
 
-/// Unsigned shadows retain zero-page indirect POKE access.
+/// An unsigned loop counter retains zero-page indirect POKE access.
 #[test]
 fn a_u16_poke_target_still_uses_the_zero_page_pointer_store() {
     let asm = asm_of("10 FOR I=51200 TO 52054 : POKE I,PEEK(I)+1 : NEXT\n");
     assert!(
-        asm.contains("STA (ZSI_V_I),Y"),
-        "u16 shadow lost its ZP indirect POKE fast path:\n{asm}"
+        asm.contains("STA (FI_0),Y"),
+        "u16 counter lost its ZP indirect POKE fast path:\n{asm}"
     );
 }
 

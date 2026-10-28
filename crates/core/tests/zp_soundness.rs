@@ -410,6 +410,7 @@ fn sequential_for_counters_still_reach_zero_page() {
     }
 }
 
+/// R is printed often enough to stay a float with a shadow, so E and Z must share a slot.
 const SHADOWS_SHARE: &str = "\
 5 READ A$,D,Z$,IN$:DATA AB,1,X,CD
 350 C=LEN(A$)
@@ -419,7 +420,7 @@ const SHADOWS_SHARE: &str = "\
 660 T=W+R
 1140 Z=ASC(Z$):ZL=LEN(IN$):IF(ZAND127)<32THENPRINT\" {$9D}\";
 1200 IFZ=141THENZ$=CHR$(-20*(ZL>1)):FORZ=2TOZL
-1300 PRINT B$(1);C;R
+1300 PRINT B$(1);C;R;R;R;R
 ";
 
 #[test]
@@ -430,5 +431,5 @@ fn shadows_that_never_live_together_share_a_zero_page_slot() {
         panic!("both shadows should sit in zero page:\n{}", b.asm);
     };
     assert_eq!(e, z, "E's and Z's shadows never live together:\n{}", b.asm);
-    assert_eq!(run_text(&b.prg), "A 2  1 \n");
+    assert_eq!(run_text(&b.prg), "A 2  1  1  1  1 \n");
 }

@@ -5,7 +5,16 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.2] - Unreleased
+## [1.0.3] - Unreleased
+
+- Programs run faster, most of all with the speed profile. Loops, math, arrays, strings and READ are all quicker.
+- Programs made with the default and size profiles are smaller.
+- New option `--no-error-checks` (No error checks in the GUI) makes programs smaller and faster by leaving out the checks for errors. Use it only for programs that run without errors.
+- New option `--fast-float` (Fast float in the GUI) does math with decimal numbers inside the program instead of in the C64 BASIC ROM. The results are the same and the program runs faster, but the file gets larger.
+- A program with a mistake now stops with the same error as on a real C64, for example text after a command, an array that is too big, or a file that is not open.
+- Fixed several cases where a compiled program gave a different result than on a real C64.
+
+## [1.0.2] - 2026-10-11
 
 - `--compress=auto|on|off` writes a compressed `.prg` with its decoder. Auto compresses files that reach past `$CFFF`.
 - `--data-relocate=auto|on|off` moves DATA to RAM at `$D000` when the program starts. Auto does it when a program leaves the heap little room or does not fit.
