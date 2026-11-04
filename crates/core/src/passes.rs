@@ -3466,6 +3466,198 @@ impl ir::Pass for LoopInvariantCodeMotion {
     }
 }
 
+/// Hoist invariant assignments at the start of a loop body.
+/// Preserve the first iteration's values and errors, including early exits.
+pub struct HoistLeadingLoopLet;
+
+impl ir::Pass for HoistLeadingLoopLet {
+    fn name(&self) -> &'static str {
+        "hoist-leading-loop-let"
+    }
+
+    fn run(&self, module: &mut ir::Module) -> Result<(), ir::PassError> {
+        if licm_has_opaque_entry(module) {
+            return Ok(());
+        }
+        let entries = licm_collect_entry_edges(module);
+        let pairs = collect_for_next_pairs(module);
+        for ((fli, fsi), (nli, nsi)) in pairs.iter().rev() {
+            hoist_leading_lets(module, *fli, *fsi, *nli, *nsi, &entries);
+        }
+        Ok(())
+    }
+}
+
+/// Collect variables and arrays written by a body; reject unknown writes.
+fn loop_body_writes(stmts: &[&Stmt]) -> Option<(HashSet<VarName>, HashSet<VarName>)> {
+    fn calls_out(s: &Stmt) -> bool {
+        use crate::visit::Visitor;
+        struct Usr(bool);
+        impl Visitor for Usr {
+            fn visit_expr(&mut self, e: &Expr) {
+                if matches!(e, Expr::Usr(_)) {
+                    self.0 = true;
+                }
+                crate::visit::walk_expr(self, e);
+            }
+        }
+        let mut u = Usr(false);
+        u.visit_stmt(0, s);
+        u.0
+    }
+    fn walk(s: &Stmt, scalars: &mut HashSet<VarName>, arrays: &mut HashSet<VarName>) -> bool {
+        // Machine code can write anything.
+        if calls_out(s) {
+            return false;
+        }
+        match s {
+            Stmt::If { then, .. } => match then {
+                ThenIr::Goto(_) => true,
+                ThenIr::Stmts(inner) => inner.iter().all(|t| walk(t, scalars, arrays)),
+            },
+            Stmt::ArrayLet { name, .. } => {
+                arrays.insert(name.clone());
+                true
+            }
+            Stmt::Let { .. }
+            | Stmt::For { .. }
+            | Stmt::Next { .. }
+            | Stmt::Goto { .. }
+            | Stmt::Return
+            | Stmt::End
+            | Stmt::Rem(_)
+            | Stmt::Poke { .. }
+            | Stmt::Print { .. } => {
+                scalars.extend(crate::dataflow::stmt_defs(s));
+                true
+            }
+            _ => false,
+        }
+    }
+    let (mut scalars, mut arrays) = (HashSet::new(), HashSet::new());
+    stmts
+        .iter()
+        .all(|s| walk(s, &mut scalars, &mut arrays))
+        .then_some((scalars, arrays))
+}
+
+/// The scalars an expression reads.
+fn expr_scalar_reads(e: &Expr) -> HashSet<VarName> {
+    use crate::visit::Visitor;
+    struct Reads(HashSet<VarName>);
+    impl Visitor for Reads {
+        fn visit_var_read(&mut self, v: &VarName) {
+            self.0.insert(v.clone());
+        }
+    }
+    let mut r = Reads(HashSet::new());
+    r.visit_expr(e);
+    r.0
+}
+
+/// Check whether arithmetic can fail only with ?OVERFLOW.
+fn only_overflows(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) => true,
+        Expr::Var(v) => !var_is_volatile(v),
+        Expr::Neg(inner) => only_overflows(inner),
+        Expr::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul, l, r) => only_overflows(l) && only_overflows(r),
+        _ => false,
+    }
+}
+
+/// Hoist leading invariant LETs without changing errors or input values.
+/// Later LETs may pass only assignments that can overflow on the same line.
+fn hoist_leading_lets(
+    module: &mut ir::Module,
+    fli: usize,
+    mut fsi: usize,
+    nli: usize,
+    nsi: usize,
+    entries: &[(usize, u16)],
+) {
+    if fli < nli {
+        let body_lines: HashSet<u16> = module.lines[fli + 1..=nli].iter().map(|l| l.number).collect();
+        if entries
+            .iter()
+            .any(|(src, tgt)| body_lines.contains(tgt) && (*src < fli || *src > nli))
+        {
+            return;
+        }
+    }
+    let Stmt::For { var: loop_var, start, end, step, .. } = &module.lines[fli].stmts[fsi] else {
+        return;
+    };
+    let loop_var = loop_var.clone();
+    let header_reads: HashSet<VarName> =
+        [start, end, step].into_iter().flat_map(expr_scalar_reads).collect();
+    // Only move a fallible LET before a FOR header with compatible errors.
+    let header = [start, end, step]
+        .into_iter()
+        .map(LicmTrap::of)
+        .max()
+        .unwrap_or(LicmTrap::Never);
+    // Index of the candidate on the FOR line; the LETs from fsi+1 up to it stay.
+    let mut p = fsi + 1;
+    loop {
+        let line = &module.lines[fli];
+        let limit = if fli == nli { nsi } else { line.stmts.len() };
+        if p >= limit {
+            return;
+        }
+        let Stmt::Let { var, value } = &line.stmts[p] else {
+            return;
+        };
+        let stays: Vec<&Stmt> = line.stmts[fsi + 1..p].iter().collect();
+        let hoist = (|| {
+            if licm_expr_has_unsafe(value) || var == &loop_var {
+                return false;
+            }
+            if !LicmTrap::of(value).may_precede(header) {
+                return false;
+            }
+            if !stays.is_empty() && !only_overflows(value) {
+                return false;
+            }
+            for s in &stays {
+                let Stmt::Let { value: earlier, .. } = s else { return false };
+                if !only_overflows(earlier) || expr_scalar_reads(earlier).contains(var) {
+                    return false;
+                }
+            }
+            // Include all other body statements, including LETs that stay.
+            let mut rest: Vec<&Stmt> = stays.clone();
+            if fli == nli {
+                rest.extend(&line.stmts[p + 1..nsi]);
+            } else {
+                rest.extend(&line.stmts[p + 1..]);
+                for l in &module.lines[fli + 1..nli] {
+                    rest.extend(&l.stmts);
+                }
+                rest.extend(&module.lines[nli].stmts[..nsi]);
+            }
+            let Some((scalars, _arrays)) = loop_body_writes(&rest) else {
+                return false;
+            };
+            let reads = expr_scalar_reads(value);
+            !(reads.contains(var)
+                || reads.contains(&loop_var)
+                || reads.iter().any(|r| scalars.contains(r))
+                || scalars.contains(var)
+                || header_reads.contains(var))
+        })();
+        if hoist {
+            let stmt = module.lines[fli].stmts.remove(p);
+            module.lines[fli].stmts.insert(fsi, stmt);
+            fsi += 1;
+            p += 1;
+        } else {
+            // Later candidates must preserve ordering past this assignment.
+            p += 1;
+        }
+    }
+}
+
 /// Every branch in the module as `(source line index, target line number)`.
 /// A jump from inside a loop body is fine: the hoisted temp ran with the FOR.
 /// Only an edge from outside the body can skip it.
@@ -3638,7 +3830,7 @@ fn licm_stmt_safe(stmt: &Stmt, blocked: &mut HashSet<VarName>) -> bool {
     match stmt {
         // Safe stmts that may write a known set of vars.
         Stmt::Let { var, value } => {
-            if licm_expr_has_unsafe(value) {
+            if licm_body_expr_unsafe(value) {
                 return false;
             }
             blocked.insert(var.clone());
@@ -3649,27 +3841,27 @@ fn licm_stmt_safe(stmt: &Stmt, blocked: &mut HashSet<VarName>) -> bool {
             indices,
             value,
         } => {
-            if licm_expr_has_unsafe(value) || indices.iter().any(licm_expr_has_unsafe) {
+            if licm_body_expr_unsafe(value) || indices.iter().any(licm_body_expr_unsafe) {
                 return false;
             }
             blocked.insert(name.clone());
             true
         }
         Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
-            !licm_expr_has_unsafe(addr) && !licm_expr_has_unsafe(value)
+            !licm_body_expr_unsafe(addr) && !licm_body_expr_unsafe(value)
         }
         Stmt::PokeFill {
             dst_start,
             dst_end,
             value,
         } => {
-            !licm_expr_has_unsafe(dst_start)
-                && !licm_expr_has_unsafe(dst_end)
-                && !licm_expr_has_unsafe(value)
+            !licm_body_expr_unsafe(dst_start)
+                && !licm_body_expr_unsafe(dst_end)
+                && !licm_body_expr_unsafe(value)
         }
         Stmt::Print { items, .. } => items.iter().all(licm_print_piece_safe),
         Stmt::If { cond, then } => {
-            if licm_expr_has_unsafe(cond) {
+            if licm_body_expr_unsafe(cond) {
                 return false;
             }
             match then {
@@ -3690,7 +3882,7 @@ fn licm_stmt_safe(stmt: &Stmt, blocked: &mut HashSet<VarName>) -> bool {
         // REM/Data/Restore are no-ops at runtime for LICM purposes.
         // RESET is only as safe as its numeric expression.
         Stmt::Rem(_) | Stmt::Data(_) | Stmt::Restore => true,
-        Stmt::Reset { target } => !licm_expr_has_unsafe(target),
+        Stmt::Reset { target } => !licm_body_expr_unsafe(target),
         // Everything else: be conservative. GOSUB/USR/FN can call
         // arbitrary code; INPUT/READ write vars unpredictably;
         // OnError/Resume/Run/Clr alter control flow; graphics and
@@ -3704,9 +3896,24 @@ fn licm_print_piece_safe(piece: &PrintPiece) -> bool {
         PrintPiece::Expr(e)
         | PrintPiece::CharOut(e)
         | PrintPiece::TabTo(e)
-        | PrintPiece::Spc(e) => !licm_expr_has_unsafe(e),
+        | PrintPiece::Spc(e) => !licm_body_expr_unsafe(e),
         PrintPiece::StrExpr(_) => false, // strings touch heap
         _ => true,
+    }
+}
+
+/// Reject unsafe body expressions; allow memory and array reads as noncandidates.
+fn licm_body_expr_unsafe(e: &Expr) -> bool {
+    match e {
+        Expr::Peek(addr) | Expr::MemPeek(addr) => licm_body_expr_unsafe(addr),
+        Expr::ArrayRef(_, idx) => idx.iter().any(licm_body_expr_unsafe),
+        Expr::Neg(inner) | Expr::Not(inner) => licm_body_expr_unsafe(inner),
+        Expr::Bin(_, l, r) => licm_body_expr_unsafe(l) || licm_body_expr_unsafe(r),
+        Expr::Func1(f, arg) => {
+            matches!(f, crate::ast::Func1::Rnd) || licm_body_expr_unsafe(arg)
+        }
+        Expr::Number(_) => false,
+        _ => licm_expr_has_unsafe(e),
     }
 }
 
@@ -3829,16 +4036,59 @@ fn licm_collect_candidates(
     blocked: &HashSet<VarName>,
     out: &mut Vec<Expr>,
 ) {
+    let Stmt::For { start, end, step, .. } = &module.lines[fli].stmts[fsi] else {
+        return;
+    };
+    // A hoisted expression must preserve the first error and its reported line.
+    let mut ran = [start, end, step]
+        .into_iter()
+        .map(LicmTrap::of)
+        .max()
+        .unwrap_or(LicmTrap::Never);
+    let mut on_for_line = if fli == nli { nsi } else { module.lines[fli].stmts.len() } - (fsi + 1);
     // FOR always runs the body at least once, so the top is safe to hoist.
     // After a branch-away, only hoist expressions that cannot trap.
     let mut speculative = false;
     licm_walk_body(module, fli, fsi, nli, nsi, |stmt| {
-        licm_collect_in_stmt(stmt, blocked, out, speculative);
+        if on_for_line == 0 {
+            ran = LicmTrap::Other;
+        }
+        on_for_line = on_for_line.saturating_sub(1);
+        licm_collect_in_stmt(stmt, blocked, out, speculative, &mut ran);
         if licm_stmt_can_branch_away(stmt) {
             speculative = true;
         }
         true
     });
+}
+
+/// Observable evaluation effects: none, overflow, or other errors and output.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum LicmTrap {
+    Never,
+    Overflow,
+    Other,
+}
+
+impl LicmTrap {
+    fn of(e: &Expr) -> Self {
+        if expr_cannot_trap(e) {
+            LicmTrap::Never
+        } else if only_overflows(e) {
+            LicmTrap::Overflow
+        } else {
+            LicmTrap::Other
+        }
+    }
+
+    /// Check whether this effect may precede `ran` without changing behavior.
+    fn may_precede(self, ran: LicmTrap) -> bool {
+        match self {
+            LicmTrap::Never => true,
+            LicmTrap::Overflow => ran <= LicmTrap::Overflow,
+            LicmTrap::Other => ran == LicmTrap::Never,
+        }
+    }
 }
 
 /// True if this body statement can skip the rest of the body.
@@ -3853,34 +4103,46 @@ fn licm_stmt_can_branch_away(stmt: &Stmt) -> bool {
     )
 }
 
+/// Track prior effects in interpreter evaluation order.
 fn licm_collect_in_stmt(
     stmt: &Stmt,
     blocked: &HashSet<VarName>,
     out: &mut Vec<Expr>,
     speculative: bool,
+    ran: &mut LicmTrap,
 ) {
+    let mut expr = |e: &Expr, rounded: bool, ran: &mut LicmTrap| {
+        licm_collect_in_expr(e, blocked, out, speculative, rounded, ran)
+    };
     match stmt {
         Stmt::Let { var, value } => {
-            licm_collect_in_expr(value, blocked, out, speculative, var.kind == VarKind::Float)
+            expr(value, var.kind == VarKind::Float, ran);
+            if !int_store_cannot_trap(var, value) {
+                *ran = LicmTrap::Other;
+            }
         }
         Stmt::ArrayLet { name, indices, value } => {
             for e in indices {
-                licm_collect_in_expr(e, blocked, out, speculative, false);
+                expr(e, false, ran);
             }
-            licm_collect_in_expr(value, blocked, out, speculative, name.kind == VarKind::Float);
+            // The element lookup can raise ?BAD SUBSCRIPT.
+            *ran = LicmTrap::Other;
+            expr(value, name.kind == VarKind::Float, ran);
         }
         Stmt::Poke { addr, value } | Stmt::Dpoke { addr, value } => {
-            licm_collect_in_expr(addr, blocked, out, speculative, false);
-            licm_collect_in_expr(value, blocked, out, speculative, false);
+            expr(addr, false, ran);
+            expr(value, false, ran);
+            *ran = LicmTrap::Other;
         }
         Stmt::PokeFill {
             dst_start,
             dst_end,
             value,
         } => {
-            licm_collect_in_expr(dst_start, blocked, out, speculative, false);
-            licm_collect_in_expr(dst_end, blocked, out, speculative, false);
-            licm_collect_in_expr(value, blocked, out, speculative, false);
+            expr(dst_start, false, ran);
+            expr(dst_end, false, ran);
+            expr(value, false, ran);
+            *ran = LicmTrap::Other;
         }
         Stmt::Print { items, .. } => {
             for p in items {
@@ -3889,20 +4151,24 @@ fn licm_collect_in_stmt(
                 | PrintPiece::TabTo(e)
                 | PrintPiece::Spc(e) = p
                 {
-                    licm_collect_in_expr(e, blocked, out, speculative, false);
+                    expr(e, false, ran);
                 }
+                // Each piece prints before the next is computed.
+                *ran = LicmTrap::Other;
             }
         }
         Stmt::If { cond, then } => {
             // The condition runs whenever the IF is reached. The THEN body does not.
-            licm_collect_in_expr(cond, blocked, out, speculative, false);
+            expr(cond, false, ran);
             if let ThenIr::Stmts(inner) = then {
                 for s in inner {
-                    licm_collect_in_stmt(s, blocked, out, true);
+                    licm_collect_in_stmt(s, blocked, out, true, &mut LicmTrap::Other);
                 }
             }
+            *ran = LicmTrap::Other;
         }
-        _ => {}
+        Stmt::Rem(_) | Stmt::Data(_) => {}
+        _ => *ran = LicmTrap::Other,
     }
 }
 
@@ -3913,41 +4179,46 @@ fn licm_collect_in_expr(
     out: &mut Vec<Expr>,
     speculative: bool,
     rounded: bool,
+    ran: &mut LicmTrap,
 ) {
+    let trap = LicmTrap::of(e);
     if licm_expr_invariant(e, blocked)
         && licm_expr_worth_hoisting(e)
-        && (!speculative || expr_cannot_trap(e))
+        && (trap == LicmTrap::Never || (!speculative && trap.may_precede(*ran)))
         && (rounded || licm_infer_kind(e) != VarKind::Float)
     {
-        // Maximal: don't descend. Dedupe so identical sub-expressions
-        // share one temp.
+        // Share identical expressions and preserve evaluation order; skip their children.
         if !out.iter().any(|x| x == e) {
             out.push(e.clone());
         }
+        // Record this expression's effect in evaluation order.
+        *ran = (*ran).max(trap);
         return;
     }
-    // Descend into children to find smaller invariant candidates.
+    // Descend into children, in evaluation order, to find smaller
+    // invariant candidates.
     match e {
         Expr::Neg(inner) | Expr::Not(inner) => {
-            licm_collect_in_expr(inner, blocked, out, speculative, false);
+            licm_collect_in_expr(inner, blocked, out, speculative, false, ran);
         }
         Expr::Bin(_, l, r) => {
-            licm_collect_in_expr(l, blocked, out, speculative, true);
-            licm_collect_in_expr(r, blocked, out, speculative, false);
+            licm_collect_in_expr(l, blocked, out, speculative, true, ran);
+            licm_collect_in_expr(r, blocked, out, speculative, false, ran);
         }
         Expr::Func1(_, arg) => {
-            licm_collect_in_expr(arg, blocked, out, speculative, false);
+            licm_collect_in_expr(arg, blocked, out, speculative, false, ran);
         }
         Expr::Peek(addr) | Expr::MemPeek(addr) => {
-            licm_collect_in_expr(addr, blocked, out, speculative, false);
+            licm_collect_in_expr(addr, blocked, out, speculative, false, ran);
         }
         Expr::ArrayRef(_, idx) => {
             for e in idx {
-                licm_collect_in_expr(e, blocked, out, speculative, false);
+                licm_collect_in_expr(e, blocked, out, speculative, false, ran);
             }
         }
         _ => {}
     }
+    *ran = (*ran).max(trap);
 }
 
 /// Hoist only when every use rounds the expression first.
@@ -10198,6 +10469,82 @@ fn array_rhs_int_safe(
     }
 }
 
+/// Infer arrays whose elements always fit i16 from initialization and writes.
+/// Iterate ranges to convergence and use `array_rhs_int_safe` for unbounded facts.
+fn ranged_int_arrays(
+    sites: &[(VarName, usize, Expr)],
+    numeric: &crate::dataflow::NumericFactsResult,
+    scalar_cand: &HashSet<VarName>,
+    array_cand: &HashSet<VarName>,
+    array_writes: &HashMap<VarName, Vec<WriteReq>>,
+    data_range: Option<crate::dataflow::IntRange>,
+) -> HashSet<VarName> {
+    use crate::dataflow::IntRange;
+    const ROUNDS: usize = 12;
+    // Widen growing ranges to i16, then verify them in later rounds.
+    const WIDEN_AT: usize = 6;
+    let mut range: HashMap<VarName, IntRange> = HashMap::new();
+    for a in array_cand {
+        let mut r = IntRange::singleton(0);
+        if array_writes.get(a).is_some_and(|w| w.iter().any(|w| matches!(w, WriteReq::Data))) {
+            match data_range {
+                Some(d) => r = r.join(d),
+                None => continue,
+            }
+        }
+        range.insert(a.clone(), r);
+    }
+    for round in 0..ROUNDS {
+        let mut changed = false;
+        let mut grew: HashSet<VarName> = HashSet::new();
+        for (a, node, value) in sites {
+            let Some(&now) = range.get(a) else { continue };
+            let live: HashSet<VarName> = range.keys().cloned().collect();
+            let r = numeric
+                .state_in_at(*node)
+                .and_then(|state| array_value_range(value, state, &range))
+                .or_else(|| array_rhs_int_safe(value, scalar_cand, &live).then(IntRange::i16));
+            match r {
+                Some(r) if r.fits_i16() => {
+                    let joined = now.join(r);
+                    if joined != now {
+                        range.insert(a.clone(), joined);
+                        grew.insert(a.clone());
+                        changed = true;
+                    }
+                }
+                _ => {
+                    range.remove(a);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return range.into_keys().collect();
+        }
+        if round + 1 == WIDEN_AT {
+            for a in grew {
+                range.insert(a, IntRange::i16());
+            }
+        }
+    }
+    HashSet::new()
+}
+
+/// Evaluate integer bounds using the current state and array ranges.
+fn array_value_range(
+    e: &Expr,
+    state: &crate::dataflow::NumericState,
+    arrays: &HashMap<VarName, crate::dataflow::IntRange>,
+) -> Option<crate::dataflow::IntRange> {
+    let mut state = state.clone();
+    let vars = std::rc::Rc::make_mut(&mut state.vars);
+    for (name, r) in arrays {
+        vars.insert(crate::dataflow::array_stand_in(name), *r);
+    }
+    crate::dataflow::expr_int_range(e, &state)
+}
+
 /// MutVisitor that flips the kind of promoted arrays from Float to
 /// Integer everywhere they appear — array reads, writes, DIMs, and
 /// READ targets. Scalar `Var` references (which may share the array's
@@ -10288,7 +10635,29 @@ impl ir::Pass for IntArrayPromote {
             })
         };
 
+        // Element writes with their CFG nodes, for the flow facts at each.
+        let mut reg = crate::analysis::Registry::new();
+        let cfg = reg.get(module, &crate::cfg::CfgBuild).clone();
+        let numeric = reg.get(module, &crate::dataflow::NumericFactAnalysis);
+        let sites: Vec<(VarName, usize, Expr)> = (0..cfg.nodes.len())
+            .filter_map(|id| match cfg.stmt_at(id, module) {
+                Stmt::ArrayLet { name, value, .. } if name.kind == VarKind::Float => {
+                    Some((name.clone(), id, value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let data_range = crate::dataflow::compute_data_range(module);
+
         loop {
+            let ranged = ranged_int_arrays(
+                &sites,
+                numeric,
+                &scalar_cand,
+                &array_cand,
+                &facts.array_writes,
+                data_range,
+            );
             // Compute drops by reading the sets immutably, then apply —
             // avoids a self-borrow while iterating.
             let drop_scalars: Vec<VarName> = scalar_cand
@@ -10298,7 +10667,10 @@ impl ir::Pass for IntArrayPromote {
                 .collect();
             let drop_arrays: Vec<VarName> = array_cand
                 .iter()
-                .filter(|a| !write_ok(facts.array_writes.get(*a), &scalar_cand, &array_cand))
+                .filter(|a| {
+                    !ranged.contains(*a)
+                        && !write_ok(facts.array_writes.get(*a), &scalar_cand, &array_cand)
+                })
                 .cloned()
                 .collect();
             if drop_scalars.is_empty() && drop_arrays.is_empty() {
@@ -10458,7 +10830,7 @@ fn compute_int_promotable(module: &ir::Module) -> HashSet<VarName> {
                 continue;
             }
             for value in values {
-                if !int_stayable(value, &candidates) {
+                if !int_valued(value, &candidates) {
                     if trace {
                         eprintln!(
                             "[intpromote] DROP {} (not int-stayable: one definition is {:?})",
@@ -11260,6 +11632,10 @@ impl PromRange {
     }
     fn fits_i16(self) -> bool {
         self.min >= i16::MIN as i64 && self.max <= i16::MAX as i64
+    }
+    /// Only -1 and 0: a comparison result, or AND / OR / NOT of them.
+    fn is_truth(self) -> bool {
+        self.min >= -1 && self.max <= 0
     }
 }
 
@@ -12078,9 +12454,11 @@ fn prom_range_of(
             let r = prom_range_of(inner, candidates, ranges)?;
             PromRange::new(-r.max, -r.min)
         }
-        // NOT / AND / OR / EOR all narrow through AYINT and produce an i16 result by
-        // construction.
-        Expr::Not(_) => PromRange::i16(),
+        // Bitwise operations convert through AYINT to i16. NOT x is -x-1.
+        Expr::Not(inner) => match prom_range_of(inner, candidates, ranges) {
+            Some(r) if r.fits_i16() => PromRange::new(-r.max - 1, -r.min - 1),
+            _ => PromRange::i16(),
+        },
         Expr::Bin(op, l, r) => match op {
             BinOp::Add => {
                 let (a, b) = bin(l, r)?;
@@ -12114,9 +12492,28 @@ fn prom_range_of(
                     }
                     _ => None,
                 });
-                mask.map_or(PromRange::i16(), |m| PromRange::new(0, m))
+                match (prom_range_of(l, candidates, ranges), prom_range_of(r, candidates, ranges)) {
+                    // Truth values: -1 AND -1 is -1, anything AND 0 is 0.
+                    (Some(a), Some(b)) if a.is_truth() && b.is_truth() => PromRange::new(-1, 0),
+                    // A non-negative operand keeps only its own bits.
+                    (Some(a), Some(b)) if a.min >= 0 && b.min >= 0 => PromRange::new(0, a.max.min(b.max)),
+                    (Some(a), _) if a.min >= 0 => PromRange::new(0, a.max),
+                    (_, Some(b)) if b.min >= 0 => PromRange::new(0, b.max),
+                    _ => mask.map_or(PromRange::i16(), |m| PromRange::new(0, m)),
+                }
             }
-            BinOp::Or | BinOp::Xor => PromRange::i16(),
+            BinOp::Or => {
+                match (prom_range_of(l, candidates, ranges), prom_range_of(r, candidates, ranges)) {
+                    (Some(a), Some(b)) if a.is_truth() && b.is_truth() => PromRange::new(-1, 0),
+                    // Non-negative operands: no bit above the wider one's top bit.
+                    (Some(a), Some(b)) if a.min >= 0 && b.min >= 0 && a.max.max(b.max) <= 32767 => {
+                        let top = a.max.max(b.max) as u64;
+                        PromRange::new(0, (top + 1).next_power_of_two() as i64 - 1)
+                    }
+                    _ => PromRange::i16(),
+                }
+            }
+            BinOp::Xor => PromRange::i16(),
             _ => return None,
         },
         // Allow one unit around the exact quotient floor for float division rounding.
@@ -12162,6 +12559,22 @@ fn prom_range_of(
         | Expr::StrCompare(_, _, _) => PromRange::i16(),
         _ => return None,
     })
+}
+
+/// Check whether an expression always yields an integer.
+/// Bitwise results qualify even if their operands require FAC evaluation.
+fn int_valued(e: &Expr, int_vars: &HashSet<VarName>) -> bool {
+    match e {
+        Expr::Bin(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And
+            | BinOp::Or,
+            _,
+            _,
+        )
+        | Expr::Not(_) => true,
+        Expr::Neg(inner) => int_valued(inner, int_vars),
+        _ => int_stayable(e, int_vars),
+    }
 }
 
 /// Predicate: does evaluating `e` always produce an i16-range integer at runtime?
@@ -13446,11 +13859,14 @@ pub(crate) fn expr_cannot_trap(e: &Expr) -> bool {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 expr_cannot_trap(l) && expr_cannot_trap(r)
             }
-            // FADD/FSUB/FMULT can overflow, and there is nothing in the IR that bounds a
-            // variable's magnitude.
+            // Float arithmetic can overflow; bounded integer and byte operands cannot.
             BinOp::Add | BinOp::Sub | BinOp::Mul => match (l.as_ref(), r.as_ref()) {
                 (Expr::Number(a), Expr::Number(b)) => fold_bin(*op, *a, *b).is_some(),
-                _ => false,
+                _ => {
+                    expr_cannot_trap(l)
+                        && expr_cannot_trap(r)
+                        && trap_free_interval(e).is_some_and(|(lo, hi)| lo > -1e30 && hi < 1e30)
+                }
             },
             _ => false,
         },
@@ -13459,7 +13875,11 @@ pub(crate) fn expr_cannot_trap(e: &Expr) -> bool {
             matches!(f, Func1::Abs | Func1::Int | Func1::Sgn) && expr_cannot_trap(arg)
         }
 
-        Expr::Peek(_) | Expr::MemPeek(_) => true,
+        // GETADR raises ?ILLEGAL QUANTITY outside 0..65535.
+        Expr::Peek(addr) | Expr::MemPeek(addr) => {
+            expr_cannot_trap(addr)
+                && trap_free_interval(addr).is_some_and(|(lo, hi)| lo >= 0.0 && hi < 65536.0)
+        }
         // String compare walks two descriptors byte by byte and drops -1/0 in FAC ($B02E).
         Expr::StrCompare(_, l, r) => str_is_pure(l) && str_is_pure(r),
         _ => false,
@@ -13482,9 +13902,34 @@ fn str_store_cannot_trap(var: &VarName) -> bool {
     !(var.kind == VarKind::String && var.base == "TI")
 }
 
-/// Runtime-written pseudo-variables: `TI`/`TI$`, `ST`, `ER`/`EL`. Name test, not kind.
-/// Distinct from [`expr_is_pure`]: reading `TI` has no side effect, it just
-/// does not give the same answer twice.
+/// Bound sums, differences and products of literals, integers and PEEKs.
+fn trap_free_interval(e: &Expr) -> Option<(f64, f64)> {
+    match e {
+        Expr::Number(n) if n.is_finite() => Some((*n, *n)),
+        Expr::Var(v) if v.kind == VarKind::Integer && !var_is_volatile(v) => {
+            Some((f64::from(i16::MIN), f64::from(i16::MAX)))
+        }
+        Expr::Peek(_) | Expr::MemPeek(_) => Some((0.0, 255.0)),
+        Expr::Neg(inner) => trap_free_interval(inner).map(|(lo, hi)| (-hi, -lo)),
+        Expr::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, r) => {
+            let (a, b) = trap_free_interval(l)?;
+            let (c, d) = trap_free_interval(r)?;
+            Some(match op {
+                BinOp::Add => (a + c, b + d),
+                BinOp::Sub => (a - d, b - c),
+                _ => {
+                    let p = [a * c, a * d, b * c, b * d];
+                    (
+                        p.iter().copied().fold(f64::INFINITY, f64::min),
+                        p.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                    )
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn var_is_volatile(v: &VarName) -> bool {
     matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL")
 }
@@ -14112,7 +14557,33 @@ mod tests {
 
     #[test]
     fn int_array_promote_skips_arithmetic_rhs() {
-        // A(0)=A(1)+A(2) — arithmetic could overflow i16; stay float.
+        // Self-dependent writes exceed i16, so retain float storage.
+        let mut m = Module {
+            lines: vec![
+                dim_line(10, "A", 5.0),
+                aset(
+                    20,
+                    "A",
+                    0.0,
+                    Expr::Bin(
+                        BinOp::Add,
+                        Box::new(Expr::Bin(
+                            BinOp::Add,
+                            Box::new(aref("A", 1.0)),
+                            Box::new(aref("A", 2.0)),
+                        )),
+                        Box::new(Expr::Number(1.0)),
+                    ),
+                ),
+            ],
+        };
+        IntArrayPromote.run(&mut m).unwrap();
+        assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Float));
+    }
+
+    /// Zero initialization and bounded writes keep every element at zero.
+    #[test]
+    fn int_array_promote_takes_bounded_arithmetic() {
         let mut m = Module {
             lines: vec![
                 dim_line(10, "A", 5.0),
@@ -14129,7 +14600,7 @@ mod tests {
             ],
         };
         IntArrayPromote.run(&mut m).unwrap();
-        assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Float));
+        assert_eq!(array_kind_in(&m, "A"), Some(VarKind::Integer));
     }
 
     #[test]

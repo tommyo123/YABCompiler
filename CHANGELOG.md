@@ -5,6 +5,13 @@ All notable changes to YABCompiler are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-11-04
+
+- Faster loops, array access and PEEK/POKE operations.
+- Faster floating-point math, with repeated calculations reused where safe.
+- More variables and arrays use byte or integer storage when their values fit.
+- CSET restores text mode after graphics. Loop optimizations preserve output and runtime errors.
+
 ## [1.0.3] - 2026-10-28
 
 - Programs run faster, most of all with the speed profile. Loops, math, arrays, strings and READ are all quicker.
@@ -247,6 +254,7 @@ First public release.
 - GitHub Actions release workflow that builds a Windows MSI installer,
   a portable ZIP, and Linux and macOS tarballs.
 
+[1.0.4]: https://github.com/tommyo123/YABCompiler/releases/tag/v1.0.4
 [1.0.1]: https://github.com/tommyo123/YABCompiler/releases/tag/v1.0.1
 [1.0.0]: https://github.com/tommyo123/YABCompiler/releases/tag/v1.0.0
 [0.9.11]: https://github.com/tommyo123/YABCompiler/releases/tag/v0.9.11

@@ -336,17 +336,17 @@ fn u8_var_vs_literal_gt_and_le_are_one_branch() {
     assert_no(&le, "__IF_U8V_KEEP");
 }
 
-/// The u8-var-vs-u8-var path.
+/// Compare byte variables using the original screen cell when no other read needs them.
 #[test]
 fn u8_var_vs_var_gt_and_le_transpose() {
     let gt = asm("10 for x=0 to 20:c=peek(1024+x):d=peek(1025+x)\n\
                   20 if c>d then print \"a\"\n30 next x\n");
-    assert_seq(&gt, &["CMP VI_C", "BCS"]);
+    assert_seq(&gt, &["LDA $0401,X", "CMP $0400,X", "BCS"]);
     assert_no(&gt, "__IF_U8VV_KEEP");
 
     let le = asm("10 for x=0 to 20:c=peek(1024+x):d=peek(1025+x)\n\
                   20 if c<=d then print \"a\"\n30 next x\n");
-    assert_seq(&le, &["CMP VI_C", "BCC"]);
+    assert_seq(&le, &["LDA $0401,X", "CMP $0400,X", "BCC"]);
     assert_no(&le, "__IF_U8VV_KEEP");
 }
 

@@ -1072,6 +1072,11 @@ pub fn array_states(module: &Module, cfg: &Cfg, arrays: &[VarName]) -> ArrayStat
 
 // ===== Numeric range facts =================================================
 
+/// Only -1 and 0: a BASIC truth value.
+fn is_truth_range(r: IntRange) -> bool {
+    r.min >= -1 && r.max <= 0
+}
+
 /// Inclusive integer range for expressions/variables that are known to
 /// evaluate to an integer. Unknown or fractional values are represented
 /// by absence of a range rather than by a top element.
@@ -1319,6 +1324,41 @@ impl crate::analysis::Analysis for NumericFactAnalysis {
             flow.caps = caps;
             per_node = solve(module, &cfg, &flow);
         }
+        // Infer bounds for counters reset by equality tests; keep only proven bounds.
+        let mut wraps = wrap_cap_guesses(module, &cfg, &per_node);
+        const WRAP_ROUNDS: usize = 4;
+        for _ in 0..WRAP_ROUNDS {
+            if wraps.is_empty() {
+                break;
+            }
+            let mut caps = flow.caps.clone();
+            for (node, var, _, cap) in &wraps {
+                caps.entry(*node).or_default().push((var.clone(), *cap));
+            }
+            let trial = NumericFactsFlow { caps, ..flow.clone() };
+            let solved = solve(module, &cfg, &trial);
+            let before = wraps.len();
+            wraps.retain(|(node, var, step, cap)| wrap_cap_holds(&solved, *node, var, *step, *cap));
+            if wraps.len() == before {
+                flow = trial;
+                per_node = solved;
+                break;
+            }
+        }
+        // Infer array ranges from writes, solve again, and verify every write stays in range.
+        let arrays = settle_array_ranges(module, &cfg, &per_node, data_range);
+        if !arrays.is_empty() {
+            let mut entry = flow.entry.clone();
+            let vars = Rc::make_mut(&mut entry.vars);
+            for (name, r) in &arrays {
+                vars.insert(array_stand_in(name), *r);
+            }
+            let trial = NumericFactsFlow { entry, ..flow.clone() };
+            let solved = solve(module, &cfg, &trial);
+            if array_writes_stay_in(module, &cfg, &solved, &arrays, data_range) {
+                per_node = solved;
+            }
+        }
         let node_by_stmt = cfg
             .nodes
             .iter()
@@ -1414,6 +1454,7 @@ impl NumericFactsResult {
     }
 }
 
+#[derive(Clone)]
 struct NumericFactsFlow {
     /// Initial numeric state: RUN sets every scalar to zero.
     entry: NumericState,
@@ -1954,8 +1995,11 @@ fn transfer_numeric_stmt(
         Stmt::Input { targets, .. } => kill_read_targets(&mut out, targets),
         Stmt::InputFile { targets, .. } => kill_read_targets(&mut out, targets),
         Stmt::Clr => {
-            for r in Rc::make_mut(&mut out.vars).values_mut() {
-                *r = IntRange::singleton(0);
+            // CLR resets arrays to zero, which every inferred range includes.
+            for (v, r) in Rc::make_mut(&mut out.vars).iter_mut() {
+                if !is_array_stand_in(v) {
+                    *r = IntRange::singleton(0);
+                }
             }
         }
         Stmt::Run(_) => out.vars = Rc::default(),
@@ -2170,6 +2214,225 @@ fn eq_exit_caps(
         }
     }
     caps
+}
+
+/// Key for an array element range; parentheses distinguish it from scalar names.
+pub(crate) fn array_stand_in(name: &VarName) -> VarName {
+    VarName {
+        base: format!("{}()", name.base),
+        kind: name.kind,
+    }
+}
+
+fn is_array_stand_in(v: &VarName) -> bool {
+    v.base.ends_with("()")
+}
+
+/// Collect numeric arrays written only by LET and READ, with LET nodes and values.
+fn array_write_sites(module: &Module, cfg: &Cfg) -> (Vec<(VarName, usize, Expr)>, HashSet<VarName>, HashSet<VarName>) {
+    let mut sites = Vec::new();
+    let mut read = HashSet::new();
+    let mut other = HashSet::new();
+    for id in 0..cfg.nodes.len() {
+        match cfg.stmt_at(id, module) {
+            Stmt::ArrayLet { name, value, .. } => sites.push((name.clone(), id, value.clone())),
+            Stmt::Read(targets) => {
+                for t in targets {
+                    if let ReadTarget::Array { name, .. } = t {
+                        read.insert(name.clone());
+                    }
+                }
+            }
+            Stmt::Input { targets, .. } | Stmt::InputFile { targets, .. } => {
+                for t in targets {
+                    if let ReadTarget::Array { name, .. } = t {
+                        other.insert(name.clone());
+                    }
+                }
+            }
+            Stmt::Get { var, indices } if !indices.is_empty() => {
+                other.insert(var.clone());
+            }
+            Stmt::Fetch { target, target_indices, .. } if !target_indices.is_empty() => {
+                other.insert(target.clone());
+            }
+            _ => {}
+        }
+    }
+    (sites, read, other)
+}
+
+/// Evaluate a range using the supplied array element bounds.
+fn expr_range_with_arrays(
+    e: &Expr,
+    state: &NumericState,
+    arrays: &HashMap<VarName, IntRange>,
+) -> Option<IntRange> {
+    let mut state = state.clone();
+    let vars = Rc::make_mut(&mut state.vars);
+    for (name, r) in arrays {
+        vars.insert(array_stand_in(name), *r);
+    }
+    expr_int_range(e, &state)
+}
+
+/// Infer array element ranges from zero initialization and all writes.
+/// Exclude unbounded writes, INPUT, GET and ranges that fail to converge.
+fn settle_array_ranges(
+    module: &Module,
+    cfg: &Cfg,
+    per_node: &[(NumericState, NumericState)],
+    data_range: Option<IntRange>,
+) -> HashMap<VarName, IntRange> {
+    const ROUNDS: usize = 12;
+    // Widen growing ranges to i16, then verify them in later rounds.
+    const WIDEN_AT: usize = 6;
+    let (sites, read, other) = array_write_sites(module, cfg);
+    let mut range: HashMap<VarName, IntRange> = HashMap::new();
+    for (name, _, _) in &sites {
+        if other.contains(name) || !matches!(name.kind, VarKind::Integer | VarKind::Float) {
+            continue;
+        }
+        let start = if read.contains(name) {
+            match data_range {
+                Some(d) => d.join(IntRange::singleton(0)),
+                None => continue,
+            }
+        } else {
+            IntRange::singleton(0)
+        };
+        range.insert(name.clone(), start);
+    }
+    for round in 0..ROUNDS {
+        let mut changed = false;
+        let mut grew = HashSet::new();
+        for (name, node, value) in &sites {
+            let Some(&now) = range.get(name) else { continue };
+            match expr_range_with_arrays(value, &per_node[*node].0, &range) {
+                Some(r) if r.fits_i16() => {
+                    let joined = now.join(r);
+                    if joined != now {
+                        range.insert(name.clone(), joined);
+                        grew.insert(name.clone());
+                        changed = true;
+                    }
+                }
+                _ => {
+                    range.remove(name);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            range.retain(|name, r| !(name.kind == VarKind::Integer && *r == IntRange::i16()));
+            return range;
+        }
+        if round + 1 == WIDEN_AT {
+            for name in grew {
+                range.insert(name, IntRange::i16());
+            }
+        }
+    }
+    HashMap::new()
+}
+
+/// Verify that every element write stays within its assumed array range.
+fn array_writes_stay_in(
+    module: &Module,
+    cfg: &Cfg,
+    per_node: &[(NumericState, NumericState)],
+    arrays: &HashMap<VarName, IntRange>,
+    data_range: Option<IntRange>,
+) -> bool {
+    let (sites, read, other) = array_write_sites(module, cfg);
+    arrays.iter().all(|(name, r)| {
+        !other.contains(name)
+            && r.min <= 0
+            && r.max >= 0
+            && (!read.contains(name) || data_range.is_some_and(|d| d.min >= r.min && d.max <= r.max))
+    }) && sites.iter().all(|(name, node, value)| {
+        let Some(r) = arrays.get(name) else { return true };
+        expr_int_range(value, &per_node[*node].0).is_some_and(|v| v.min >= r.min && v.max <= r.max)
+    })
+}
+
+/// `var = var + k` or `var = var - k` for a small literal `k`: the signed step.
+fn literal_step(value: &Expr, var: &VarName) -> Option<i32> {
+    let (sign, lit) = match value {
+        Expr::Bin(BinOp::Add, l, r) => match (l.as_ref(), r.as_ref()) {
+            (Expr::Var(v), Expr::Number(n)) | (Expr::Number(n), Expr::Var(v)) if v == var => (1, *n),
+            _ => return None,
+        },
+        Expr::Bin(BinOp::Sub, l, r) => match (l.as_ref(), r.as_ref()) {
+            (Expr::Var(v), Expr::Number(n)) if v == var => (-1, *n),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (lit.is_finite() && lit.fract() == 0.0 && lit > 0.0 && lit <= 1024.0).then_some(sign * lit as i32)
+}
+
+/// Propose bounds for constant steps followed by equality tests.
+/// Keep only bounds confirmed by `wrap_cap_holds`.
+fn wrap_cap_guesses(
+    module: &Module,
+    cfg: &Cfg,
+    per_node: &[(NumericState, NumericState)],
+) -> Vec<(usize, VarName, i32, IntRange)> {
+    let mut out = Vec::new();
+    for (step_node, node) in cfg.nodes.iter().enumerate() {
+        let Stmt::Let { var, value } = cfg.stmt_at(step_node, module) else {
+            continue;
+        };
+        let Some(step) = literal_step(value, var) else {
+            continue;
+        };
+        if node.successors.len() != 1 {
+            continue;
+        }
+        let Stmt::If {
+            cond: Expr::Bin(BinOp::Eq | BinOp::Ne, l, r),
+            ..
+        } = cfg.stmt_at(node.successors[0], module)
+        else {
+            continue;
+        };
+        let limit = match (l.as_ref(), r.as_ref()) {
+            (Expr::Var(v), lit) | (lit, Expr::Var(v)) if v == var => expr_as_int_literal(lit),
+            _ => None,
+        };
+        let (Some(limit), Some(now)) = (limit, per_node[step_node].1.get(var)) else {
+            continue;
+        };
+        let cap = if step > 0 {
+            if now.min > limit || now.max <= limit {
+                continue;
+            }
+            IntRange::new(now.min, limit)
+        } else {
+            if now.max < limit || now.min >= limit {
+                continue;
+            }
+            IntRange::new(limit, now.max)
+        };
+        out.push((step_node, var.clone(), step, cap));
+    }
+    out
+}
+
+/// Verify that a step preserves its assumed bound under the solved facts.
+fn wrap_cap_holds(
+    per_node: &[(NumericState, NumericState)],
+    step_node: usize,
+    var: &VarName,
+    step: i32,
+    cap: IntRange,
+) -> bool {
+    let Some(before) = per_node[step_node].0.get(var) else {
+        return false;
+    };
+    let (lo, hi) = (i64::from(before.min) + i64::from(step), i64::from(before.max) + i64::from(step));
+    lo >= i64::from(cap.min) && hi <= i64::from(cap.max)
 }
 
 /// Bound variable steps by a FOR trip count when each write runs at most once per round.
@@ -2516,10 +2779,18 @@ pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
         Expr::Not(inner) => {
             let r = expr_int_range(inner, state)?;
             if r.fits_i16() {
-                Some(IntRange::i16())
+                // NOT x is -x-1.
+                Some(IntRange::new(-r.max - 1, -r.min - 1))
             } else {
                 None
             }
+        }
+        // A comparison is -1 or 0 whatever its operands are.
+        Expr::Bin(op @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), l, r) => {
+            Some(match (expr_int_range(l, state), expr_int_range(r, state)) {
+                (Some(a), Some(b)) => compare_int_range(*op, a, b),
+                _ => IntRange::new(-1, 0),
+            })
         }
         Expr::Bin(op, l, r) => {
             // AND with a non-negative constant mask clamps the
@@ -2569,6 +2840,10 @@ pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
                     if !(a.fits_i16() && b.fits_i16()) {
                         return None;
                     }
+                    // Truth values stay truth values.
+                    if is_truth_range(a) && is_truth_range(b) {
+                        return Some(IntRange::new(-1, 0));
+                    }
                     // Both u8 → result u8 (bitwise AND of two
                     // unsigned bytes can't exceed a byte).
                     if a.fits_u8() && b.fits_u8() {
@@ -2579,6 +2854,9 @@ pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
                 BinOp::Or => {
                     if !(a.fits_i16() && b.fits_i16()) {
                         return None;
+                    }
+                    if is_truth_range(a) && is_truth_range(b) {
+                        return Some(IntRange::new(-1, 0));
                     }
                     // Both operands non-negative and fit u8 → result
                     // also fits u8 (the bitwise OR of two unsigned
@@ -2638,8 +2916,12 @@ pub fn expr_int_range(e: &Expr, state: &NumericState) -> Option<IntRange> {
             }
         }
         Expr::Peek(_) | Expr::MemPeek(_) => Some(IntRange::u8()),
-        Expr::ArrayRef(name, _) if name.kind == VarKind::Integer => Some(IntRange::i16()),
-        Expr::ArrayRef(_, _) => None,
+        // Use the proven element range, or i16 for an unbounded integer array.
+        Expr::ArrayRef(name, _) => match state.get(&array_stand_in(name)) {
+            Some(r) => Some(r),
+            None if name.kind == VarKind::Integer => Some(IntRange::i16()),
+            None => None,
+        },
         Expr::Len(_) => Some(IntRange::u8()),
         Expr::Asc(_) => Some(IntRange::u8()),
         Expr::StrCompare(_, _, _) => Some(IntRange::new(-1, 0)),

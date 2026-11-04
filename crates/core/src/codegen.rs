@@ -1165,6 +1165,12 @@ struct Codegen {
     used_fdiv2k: bool,
     /// True iff `x * 2^k` used the exponent helper `__FMUL2K`.
     used_fmul2k: bool,
+    /// Whether unrounded multiplication needs `__FMUL2K_RND`.
+    used_fmul2k_r: bool,
+    /// Whether unrounded division needs `__FDIV2K_RND`.
+    used_fdiv2k_r: bool,
+    /// Whether multiplication needs `__FMULT_P2`.
+    used_fmult_p2: bool,
     /// True iff `2^n` used the helper `__POW2`.
     used_pow2: bool,
     /// True iff `2^n` used its entry `__POW2_FAC`, which takes n in FAC.
@@ -1350,11 +1356,19 @@ struct Codegen {
     /// True iff `MULTI ON` appears anywhere in the program — gates
     /// the runtime MULTI flag and the `__DRAW_MC` 2-bit pixel path.
     used_tsb_multi: bool,
-    /// True iff bare `MEM` appears anywhere — gates emission of
-    /// the `__MEM_INIT` helper (chars-to-$E000 copy + VIC bank /
-    /// $D018 / KERNAL $0288 reconfigure) and switches CSET 0/1
-    /// to the MEM-mode XOR'd $D018 values.
+    /// Whether MEM occurs in the program. Enables `__MEM_INIT` and runtime
+    /// MEM detection in `__CSET_TEXT`.
     used_mem_mode: bool,
+    /// Whether CSET needs the `__CSET_TEXT` helper.
+    used_cset_text: bool,
+    /// Whether a float product needs `__FMUL_UNIT` for a -1, 0 or 1 operand.
+    used_fmul_unit: bool,
+    /// Common subexpressions of the LET run being emitted.
+    cse: CseWindow,
+    /// Maximum FAC slot count for `__CSE_SLOTS`.
+    cse_max_slots: usize,
+    /// Unique save markers prevent reuse after a save moves or is removed.
+    cse_saves: usize,
     /// True iff any drawing command takes (or could take) a mode
     /// argument. CHAR/TEXT always set this since they expose mode;
     /// other commands set it when the parser captured a trailing
@@ -1960,6 +1974,26 @@ struct CopyLoop {
     next_line: bool,
 }
 
+/// A run of LET statements whose repeated subexpressions are evaluated once.
+#[derive(Default)]
+struct CseWindow {
+    open: bool,
+    /// Index of the first statement after the run.
+    end: usize,
+    /// Expressions that occur twice before a variable they read changes.
+    candidates: Vec<Expr>,
+    slots: Vec<CseSlot>,
+}
+
+/// A saved FAC: exponent, mantissa, sign and rounding byte.
+struct CseSlot {
+    key: Expr,
+    index: usize,
+    /// Save marker and starting position in the emitted code.
+    marker: String,
+    at: usize,
+}
+
 /// A 24-bit loop sum; byte 3 marks a fallback to the float variable.
 #[derive(Clone, Debug)]
 struct WideSum {
@@ -1997,6 +2031,66 @@ enum StepLoc {
         slot_label: String,
         sign_label: String,
     },
+}
+
+/// High byte implied by an integer expression computed in one byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ByteHi {
+    /// The high byte is zero.
+    Zero,
+    /// The high byte repeats bit 7 of the low byte.
+    Sign,
+    /// The high byte is $FF.
+    Ones,
+    /// The high byte is zero whenever the low byte is zero.
+    Truthful,
+    /// Unknown high byte. Valid only under AND with a zero high byte.
+    Unknown,
+}
+
+impl ByteHi {
+    fn and(self, other: Self) -> Option<Self> {
+        use ByteHi::*;
+        match (self, other) {
+            (Zero, _) | (_, Zero) => Some(Zero),
+            (Unknown, _) | (_, Unknown) => None,
+            (Ones, k) | (k, Ones) => (k != Truthful).then_some(k),
+            (Sign, Sign) => Some(Sign),
+            _ => None,
+        }
+    }
+
+    fn or(self, other: Self) -> Option<Self> {
+        use ByteHi::*;
+        match (self, other) {
+            (Unknown, _) | (_, Unknown) => None,
+            (Ones, _) | (_, Ones) => Some(Ones),
+            (Zero, Zero) => Some(Zero),
+            (Sign, Sign) => Some(Sign),
+            // A high byte from either side is nonzero only with that side's low byte.
+            _ => Some(Truthful),
+        }
+    }
+
+    fn xor(self, other: Self) -> Option<Self> {
+        use ByteHi::*;
+        match (self, other) {
+            (Zero, Zero) | (Ones, Ones) => Some(Zero),
+            (Zero, Ones) | (Ones, Zero) => Some(Ones),
+            (Sign, Sign) => Some(Sign),
+            _ => None,
+        }
+    }
+
+    fn not(self) -> Option<Self> {
+        use ByteHi::*;
+        match self {
+            Zero => Some(Ones),
+            Ones => Some(Zero),
+            Sign => Some(Sign),
+            Truthful | Unknown => None,
+        }
+    }
 }
 
 /// A leaf operand that the int16 fast path knows how to read with a
@@ -2392,6 +2486,9 @@ impl Codegen {
             used_div16: false,
             used_fdiv2k: false,
             used_fmul2k: false,
+            used_fmul2k_r: false,
+            used_fdiv2k_r: false,
+            used_fmult_p2: false,
             used_pow2: false,
             used_pow2_fac: false,
             used_fast_rnd: false,
@@ -2466,6 +2563,11 @@ impl Codegen {
             used_tsb_lowcol: false,
             used_tsb_multi: false,
             used_mem_mode: false,
+            used_cset_text: false,
+            used_fmul_unit: false,
+            cse: CseWindow::default(),
+            cse_max_slots: 0,
+            cse_saves: 0,
             used_draw_mode: false,
             used_tsb_detect: false,
             used_str_dup: false,
@@ -3198,6 +3300,11 @@ impl Codegen {
             }
         }
         Ok(())
+    }
+
+    /// Multiply or divide by powers of two by adjusting the exponent.
+    fn pot_float_helpers(&self) -> bool {
+        self.profile != Profile::Size
     }
 
     /// The speed profile's float code: under Speed, or everywhere with `--fast-float`.
@@ -4896,6 +5003,20 @@ impl Codegen {
                 }
             }
         }
+        // Use two bytes to avoid repeated widening with integer array elements.
+        if !signed.is_empty() {
+            let mut paired = HashSet::new();
+            for line in &module.lines {
+                for stmt in &line.stmts {
+                    collect_vars_paired_with_int_elements(stmt, &mut paired);
+                }
+            }
+            for v in paired {
+                if signed.remove(&v).is_some() {
+                    candidates.remove(&v);
+                }
+            }
+        }
         // REM-hint force-promotion: every integer scalar whose base
         // the user marked `\BYTE` (or `@b=`) goes in regardless of
         // the range proof. The user takes the wrap risk; the source
@@ -5610,9 +5731,7 @@ impl Codegen {
             self.used_music_play = true;
             self.used_tsb_sid = true;
         }
-        // MEM mode is detected up-front so CSET 0 / CSET 1 emitted
-        // anywhere in the program (including before the MEM call
-        // in source order) pick the MEM-mode XOR'd $D018 values.
+        // Detect MEM before emission so CSET can check $0288 anywhere in the program.
         if scan_module_uses_mem_mode(module) {
             self.used_mem_mode = true;
         }
@@ -5870,11 +5989,19 @@ impl Codegen {
             } else {
                 0
             };
+            // Labels start new lines, so cached expressions cannot span them.
+            self.cse_close();
             while i < stmts.len() {
                 let path = crate::cfg::StmtPath {
                     line_idx,
                     path: vec![i],
                 };
+                if self.cse.open && i >= self.cse.end {
+                    self.cse_close();
+                }
+                if !self.cse.open {
+                    self.cse_open_at(stmts, i);
+                }
                 if let Some(plan) = self.copy_loop_plans.get(&path).cloned() {
                     // The FOR stands for its POKE and NEXT as well.
                     let taken = if plan.next_line {
@@ -5920,9 +6047,13 @@ impl Codegen {
                             path: vec![i],
                         },
                     )?;
+                    if self.cse.open {
+                        self.cse_kill_after(&stmts[i]);
+                    }
                     i += 1;
                 }
             }
+            self.cse_close();
             if self.curlin_hi_marked || self.curlin_clobbered_by_call {
 
                 last_curlin_hi = None;
@@ -6611,11 +6742,11 @@ __RSC_HIT:
             let value = f64::from_bits(*bits);
             let label = self.intern_float(value);
             let stub = op_short_name(*op);
-            let rom = op_rom_addr(*op);
+            let target = self.const_op_target(*op, value);
             writeln!(self.code, "__{}_{}:", stub, label).unwrap();
             writeln!(self.code, "    LDA #<{label}").unwrap();
             writeln!(self.code, "    LDY #>{label}").unwrap();
-            writeln!(self.code, "    JMP ${:04X}", rom).unwrap();
+            writeln!(self.code, "    JMP {target}").unwrap();
         }
         if self.used_bnds_check {
             // Caller has loaded the array's max index in A=lo / X=hi
@@ -7384,6 +7515,11 @@ __I24_POS:
                 writeln!(self.code, "{line}").unwrap();
             }
         }
+        if self.used_fdiv2k_r {
+            // Round FAC first, as the interpreter rounds a left operand it stacks.
+            writeln!(self.code, "__FDIV2K_RND:").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::ROUND).unwrap();
+        }
         if self.used_fdiv2k {
             // Divide FAC by 2^X through its exponent, preserving zero and underflow behavior.
             for line in [
@@ -7407,6 +7543,13 @@ __I24_POS:
             ] {
                 writeln!(self.code, "{line}").unwrap();
             }
+        }
+        if self.used_fmul2k_r {
+            // Round FAC first, as the interpreter rounds a left operand it stacks.
+            writeln!(self.code, "__FMUL2K_RND:").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::ROUND).unwrap();
+            writeln!(self.code, "    LDA #$00").unwrap();
+            writeln!(self.code, "    STA ${:02X}", rt::FAC_ROUNDING).unwrap();
         }
         if self.used_fmul2k {
             // Multiply FAC by 2^X through its exponent, checking overflow and underflow.
@@ -8832,6 +8975,43 @@ __I24_POS:
             writeln!(self.code, "    LDA __TSB_SCROLL_H").unwrap();
             writeln!(self.code, "    STA __TSB_RECT_H").unwrap();
             writeln!(self.code, "__TRS_RTS:").unwrap();
+            writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.used_fmul_unit {
+            self.code.push_str(FMUL_UNIT);
+        }
+        if self.used_fmult_p2 {
+            self.code.push_str(FMULT_P2);
+        }
+        if self.used_cset_text {
+            // Restore text mode. A holds $D018 ($15 or $17); only A is clobbered.
+            // Read $0288 for MEM mode: bank 3, screen $CC00, chars $E000/$E800.
+            // Clear HIRES and MULTI without changing the KERNAL screen page.
+            writeln!(self.code, "__CSET_TEXT:").unwrap();
+            if self.used_mem_mode {
+                writeln!(self.code, "    PHA").unwrap();
+                writeln!(self.code, "    LDA $0288").unwrap();
+                writeln!(self.code, "    CMP #$CC").unwrap();
+                writeln!(self.code, "    BEQ __CSET_TEXT_MEM").unwrap();
+                writeln!(self.code, "    PLA").unwrap();
+                writeln!(self.code, "    STA $D018").unwrap();
+                writeln!(self.code, "    LDA #$C7").unwrap();
+                writeln!(self.code, "    JMP __CSET_TEXT_BANK").unwrap();
+                writeln!(self.code, "__CSET_TEXT_MEM:").unwrap();
+                writeln!(self.code, "    PLA").unwrap();
+                writeln!(self.code, "    EOR #$2C").unwrap();
+                writeln!(self.code, "    STA $D018").unwrap();
+                writeln!(self.code, "    LDA #$C4").unwrap();
+                writeln!(self.code, "__CSET_TEXT_BANK:").unwrap();
+            } else {
+                writeln!(self.code, "    STA $D018").unwrap();
+                writeln!(self.code, "    LDA #$C7").unwrap();
+            }
+            writeln!(self.code, "    STA $DD00").unwrap();
+            writeln!(self.code, "    LDA #$1B").unwrap();
+            writeln!(self.code, "    STA $D011").unwrap();
+            writeln!(self.code, "    LDA #$C8").unwrap();
+            writeln!(self.code, "    STA $D016").unwrap();
             writeln!(self.code, "    RTS").unwrap();
         }
         if self.used_mem_mode {
@@ -14783,6 +14963,26 @@ __ARR_APPEND_POST:
                 writeln!(self.code, "T{i}:").unwrap();
                 emit_byte_run(&mut self.code, &[0u8; 5], false);
             }
+        }
+        if self.cse_max_slots > 0 && self.profile != Profile::Speed {
+            // X = slot offset. Save and reload FAC with its rounding byte.
+            writeln!(self.code, "__CSE_SAVE:").unwrap();
+            for (k, zp) in CSE_FAC_CELLS.iter().enumerate() {
+                writeln!(self.code, "    LDA ${zp:02X}").unwrap();
+                writeln!(self.code, "    STA __CSE_SLOTS+{k},X").unwrap();
+            }
+            writeln!(self.code, "    RTS").unwrap();
+            writeln!(self.code, "__CSE_LOAD:").unwrap();
+            for (k, zp) in CSE_FAC_CELLS.iter().enumerate() {
+                writeln!(self.code, "    LDA __CSE_SLOTS+{k},X").unwrap();
+                writeln!(self.code, "    STA ${zp:02X}").unwrap();
+            }
+            writeln!(self.code, "    RTS").unwrap();
+        }
+        if self.cse_max_slots > 0 {
+            // Saved FACs of common subexpressions, seven bytes each.
+            writeln!(self.code, "__CSE_SLOTS:").unwrap();
+            emit_byte_run(&mut self.code, &vec![0u8; 7 * self.cse_max_slots], false);
         }
 
         if self.used_saved_sp {
@@ -22438,12 +22638,34 @@ __TAG_BUF:
         // the RHS reduces to int16 leaves we skip FAC entirely. Both
         // smaller AND faster than the FAC roundtrip — always on.
         if var.kind == VarKind::Integer {
+            if let Some(sub) = neg_plus_as_sub(value) {
+                return self.emit_let(var, &sub);
+            }
             let label = self.intern_var(var.clone());
+            if self.try_emit_truth_let(var, value, &label)? {
+                self.invalidate_fac_cache();
+                return Ok(());
+            }
             if self.int_var_is_u8_storage(var) {
+                // Only the low byte is stored, so byte arithmetic is sufficient.
+                if self.byte_logic_ok(value) {
+                    self.emit_byte_logic_to_a(value)?;
+                    writeln!(self.code, "    STA {label}").unwrap();
+                    self.invalidate_fac_cache();
+                    return Ok(());
+                }
                 if self.try_emit_u8_let(value, &label) {
                     self.invalidate_fac_cache();
                     return Ok(());
                 }
+                // All stored values fit a signed byte, so compute only the low byte.
+                let mark = self.code.len();
+                if self.try_emit_byte_eval_to_a(value) {
+                    writeln!(self.code, "    STA {label}").unwrap();
+                    self.invalidate_fac_cache();
+                    return Ok(());
+                }
+                self.code.truncate(mark);
                 // Byte-eval can't lower `a%*2+1` and friends. Try the
                 // int-island add/sub evaluator and truncate the result
                 // to the u8 slot — sound because every value assigned
@@ -22464,6 +22686,9 @@ __TAG_BUF:
                 self.invalidate_fac_cache();
                 return Ok(());
             } else if self.try_emit_int16_addsub_let_trapping(value, &label) {
+                self.invalidate_fac_cache();
+                return Ok(());
+            } else if self.try_emit_int16_add_byte_let_trapping(value, &label) {
                 self.invalidate_fac_cache();
                 return Ok(());
             } else if self.profile == Profile::Speed && self.try_emit_int16_mul_let_trapping(value, &label) {
@@ -22531,6 +22756,36 @@ __TAG_BUF:
             }
         }
         Ok(())
+    }
+
+    /// Store a comparison as -1/0 or its negation as 1/0 directly from A.
+    fn try_emit_truth_let(
+        &mut self,
+        var: &VarName,
+        value: &Expr,
+        dest: &str,
+    ) -> Result<bool, CodegenError> {
+        let (truth, negated) = match value {
+            Expr::Neg(inner) if is_basic_bool(inner) => (inner.as_ref(), true),
+            _ if is_basic_bool(value) && !matches!(value, Expr::Number(_)) => (value, false),
+            _ => return Ok(false),
+        };
+        if self.heap_init_needed && expr_uses_heap(truth) {
+            return Ok(false);
+        }
+        let u8_slot = self.int_var_is_u8_storage(var);
+        self.emit_bool_to_a(truth)?;
+        if negated {
+            writeln!(self.code, "    AND #$01").unwrap();
+        }
+        writeln!(self.code, "    STA {dest}").unwrap();
+        if !u8_slot {
+            if negated {
+                writeln!(self.code, "    LDA #$00").unwrap();
+            }
+            writeln!(self.code, "    STA {dest}+1").unwrap();
+        }
+        Ok(true)
     }
 
     fn try_emit_u8_let(&mut self, value: &Expr, dest: &str) -> bool {
@@ -23289,6 +23544,10 @@ __TAG_BUF:
 
                 writeln!(self.code, "    LDY #${off:02X}").unwrap();
                 writeln!(self.code, "    LDA ({zp_label}),Y").unwrap();
+            } else if let Some((zp_label, index)) = self.expr_zp_pointer_plus_byte(addr) {
+                let tag = self.peek_page_tag(addr);
+                writeln!(self.code, "    LDY {index}").unwrap();
+                writeln!(self.code, "    LDA ({zp_label}),Y{tag}").unwrap();
             } else {
                 let id = self.fresh_id();
                 let patch = format!("__PEEK_INT_{id}");
@@ -24495,6 +24754,44 @@ __TAG_BUF:
         true
     }
 
+    /// Add a byte in A to an integer leaf with overflow checking.
+    fn try_emit_int16_add_byte_let_trapping(&mut self, value: &Expr, dest: &str) -> bool {
+        let Expr::Bin(BinOp::Add, a, b) = value else {
+            return false;
+        };
+        if self.used_error_continuation {
+            return false;
+        }
+        let (leaf_expr, byte) = if self.int16_leaf(a).is_some() { (a.as_ref(), b.as_ref()) } else { (b.as_ref(), a.as_ref()) };
+        let Some(leaf) = self.int16_leaf(leaf_expr) else {
+            return false;
+        };
+        if self.int16_leaf(byte).is_some()
+            || !self.expr_proves_u8(byte)
+            || self.expr_reads_unsigned_shadow(leaf_expr)
+            || matches!(&leaf, Int16Operand::Var(v) if self.int_var_is_u8_storage(v) && self.int_var_byte_is_signed(v))
+        {
+            return false;
+        }
+        let mark = self.code.len();
+        if !self.try_emit_byte_eval_to_a(byte) {
+            self.code.truncate(mark);
+            return false;
+        }
+        let ok = format!("__ADD_OK_{}", self.fresh_id());
+        self.used_illegal_qty = true;
+        writeln!(self.code, "    CLC").unwrap();
+        self.emit_int16_alu_byte(&leaf, false, "ADC");
+        writeln!(self.code, "    STA {dest}").unwrap();
+        self.emit_int16_load_byte(&leaf, true);
+        writeln!(self.code, "    ADC #$00").unwrap();
+        writeln!(self.code, "    STA {dest}+1").unwrap();
+        writeln!(self.code, "    BVC {ok}").unwrap();
+        writeln!(self.code, "    JMP __ILLEGAL_QTY").unwrap();
+        writeln!(self.code, "{ok}:").unwrap();
+        true
+    }
+
     /// Use checked 16-bit multiplication for integer assignments in the speed profile.
     fn try_emit_int16_mul_let_trapping(&mut self, value: &Expr, dest: &str) -> bool {
         let Expr::Bin(BinOp::Mul, a, b) = value else {
@@ -25432,6 +25729,20 @@ __TAG_BUF:
             writeln!(self.code, "    BEQ {skip_label}").unwrap();
             return Ok(());
         }
+        // Test the low byte unless a fixed $FF high byte makes the result true.
+        if (self.byte_logic_ok(cond) || matches!(cond, Expr::Var(_)) && self.byte_leaf_hi(cond).is_some())
+            && self.byte_logic_hi(cond) != Some(ByteHi::Unknown)
+        {
+            let hi = self.byte_logic_hi(cond).expect("checked");
+            self.emit_byte_logic_to_a(cond)?;
+            if hi != ByteHi::Ones {
+                writeln!(self.code, "    BEQ {skip_label}").unwrap();
+            }
+            return Ok(());
+        }
+        if self.try_emit_if_byte_logic_compare(cond, skip_label)? {
+            return Ok(());
+        }
         // PEEK-byte compare: `IF PEEK(addr) <op> u8` → 1-byte LDA/CMP
         // dance. Common in keyboard/joystick polling. Saves ~16 bytes
         // vs the FAC compare path and keeps the value byte-domain.
@@ -25811,7 +26122,69 @@ __TAG_BUF:
         Some((IfByte::Direct(self.u8_var_low_byte_label(e)?), false))
     }
 
-    /// Emit a byte comparison involving PEEK; return whether it was supported.
+    /// Compare a byte expression with a literal using unsigned arithmetic.
+    fn try_emit_if_byte_logic_compare(
+        &mut self,
+        cond: &Expr,
+        skip_label: &str,
+    ) -> Result<bool, CodegenError> {
+        let Expr::Bin(op, a, b) = cond else {
+            return Ok(false);
+        };
+        if !matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            return Ok(false);
+        }
+        let zero_hi = |s: &Self, e: &Expr| {
+            s.byte_logic_ok(e) && s.byte_logic_hi(e) == Some(ByteHi::Zero)
+        };
+        let (tree, k, op) = match (u8_literal(a), u8_literal(b)) {
+            (_, Some(k)) if zero_hi(self, a) => (a, k, *op),
+            (Some(k), _) if zero_hi(self, b) => {
+                let flipped = match op {
+                    BinOp::Lt => BinOp::Gt,
+                    BinOp::Le => BinOp::Ge,
+                    BinOp::Gt => BinOp::Lt,
+                    BinOp::Ge => BinOp::Le,
+                    other => *other,
+                };
+                (b, k, flipped)
+            }
+            _ => return Ok(false),
+        };
+        // `A > k` is `A >= k+1`, `A <= k` is `A < k+1`.
+        let (op, k) = match op {
+            BinOp::Gt | BinOp::Le if k == 255 => (op, k),
+            BinOp::Gt => (BinOp::Ge, k + 1),
+            BinOp::Le => (BinOp::Lt, k + 1),
+            other => (other, k),
+        };
+        // The tree runs even when the answer is fixed: a PEEK may read I/O.
+        self.emit_byte_logic_to_a(tree)?;
+        match (op, k) {
+            (BinOp::Ge, 0) | (BinOp::Le, 255) => {}
+            (BinOp::Lt, 0) | (BinOp::Gt, 255) => {
+                writeln!(self.code, "    JMP {skip_label}").unwrap();
+            }
+            (BinOp::Eq, 0) => writeln!(self.code, "    BNE {skip_label}").unwrap(),
+            (BinOp::Ne, 0) => writeln!(self.code, "    BEQ {skip_label}").unwrap(),
+            _ => {
+                writeln!(self.code, "    CMP #${k:02X}").unwrap();
+                let skip_on = match op {
+                    BinOp::Eq => "BNE",
+                    BinOp::Ne => "BEQ",
+                    BinOp::Lt => "BCS",
+                    BinOp::Ge => "BCC",
+                    _ => unreachable!(),
+                };
+                writeln!(self.code, "    {skip_on} {skip_label}").unwrap();
+            }
+        }
+        Ok(true)
+    }
+
     fn try_emit_if_peek_u8_compare(&mut self, cond: &Expr, skip_label: &str) -> bool {
         let Expr::Bin(op, a, b) = cond else {
             return false;
@@ -28360,13 +28733,154 @@ __TAG_BUF:
             writeln!(self.code, "    ; reuse FAC").unwrap();
             return Ok(());
         }
+        if self.try_emit_cse_load(e) {
+            if expr_fac_cacheable(e) {
+                self.set_fac_cache_expr(e);
+            } else {
+                self.invalidate_fac_cache();
+            }
+            return Ok(());
+        }
         self.emit_expr_to_fac_uncached(e)?;
+        self.emit_cse_save(e);
         if expr_fac_cacheable(e) {
             self.set_fac_cache_expr(e);
         } else {
             self.invalidate_fac_cache();
         }
         Ok(())
+    }
+
+    /// Reload FAC, including its rounding byte. The save must be unchanged
+    /// and precede this load without an intervening label.
+    fn try_emit_cse_load(&mut self, e: &Expr) -> bool {
+        if !self.cse.open {
+            return false;
+        }
+        let Some(pos) = self.cse.slots.iter().position(|s| &s.key == e) else {
+            return false;
+        };
+        let slot = &self.cse.slots[pos];
+        let intact = self.code.get(slot.at..).is_some_and(|rest| {
+            rest.starts_with(&slot.marker) && !code_defines_a_label(&rest[slot.marker.len()..])
+        });
+        let base = slot.index * 7;
+        if !intact {
+            self.cse.slots.remove(pos);
+            return false;
+        }
+        if self.profile == Profile::Speed {
+            for (k, zp) in CSE_FAC_CELLS.iter().enumerate() {
+                writeln!(self.code, "    LDA __CSE_SLOTS+{}", base + k).unwrap();
+                writeln!(self.code, "    STA ${zp:02X}").unwrap();
+            }
+        } else {
+            writeln!(self.code, "    LDX #${base:02X}").unwrap();
+            writeln!(self.code, "    JSR __CSE_LOAD").unwrap();
+        }
+        true
+    }
+
+    /// Save FAC after evaluating a candidate the run will need again.
+    fn emit_cse_save(&mut self, e: &Expr) {
+        if !self.cse.open
+            || !self.cse.candidates.contains(e)
+            || self.cse.slots.iter().any(|s| &s.key == e)
+        {
+            return;
+        }
+        let Some(index) = (0..CSE_MAX_SLOTS).find(|i| !self.cse.slots.iter().any(|s| s.index == *i))
+        else {
+            return;
+        };
+        self.cse_saves += 1;
+        let marker = format!("    ; cse save {}\n", self.cse_saves);
+        let at = self.code.len();
+        self.code.push_str(&marker);
+        let base = index * 7;
+        if self.profile == Profile::Speed {
+            for (k, zp) in CSE_FAC_CELLS.iter().enumerate() {
+                writeln!(self.code, "    LDA ${zp:02X}").unwrap();
+                writeln!(self.code, "    STA __CSE_SLOTS+{}", base + k).unwrap();
+            }
+        } else {
+            writeln!(self.code, "    LDX #${base:02X}").unwrap();
+            writeln!(self.code, "    JSR __CSE_SAVE").unwrap();
+        }
+        self.cse_max_slots = self.cse_max_slots.max(index + 1);
+        self.cse.slots.push(CseSlot {
+            key: e.clone(),
+            index,
+            marker,
+            at,
+        });
+    }
+
+    fn cse_close(&mut self) {
+        self.cse = CseWindow::default();
+    }
+
+    /// Start caching repeated subexpressions in a run of LET statements.
+    fn cse_open_at(&mut self, stmts: &[Stmt], i: usize) {
+        // The size profile keeps the shorter recomputation.
+        if self.profile == Profile::Size
+            || self.used_error_continuation
+            || self.used_on_error
+            || self.used_on_key
+        {
+            return;
+        }
+        let mut j = i;
+        while j < stmts.len() && self.cse_stmt_ok(&stmts[j]) {
+            j += 1;
+        }
+        if j == i {
+            return;
+        }
+        let candidates = cse_candidates(&stmts[i..j]);
+        if candidates.is_empty() {
+            return;
+        }
+        self.cse = CseWindow {
+            open: true,
+            end: j,
+            candidates,
+            slots: Vec::new(),
+        };
+    }
+
+    /// Accept numeric LETs that use FAC without FN parameter rebinding.
+    fn cse_stmt_ok(&self, stmt: &Stmt) -> bool {
+        let (var, exprs): (&VarName, Vec<&Expr>) = match stmt {
+            Stmt::Let { var, value } => (var, vec![value]),
+            Stmt::ArrayLet {
+                name,
+                indices,
+                value,
+            } => (name, indices.iter().chain(std::iter::once(value)).collect()),
+            _ => return false,
+        };
+        if matches!(var.base.as_str(), "TI" | "ST" | "ER" | "EL")
+            || self.checked_shadows.contains_key(var)
+            || self.wide_sums.iter().any(|w| &w.var == var)
+            || (self.heap_init_needed && stmt_allocates_heap(stmt))
+        {
+            return false;
+        }
+        exprs.iter().all(|e| !expr_rebinds_or_allocates(e)) && self.cs_reads(&exprs).is_empty()
+    }
+
+    /// Invalidate cached expressions that read the assigned variable.
+    fn cse_kill_after(&mut self, stmt: &Stmt) {
+        let target = match stmt {
+            Stmt::Let { var, .. } => var,
+            Stmt::ArrayLet { name, .. } => name,
+            _ => {
+                self.cse_close();
+                return;
+            }
+        };
+        self.cse.slots.retain(|s| !expr_mentions_name(&s.key, target));
     }
 
     fn emit_expr_to_fac_uncached(&mut self, e: &Expr) -> Result<(), CodegenError> {
@@ -29649,6 +30163,14 @@ __TAG_BUF:
             writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
             return Ok(());
         }
+        if let Some((zp_label, index)) = self.expr_zp_pointer_plus_byte(addr) {
+            let tag = self.peek_page_tag(addr);
+            writeln!(self.code, "    LDY {index}").unwrap();
+            writeln!(self.code, "    LDA ({zp_label}),Y{tag}").unwrap();
+            writeln!(self.code, "    TAY").unwrap();
+            writeln!(self.code, "    JSR ${:04X}", rt::BYTEFAC).unwrap();
+            return Ok(());
+        }
         let id = self.fresh_id();
         let patch = format!("__PEEK_{id}");
         if !self.try_emit_int16_addr_patch(addr, &patch) {
@@ -29846,6 +30368,24 @@ __TAG_BUF:
             self.used_fac_byte = true;
             self.invalidate_fac_cache();
             writeln!(self.code, "    LDY #${off:02X}").unwrap();
+            writeln!(self.code, "    STA ({zp_label}),Y").unwrap();
+            return Ok(());
+        }
+        // `base + i` with the base pair in zero page: (base),Y with Y = i.
+        if let Some((zp_label, index)) = self.expr_zp_pointer_plus_byte(addr) {
+            if let Expr::Var(v) = value
+                && v.kind == VarKind::Integer
+                && v.base != "TI"
+                && v.base != "ST"
+            {
+                self.emit_int_var_byte_to_a(v);
+            } else if !self.try_emit_int16_byte_to_a(value) {
+                self.emit_byte_fallback_to_fac(value)?;
+                writeln!(self.code, "    JSR __FAC_BYTE").unwrap();
+                self.used_fac_byte = true;
+                self.invalidate_fac_cache();
+            }
+            writeln!(self.code, "    LDY {index}").unwrap();
             writeln!(self.code, "    STA ({zp_label}),Y").unwrap();
             return Ok(());
         }
@@ -31977,18 +32517,17 @@ __TAG_BUF:
             self.used_fac_byte = true;
             self.invalidate_fac_cache();
         }
+        // CSET 0 selects upper case, 1 lower case, and other values graphics.
         let id = self.fresh_id();
-        let cset1 = format!("__CSET_1_{id}");
         let cset2 = format!("__CSET_2_{id}");
         let done = format!("__CSET_DONE_{id}");
-        writeln!(self.code, "    CMP #$00").unwrap();
-        writeln!(self.code, "    BNE {cset1}").unwrap();
-        self.emit_cset_const(0);
-        writeln!(self.code, "    JMP {done}").unwrap();
-        writeln!(self.code, "{cset1}:").unwrap();
-        writeln!(self.code, "    CMP #$01").unwrap();
-        writeln!(self.code, "    BNE {cset2}").unwrap();
-        self.emit_cset_const(1);
+        writeln!(self.code, "    CMP #$02").unwrap();
+        writeln!(self.code, "    BCS {cset2}").unwrap();
+        // Map modes 0 and 1 to $D018 values $15 and $17.
+        writeln!(self.code, "    ASL").unwrap();
+        writeln!(self.code, "    ORA #$15").unwrap();
+        self.used_cset_text = true;
+        writeln!(self.code, "    JSR __CSET_TEXT").unwrap();
         writeln!(self.code, "    JMP {done}").unwrap();
         writeln!(self.code, "{cset2}:").unwrap();
         self.emit_cset_const(2);
@@ -31997,23 +32536,13 @@ __TAG_BUF:
     }
 
     fn emit_cset_const(&mut self, mode: u8) {
-        // CSET 0/1 in normal mode point at the standard char ROM
-        // shadow at $1000 / $1800 (VIC bank 0). When MEM mode is
-        // active the reference XORs $D018 with $2C — that lands
-        // CSET 0 at $E000 (upper case in the relocated chars) and
-        // CSET 1 at $E800 (lower case). We pick the MEM-mode
-        // values up front when `used_mem_mode` is set so any CSET
-        // call after MEM uses the right bank.
+        // Restore text mode, including the MEM layout selected by $0288.
         match mode {
-            0 => {
-                let v = if self.used_mem_mode { 0x39 } else { 0x15 };
+            0 | 1 => {
+                let v = if mode == 0 { 0x15 } else { 0x17 };
+                self.used_cset_text = true;
                 writeln!(self.code, "    LDA #${:02X}", v).unwrap();
-                writeln!(self.code, "    STA $D018").unwrap();
-            }
-            1 => {
-                let v = if self.used_mem_mode { 0x3B } else { 0x17 };
-                writeln!(self.code, "    LDA #${:02X}", v).unwrap();
-                writeln!(self.code, "    STA $D018").unwrap();
+                writeln!(self.code, "    JSR __CSET_TEXT").unwrap();
             }
             _ => {
                 writeln!(self.code, "    LDA #$3B").unwrap();
@@ -32874,7 +33403,20 @@ __TAG_BUF:
                     writeln!(self.code, "    LDA #${:02X}", v).unwrap();
                     return true;
                 }
-                false
+                // The low byte of -x is 0 minus the low byte of x.
+                if let Some(operand) = self.byte_simple_operand(inner) {
+                    writeln!(self.code, "    LDA #$00").unwrap();
+                    writeln!(self.code, "    SEC").unwrap();
+                    writeln!(self.code, "    SBC {operand}").unwrap();
+                    return true;
+                }
+                if !self.try_emit_byte_eval_to_a(inner) {
+                    return false;
+                }
+                writeln!(self.code, "    EOR #$FF").unwrap();
+                writeln!(self.code, "    CLC").unwrap();
+                writeln!(self.code, "    ADC #$01").unwrap();
+                true
             }
             Expr::Var(v) if v.kind == VarKind::Integer && v.base != "TI" && v.base != "ST" => {
 
@@ -32940,6 +33482,12 @@ __TAG_BUF:
                 if let Some((zp_label, off)) = self.expr_zp_pointer_label_offset(addr) {
                     writeln!(self.code, "    LDY #${off:02X}").unwrap();
                     writeln!(self.code, "    LDA ({zp_label}),Y").unwrap();
+                    return true;
+                }
+                if let Some((zp_label, index)) = self.expr_zp_pointer_plus_byte(addr) {
+                    let tag = self.peek_page_tag(addr);
+                    writeln!(self.code, "    LDY {index}").unwrap();
+                    writeln!(self.code, "    LDA ({zp_label}),Y{tag}").unwrap();
                     return true;
                 }
                 let id = self.fresh_id();
@@ -33071,7 +33619,39 @@ __TAG_BUF:
         None
     }
 
-    /// Resolve a zero-page pointer and nonnegative byte displacement.
+    /// Resolve a zero-page pointer plus an unsigned byte offset.
+    /// The sum must fit a 16-bit address.
+    fn peek_page_tag(&self, addr: &Expr) -> String {
+        if self
+            .current_expr_int_range(addr)
+            .is_some_and(|r| r.min >= 0x100 && r.max <= 0xFFFF)
+        {
+            format!(" ; {}", crate::peephole::ABOVE_ZERO_PAGE)
+        } else {
+            String::new()
+        }
+    }
+
+    fn expr_zp_pointer_plus_byte(&mut self, e: &Expr) -> Option<(String, String)> {
+        let Expr::Bin(BinOp::Add, l, r) = e else { return None };
+        if !self
+            .current_expr_int_range(e)
+            .is_some_and(|range| range.min >= 0 && range.max <= 65535)
+        {
+            return None;
+        }
+        for (base, index) in [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())] {
+            if !matches!(index, Expr::Var(_)) || self.byte_leaf_hi(index) != Some(ByteHi::Zero) {
+                continue;
+            }
+            if let Some(label) = self.expr_zp_pointer_label(base) {
+                let operand = self.byte_simple_operand(index)?;
+                return Some((label, operand));
+            }
+        }
+        None
+    }
+
     fn expr_zp_pointer_label_offset(&self, e: &Expr) -> Option<(String, u8)> {
         if self.addr_range_may_leave_u16(e) {
             return None;
@@ -34012,28 +34592,46 @@ __TAG_BUF:
         if matches!(op, BinOp::Pow) {
             return self.emit_pow(lhs, rhs);
         }
-        // Divide by a power of two with the exponent helper in the speed profile.
+        // Divide by a power of two through the exponent of the rounded dividend.
         if op == BinOp::Div
-            && self.fast_float_code()
+            && self.pot_float_helpers()
             && let Some(k) = mul_pot_exponent(rhs)
             && k <= 16
         {
-            self.emit_load_as_movfm(lhs)?;
+            let entry = self.emit_rounded_left_operand(lhs, "__FDIV2K")?;
             writeln!(self.code, "    LDX #${k:02X}").unwrap();
-            writeln!(self.code, "    JSR __FDIV2K").unwrap();
+            writeln!(self.code, "    JSR {entry}").unwrap();
             self.used_fdiv2k = true;
             self.invalidate_fac_cache();
             return Ok(());
         }
-        // Multiply by a power of two by adjusting the loaded operand exponent.
+        // Multiply by a power of two through the exponent of the rounded left operand.
         if op == BinOp::Mul
-            && self.fast_float_code()
+            && self.pot_float_helpers()
             && let Some(k) = pot_scale_exponent(rhs)
         {
-            self.emit_load_as_movfm(lhs)?;
+            let entry = self.emit_rounded_left_operand(lhs, "__FMUL2K")?;
             writeln!(self.code, "    LDX #${:02X}", k as u8).unwrap();
-            writeln!(self.code, "    JSR __FMUL2K").unwrap();
+            writeln!(self.code, "    JSR {entry}").unwrap();
             self.used_fmul2k = true;
+            self.invalidate_fac_cache();
+            return Ok(());
+        }
+        // Select the product directly for an integer flag in -1..1.
+        if op == BinOp::Mul
+            && let Expr::Var(v) = lhs
+            && v.kind == VarKind::Integer
+            && v.base != "TI"
+            && v.base != "ST"
+            && self
+                .current_expr_int_range(lhs)
+                .is_some_and(|r| r.min >= -1 && r.max <= 1)
+            && let Some(operand) = self.byte_simple_operand(lhs)
+        {
+            self.emit_expr_to_fac(rhs)?;
+            writeln!(self.code, "    LDA {operand}").unwrap();
+            writeln!(self.code, "    JSR __FMUL_UNIT").unwrap();
+            self.used_fmul_unit = true;
             self.invalidate_fac_cache();
             return Ok(());
         }
@@ -34346,11 +34944,43 @@ __TAG_BUF:
         if fac_op_stub_worth_it(count) {
             writeln!(self.code, "    JSR __{}_{}", op_short_name(op), label).unwrap();
         } else {
+            let target = self.const_op_target(op, value);
             writeln!(self.code, "    LDA #<{label}").unwrap();
             writeln!(self.code, "    LDY #>{label}").unwrap();
-            writeln!(self.code, "    JSR ${:04X}", op_rom_addr(op)).unwrap();
+            writeln!(self.code, "    JSR {target}").unwrap();
         }
         self.invalidate_fac_cache();
+    }
+
+    /// Select the ROM routine or `__FMULT_P2` for a power of two.
+    fn const_op_target(&mut self, op: BinOp, value: f64) -> String {
+        if op == BinOp::Mul && self.pot_float_helpers() && pot_scale_exponent(&Expr::Number(value)).is_some() {
+            self.used_fmult_p2 = true;
+            "__FMULT_P2".to_string()
+        } else {
+            format!("${:04X}", op_rom_addr(op))
+        }
+    }
+
+    /// Evaluate and round the left operand before scaling by a power of two.
+    /// Variables are already rounded when loaded.
+    fn emit_rounded_left_operand(&mut self, e: &Expr, entry: &str) -> Result<String, CodegenError> {
+        if let Expr::Var(v) = e
+            && self.float_slot_is_current(v)
+        {
+            self.emit_load_as_movfm(e)?;
+            return Ok(entry.to_string());
+        }
+        self.emit_expr_to_fac(e)?;
+        if fac_result_is_already_rounded(e) {
+            return Ok(entry.to_string());
+        }
+        if entry == "__FMUL2K" {
+            self.used_fmul2k_r = true;
+        } else {
+            self.used_fdiv2k_r = true;
+        }
+        Ok(format!("{entry}_RND"))
     }
 
     /// Stash FAC into a temp slot. T0 is the hot one — the outermost
@@ -34378,6 +35008,9 @@ __TAG_BUF:
             writeln!(self.code, "    JSR __BOOL_TO_FAC").unwrap();
             self.used_bool_to_fac = true;
             self.invalidate_fac_cache();
+            return Ok(());
+        }
+        if self.try_emit_byte_logic_to_fac(&Expr::Bin(op, Box::new(lhs.clone()), Box::new(rhs.clone())))? {
             return Ok(());
         }
         let mnem = match op {
@@ -34486,6 +35119,157 @@ __TAG_BUF:
         Ok(())
     }
 
+    /// High byte implied by an integer leaf loaded from one byte.
+    fn byte_leaf_hi(&self, e: &Expr) -> Option<ByteHi> {
+        // `byte_simple_operand` loads a literal as its low byte.
+        if let Expr::Number(n) = e {
+            let n = *n;
+            if !n.is_finite() || n.fract() != 0.0 {
+                return None;
+            }
+            return match n as i64 {
+                // 0..127 is Sign too; Zero also masks a 16-bit operand.
+                0..=255 => Some(ByteHi::Zero),
+                -128..=-1 => Some(ByteHi::Sign),
+                -256..=-129 => Some(ByteHi::Ones),
+                _ => None,
+            };
+        }
+        if let Expr::Peek(addr) = e {
+            return (as_u16_literal(addr).is_some() && !self.addr_literal_out_of_rom_range(addr))
+                .then_some(ByteHi::Zero);
+        }
+        let Expr::Var(v) = e else { return None };
+        if v.base == "TI" || v.base == "ST" {
+            return None;
+        }
+        if self.int_for_counter_label(v).is_some() {
+            return Some(ByteHi::Unknown);
+        }
+        if self.u8_for_counter_label(v).is_some() {
+            return Some(ByteHi::Zero);
+        }
+        if v.kind != VarKind::Integer {
+            return None;
+        }
+        if !self.int_var_is_u8_storage(v) {
+            // A 16-bit integer's low byte sits at its label.
+            return Some(ByteHi::Unknown);
+        }
+        if !self.int_var_byte_is_signed(v) {
+            return Some(ByteHi::Zero);
+        }
+        self.signed_byte_negative_from(v).is_none().then_some(ByteHi::Sign)
+    }
+
+    /// High byte implied by a bitwise expression computed in one byte.
+    fn byte_logic_hi(&self, e: &Expr) -> Option<ByteHi> {
+        if is_basic_bool(e) && !matches!(e, Expr::Number(_)) {
+            // `emit_bool_to_a`'s $FF / $00.
+            return Some(ByteHi::Sign);
+        }
+        match e {
+            Expr::Not(inner) => self.byte_logic_hi(inner)?.not(),
+            Expr::Bin(op @ (BinOp::And | BinOp::Or | BinOp::Xor), l, r) => {
+                let (a, b) = (self.byte_logic_hi(l)?, self.byte_logic_hi(r)?);
+                match op {
+                    BinOp::And => a.and(b),
+                    BinOp::Or => a.or(b),
+                    _ => a.xor(b),
+                }
+            }
+            _ => self.byte_leaf_hi(e),
+        }
+    }
+
+    /// Accept byte bitwise expressions that leave the heap unchanged.
+    fn byte_logic_ok(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Not(_) | Expr::Bin(BinOp::And | BinOp::Or | BinOp::Xor, _, _))
+            && !(self.heap_init_needed && expr_uses_heap(e))
+            && self.byte_logic_hi(e).is_some()
+    }
+
+    /// Compute a supported bitwise expression into A and set N and Z.
+    fn emit_byte_logic_to_a(&mut self, e: &Expr) -> Result<(), CodegenError> {
+        if is_basic_bool(e) && !matches!(e, Expr::Number(_)) {
+            return self.emit_bool_to_a(e);
+        }
+        match e {
+            Expr::Not(inner) => {
+                self.emit_byte_logic_to_a(inner)?;
+                writeln!(self.code, "    EOR #$FF").unwrap();
+            }
+            Expr::Bin(op @ (BinOp::And | BinOp::Or | BinOp::Xor), l, r) => {
+                let mnem = match op {
+                    BinOp::And => "AND",
+                    BinOp::Or => "ORA",
+                    _ => "EOR",
+                };
+                let leaf = |s: &Self, x: &Expr| s.byte_leaf_hi(x).is_some();
+                if leaf(self, r) {
+                    self.emit_byte_logic_to_a(l)?;
+                    let operand = self.byte_simple_operand(r).expect("a byte leaf");
+                    writeln!(self.code, "    {mnem} {operand}").unwrap();
+                } else if leaf(self, l) {
+                    self.emit_byte_logic_to_a(r)?;
+                    let operand = self.byte_simple_operand(l).expect("a byte leaf");
+                    writeln!(self.code, "    {mnem} {operand}").unwrap();
+                } else {
+                    let slot = self.logic_byte_slot();
+                    self.emit_byte_logic_to_a(l)?;
+                    writeln!(self.code, "    STA {slot}").unwrap();
+                    self.push_logic_slot();
+                    let rhs = self.emit_byte_logic_to_a(r);
+                    self.pop_logic_slot();
+                    rhs?;
+                    writeln!(self.code, "    {mnem} {slot}").unwrap();
+                }
+                self.invalidate_fac_cache();
+            }
+            _ => {
+                let operand = self.byte_simple_operand(e).expect("a byte leaf");
+                writeln!(self.code, "    LDA {operand}").unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute the low byte, derive the high byte, and convert through GIVAYF.
+    fn try_emit_byte_logic_to_fac(&mut self, e: &Expr) -> Result<bool, CodegenError> {
+        if !self.byte_logic_ok(e) {
+            return Ok(false);
+        }
+        let hi = self.byte_logic_hi(e).expect("checked");
+        if hi == ByteHi::Truthful {
+            return Ok(false);
+        }
+        let truth = self
+            .current_expr_int_range(e)
+            .is_some_and(|r| r.min >= -1 && r.max <= 0);
+        self.emit_byte_logic_to_a(e)?;
+        if truth {
+            writeln!(self.code, "    JSR __BOOL_TO_FAC").unwrap();
+            self.used_bool_to_fac = true;
+        } else {
+            writeln!(self.code, "    TAY").unwrap();
+            match hi {
+                ByteHi::Zero => writeln!(self.code, "    LDA #$00").unwrap(),
+                ByteHi::Ones => writeln!(self.code, "    LDA #$FF").unwrap(),
+                _ => {
+                    let done = format!("__BLF_{}", self.fresh_id());
+                    writeln!(self.code, "    ASL").unwrap();
+                    writeln!(self.code, "    LDA #$00").unwrap();
+                    writeln!(self.code, "    BCC {done}").unwrap();
+                    writeln!(self.code, "    LDA #$FF").unwrap();
+                    writeln!(self.code, "{done}:").unwrap();
+                }
+            }
+            writeln!(self.code, "    JSR ${:04X}", rt::GIVAYF).unwrap();
+        }
+        self.invalidate_fac_cache();
+        Ok(true)
+    }
+
     fn md_tmp_slots(&mut self) -> (String, String) {
         self.md_max_depth = self.md_max_depth.max(self.md_depth);
         if self.md_depth == 0 {
@@ -34542,6 +35326,9 @@ __TAG_BUF:
     /// `NOT n` — bitwise complement of the signed 16-bit int form of `n`.
     /// Single-arg variant of emit_logic without the scratch dance.
     fn emit_not(&mut self, arg: &Expr) -> Result<(), CodegenError> {
+        if self.try_emit_byte_logic_to_fac(&Expr::Not(Box::new(arg.clone())))? {
+            return Ok(());
+        }
         self.emit_expr_to_fac(arg)?;
         self.emit_ayint(Some(arg));
         writeln!(self.code, "    LDA ${:02X}", rt::LINNUM_LO).unwrap();
@@ -37952,7 +38739,87 @@ __RND_ARG:
     JMP $E097
 ";
 
-/// Clear fractional bits for nonnegative INT arguments; delegate other cases to ROM.
+/// Multiply FAC by -1, 0 or 1 supplied in A. Preserve FMULT rounding.
+/// Use ROM FMULT for its zero-byte shift and exponent $FF cases.
+pub const FMUL_UNIT: &str = "\
+__FMUL_UNIT:
+    LDX $61
+    BEQ __FMU_RTS
+    TAX
+    BEQ __FMU_ZERO
+    LDA $64
+    BEQ __FMU_SLOW
+    LDA $61
+    CMP #$FF
+    BEQ __FMU_SLOW
+    LDA $70
+    AND #$FE
+    STA $70
+    INX
+    BNE __FMU_RTS
+    LDA $66
+    EOR #$80
+    STA $66
+__FMU_RTS:
+    RTS
+__FMU_ZERO:
+    STX $61
+    STX $66
+    RTS
+__FMU_SLOW:
+    LDA #<__FMU_ONE
+    LDY #>__FMU_ONE
+    INX
+    BNE __FMU_MUL
+    LDA #<__FMU_MONE
+    LDY #>__FMU_MONE
+__FMU_MUL:
+    JMP $BA28
+__FMU_ONE:
+    .byte $81,$00,$00,$00,$00
+__FMU_MONE:
+    .byte $81,$80,$00,$00,$00
+";
+
+/// Multiply FAC by the power of two at A/Y, preserving FMULT rounding.
+/// Use ROM FMULT for zero-byte shifts, underflow and overflow.
+pub const FMULT_P2: &str = "\
+__FMULT_P2:
+    LDX $61
+    BEQ __FP2_RTS
+    LDX $64
+    BEQ __FP2_ROM
+    STA $22
+    STY $23
+    LDY #$00
+    LDA ($22),Y
+    CLC
+    ADC $61
+    BCS __FP2_HI
+    SBC #$80
+    BCC __FP2_ROMP
+    BEQ __FP2_ROMP
+__FP2_SET:
+    STA $61
+    LDA $70
+    AND #$FE
+    STA $70
+__FP2_RTS:
+    RTS
+__FP2_HI:
+    CMP #$80
+    BCS __FP2_ROMP
+    ADC #$7F
+    BCC __FP2_SET
+__FP2_ROMP:
+    LDA $22
+    LDY $23
+__FP2_ROM:
+    JMP $BA28
+";
+
+/// Clear fractional bits for INT; use ROM for a nonzero QINT fill byte.
+/// Round negative fractions toward minus infinity, including the rounding byte.
 pub const FAST_INT: &str = "\
 __INT:
     LDA $61
@@ -37960,7 +38827,7 @@ __INT:
     CMP #$A0
     BCS __INT_DONE
     LDY $66
-    BMI __INT_ROM
+    BMI __INT_NEG
     LDY $68
     BNE __INT_ROM
     STY $66
@@ -37998,8 +38865,72 @@ __INT_ZERO:
     RTS
 __INT_ROM:
     JMP $BCCC
+__INT_NEG:
+    LDY #$FF
+    STY $66
+    LDY #$00
+    STY $68
+    SBC #$80
+    BCC __INT_M1
+    EOR #$1F
+    LDY #$03
+__INT_NBYTE:
+    CMP #$08
+    BCC __INT_NPART
+    TAX
+    LDA $62,Y
+    ORA $70
+    STA $70
+    LDA #$00
+    STA $62,Y
+    TXA
+    SBC #$08
+    DEY
+    BPL __INT_NBYTE
+__INT_NPART:
+    TAX
+    LDA __INT_MASK,X
+    EOR #$FF
+    AND $62,Y
+    ORA $70
+    BEQ __INT_NX
+    LDA $62,Y
+    AND __INT_MASK,X
+    CLC
+    ADC __INT_UNIT,X
+    STA $62,Y
+    BCC __INT_NC
+__INT_NRIP:
+    DEY
+    BMI __INT_NOVF
+    LDA $62,Y
+    ADC #$00
+    STA $62,Y
+    BCS __INT_NRIP
+    BCC __INT_NC
+__INT_NOVF:
+    ROR $62
+    INC $61
+__INT_NC:
+    LDA #$00
+__INT_NX:
+    STA $70
+    RTS
+__INT_M1:
+    LDA #$81
+    STA $61
+    LDA #$80
+    STA $62
+    LDA #$00
+    STA $63
+    STA $64
+    STA $65
+    STA $70
+    RTS
 __INT_MASK:
     .byte $FF,$FE,$FC,$F8,$F0,$E0,$C0,$80
+__INT_UNIT:
+    .byte $01,$02,$04,$08,$10,$20,$40,$80
 ";
 
 /// Align close FADD operands locally before ROM addition and normalization.
@@ -40723,27 +41654,234 @@ fn i16_split_if_integral(n: f64) -> Option<(u8, u8)> {
     }
 }
 
-/// Match `PEEK(<literal addr>)` and return the address. Falls
-/// through for runtime addresses.
-/// Does `e` produce a canonical BASIC boolean (-1 for true, 0 for
-/// false)?
-///
-/// BASIC v2's `AND` and `OR` are bitwise on i16, not logical. For
-/// `IF X AND Y THEN` the only sound short-circuit lowering is when
-/// both X and Y already evaluate to -1 or 0 — there the bitwise
-/// AND of -1/0 pairs degenerates to the logical AND that
-/// short-circuit emits. For arbitrary integer operands (e.g.
-/// `IF PEEK(addr) AND mask`) the mask has to be computed in full.
-///
-/// Recognised shapes:
-///   * Comparison ops (`=`, `<>`, `<`, `<=`, `>`, `>=`) — produce
-///     -1/0 by ROM convention.
-///   * String compares (`StrCompare`) — same convention.
-///   * `Number(-1.0)` and `Number(0.0)` literals.
-///   * `Not(x)` where `x` is itself basic-bool: NOT of -1 is 0
-///     and vice versa.
-///   * `Bin(And|Or, l, r)` where both `l` and `r` are basic-bool —
-///     bitwise of two -1/0 values stays -1/0.
+/// Saved FAC layout: $61-$66 followed by the rounding byte.
+const CSE_FAC_CELLS: [u8; 7] = [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x70];
+
+/// Minimum estimated cost for caching, allowing 100 cycles per save and reload.
+const CSE_MIN_COST: u32 = 250;
+
+/// Limit slots so each offset fits an immediate LDX operand.
+const CSE_MAX_SLOTS: usize = 36;
+
+/// Check whether a line defines a label.
+fn code_defines_a_label(code: &str) -> bool {
+    code.lines().any(|l| {
+        let t = l.split(';').next().unwrap_or("").trim();
+        t.ends_with(':')
+    })
+}
+
+/// Check whether an expression reads a scalar or array named `name`.
+fn expr_mentions_name(e: &Expr, name: &VarName) -> bool {
+    let mut found = false;
+    walk_cse_children(e, &mut |x| match x {
+        Expr::Var(v) | Expr::ArrayRef(v, _) if v == name => found = true,
+        _ => {}
+    });
+    found
+}
+
+/// Visit `e` and every expression below it.
+fn walk_cse_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Neg(x) | Expr::Not(x) | Expr::Func1(_, x) | Expr::Peek(x) | Expr::MemPeek(x)
+        | Expr::Pos(x) | Expr::Fre(x) | Expr::Usr(x) | Expr::Joy(x) | Expr::Pot(x)
+        | Expr::FnCall(_, x) => walk_cse_children(x, f),
+        Expr::Bin(_, l, r) | Expr::At(l, r) | Expr::Test(l, r) => {
+            walk_cse_children(l, f);
+            walk_cse_children(r, f);
+        }
+        Expr::ArrayRef(_, idx) => {
+            for i in idx {
+                walk_cse_children(i, f);
+            }
+        }
+        Expr::Check { first, second } => {
+            walk_cse_children(first, f);
+            if let Some(s) = second {
+                walk_cse_children(s, f);
+            }
+        }
+        Expr::Inst { start, .. } => {
+            if let Some(s) = start {
+                walk_cse_children(s, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Exclude FN parameter rebinding and string allocation from cached runs.
+fn expr_rebinds_or_allocates(e: &Expr) -> bool {
+    let mut bad = false;
+    walk_cse_children(e, &mut |x| {
+        if matches!(
+            x,
+            Expr::FnCall(..)
+                | Expr::Usr(_)
+                | Expr::String(_)
+                | Expr::Nrm(_)
+                | Expr::Len(_)
+                | Expr::Asc(_)
+                | Expr::StrCompare(..)
+                | Expr::Val(_)
+                | Expr::Inst { .. }
+        ) {
+            bad = true;
+        }
+    });
+    bad
+}
+
+/// Check for repeatable values with unchanged variables; exclude RND, PEEK and I/O.
+fn cse_pure(e: &Expr) -> bool {
+    match e {
+        Expr::Number(n) => n.is_finite(),
+        Expr::Var(v) => !matches!(v.base.as_str(), "TI" | "ST" | "ER" | "EL"),
+        Expr::Neg(x) | Expr::Not(x) => cse_pure(x),
+        Expr::Bin(_, l, r) => cse_pure(l) && cse_pure(r),
+        Expr::Func1(f, x) => *f != Func1::Rnd && cse_pure(x),
+        Expr::ArrayRef(a, idx) => {
+            !matches!(a.base.as_str(), "TI" | "ST" | "ER" | "EL") && idx.iter().all(cse_pure)
+        }
+        _ => false,
+    }
+}
+
+/// Rough cycles to evaluate `e` into FAC.
+fn cse_cost(e: &Expr) -> u32 {
+    match e {
+        Expr::Number(_) => 0,
+        Expr::Var(v) => {
+            if v.kind == VarKind::Integer {
+                90
+            } else {
+                0
+            }
+        }
+        Expr::Neg(x) => 10 + cse_cost(x),
+        Expr::Not(x) => 150 + cse_cost(x),
+        // A float index goes through a conversion to an integer first.
+        Expr::ArrayRef(_, idx) => {
+            let convert = |i: &Expr| match i {
+                Expr::Var(v) if v.kind == VarKind::Float => 200,
+                Expr::Number(_) => 0,
+                Expr::Var(_) => 0,
+                _ => 200,
+            };
+            100 + idx.iter().map(|i| cse_cost(i) + convert(i)).sum::<u32>()
+        }
+        Expr::Func1(f, x) => {
+            let own = match f {
+                Func1::Abs | Func1::Sgn => 30,
+                Func1::Int => 300,
+                Func1::Sqr => 25_000,
+                _ => 15_000,
+            };
+            own + cse_cost(x)
+        }
+        Expr::Bin(op, l, r) => {
+            let pot = |x: &Expr| mul_pot_exponent(x).is_some() || pot_scale_exponent(x).is_some();
+            let own = match op {
+                BinOp::Add | BinOp::Sub => 300,
+                BinOp::Mul if pot(l) || pot(r) => 60,
+                BinOp::Mul => 1_000,
+                BinOp::Div if pot(r) => 60,
+                BinOp::Div => 2_000,
+                BinOp::Pow => 20_000,
+                _ => 200,
+            };
+            own + cse_cost(l) + cse_cost(r)
+        }
+        _ => 0,
+    }
+}
+
+/// Cache pure arithmetic when evaluation costs more than a reload.
+fn cse_key(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow, ..)
+            | Expr::Func1(..)
+            | Expr::ArrayRef(..)
+    ) && cse_pure(e)
+        && cse_cost(e) >= CSE_MIN_COST
+}
+
+/// Find repeated subexpressions before their inputs change.
+/// Do not count children of an expression that will be reloaded.
+fn cse_candidates(stmts: &[Stmt]) -> Vec<Expr> {
+    fn count(e: &Expr, counts: &mut Vec<(Expr, u32)>, out: &mut Vec<Expr>) {
+        if cse_key(e) {
+            let n = match counts.iter_mut().find(|(k, _)| k == e) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    counts.push((e.clone(), 1));
+                    1
+                }
+            };
+            if n >= 2 {
+                if !out.contains(e) {
+                    out.push(e.clone());
+                }
+                return;
+            }
+        }
+        match e {
+            Expr::Neg(x) | Expr::Not(x) | Expr::Func1(_, x) => count(x, counts, out),
+            Expr::Bin(_, l, r) => {
+                count(l, counts, out);
+                count(r, counts, out);
+            }
+            Expr::ArrayRef(_, idx) => {
+                for i in idx {
+                    count(i, counts, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut counts: Vec<(Expr, u32)> = Vec::new();
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let (target, exprs): (&VarName, Vec<&Expr>) = match stmt {
+            Stmt::Let { var, value } => (var, vec![value]),
+            Stmt::ArrayLet {
+                name,
+                indices,
+                value,
+            } => (name, indices.iter().chain(std::iter::once(value)).collect()),
+            _ => break,
+        };
+        for e in exprs {
+            count(e, &mut counts, &mut out);
+        }
+        counts.retain(|(k, _)| !expr_mentions_name(k, target));
+    }
+    out
+}
+
+/// Rewrite integer `-a+b` or `b+-a` as `b-a` for integer LET emission.
+fn neg_plus_as_sub(e: &Expr) -> Option<Expr> {
+    let int_leaf = |e: &Expr| match e {
+        Expr::Var(v) => v.kind == VarKind::Integer && v.base != "TI" && v.base != "ST",
+        Expr::Number(n) => n.fract() == 0.0 && (-32768.0..=32767.0).contains(n),
+        _ => false,
+    };
+    let Expr::Bin(BinOp::Add, l, r) = e else {
+        return None;
+    };
+    let (a, b) = match (l.as_ref(), r.as_ref()) {
+        (Expr::Neg(a), b) | (b, Expr::Neg(a)) => (a.as_ref(), b),
+        _ => return None,
+    };
+    (int_leaf(a) && int_leaf(b)).then(|| Expr::Bin(BinOp::Sub, Box::new(b.clone()), Box::new(a.clone())))
+}
+
 fn is_basic_bool(e: &Expr) -> bool {
     match e {
         Expr::Bin(op, _, _) => {
@@ -40844,7 +41982,31 @@ enum ByteSign {
     Signed,
 }
 
-/// Classify ranges that fit one byte of storage.
+/// Collect variables compared or combined with integer array elements.
+fn collect_vars_paired_with_int_elements(stmt: &Stmt, out: &mut HashSet<VarName>) {
+    struct Pairs<'a>(&'a mut HashSet<VarName>);
+    impl crate::visit::Visitor for Pairs<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if let Expr::Bin(
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Add | BinOp::Sub,
+                l,
+                r,
+            ) = e
+            {
+                for (a, b) in [(l, r), (r, l)] {
+                    if let (Expr::Var(v), Expr::ArrayRef(name, _)) = (a.as_ref(), b.as_ref())
+                        && name.kind == VarKind::Integer
+                    {
+                        self.0.insert(v.clone());
+                    }
+                }
+            }
+            crate::visit::walk_expr(self, e);
+        }
+    }
+    crate::visit::Visitor::visit_stmt(&mut Pairs(out), 0, stmt);
+}
+
 fn range_fits_byte(range: crate::dataflow::IntRange) -> Option<ByteSign> {
     if range_fits_u8(range) {
         return Some(ByteSign::Unsigned);
@@ -41480,18 +42642,17 @@ fn loop_hot_lines(module: &ir::Module) -> HashSet<u16> {
         }
     }
 
-    // FOR/NEXT bodies via depth tracking — a line is inside a loop when
-    // the FOR depth is non-zero on entry or exit (the FOR header and
-    // the NEXT both count).
+    // Mark lines with positive FOR depth at any point, including FOR and NEXT.
     let mut for_open: Vec<bool> = Vec::new();
 
     let mut struct_open_unused: Vec<bool> = Vec::new();
     for line in &module.lines {
-        let before = for_open.len();
+        let mut deepest = for_open.len();
         for stmt in &line.stmts {
             adjust_for_depth(stmt, &mut for_open, &mut struct_open_unused);
+            deepest = deepest.max(for_open.len());
         }
-        if before > 0 || !for_open.is_empty() {
+        if deepest > 0 {
             hot.insert(line.number);
         }
     }
@@ -46897,25 +48058,25 @@ __LOOP:
     #[test]
     fn codegen_logic_uses_facword_for_non_negative_operand() {
         let x = ivar("X");
-        let m = Module {
+        let module = |value: f64| Module {
             lines: vec![
                 Line {
                     number: 10,
                     stmts: vec![Stmt::Let {
                         var: x.clone(),
-                        value: Expr::Number(5.0),
+                        value: Expr::Number(value),
                     }],
                 },
                 Line {
                     number: 20,
                     stmts: vec![Stmt::Print {
-                        items: vec![PrintPiece::Expr(Expr::Not(Box::new(Expr::Var(x))))],
+                        items: vec![PrintPiece::Expr(Expr::Not(Box::new(Expr::Var(x.clone()))))],
                         newline: true,
                     }],
                 },
             ],
         };
-        let asm = emit_with_profile(&m, Profile::default()).unwrap();
+        let asm = emit_with_profile(&module(5000.0), Profile::default()).unwrap();
         assert!(
             asm.contains("JSR $B7F7"),
             "non-negative NOT operand should use FACWORD\n{asm}"
@@ -46924,6 +48085,10 @@ __LOOP:
             !asm.contains("JSR __FAC_TO_INT16"),
             "signed prelude should be skipped\n{asm}"
         );
+        // A one-byte operand stays out of FAC until the result.
+        let asm = emit_with_profile(&module(5.0), Profile::default()).unwrap();
+        assert!(asm.contains("EOR #$FF"), "{asm}");
+        assert!(!asm.contains("JSR $B7F7") && !asm.contains("__FAC_TO_INT16"), "{asm}");
     }
 
     #[test]

@@ -151,11 +151,12 @@ fn straight_line_reuse_still_fires() {
     }
 }
 
-/// Reuse inside one iteration is untouched ; the invalidation is at the loop top, not everywhere in the body.
+/// Keep address reuse within each iteration; invalidate it at loop entry.
+/// Fractional values retain float array storage.
 #[test]
 fn reuse_within_one_iteration_still_fires() {
     let src = "10 DIMA(20)\n\
-               20 FORI=0TO20:A(I)=I+1:NEXTI\n\
+               20 FORI=0TO20:A(I)=I+.5:NEXTI\n\
                40 FORJ=0TO2\n\
                50 PRINTA(2);A(2)\n\
                60 NEXTJ\n";
@@ -169,7 +170,7 @@ fn reuse_within_one_iteration_still_fires() {
         assert!(clean, "{p:?}: clean exit");
         assert_eq!(
             out.lines().map(str::trim_end).collect::<Vec<_>>(),
-            [" 3  3", " 3  3", " 3  3"],
+            [" 2.5  2.5", " 2.5  2.5", " 2.5  2.5"],
             "{p:?}"
         );
     }

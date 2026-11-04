@@ -130,11 +130,16 @@ fn zp_slot_sharing_still_fires_after_the_def_edges() {
             )
         })
         .collect();
-    // At least one of them, not both.
+    // A late counter takes a byte an earlier, dead variable held.
+    let earlier: Vec<u8> = eq
+        .iter()
+        .filter(|(l, _)| l.starts_with("VI_") && !["VI_T", "VI_U"].contains(&l.as_str()))
+        .map(|(_, a)| *a)
+        .collect();
     assert!(
-        late.iter().any(|&(_, a)| a == i),
-        "neither T nor U reused ${i:02X}, so a slot freed by a dead variable is \
-         no longer being handed out: {late:02X?}"
+        late.iter().any(|&(_, a)| a == i || earlier.contains(&a)),
+        "neither T nor U reused a freed byte, so a slot freed by a dead variable \
+         is no longer being handed out: {late:02X?}"
     );
 
     let vars: Vec<u8> = eq

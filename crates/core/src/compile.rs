@@ -11262,16 +11262,9 @@ fn lower_and_optimize_with_source_types(
     // a FOR/NEXT pair that the induction passes would otherwise
     // analyse for nothing.
     pipeline.add(crate::passes::PokeLoopFusion);
-    // LICM hoists pure invariant subexpressions (`X*K` where X and
-    // K are loop-invariant scalars) into a fresh LET before the
-    // FOR. For BASIC v2 this is a big win because float
-    // multiplications cost ~200 cycles each and naive codegen
-    // re-evaluates the whole RHS every iteration. Conservative
-    // scope: pure arithmetic only (no PEEK/array/string/USR/FN/
-    // GOSUB), no division/pow/sqr/log/sin/cos/tan/atn (could
-    // trap when the loop runs zero times), no Rnd (stateful).
-    // Re-fold afterwards to clean up any constant subexpressions
-    // exposed by the rewrite.
+    // Hoist invariant assignments and expressions while preserving runtime errors.
+    // Fold constants exposed by either pass.
+    pipeline.add(crate::passes::HoistLeadingLoopLet);
     pipeline.add(crate::passes::LoopInvariantCodeMotion);
     pipeline.add(crate::passes::ConstantFold);
     // Promote provably-integer float arrays to 2-byte integer storage

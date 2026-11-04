@@ -116,11 +116,64 @@ fn unary_minus_on_a_signed_byte_is_sign_extended() {
     check_out(src, "9");
 }
 
+/// A signed byte compared with a 16-bit integer that is not an array element.
+const SCALAR_COMPARE_SIGNED: &str = "\
+10 gosub 100
+20 k=300:if q=1 then k=-300
+30 if k>e then print \"gt\";
+40 if e<k then print \"lt\";
+50 print k+e
+60 end
+100 e=-9
+105 if q=1 then e=-8
+120 return
+";
+
+#[test]
+fn compare_with_a_wide_scalar_is_sign_extended() {
+    check_out(SCALAR_COMPARE_SIGNED, "GTLT 291");
+}
+
+/// Keep a changing direction in one byte when every stored value fits.
+#[test]
+fn a_signed_byte_negates_one_byte_wide() {
+    let src = "\
+10 x=10:dx=1
+20 for n=1 to 60
+30 x=x+dx:if x<=0 or x>=12 then dx=-dx
+40 print x;
+50 next
+";
+    let want = (1..=60)
+            .scan((10i32, 1i32), |(x, dx), _| {
+                *x += *dx;
+                if *x <= 0 || *x >= 12 {
+                    *dx = -*dx;
+                }
+                Some(x.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    check_out(src, &want);
+    for profile in PROFILES {
+        let asm = build(src, profile).asm;
+        assert!(asm.contains("    SBC VI_DX\n    STA VI_DX\n"), "({profile:?}):\n{asm}");
+    }
+}
+
+/// Use two bytes when array comparisons would otherwise require repeated widening.
+#[test]
+fn a_signed_byte_meeting_array_elements_takes_two_bytes() {
+    for profile in PROFILES {
+        let asm = build(RHS_SIGNED, profile).asm;
+        assert!(asm.contains("VI_E+1"), "({profile:?}):\n{asm}");
+    }
+}
+
 #[test]
 fn signed_byte_storage_is_still_used() {
     for (name, src) in [
-        ("compare", RHS_SIGNED),
-        ("compare-lhs", LHS_SIGNED_POSITIVE_VALUE),
+        ("compare", SCALAR_COMPARE_SIGNED),
         ("bitwise", BITWISE_SIGNED),
     ] {
         for profile in PROFILES {

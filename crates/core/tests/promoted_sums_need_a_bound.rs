@@ -64,3 +64,11 @@ fn nested_loops_count_past_32767() {
 fn a_guarded_counter_past_32767() {
     same_as_the_rom("10 N=N+1000:A=N+1:B=N+2:C=N-1\n20 IF N<40000 THEN 10\n30 PRINT N;A\n");
 }
+
+/// Add PEEK bytes to integers and preserve overflow errors.
+#[test]
+fn a_sum_of_peeks() {
+    same_as_the_rom("10 FOR I=0 TO 99:POKE 828+I,I*7 AND 255:NEXT\n20 S=0:FOR I=0 TO 99:S=S+PEEK(828+I):NEXT:PRINT S\n");
+    same_as_the_rom("10 FOR I=0 TO 99:POKE 828+I,250:NEXT\n20 S%=32000:FOR I=0 TO 99:S%=S%+PEEK(828+I):PRINT S%;:NEXT\n");
+    same_as_the_rom("10 FOR I=0 TO 99:POKE 828+I,250:NEXT\n20 S=32000:FOR I=0 TO 99:S=PEEK(828+I)+S:NEXT:PRINT S\n");
+}

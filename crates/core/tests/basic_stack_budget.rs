@@ -566,10 +566,16 @@ fn the_cap_compare_lives_in_the_helper_and_not_at_the_call_site() {
              ({profile:?}):\n{asm}"
         );
 
+        // A holds the total on both ways into the test, so the reload may go.
         assert!(
             asm.contains(
                 "__FOR_BYTES_TEST:\n    \
                  LDA __FOR_BYTES_ACC\n    \
+                 CMP #$A8\n    \
+                 BCS __FOR_OOM\n    \
+                 RTS\n"
+            ) || asm.contains(
+                "__FOR_BYTES_TEST:\n    \
                  CMP #$A8\n    \
                  BCS __FOR_OOM\n    \
                  RTS\n"

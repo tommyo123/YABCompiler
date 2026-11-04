@@ -32,10 +32,29 @@ fn unrounded_uses_stay_in_the_loop() {
     );
 }
 
+/// Keep fallible expressions after PRINT to preserve output and error lines.
+#[test]
+fn a_hoist_never_moves_an_error_ahead() {
+    for src in [
+        "10 B=1E30:C=1E30:D=5:IF D=3 THEN B=1:C=2\n20 FOR I=1 TO 3:PRINT I;:A=B*C+D:NEXT\n",
+        "10 B=1E30:C=1E30:D=5:IF D=3 THEN B=1:C=2\n20 FOR I=1 TO 3\n30 A=B*C+D\n40 NEXT\n",
+        "10 Z=0:B=1E30:IF B=3 THEN Z=1\n20 FOR I=1 TO 1/Z:A=B*B:NEXT\n",
+        "10 B=1E30:C=1E30:Z=0:IF Z=3 THEN B=1\n20 FOR I=1 TO 3:A=I/Z+B*C:NEXT\n",
+    ] {
+        same_as_the_rom(src);
+    }
+}
+
 #[test]
 fn rounded_uses_still_hoist() {
+    // Reading L keeps the LET in the loop; its invariant subexpression can move.
     let src = "10 READ X:DATA -2\n20 X=X/3\n\
-               30 FOR L=1 TO 2:A=X*2+X:B=(X*2+X)*3:PRINT A;B;:NEXT\n";
+               30 FOR L=1 TO 2:A=X*2+X+L:B=(X*2+X)*3:PRINT A;B;:NEXT\n";
     same_as_the_rom(src);
     assert!(build(src, Profile::Default).asm.contains("__LICM_"), "the hoist is gone");
+    // Leading invariant LETs run once before the FOR.
+    same_as_the_rom(
+        "10 READ X:DATA -2\n20 X=X/3\n\
+         30 FOR L=1 TO 2:A=X*2+X:B=(X*2+X)*3:PRINT A;B;:NEXT\n",
+    );
 }

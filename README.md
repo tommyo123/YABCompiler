@@ -7,14 +7,11 @@ machine code.
 Input is `.bas` source or a tokenized `.prg`. The compiled `.prg` runs
 on a stock C64 or in an emulator.
 
-## Version 1.0.3
+## Version 1.0.4
 
-Loops, math, arrays, strings and READ run faster. The default and size
-profiles produce smaller programs. Runtime errors match C64 BASIC
-more closely.
-
-New options: `--no-error-checks` and `--fast-float`. Both are available
-in the CLI and GUI.
+Loops, array access, memory access and floating-point math run faster.
+Repeated calculations are reused, and more variables and arrays use
+byte or integer storage. CSET restores text mode after graphics.
 
 ## Download
 

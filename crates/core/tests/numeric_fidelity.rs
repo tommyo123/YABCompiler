@@ -205,8 +205,12 @@ fn not_folds_with_ayint_floor_semantics() {
 }
 #[test]
 fn in_range_narrowing_keeps_the_facword_fast_path() {
-    let src = "10 PRINT PEEK(53280) AND 15\n20 END\n";
+    let src = "10 PRINT PEEK(53280)*3 AND 15\n20 END\n";
     check_rom_call(src, "$B7F7", true);
+    check_asm(src, "JSR __AYINT", false);
+    // A PEEK itself is a byte: masked one byte wide, no conversion at all.
+    let src = "10 PRINT PEEK(53280) AND 15\n20 END\n";
+    check_rom_call(src, "$B7F7", false);
     check_asm(src, "JSR __AYINT", false);
 }
 #[test]

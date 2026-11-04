@@ -202,8 +202,9 @@ fn word_range_loop_still_uses_the_int_specialisation() {
 #[test]
 fn index_register_promotion_still_fires() {
     let asm = asm_of("10 F=1\n20 FOR I=1 TO 100\n30 NEXT I\n40 PRINT F\n50 END\n");
+    // I is read nowhere after the loop, so it counts in X and is never stored.
     assert!(
-        asm.contains("loop index -> X"),
+        asm.contains("loop index -> X") || asm.contains("    INX\n    CPX #$65\n"),
         "the peephole must still promote the loop counter to X:\n{asm}"
     );
 }

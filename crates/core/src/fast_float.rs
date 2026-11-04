@@ -76,6 +76,7 @@ const CONUPK: &str = "
 ";
 
 /// Shift a 40-bit operand right by A; return its rounding byte with carry clear.
+/// Move whole bytes first, then use unrolled shifts for the remaining bits.
 fn shift_right(out: &mut Lines, tag: &str, o: [u8; 4]) {
     let p = format!("__FA_{tag}");
     let [o0, o1, o2, o3] = o;
@@ -153,26 +154,56 @@ fn shift_right(out: &mut Lines, tag: &str, o: [u8; 4]) {
     TAX
     LDA $70
 {p}X:
-    CPX #$06
+    CPX #$05
     BCS {p}L
-    CPX #$00
-    BEQ {p}C
-{p}R:
+    CPX #$03
+    BCC {p}K
+    BEQ {p}R3
+{p}R4:
     LSR ${o0:02X}
     ROR ${o1:02X}
     ROR ${o2:02X}
     ROR ${o3:02X}
     ROR
-    DEX
-    BNE {p}R
+{p}R3:
+    LSR ${o0:02X}
+    ROR ${o1:02X}
+    ROR ${o2:02X}
+    ROR ${o3:02X}
+    ROR
+{p}R2:
+    LSR ${o0:02X}
+    ROR ${o1:02X}
+    ROR ${o2:02X}
+    ROR ${o3:02X}
+    ROR
+{p}R1:
+    LSR ${o0:02X}
+    ROR ${o1:02X}
+    ROR ${o2:02X}
+    ROR ${o3:02X}
+    ROR
 {p}C:
     CLC
     JMP {p}D
+{p}K:
+    CPX #$01
+    BEQ {p}R1
+    BCS {p}R2
+    BCC {p}C
 {p}L:
     LDY #$00
     STY $57
-    CPX #$07
-    BEQ {p}L1
+    CPX #$06
+    BEQ {p}L2
+    BCS {p}L1
+    ASL
+    ROL ${o3:02X}
+    ROL ${o2:02X}
+    ROL ${o1:02X}
+    ROL ${o0:02X}
+    ROL $57
+{p}L2:
     ASL
     ROL ${o3:02X}
     ROL ${o2:02X}
@@ -255,6 +286,32 @@ __FA_GO:
     STY $70
 ";
 
+/// Normalize nonnegative differences requiring at most one shift.
+/// Use ROM NORMAL for other cases; carry clear indicates a borrow.
+const FADD_NORM: &str = "
+__FA_NORM:
+    BCC __FA_NNEG
+    LDA $62
+    BMI __FA_NRTS
+    CMP #$40
+    BCC __FA_NROM
+    ASL $70
+    ROL $65
+    ROL $64
+    ROL $63
+    ROL $62
+    DEC $61
+    BNE __FA_NRTS
+    LDA #$00
+    STA $66
+__FA_NRTS:
+    RTS
+__FA_NROM:
+    JMP $B8D7
+__FA_NNEG:
+    JMP $B8D2
+";
+
 /// FSUBT: negate FAC and add.
 const FSUBT: &str = "
 __FSUBT:
@@ -307,7 +364,7 @@ __FA_SA:
     LDA $62
     SBC $6A
     STA $62
-    JMP $B8D2
+    JMP __FA_NORM
 __FA_FS:
     LDY $69
     STY $61
@@ -337,8 +394,9 @@ __FA_FS:
     LDA $6A
     SBC $62
     STA $62
-    JMP $B8D2",
+    JMP __FA_NORM",
             );
+            out.push(FADD_NORM);
         }
         Form::Compact => {
             out.push(
@@ -609,10 +667,140 @@ fn column(form: Form, c: usize) -> u8 {
     }
 }
 
+/// Multiplicand (ARG) bytes low to high.
+const A: [u8; 4] = [0x6D, 0x6C, 0x6B, 0x6A];
+/// Multiplier (FAC) bytes low to high: the rounding byte first.
+const M: [u8; 5] = [0x70, 0x65, 0x64, 0x63, 0x62];
+
+/// Zero the product columns and clear carry for the first product.
+fn clear_columns(out: &mut Lines, form: Form) {
+    out.push(
+        "
+    LDA #$00
+    CLC",
+    );
+    for c in 2..=8 {
+        let _ = writeln!(out.0, "    STA ${:02X}", column(form, c));
+    }
+}
+
+/// How an unrolled product adds into its columns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Add {
+    /// The product once.
+    Once,
+    /// Add twice to include the matching product in a square.
+    Twice,
+    /// Square a row byte using f(2a), since f(0) is zero.
+    Square,
+}
+
+/// Multiply FAC row byte `m` by ARG bytes and add using each `Add` mode.
+fn fast_row(out: &mut Lines, form: Form, label: &mut usize, i: usize, m: u8, products: &[(usize, Add)]) {
+    let col = |c| column(form, c);
+    let mut next = || {
+        *label += 1;
+        format!("__FM_L{label}")
+    };
+    if products.is_empty() {
+        return;
+    }
+    let skip_row = next();
+    out.push(&format!(
+        "
+    LDA ${m:02X}
+    BEQ {skip_row}"
+    ));
+    // Keep carry clear between products so subtraction and addition restore the exact product.
+    out.push(
+        "
+    STA $22
+    STA $24
+    EOR #$FF
+    CLC
+    ADC #$01
+    STA $26
+    STA $28",
+    );
+    for &(j, kind) in products {
+        let a = A[j];
+        let c = i + j;
+        let skip = next();
+        let (lo, hi) = (col(c), col(c + 1));
+        if kind == Add::Square {
+            // Carry is clear, so add the table value directly.
+            out.push(&format!(
+                "
+    LDY ${a:02X}
+    LDA ($22),Y
+    ADC ${lo:02X}
+    STA ${lo:02X}
+    LDA ($24),Y
+    ADC ${hi:02X}
+    STA ${hi:02X}"
+            ));
+            if c + 2 <= 8 {
+                let _ = writeln!(out.0, "    BCC {skip}");
+                let _ = writeln!(out.0, "    INC ${:02X}", col(c + 2));
+                if c + 3 <= 8 {
+                    let carried = next();
+                    let _ = writeln!(out.0, "    BNE {carried}");
+                    let _ = writeln!(out.0, "    JSR __FM_RIP{}", c + 3);
+                    let _ = writeln!(out.0, "{carried}:");
+                }
+                let _ = writeln!(out.0, "    CLC");
+            }
+            let _ = writeln!(out.0, "{skip}:");
+            continue;
+        }
+        out.push(&format!(
+            "
+    LDY ${a:02X}
+    BEQ {skip}
+    LDA ($22),Y
+    SBC ($26),Y
+    TAX
+    LDA ($24),Y
+    SBC ($28),Y
+    TAY"
+        ));
+        // Subtraction leaves product minus one in Y:X; carry restores the missing one.
+        let adds = if kind == Add::Twice { 2 } else { 1 };
+        for add in 0..adds {
+            let after = if add + 1 < adds { next() } else { skip.clone() };
+            if add > 0 {
+                let _ = writeln!(out.0, "    SEC");
+            }
+            out.push(&format!(
+                "
+    TXA
+    ADC ${lo:02X}
+    STA ${lo:02X}
+    TYA
+    ADC ${hi:02X}
+    STA ${hi:02X}"
+            ));
+            if c + 2 <= 8 {
+                let _ = writeln!(out.0, "    BCC {after}");
+                let _ = writeln!(out.0, "    INC ${:02X}", col(c + 2));
+                if c + 3 <= 8 {
+                    let carried = next();
+                    let _ = writeln!(out.0, "    BNE {carried}");
+                    let _ = writeln!(out.0, "    JSR __FM_RIP{}", c + 3);
+                    let _ = writeln!(out.0, "{carried}:");
+                }
+            }
+            if add + 1 == adds {
+                let _ = writeln!(out.0, "    CLC");
+            }
+            let _ = writeln!(out.0, "{after}:");
+        }
+    }
+    let _ = writeln!(out.0, "{skip_row}:");
+}
+
 /// Emit table-based multiplication with ROM fallbacks for ambiguous low-product carries.
 pub fn fmult_helper(form: Form) -> String {
-    // Multiplicand bytes low to high.
-    const A: [u8; 4] = [0x6D, 0x6C, 0x6B, 0x6A];
     let col = |c| column(form, c);
     let mut out = Lines(String::new());
     // The warm-up jumps become `BIT`, which changes Z, so the T entry tests FAC again.
@@ -679,13 +867,29 @@ __FM_PL1:
     STA $27
 __FM_PH1:
     LDA #$00
-    STA $29
-    LDA #$00
-    CLC",
+    STA $29",
     );
-    for c in 2..=8 {
-        let _ = writeln!(out.0, "    STA ${:02X}", col(c));
+    if form == Form::Fast {
+        // Equal mantissas (a square) take the shorter path after the tail.
+        out.push(
+            "
+    LDA $65
+    CMP $6D
+    BNE __FM_FULL
+    LDA $64
+    CMP $6C
+    BNE __FM_FULL
+    LDA $63
+    CMP $6B
+    BNE __FM_FULL
+    LDA $62
+    CMP $6A
+    BNE __FM_FULL
+    JMP __FM_SQ
+__FM_FULL:",
+        );
     }
+    clear_columns(&mut out, form);
     // Keep carry clear between products so subtraction and addition restore the exact product.
     const ROW_SETUP: &str = "
     STA $22
@@ -697,59 +901,10 @@ __FM_PH1:
     STA $28";
     match form {
         Form::Fast => {
-            // Multiplier bytes low to high: the rounding byte first.
-            const M: [u8; 5] = [0x70, 0x65, 0x64, 0x63, 0x62];
             let mut label = 0;
-            let mut next = || {
-                label += 1;
-                format!("__FM_L{label}")
-            };
             for (i, m) in M.iter().enumerate() {
-                let skip_row = next();
-                out.push(&format!(
-                    "
-    LDA ${m:02X}
-    BEQ {skip_row}"
-                ));
-                out.push(ROW_SETUP);
-                for (j, a) in A.iter().enumerate() {
-                    let c = i + j;
-                    if c < 2 {
-                        continue;
-                    }
-                    let skip = next();
-                    let (lo, hi) = (col(c), col(c + 1));
-                    out.push(&format!(
-                        "
-    LDY ${a:02X}
-    BEQ {skip}
-    LDA ($22),Y
-    SBC ($26),Y
-    TAX
-    LDA ($24),Y
-    SBC ($28),Y
-    TAY
-    TXA
-    ADC ${lo:02X}
-    STA ${lo:02X}
-    TYA
-    ADC ${hi:02X}
-    STA ${hi:02X}"
-                    ));
-                    if c + 2 <= 8 {
-                        let _ = writeln!(out.0, "    BCC {skip}");
-                        let _ = writeln!(out.0, "    INC ${:02X}", col(c + 2));
-                        if c + 3 <= 8 {
-                            let carried = next();
-                            let _ = writeln!(out.0, "    BNE {carried}");
-                            let _ = writeln!(out.0, "    JSR __FM_RIP{}", c + 3);
-                            let _ = writeln!(out.0, "{carried}:");
-                        }
-                    }
-                    let _ = writeln!(out.0, "    CLC");
-                    let _ = writeln!(out.0, "{skip}:");
-                }
-                let _ = writeln!(out.0, "{skip_row}:");
+                let products: Vec<(usize, Add)> = (0..A.len()).filter(|j| i + j >= 2).map(|j| (j, Add::Once)).collect();
+                fast_row(&mut out, form, &mut label, i, *m, &products);
             }
         }
         Form::Compact => {
@@ -836,6 +991,9 @@ __FM_SUM:",
             );
         }
     }
+    if form == Form::Fast {
+        out.push("__FM_SUM:");
+    }
     out.push(&format!(
         "
     LDA ${c3:02X}
@@ -903,6 +1061,23 @@ __FM_RIPX:
             c7 = col(7),
             c8 = col(8),
         ));
+        // Equal mantissas share mirrored products. Add each pair twice and diagonals once.
+        out.push("__FM_SQ:");
+        clear_columns(&mut out, form);
+        let mut label = 100;
+        for (i, m) in M.iter().enumerate() {
+            let products: Vec<(usize, Add)> = (0..A.len())
+                .filter(|&j| i + j >= 2)
+                .filter_map(|j| match i {
+                    0 => Some((j, Add::Once)),
+                    _ if j + 1 == i => Some((j, Add::Square)),
+                    _ if j + 1 > i => Some((j, Add::Twice)),
+                    _ => None,
+                })
+                .collect();
+            fast_row(&mut out, form, &mut label, i, *m, &products);
+        }
+        out.push("    JMP __FM_SUM");
     }
     out.push(&format!(
         "
@@ -1060,7 +1235,8 @@ pub(crate) fn append_table_area(asm: &str) -> String {
     out
 }
 
-/// Emit power functions through local float routines, preserving required scratch state.
+/// Emit power functions using local float routines.
+/// For SQR, halve FAC and truncate rounding bit 0; use FMULT when $64 is zero.
 const FX_SQR_PWR: &str = "
 __FX_SQR:
     JSR $BC0C
@@ -1090,9 +1266,7 @@ __FX_PW2:
     TYA
     PHA
     JSR __FX_LOG
-    LDA #$4E
-    LDY #$00
-    JSR $BA28
+    JSR __FX_MULY
     JSR __FX_EXP
     PLA
     LSR
@@ -1104,6 +1278,32 @@ __FX_PW2:
     STA $66
 __FX_PW3:
     RTS
+__FX_MULY:
+    LDA $4E
+    CMP #$80
+    BNE __FX_MYF
+    LDA $4F
+    ORA $50
+    ORA $51
+    ORA $52
+    BNE __FX_MYF
+    LDA $64
+    BEQ __FX_MYF
+    LDA $61
+    BEQ __FX_MYR
+    LDA $70
+    AND #$FE
+    STA $70
+    DEC $61
+    BNE __FX_MYR
+    LDA #$00
+    STA $66
+__FX_MYR:
+    RTS
+__FX_MYF:
+    LDA #$4E
+    LDY #$00
+    JMP $BA28
 ";
 
 /// LOG ($B9EA).
@@ -1169,7 +1369,7 @@ __FX_EX1:
 __FX_EX2:
     JSR $BAD4
 __FX_EX3:
-    JSR $BCCC ; ROM INT: sets $07
+    JSR __FX_INT07
     LDA $07
     CLC
     ADC #$81
@@ -1197,6 +1397,31 @@ __FX_EX4:
     PLA
     JSR $BAB9
     RTS
+__FX_INT07:
+    LDA $68
+    BNE __FX_I7R
+    JSR $BCCC
+    LDA $61
+    BEQ __FX_I7Z
+    LDX $61
+    LDA $62
+__FX_I7S:
+    CPX #$88
+    BCS __FX_I7M
+    LSR
+    INX
+    BNE __FX_I7S
+__FX_I7M:
+    BIT $66
+    BPL __FX_I7Z
+    EOR #$FF
+    CLC
+    ADC #$01
+__FX_I7Z:
+    STA $07
+    RTS
+__FX_I7R:
+    JMP $BCCC ; ROM INT: sets $07
 ";
 
 /// The polynomial evaluators ($E043, $E059) the power and trig families share.
@@ -1520,10 +1745,76 @@ pub(crate) fn route(asm: &str, form: Form) -> String {
     let asm =
         crate::codegen::route_rom_calls(&asm, &fdiv, &block(&fdiv_helper(form))).unwrap_or(asm);
     let fmult = [("$BA28", "__FMULT"), ("$BA2B", "__FMULTT")];
-    match crate::codegen::route_rom_calls(&asm, &fmult, &block(&fmult_helper(form))) {
+    let asm = match crate::codegen::route_rom_calls(&asm, &fmult, &block(&fmult_helper(form))) {
         Some(routed) => append_table_area(&routed),
         None => asm,
+    };
+    if form == Form::Fast {
+        direct_operand_stubs(&asm)
+    } else {
+        asm
     }
+}
+
+/// The entry past CONUPK for each memory-operand routine.
+const AFTER_CONUPK: [(&str, &str); 4] = [
+    ("__FMULT", "__FMULTT"),
+    ("__FADD", "__FADDT"),
+    ("__FSUB", "__FSUBT"),
+    ("__FDIV", "__FDIVT"),
+];
+
+/// Load a fixed operand directly into ARG and skip CONUPK.
+fn direct_operand_stubs(asm: &str) -> String {
+    let lines: Vec<&str> = asm.lines().collect();
+    let code = |l: &str| l.split(';').next().unwrap_or("").trim().to_string();
+    let mut out = String::with_capacity(asm.len() + 4096);
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 2 < lines.len() {
+            let (a, b, c) = (code(lines[i]), code(lines[i + 1]), code(lines[i + 2]));
+            let sym_a = a.strip_prefix("LDA #<");
+            let sym_b = b.strip_prefix("LDY #>");
+            let target = c
+                .strip_prefix("JMP ")
+                .and_then(|t| AFTER_CONUPK.iter().find(|(from, _)| *from == t))
+                .map(|(_, to)| *to);
+            if let (Some(sa), Some(sb), Some(to)) = (sym_a, sym_b, target)
+                && sa == sb
+                && sa.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                let x = sa;
+                let _ = write!(
+                    out,
+                    "    LDA {x}+4
+    STA $6D
+    LDA {x}+3
+    STA $6C
+    LDA {x}+2
+    STA $6B
+    LDA {x}+1
+    STA $6E
+    EOR $66
+    STA $6F
+    LDA $6E
+    ORA #$80
+    STA $6A
+    LDA {x}
+    STA $69
+    LDY #$00
+    LDA $61
+    JMP {to}
+"
+                );
+                i += 3;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
 }
 
 /// Route multiplication and power functions to ROM and remove their table storage.

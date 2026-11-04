@@ -239,13 +239,13 @@ fn exor_truth_table() {
     );
 }
 
-/// The stash is live across the right operand's evaluation, so a bitwise operator *inside* that
-/// operand must take its own cell.
+/// Nested bitwise operands need separate temporary cells.
+/// Division in each subscript prevents operand skipping.
 #[test]
 fn right_nested_chains_keep_every_stash() {
     let src = "10 DIM Q(1):READ U\n20 Q(0)=0:Q(1)=1\n30 FOR A=0 TO 1\n40 FOR B=0 TO 1\n\
                50 FOR C=0 TO 1\n60 FOR D=0 TO 1\n70 T=0\n\
-               80 IF Q(A*U)=1 AND (Q(B*U)=1 AND (Q(C*U)=1 AND Q(D*U)=1)) THEN T=1\n\
+               80 IF Q(A/U)=1 AND (Q(B/U)=1 AND (Q(C/U)=1 AND Q(D/U)=1)) THEN T=1\n\
                90 PRINT T\n100 NEXT D\n110 NEXT C\n120 NEXT B\n130 NEXT A\n140 END\n150 DATA 1\n";
     check_output(
         src,

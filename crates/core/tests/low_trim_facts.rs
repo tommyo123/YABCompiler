@@ -193,6 +193,10 @@ fn txttab_read() -> Vec<u8> {
     b.push(0xAC);
     b.push(0xC2);
     b.extend_from_slice(b"(44)");
+    // `:PRINT A` keeps the pointer live; a dead read would be dropped.
+    b.push(b':');
+    b.push(0x99);
+    b.push(b'A');
     b
 }
 
